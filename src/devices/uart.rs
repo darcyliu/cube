@@ -47,6 +47,23 @@ pub struct Pl011Uart {
 }
 
 impl Pl011Uart {
+    fn push_bytes(q: &Arc<Mutex<VecDeque<u8>>>, irq_num: u32, bytes: &[u8]) {
+        let mut guard = q.lock().unwrap();
+        for &b in bytes {
+            if b == 0x1d {
+                eprintln!("\r\n[VMM] Escape key Ctrl-] pressed. Exiting VM.\r\n");
+                std::process::exit(0);
+            }
+            let byte = if b == b'\r' { b'\n' } else { b };
+            guard.push_back(byte);
+        }
+        drop(guard);
+        unsafe {
+            crate::hypervisor::hv_gic_set_spi(irq_num, true);
+        }
+        crate::vcpu::kick_vcpu();
+    }
+
     pub fn new(irq_num: u32, interactive_stdin: bool) -> Self {
         let rx_queue = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -61,31 +78,38 @@ impl Pl011Uart {
                         match stdin.read(&mut buf) {
                             Ok(0) => break, // EOF
                             Ok(n) => {
-                                let mut q = q_clone.lock().unwrap();
-                                for &b in &buf[..n] {
-                                    // Ctrl-] (0x1d) escape to quit VM
-                                    if b == 0x1d {
-                                        eprintln!("\r\n[VMM] Escape key Ctrl-] pressed. Exiting VM.\r\n");
-                                        std::process::exit(0);
-                                    }
-                                    // In raw terminal mode, Enter sends '\r' (0x0d). Translate to '\n' (0x0a)
-                                    // so FreeBSD line readers (like /sbin/init and shells) accept the line.
-                                    let byte = if b == b'\r' { b'\n' } else { b };
-                                    q.push_back(byte);
-                                }
-                                drop(q);
-
-                                // Raise GIC SPI interrupt and kick vCPU out of hv_vcpu_run
-                                unsafe {
-                                    crate::hypervisor::hv_gic_set_spi(irq_num, true);
-                                }
-                                crate::vcpu::kick_vcpu();
+                                Self::push_bytes(&q_clone, irq_num, &buf[..n]);
                             }
                             Err(_) => break,
                         }
                     }
                 })
                 .expect("Failed to spawn stdin thread");
+
+            // Optional host-side command injector used by automated tests.
+            // Bytes written to /tmp/vmm-uart-in are pushed into the PL011 RX FIFO.
+            let q_inject = Arc::clone(&rx_queue);
+            thread::Builder::new()
+                .name("vmm-uart-inject".into())
+                .spawn(move || {
+                    let path = "/tmp/vmm-uart-in";
+                    loop {
+                        match std::fs::File::open(path) {
+                            Ok(mut f) => {
+                                let mut buf = [0u8; 256];
+                                loop {
+                                    match f.read(&mut buf) {
+                                        Ok(0) => break,
+                                        Ok(n) => Self::push_bytes(&q_inject, irq_num, &buf[..n]),
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            Err(_) => thread::sleep(std::time::Duration::from_millis(200)),
+                        }
+                    }
+                })
+                .expect("Failed to spawn uart inject thread");
         }
 
         Self {
@@ -103,6 +127,10 @@ impl Pl011Uart {
         let pending = (rx_pending | self.tx_int) & self.imsc;
         unsafe {
             crate::hypervisor::hv_gic_set_spi(self.irq_num, pending != 0);
+        }
+        // Kick only for RX so console output does not flood hv_vcpus_exit.
+        if (rx_pending & self.imsc) != 0 {
+            crate::vcpu::kick_vcpu();
         }
     }
 }

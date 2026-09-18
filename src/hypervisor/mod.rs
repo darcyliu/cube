@@ -83,6 +83,12 @@ pub const HV_SYS_REG_FAR_EL1: u16 = 0xc300;
 pub const HV_SYS_REG_MAIR_EL1: u16 = 0xc510;
 pub const HV_SYS_REG_VBAR_EL1: u16 = 0xc600;
 pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
+pub const HV_SYS_REG_CNTV_CTL_EL0: u16 = 0xdf19;
+pub const HV_SYS_REG_CNTV_CVAL_EL0: u16 = 0xdf1a;
+
+pub const CNTV_CTL_ENABLE: u64 = 1 << 0;
+pub const CNTV_CTL_IMASK: u64 = 1 << 1;
+pub const CNTV_CTL_ISTATUS: u64 = 1 << 2;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +166,9 @@ unsafe extern "C" {
     pub fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> hv_return_t;
 
+    pub fn hv_vcpu_get_vtimer_mask(vcpu: u64, vtimer_is_masked: *mut bool) -> hv_return_t;
+    pub fn hv_vcpu_set_vtimer_mask(vcpu: u64, vtimer_is_masked: bool) -> hv_return_t;
+
     // GIC v3 In-Kernel Device APIs (macOS 15+)
     pub fn hv_gic_config_create() -> *mut core::ffi::c_void;
     pub fn hv_gic_config_set_distributor_base(
@@ -175,3 +184,20 @@ unsafe extern "C" {
 
     pub fn os_release(object: *mut core::ffi::c_void);
 }
+
+// -----------------------------------------------------------------------------
+// ARM Power State Coordination Interface (PSCI) Constants
+// -----------------------------------------------------------------------------
+pub const PSCI_VERSION: u64 = 0x8400_0000;
+pub const PSCI_CPU_OFF: u64 = 0x8400_0002;
+pub const PSCI_CPU_ON_AARCH32: u64 = 0x8400_0003;
+pub const PSCI_CPU_ON_AARCH64: u64 = 0xc400_0003;
+pub const PSCI_MIGRATE_INFO_TYPE: u64 = 0x8400_0006;
+pub const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+pub const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+pub const PSCI_FEATURES: u64 = 0x8400_000a;
+
+pub const PSCI_SUCCESS: i64 = 0;
+pub const PSCI_NOT_SUPPORTED: i64 = -1;
+pub const PSCI_INVALID_PARAMETERS: i64 = -2;
+pub const PSCI_ALREADY_ON: i64 = -4;

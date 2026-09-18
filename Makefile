@@ -36,8 +36,10 @@ fetch-image:
 freebsd-root: all fetch-freebsd fetch-image
 	./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img
 
+CPUS ?= 2
+
 freebsd-net: all fetch-freebsd fetch-image
-	./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet
+	./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus $(CPUS)
 
 sudo-freebsd-net: all fetch-freebsd fetch-image
 	@IF="$$(route get default 2>/dev/null | awk '/interface:/{print $$2}')"; \
@@ -46,7 +48,7 @@ sudo-freebsd-net: all fetch-freebsd fetch-image
 		sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null; \
 		printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$$IF" "$$IF" "$$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true; \
 	fi
-	sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet
+	sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus $(CPUS)
 
 release:
 	cargo build --release

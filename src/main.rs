@@ -10,11 +10,14 @@ mod vm;
 use std::env;
 use std::fs;
 use std::process;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::thread;
 
 use devices::uart::Pl011Uart;
 use devices::virtio::block::VirtioBlock;
 use devices::virtio::net::VirtioNet;
-use vcpu::{Vcpu, VcpuExitStatus};
+use vcpu::{Vcpu, VcpuExitStatus, VcpuManager};
 use vm::Vm;
 
 const DEFAULT_RAM_BASE: u64 = 0x4000_0000;
@@ -50,6 +53,7 @@ fn main() {
     let mut is_freebsd = false;
     let mut net_mode: Option<String> = None;
     let mut mac_addr: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    let mut cpus: usize = 1;
 
     let mut i = 1;
     while i < args.len() {
@@ -98,6 +102,21 @@ fn main() {
                     }
                 }
             }
+            "--cpus" | "-c" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    if let Ok(c) = args[i].parse::<usize>() {
+                        if c == 0 || c > 16 {
+                            eprintln!("\x1b[1;31m[VMM Error] CPU count must be between 1 and 16\x1b[0m");
+                            process::exit(1);
+                        }
+                        cpus = c;
+                    } else {
+                        eprintln!("\x1b[1;31m[VMM Error] Invalid CPU count: '{}'\x1b[0m", args[i]);
+                        process::exit(1);
+                    }
+                }
+            }
             "--net" | "-n" => {
                 if i + 1 < args.len() {
                     i += 1;
@@ -121,6 +140,7 @@ fn main() {
                 println!("Options:");
                 println!("  -f, --freebsd [PATH]     Boot FreeBSD kernel (defaults to boot/kernel/kernel)");
                 println!("  -k, --kernel <PATH>      Boot specified ELF kernel");
+                println!("  -c, --cpus <N>           Number of virtual CPUs (default: 1)");
                 println!("  -d, --disk <PATH>        Attach raw disk image as VirtIO block device");
                 println!("  -r, --root <DEV>         Root filesystem device (e.g. ufs:/dev/vtbd0p2)");
                 println!("  -b, --bootargs <ARGS>    Custom kernel boot arguments");
@@ -186,6 +206,7 @@ fn main() {
                 &bootargs,
                 net_mode.as_deref(),
                 mac_addr,
+                cpus,
             );
             return;
         } else {
@@ -216,7 +237,7 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
-/// Boots an OS kernel ELF (such as FreeBSD ARM64) with GICv3 and Device Tree.
+/// Boots an OS kernel ELF (such as FreeBSD ARM64) with GICv3, multi-vCPU SMP, and Device Tree.
 fn boot_os_kernel(
     kernel_path: &str,
     elf_data: &[u8],
@@ -225,6 +246,7 @@ fn boot_os_kernel(
     bootargs: &str,
     net_mode: Option<&str>,
     mac_addr: [u8; 6],
+    cpus: usize,
 ) {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
@@ -235,6 +257,7 @@ fn boot_os_kernel(
         ram_size / (1024 * 1024),
         DEFAULT_RAM_BASE
     );
+    println!("[VMM] Configuring {} virtual CPUs (SMP)...", cpus);
     println!("[VMM] Bootargs: \"{}\"", bootargs);
 
     let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
@@ -300,7 +323,7 @@ fn boot_os_kernel(
 
     // Generate and load Device Tree Blob (DTB)
     let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000; // 0x48000000 (128MB offset)
-    let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, ram_size as u64, bootargs) {
+    let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, ram_size as u64, bootargs, cpus) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("\x1b[1;31m[VMM Error] Failed to generate DTB: {}\x1b[0m", e);
@@ -313,16 +336,65 @@ fn boot_os_kernel(
         process::exit(1);
     }
 
-    // Create vCPU #0
-    let mut vcpu = match Vcpu::new() {
+    // Set up Multi-vCPU manager
+    let vcpu_mgr = VcpuManager::new(cpus);
+    let mut secondary_threads = Vec::new();
+    let mmio_shared = vm.mmio().clone();
+
+    // Spawn secondary worker threads for vCPUs 1..cpus-1
+    for slot in vcpu_mgr.slots() {
+        let slot_clone = Arc::clone(slot);
+        let mgr_clone = Arc::clone(&vcpu_mgr);
+        let mmio_clone = mmio_shared.clone();
+        let cpu_idx = slot.vcpu_index;
+
+        let handle = thread::Builder::new()
+            .name(format!("vmm-vcpu-{}", cpu_idx))
+            .spawn(move || {
+                // Initialize secondary vCPU on its own OS thread (Apple Hypervisor affinity requirement)
+                let mut vcpu = match Vcpu::with_manager(cpu_idx, Some(mgr_clone)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("\x1b[1;31m[VMM Error] Failed to create secondary vCPU {}: {}\x1b[0m", cpu_idx, e);
+                        return;
+                    }
+                };
+
+                // Park on condvar until PSCI CPU_ON release
+                let boot_args = {
+                    let mut guard = slot_clone.boot_args.lock().unwrap();
+                    while guard.is_none() {
+                        if slot_clone.is_online.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        guard = slot_clone.condvar.wait(guard).unwrap();
+                    }
+                    guard.take()
+                };
+
+                if let Some(args) = boot_args {
+                    if let Err(e) = vcpu.setup_secondary_boot_state(args.entry_point, args.context_id) {
+                        eprintln!("\x1b[1;31m[VMM Error] Failed to setup secondary vCPU {} boot state: {}\x1b[0m", cpu_idx, e);
+                        return;
+                    }
+                    let _ = vcpu.run(&mmio_clone);
+                }
+            })
+            .expect("Failed to spawn secondary vCPU thread");
+
+        secondary_threads.push(handle);
+    }
+
+    // Create boot vCPU #0
+    let mut vcpu0 = match Vcpu::with_manager(0, Some(Arc::clone(&vcpu_mgr))) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to create vCPU: {}\x1b[0m", e);
+            eprintln!("\x1b[1;31m[VMM Error] Failed to create boot vCPU 0: {}\x1b[0m", e);
             process::exit(1);
         }
     };
 
-    if let Err(e) = vcpu.setup_os_boot_state(loaded.entry_point, dtb_addr, 0) {
+    if let Err(e) = vcpu0.setup_os_boot_state(loaded.entry_point, dtb_addr, 0) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to setup OS boot registers: {}\x1b[0m", e);
         process::exit(1);
     }
@@ -333,7 +405,13 @@ fn boot_os_kernel(
     // Set terminal to raw mode so keystrokes are sent immediately to the guest
     let _term_guard = terminal::TerminalGuard::enter_raw_mode();
 
-    run_loop(&mut vcpu, vm.mmio_mut());
+    run_loop(&mut vcpu0, vm.mmio());
+
+    // Signal shutdown to secondary vCPUs and join threads
+    vcpu_mgr.request_shutdown();
+    for handle in secondary_threads {
+        let _ = handle.join();
+    }
 }
 
 /// Boots a raw flat binary payload (like the baremetal test).
@@ -377,10 +455,10 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize) {
     println!("[VMM] Entering guest execution loop...");
     println!("--------------------------------------------------");
 
-    run_loop(&mut vcpu, vm.mmio_mut());
+    run_loop(&mut vcpu, vm.mmio());
 }
 
-fn run_loop(vcpu: &mut Vcpu, mmio: &mut devices::MmioBus) {
+fn run_loop(vcpu: &mut Vcpu, mmio: &devices::MmioBus) {
     match vcpu.run(mmio) {
         Ok(status) => {
             println!("--------------------------------------------------");

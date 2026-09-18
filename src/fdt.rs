@@ -9,7 +9,25 @@ pub fn generate_dtb(
     ram_base: u64,
     ram_size: u64,
     bootargs: &str,
+    num_cpus: usize,
 ) -> Result<Vec<u8>, String> {
+    let cpus_count = num_cpus.max(1);
+    let mut cpus_dts = String::new();
+    for i in 0..cpus_count {
+        cpus_dts.push_str(&format!(
+            r#"        cpu@{i} {{
+            device_type = "cpu";
+            compatible = "arm,arm-v8";
+            reg = <0x{i:x}>;
+            enable-method = "psci";
+        }};
+"#
+        ));
+    }
+
+    // In GICv3, each vCPU has a 128KB (0x20000) Redistributor region (RD_base + SGI_base)
+    let redist_size = (cpus_count as u64) * 0x20000;
+
     let dts = format!(
         r#"/dts-v1/;
 
@@ -27,14 +45,7 @@ pub fn generate_dtb(
     cpus {{
         #address-cells = <1>;
         #size-cells = <0>;
-
-        cpu@0 {{
-            device_type = "cpu";
-            compatible = "arm,arm-v8";
-            reg = <0x0>;
-            enable-method = "psci";
-        }};
-    }};
+{cpus_dts}    }};
 
     psci {{
         compatible = "arm,psci-1.0", "arm,psci-0.2", "arm,psci";
@@ -51,7 +62,7 @@ pub fn generate_dtb(
         #interrupt-cells = <3>;
         interrupt-controller;
         reg = <0x0 0x08000000 0x0 0x10000>,
-              <0x0 0x080a0000 0x0 0x20000>;
+              <0x0 0x080a0000 0x0 0x{redist_size:x}>;
     }};
 
     timer {{
@@ -61,6 +72,7 @@ pub fn generate_dtb(
                      <1 14 0xf08>,
                      <1 11 0xf08>,
                      <1 10 0xf08>;
+        always-on;
     }};
 
     pl011@09000000 {{
