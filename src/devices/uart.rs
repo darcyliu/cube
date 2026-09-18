@@ -33,11 +33,15 @@ const UART_FR_RXFE: u64 = 1 << 4;
 // Interrupt bits:
 // Bit 4: RXIM / RXIS (Receive interrupt)
 // Bit 5: TXIM / TXIS (Transmit interrupt)
+// Bit 6: RTIM / RTIS (Receive Timeout interrupt)
 const INT_RX: u32 = 1 << 4;
+const INT_TX: u32 = 1 << 5;
+const INT_RT: u32 = 1 << 6;
 
 pub struct Pl011Uart {
     cr: u32,
     imsc: u32,
+    tx_int: u32,
     rx_queue: Arc<Mutex<VecDeque<u8>>>,
     irq_num: u32,
 }
@@ -64,14 +68,18 @@ impl Pl011Uart {
                                         eprintln!("\r\n[VMM] Escape key Ctrl-] pressed. Exiting VM.\r\n");
                                         std::process::exit(0);
                                     }
-                                    q.push_back(b);
+                                    // In raw terminal mode, Enter sends '\r' (0x0d). Translate to '\n' (0x0a)
+                                    // so FreeBSD line readers (like /sbin/init and shells) accept the line.
+                                    let byte = if b == b'\r' { b'\n' } else { b };
+                                    q.push_back(byte);
                                 }
                                 drop(q);
 
-                                // Raise GIC SPI interrupt
+                                // Raise GIC SPI interrupt and kick vCPU out of hv_vcpu_run
                                 unsafe {
                                     crate::hypervisor::hv_gic_set_spi(irq_num, true);
                                 }
+                                crate::vcpu::kick_vcpu();
                             }
                             Err(_) => break,
                         }
@@ -83,8 +91,18 @@ impl Pl011Uart {
         Self {
             cr: 0x301, // RXE | TXE | UARTEN
             imsc: 0,
+            tx_int: INT_TX, // TX FIFO starts empty
             rx_queue,
             irq_num,
+        }
+    }
+
+    fn update_irq(&self) {
+        let q = self.rx_queue.lock().unwrap();
+        let rx_pending = if q.is_empty() { 0 } else { INT_RX | INT_RT };
+        let pending = (rx_pending | self.tx_int) & self.imsc;
+        unsafe {
+            crate::hypervisor::hv_gic_set_spi(self.irq_num, pending != 0);
         }
     }
 }
@@ -95,11 +113,8 @@ impl MmioDevice for Pl011Uart {
             UART_DR => {
                 let mut q = self.rx_queue.lock().unwrap();
                 let byte = q.pop_front().unwrap_or(0);
-                if q.is_empty() {
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-                    }
-                }
+                drop(q);
+                self.update_irq();
                 byte as u64
             }
             UART_FR => {
@@ -111,16 +126,13 @@ impl MmioDevice for Pl011Uart {
             UART_IMSC => self.imsc as u64,
             UART_RIS => {
                 let q = self.rx_queue.lock().unwrap();
-                if q.is_empty() {
-                    0
-                } else {
-                    INT_RX as u64
-                }
+                let rx = if q.is_empty() { 0 } else { INT_RX | INT_RT };
+                (rx | self.tx_int) as u64
             }
             UART_MIS => {
                 let q = self.rx_queue.lock().unwrap();
-                let ris = if q.is_empty() { 0 } else { INT_RX };
-                (ris & self.imsc) as u64
+                let rx = if q.is_empty() { 0 } else { INT_RX | INT_RT };
+                ((rx | self.tx_int) & self.imsc) as u64
             }
             _ => 0,
         }
@@ -131,26 +143,27 @@ impl MmioDevice for Pl011Uart {
             UART_DR => {
                 let ch = (data & 0xff) as u8;
                 let mut stdout = io::stdout().lock();
-                let _ = stdout.write_all(&[ch]);
+                if ch == b'\n' {
+                    let _ = stdout.write_all(b"\r\n");
+                } else {
+                    let _ = stdout.write_all(&[ch]);
+                }
                 let _ = stdout.flush();
+                // Data was sent immediately, transmit FIFO is ready for more
+                self.tx_int = INT_TX;
+                self.update_irq();
             }
             UART_CR => {
                 self.cr = data as u32;
             }
             UART_IMSC => {
                 self.imsc = data as u32;
+                self.update_irq();
             }
             UART_ICR => {
-                // Clear interrupts
                 let val = data as u32;
-                if (val & INT_RX) != 0 {
-                    let q = self.rx_queue.lock().unwrap();
-                    if q.is_empty() {
-                        unsafe {
-                            crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-                        }
-                    }
-                }
+                self.tx_int &= !val;
+                self.update_irq();
             }
             _ => {}
         }

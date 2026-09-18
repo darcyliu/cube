@@ -13,12 +13,13 @@ use std::process;
 
 use devices::uart::Pl011Uart;
 use devices::virtio::block::VirtioBlock;
+use devices::virtio::net::VirtioNet;
 use vcpu::{Vcpu, VcpuExitStatus};
 use vm::Vm;
 
 const DEFAULT_RAM_BASE: u64 = 0x4000_0000;
 const DEFAULT_BAREMETAL_RAM_SIZE: usize = 64 * 1024 * 1024; // 64 MB
-const OS_RAM_SIZE: usize = 512 * 1024 * 1024;              // 512 MB for FreeBSD/Linux
+const DEFAULT_OS_RAM_SIZE: usize = 1024 * 1024 * 1024;      // 1024 MB (1GB) for FreeBSD/Linux
 
 const MMIO_GICD_BASE: u64 = 0x0800_0000;
 const MMIO_GICR_BASE: u64 = 0x080a_0000;
@@ -30,6 +31,10 @@ const MMIO_VIRTIO_BLK_BASE: u64 = 0x0a00_0000;
 const MMIO_VIRTIO_BLK_SIZE: u64 = 0x0200;
 const VIRTIO_BLK_IRQ: u32 = 34; // SPI 2 (intid 34)
 
+const MMIO_VIRTIO_NET_BASE: u64 = 0x0a00_0200;
+const MMIO_VIRTIO_NET_SIZE: u64 = 0x0200;
+const VIRTIO_NET_IRQ: u32 = 35; // SPI 3 (intid 35)
+
 // Embedded default payload built by build.rs
 const DEFAULT_PAYLOAD: &[u8] = include_bytes!("../guest/payload.bin");
 
@@ -39,7 +44,12 @@ fn main() {
     // Parse command line arguments
     let mut kernel_path: Option<String> = None;
     let mut disk_path: Option<String> = None;
+    let mut root_dev: Option<String> = None;
+    let mut custom_bootargs: Option<String> = None;
+    let mut ram_mb: Option<usize> = None;
     let mut is_freebsd = false;
+    let mut net_mode: Option<String> = None;
+    let mut mac_addr: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
     let mut i = 1;
     while i < args.len() {
@@ -65,14 +75,59 @@ fn main() {
                     disk_path = Some(args[i].clone());
                 }
             }
+            "--root" | "-r" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    root_dev = Some(args[i].clone());
+                }
+            }
+            "--bootargs" | "-b" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    custom_bootargs = Some(args[i].clone());
+                }
+            }
+            "--ram" | "-m" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    if let Ok(mb) = args[i].parse::<usize>() {
+                        ram_mb = Some(mb);
+                    } else {
+                        eprintln!("\x1b[1;31m[VMM Error] Invalid RAM size: '{}'\x1b[0m", args[i]);
+                        process::exit(1);
+                    }
+                }
+            }
+            "--net" | "-n" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    net_mode = Some(args[i].clone());
+                }
+            }
+            "--mac" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    if let Some(mac) = parse_mac(&args[i]) {
+                        mac_addr = mac;
+                    } else {
+                        eprintln!("\x1b[1;31m[VMM Error] Invalid MAC address: '{}'\x1b[0m", args[i]);
+                        process::exit(1);
+                    }
+                }
+            }
             "--help" | "-h" => {
                 println!("Usage: vmm [OPTIONS] [PAYLOAD/KERNEL]");
                 println!();
                 println!("Options:");
-                println!("  -f, --freebsd [PATH]   Boot FreeBSD kernel (defaults to boot/kernel/kernel)");
-                println!("  -k, --kernel <PATH>    Boot specified ELF kernel");
-                println!("  -d, --disk <PATH>      Attach raw disk image as VirtIO block device");
-                println!("  -h, --help             Display this help message");
+                println!("  -f, --freebsd [PATH]     Boot FreeBSD kernel (defaults to boot/kernel/kernel)");
+                println!("  -k, --kernel <PATH>      Boot specified ELF kernel");
+                println!("  -d, --disk <PATH>        Attach raw disk image as VirtIO block device");
+                println!("  -r, --root <DEV>         Root filesystem device (e.g. ufs:/dev/vtbd0p2)");
+                println!("  -b, --bootargs <ARGS>    Custom kernel boot arguments");
+                println!("  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)");
+                println!("  -n, --net <MODE>         Network mode: vmnet (default), tap:<dev>, mock, none");
+                println!("      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)");
+                println!("  -h, --help               Display this help message");
                 return;
             }
             arg if !arg.starts_with('-') => {
@@ -91,6 +146,11 @@ fn main() {
         kernel_path = Some("boot/kernel/kernel".to_string());
     }
 
+    // Default root device when disk is provided but --root is not specified
+    if disk_path.is_some() && root_dev.is_none() {
+        root_dev = Some("ufs:/dev/vtbd0p2".to_string());
+    }
+
     if let Some(ref path) = kernel_path {
         let file_data = match fs::read(path) {
             Ok(data) => data,
@@ -103,10 +163,36 @@ fn main() {
         let is_elf = file_data.len() >= 4 && &file_data[0..4] == b"\x7fELF";
 
         if is_elf || is_freebsd {
-            boot_os_kernel(path, &file_data, disk_path.as_deref());
+            let ram_size = ram_mb
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or(DEFAULT_OS_RAM_SIZE);
+
+            let bootargs = match custom_bootargs {
+                Some(b) => b,
+                None => match root_dev {
+                    Some(ref root) => format!(
+                        "FreeBSD: -v -s -h boot_serial=YES console=comconsole vfs.root.mountfrom={}",
+                        root
+                    ),
+                    None => "FreeBSD: -v -s -h boot_serial=YES console=comconsole".to_string(),
+                },
+            };
+
+            boot_os_kernel(
+                path,
+                &file_data,
+                disk_path.as_deref(),
+                ram_size,
+                &bootargs,
+                net_mode.as_deref(),
+                mac_addr,
+            );
             return;
         } else {
-            boot_flat_binary(path, &file_data);
+            let ram_size = ram_mb
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or(DEFAULT_BAREMETAL_RAM_SIZE);
+            boot_flat_binary(path, &file_data, ram_size);
             return;
         }
     }
@@ -115,18 +201,43 @@ fn main() {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
-    boot_flat_binary("embedded EL1 baremetal test suite", DEFAULT_PAYLOAD);
+    boot_flat_binary("embedded EL1 baremetal test suite", DEFAULT_PAYLOAD, DEFAULT_BAREMETAL_RAM_SIZE);
+}
+
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(|c| c == ':' || c == '-').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(mac)
 }
 
 /// Boots an OS kernel ELF (such as FreeBSD ARM64) with GICv3 and Device Tree.
-fn boot_os_kernel(kernel_path: &str, elf_data: &[u8], disk_path: Option<&str>) {
+fn boot_os_kernel(
+    kernel_path: &str,
+    elf_data: &[u8],
+    disk_path: Option<&str>,
+    ram_size: usize,
+    bootargs: &str,
+    net_mode: Option<&str>,
+    mac_addr: [u8; 6],
+) {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("[VMM] Preparing to boot OS kernel from '{}'...", kernel_path);
-    println!("[VMM] Allocating 512MB RAM at GPA 0x{:08x}...", DEFAULT_RAM_BASE);
+    println!(
+        "[VMM] Allocating {}MB RAM at GPA 0x{:08x}...",
+        ram_size / (1024 * 1024),
+        DEFAULT_RAM_BASE
+    );
+    println!("[VMM] Bootargs: \"{}\"", bootargs);
 
-    let mut vm = match Vm::new(DEFAULT_RAM_BASE, OS_RAM_SIZE) {
+    let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m", e);
@@ -166,6 +277,17 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8], disk_path: Option<&str>) {
         MMIO_VIRTIO_BLK_BASE, VIRTIO_BLK_IRQ
     );
 
+    // Attach VirtIO-MMIO Network Device
+    if net_mode != Some("none") {
+        let virtio_net = VirtioNet::new(mac_addr, VIRTIO_NET_IRQ, vm.memory(), net_mode.unwrap_or("vmnet"));
+        vm.mmio_mut()
+            .register(MMIO_VIRTIO_NET_BASE, MMIO_VIRTIO_NET_SIZE, Box::new(virtio_net));
+        println!(
+            "[VMM] Registered VirtIO-MMIO network device at GPA 0x{:08x} (IRQ {})",
+            MMIO_VIRTIO_NET_BASE, VIRTIO_NET_IRQ
+        );
+    }
+
     // Load kernel ELF: FreeBSD locore requires 2MB alignment from RAM base
     let kernel_phys_load = DEFAULT_RAM_BASE + 0x0020_0000; // 0x40200000
     let loaded = match elf::load_elf64(elf_data, &vm.memory(), kernel_phys_load) {
@@ -178,8 +300,7 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8], disk_path: Option<&str>) {
 
     // Generate and load Device Tree Blob (DTB)
     let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000; // 0x48000000 (128MB offset)
-    let bootargs = "boot_verbose=1 boot_single=1 console=ttyAMA0 earlycon=pl011,0x09000000";
-    let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, OS_RAM_SIZE as u64, bootargs) {
+    let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, ram_size as u64, bootargs) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("\x1b[1;31m[VMM Error] Failed to generate DTB: {}\x1b[0m", e);
@@ -216,8 +337,8 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8], disk_path: Option<&str>) {
 }
 
 /// Boots a raw flat binary payload (like the baremetal test).
-fn boot_flat_binary(name: &str, payload_data: &[u8]) {
-    let mut vm = match Vm::new(DEFAULT_RAM_BASE, DEFAULT_BAREMETAL_RAM_SIZE) {
+fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize) {
+    let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m", e);

@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod block;
+pub mod net;
 
 // VirtIO MMIO Register Offsets (Modern, Version 2)
 pub const VIRTIO_MMIO_MAGIC_VALUE: u64 = 0x000;
@@ -49,6 +50,17 @@ pub const VIRTIO_STATUS_FAILED: u32 = 128;
 // Descriptor Flags
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
+
+// VirtIO Network Features
+pub const VIRTIO_NET_F_MAC: u64 = 1 << 5;
+pub const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
+pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+
+// VirtIO Network Status
+pub const VIRTIO_NET_S_LINK_UP: u16 = 1;
+
+// VirtIO Modern Network Header length (virtio_net_hdr_v1)
+pub const VIRTIO_NET_HDR_SIZE: usize = 12;
 
 // Split Virtqueue state for a single queue
 #[derive(Clone, Copy, Default)]

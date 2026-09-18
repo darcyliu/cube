@@ -76,6 +76,13 @@ pub fn generate_dtb(
         interrupt-parent = <&intc>;
         interrupts = <0 2 4>; /* SPI 2 (interrupt ID 34) */
     }};
+
+    virtio_mmio@0a000200 {{
+        compatible = "virtio,mmio";
+        reg = <0x0 0x0a000200 0x0 0x200>;
+        interrupt-parent = <&intc>;
+        interrupts = <0 3 4>; /* SPI 3 (interrupt ID 35) */
+    }};
 }};
 "#,
         bootargs = bootargs,

@@ -65,15 +65,46 @@ It supports booting both custom baremetal ARM64 payloads at EL1 and full operati
 make run
 ```
 
-### 2. Boot Official FreeBSD 14-RELEASE with VirtIO Disk
+### 2. Boot Official FreeBSD 14-RELEASE with Real Rootfs (Live Shell)
 ```bash
-# Automatically downloads the official ARM64 kernel and boots it:
-make freebsd
-
-# Or attach a virtual disk image:
-dd if=/dev/zero of=disk.img bs=1M count=64
-./target/debug/vmm --freebsd boot/kernel/kernel --disk disk.img
+# Automatically fetches kernel & official mini-memstick rootfs, mounts /dev/vtbd0p2, and boots to live shell:
+make freebsd-root
 ```
+When prompted:
+```
+Enter full pathname of shell or RETURN for /bin/sh:
+```
+Press `Enter` to access the live FreeBSD root `#` prompt!
+
+### 3. Boot FreeBSD with VirtIO-Net Networking (NAT & Internet Access)
+```bash
+# Run with root privileges to automatically enable macOS vmnet.framework NAT:
+sudo make sudo-freebsd-net
+
+# Or run unprivileged (uses user-mode fallback backend):
+make freebsd-net
+```
+Inside the FreeBSD single-user shell:
+```sh
+# 1. Remount root read-write:
+mount -u -w /
+mkdir -p /var/db /var/run
+
+# 2. Acquire DHCP lease and set default gateway:
+dhclient vtnet0
+route add default 192.168.18.1
+
+# 3. Configure DNS resolver:
+rm -f /etc/resolv.conf
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+
+# 4. Fetch web pages across the internet!
+fetch -o - http://example.com | head -n 15
+fetch --no-verify-peer -o - https://www.freebsd.org | head -n 15
+```
+
+For complete architectural details, troubleshooting steps, and NAT forwarding explanations, see [docs/networking.md](docs/networking.md).
 
 Press `Ctrl-]` at any time to detach from the guest and return to the host terminal.
 
@@ -87,6 +118,8 @@ vmm/
 ├── build.rs                 # Links Hypervisor.framework & assembles guest payload
 ├── entitlements.plist       # com.apple.security.hypervisor entitlement
 ├── Makefile                 # Convenient build, sign, and run automation
+├── docs/
+│   └── networking.md        # VirtIO-Net architecture, troubleshooting & UX guide
 ├── guest/
 │   └── payload.S            # Baremetal ARM64 assembly test program
 └── src/
@@ -104,5 +137,6 @@ vmm/
         ├── uart.rs          # ARM PL011-compatible virtual serial console
         └── virtio/
             ├── mod.rs       # Modern VirtIO MMIO v2 constants and ring structures
-            └── block.rs     # VirtIO block device (virtio-blk) implementation
+            ├── block.rs     # VirtIO block device (virtio-blk) implementation
+            └── net.rs       # VirtIO network device (virtio-net) with macOS vmnet backend
 ```

@@ -2,11 +2,22 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use crate::devices::MmioBus;
 use crate::hypervisor::*;
+
+static VCPU_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Forces the running vCPU to immediately exit hv_vcpu_run so it can process pending interrupts.
+pub fn kick_vcpu() {
+    let id = VCPU_ID.load(Ordering::Relaxed);
+    unsafe {
+        let _ = hv_vcpus_exit(&id, 1);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VcpuExitStatus {
@@ -31,6 +42,8 @@ impl Vcpu {
         unsafe {
             check_hv(hv_vcpu_create(&mut id, &mut exit_ptr, std::ptr::null()))?;
         }
+
+        VCPU_ID.store(id, Ordering::Relaxed);
 
         Ok(Self {
             id,
@@ -185,7 +198,8 @@ impl Vcpu {
                     }
                 }
                 HV_EXIT_REASON_CANCELED => {
-                    return Ok(VcpuExitStatus::Canceled);
+                    // vCPU was kicked by another thread (hv_vcpus_exit) to process interrupts
+                    continue;
                 }
                 HV_EXIT_REASON_VTIMER_ACTIVATED => {
                     // ARM Generic Virtual Timer fired

@@ -152,6 +152,7 @@ unsafe extern "C" {
     ) -> hv_return_t;
     pub fn hv_vcpu_destroy(vcpu: u64) -> hv_return_t;
     pub fn hv_vcpu_run(vcpu: u64) -> hv_return_t;
+    pub fn hv_vcpus_exit(vcpus: *const u64, vcpu_count: u32) -> hv_return_t;
 
     pub fn hv_vcpu_get_reg(vcpu: u64, reg: u32, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_reg(vcpu: u64, reg: u32, value: u64) -> hv_return_t;
