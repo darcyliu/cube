@@ -87,7 +87,6 @@ pkg install -y ca_root_nss
 ---
 
 ## 4. Verification
-
 After running the above commands:
 ```sh
 # Verify package installation works
@@ -96,3 +95,70 @@ pkg install -y curl
 # Verify HTTPS works after installing ca_root_nss
 curl -I https://www.freebsd.org
 ```
+
+---
+
+## 5. One-Time Setup for Automated Multi-User & SSH
+
+To allow FreeBSD to boot unattended directly into multi-user mode (`/sbin/init`), mount filesystems automatically, start DHCP networking, and run `sshd`, execute this one-time setup inside your single-user shell:
+
+```sh
+# 1. Configure /etc/fstab for automatic read-write root mount
+cat << 'EOF' > /etc/fstab
+/dev/vtbd0p2  /  ufs  rw,noatime  1  1
+EOF
+
+# 2. Configure /etc/rc.conf for automated network & SSH daemon
+cat << 'EOF' > /etc/rc.conf
+hostname="freebsd-vmm"
+ifconfig_vtnet0="DHCP"
+sshd_enable="YES"
+sendmail_enable="NONE"
+dumpdev="NO"
+EOF
+
+# 3. Disable installer autorun (from installer memstick)
+rm -f /etc/rc.local
+
+# 4. Enable SSH root login and set a password
+sed -i '' 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i '' 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# Set a root password (e.g. 'root' or your choice)
+passwd root
+
+# (Optional) Authorize your host Mac's SSH public key for instant key-based login:
+# mkdir -p /root/.ssh
+# echo "YOUR_HOST_SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
+# chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+
+# 5. Flush filesystem to disk
+sync
+```
+
+Press **`Ctrl-]`** to exit the VM back to macOS.
+
+---
+
+## 6. Multi-User Boot & SSH Access from macOS
+
+Once provisioned, boot FreeBSD directly in multi-user mode with port forwarding:
+
+```bash
+sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus 2 --multiuser --ssh-port 2222
+```
+
+FreeBSD will boot `/sbin/init`, run `/etc/rc`, bring up `vtnet0` via DHCP (`192.168.18.2`), start `sshd`, and present a login prompt on `ttyu0`.
+
+### Connecting via SSH from macOS
+
+Open a standard macOS Terminal window and run either:
+
+```bash
+# Option A: Direct connection over macOS vmnet bridge
+ssh root@192.168.18.2
+
+# Option B: Local port-forward connection
+ssh -p 2222 root@localhost
+```
+

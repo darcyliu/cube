@@ -1,6 +1,7 @@
 mod devices;
 mod elf;
 mod fdt;
+mod forward;
 mod hypervisor;
 mod memory;
 mod terminal;
@@ -61,6 +62,8 @@ fn main() {
     let mut custom_bootargs: Option<String> = None;
     let mut ram_mb: Option<usize> = None;
     let mut is_freebsd = false;
+    let mut is_multiuser = false;
+    let mut ssh_port: Option<u16> = None;
     let mut net_mode: Option<String> = None;
     let mut mac_addr: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     let mut cpus: usize = 1;
@@ -75,6 +78,20 @@ fn main() {
                     kernel_path = Some(args[i].clone());
                 } else if std::path::Path::new("boot/kernel/kernel").exists() {
                     kernel_path = Some("boot/kernel/kernel".to_string());
+                }
+            }
+            "--multiuser" | "--multi-user" | "-u" => {
+                is_multiuser = true;
+            }
+            "--ssh-port" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    if let Ok(port) = args[i].parse::<u16>() {
+                        ssh_port = Some(port);
+                    } else {
+                        eprintln!("\x1b[1;31m[VMM Error] Invalid SSH port: '{}'\x1b[0m", args[i]);
+                        process::exit(1);
+                    }
                 }
             }
             "--kernel" | "-k" => {
@@ -149,6 +166,8 @@ fn main() {
                 println!();
                 println!("Options:");
                 println!("  -f, --freebsd [PATH]     Boot FreeBSD kernel (defaults to boot/kernel/kernel)");
+                println!("  -u, --multiuser          Boot FreeBSD into multi-user mode (omits single-user -s)");
+                println!("      --ssh-port <PORT>    Forward host TCP port to guest SSH (e.g. 2222 -> 192.168.18.2:22)");
                 println!("  -k, --kernel <PATH>      Boot specified ELF kernel");
                 println!("  -c, --cpus <N>           Number of virtual CPUs (default: 1)");
                 println!("  -d, --disk <PATH>        Attach raw disk image as VirtIO block device");
@@ -199,14 +218,21 @@ fn main() {
 
             let bootargs = match custom_bootargs {
                 Some(b) => b,
-                None => match root_dev {
-                    Some(ref root) => format!(
-                        "FreeBSD: -v -s -h boot_serial=YES console=comconsole vfs.root.mountfrom={}",
-                        root
-                    ),
-                    None => "FreeBSD: -v -s -h boot_serial=YES console=comconsole".to_string(),
-                },
+                None => {
+                    let s_flag = if is_multiuser { "" } else { " -s" };
+                    match root_dev {
+                        Some(ref root) => format!(
+                            "FreeBSD: -v{} -h boot_serial=YES console=comconsole vfs.root.mountfrom={}",
+                            s_flag, root
+                        ),
+                        None => format!("FreeBSD: -v{} -h boot_serial=YES console=comconsole", s_flag),
+                    }
+                }
             };
+
+            if let Some(port) = ssh_port {
+                forward::start_port_forward(port, "192.168.18.2:22".to_string());
+            }
 
             boot_os_kernel(
                 path,
