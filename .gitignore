@@ -1,3 +1,5 @@
 /target
 guest/*.o
 guest/*.bin
+/boot
+*.txz

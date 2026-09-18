@@ -2,6 +2,9 @@
 
 #![allow(dead_code)]
 
+use std::thread;
+use std::time::Duration;
+
 use crate::devices::MmioBus;
 use crate::hypervisor::*;
 
@@ -16,6 +19,7 @@ pub enum VcpuExitStatus {
 pub struct Vcpu {
     id: u64,
     exit_ptr: *mut HvVcpuExit,
+    wfi_halts_vm: bool,
 }
 
 impl Vcpu {
@@ -28,7 +32,15 @@ impl Vcpu {
             check_hv(hv_vcpu_create(&mut id, &mut exit_ptr, std::ptr::null()))?;
         }
 
-        Ok(Self { id, exit_ptr })
+        Ok(Self {
+            id,
+            exit_ptr,
+            wfi_halts_vm: true,
+        })
+    }
+
+    pub fn set_wfi_halts_vm(&mut self, halt: bool) {
+        self.wfi_halts_vm = halt;
     }
 
     pub fn id(&self) -> u64 {
@@ -65,21 +77,48 @@ impl Vcpu {
         Ok(())
     }
 
-    /// Sets initial state for booting at Exception Level 1 (EL1).
+    /// Sets initial state for booting at Exception Level 1 (EL1) for baremetal tests.
     pub fn setup_boot_state(&self, entry_point: u64, stack_pointer: u64) -> HvResult<()> {
-        // Initial PC
         self.set_reg(HV_REG_PC, entry_point)?;
+        self.set_reg(HV_REG_CPSR, 0x3c5)?; // EL1h, DAIF masked
+        self.set_sys_reg(HV_SYS_REG_SP_EL1, stack_pointer)?;
+        self.set_sys_reg(HV_SYS_REG_SCTLR_EL1, 0x00000000)?;
+        self.set_sys_reg(HV_SYS_REG_CPACR_EL1, 3 << 20)?;
+        self.set_sys_reg(HV_SYS_REG_MPIDR_EL1, 0x8000_0000)?;
+        Ok(())
+    }
 
-        // Set CPSR: EL1h mode with all DAIF interrupts masked (0x3c5 = 0b0011_1100_0101)
+    /// Sets initial state for booting an OS kernel (FreeBSD / Linux) according to the ARM64 boot specification:
+    /// - X0 = physical address of Device Tree Blob (DTB)
+    /// - X1 = 0, X2 = 0, X3 = 0
+    /// - PC = kernel entry point
+    /// - CPSR = EL1h with DAIF interrupts masked (0x3c5)
+    /// - MPIDR_EL1 = affinity value for vCPU
+    pub fn setup_os_boot_state(
+        &mut self,
+        kernel_entry: u64,
+        dtb_phys_addr: u64,
+        vcpu_index: u64,
+    ) -> HvResult<()> {
+        self.wfi_halts_vm = false; // Don't terminate on kernel idle WFI
+
+        self.set_reg(HV_REG_PC, kernel_entry)?;
+        self.set_reg(HV_REG_X0, dtb_phys_addr)?;
+        self.set_reg(HV_REG_X1, 0)?;
+        self.set_reg(HV_REG_X2, 0)?;
+        self.set_reg(HV_REG_X3, 0)?;
+
+        // Mode EL1h, interrupts masked
         self.set_reg(HV_REG_CPSR, 0x3c5)?;
 
-        // Set SP_EL1
-        self.set_sys_reg(HV_SYS_REG_SP_EL1, stack_pointer)?;
+        // Set affinity required for GICv3 interrupt routing (Aff0 = vcpu_index)
+        let mpidr = 0x8000_0000 | (vcpu_index & 0xff);
+        self.set_sys_reg(HV_SYS_REG_MPIDR_EL1, mpidr)?;
 
-        // SCTLR_EL1: standard reset value, MMU disabled (flat physical addressing)
-        self.set_sys_reg(HV_SYS_REG_SCTLR_EL1, 0x00000000)?;
+        // Standard MMU off at boot
+        self.set_sys_reg(HV_SYS_REG_SCTLR_EL1, 0x0000_0000)?;
 
-        // CPACR_EL1: Enable FP/NEON access at EL1 (FPEN = 0b11 at bits [21:20])
+        // Enable FP/NEON
         self.set_sys_reg(HV_SYS_REG_CPACR_EL1, 3 << 20)?;
 
         Ok(())
@@ -115,12 +154,31 @@ impl Vcpu {
                         }
                         // EC 0x01: Trapped WFI / WFE instruction
                         0x01 => {
-                            return Ok(VcpuExitStatus::Halted);
+                            if self.wfi_halts_vm {
+                                return Ok(VcpuExitStatus::Halted);
+                            } else {
+                                // Kernel is idling in WFI: advance PC and yield
+                                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
+                                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
+                                thread::sleep(Duration::from_micros(500));
+                            }
+                        }
+                        // EC 0x18: System register access trap
+                        0x18 => {
+                            self.handle_sysreg_trap(syndrome)?;
+                        }
+                        // EC 0x20 / 0x21: Instruction Abort
+                        0x20 | 0x21 => {
+                            let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+                            return Err(format!(
+                                "Instruction Abort (EC 0x{:02x}) at PC=0x{:016x}, Fault IPA=0x{:016x}, FAR=0x{:016x}",
+                                ec, pc, exit.exception.physical_address, exit.exception.virtual_address
+                            ));
                         }
                         _ => {
                             let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
                             return Err(format!(
-                                "Unhandled Exception Class EC=0x{:02x} at PC=0x{:08x} (Syndrome=0x{:016x}, FAR=0x{:016x}, IPA=0x{:016x})",
+                                "Unhandled Exception Class EC=0x{:02x} at PC=0x{:016x} (Syndrome=0x{:016x}, FAR=0x{:016x}, IPA=0x{:016x})",
                                 ec, pc, syndrome, exit.exception.virtual_address, exit.exception.physical_address
                             ));
                         }
@@ -130,7 +188,7 @@ impl Vcpu {
                     return Ok(VcpuExitStatus::Canceled);
                 }
                 HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                    // Timer event; continue execution for prototype
+                    // ARM Generic Virtual Timer fired
                 }
                 _ => {
                     return Err(format!("Unexpected vCPU exit reason: {}", exit.reason));
@@ -149,7 +207,7 @@ impl Vcpu {
         if isv == 0 {
             let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
             return Err(format!(
-                "Data abort at IPA 0x{:08x} (PC=0x{:08x}) has ISV=0 (instruction syndrome invalid)",
+                "Data abort at IPA 0x{:08x} (PC=0x{:016x}) has ISV=0 (instruction syndrome invalid)",
                 fault_ipa, pc
             ));
         }
@@ -182,6 +240,38 @@ impl Vcpu {
         Ok(())
     }
 
+    fn handle_sysreg_trap(&mut self, syndrome: u64) -> Result<(), String> {
+        let op0 = (syndrome >> 20) & 3;
+        let op2 = (syndrome >> 17) & 7;
+        let op1 = (syndrome >> 14) & 7;
+        let crn = (syndrome >> 10) & 0xf;
+        let rt = ((syndrome >> 5) & 0x1f) as u32;
+        let crm = (syndrome >> 1) & 0xf;
+        let is_read = (syndrome & 1) == 1; // 1 = MRS (read), 0 = MSR (write)
+
+        // op0 == 2 is ARM Debug register space (OSLAR_EL1, OSLSR_EL1, MDSCR_EL1, etc.)
+        if op0 == 2 {
+            if is_read && rt != 31 {
+                // Return 0 for debug register reads (e.g. OSLSR_EL1: unlocked)
+                self.set_reg(HV_REG_X0 + rt, 0).map_err(|e| e.to_string())?;
+            }
+            // Writes to debug registers (like OSLAR_EL1 lock/unlock) are safely ignored
+        } else {
+            let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+            return Err(format!(
+                "Unhandled System Register access (EC 0x18) at PC=0x{:016x}: \
+                op0={}, op1={}, CRn={}, CRm={}, op2={}, Rt={}, is_read={}",
+                pc, op0, op1, crn, crm, op2, rt, is_read
+            ));
+        }
+
+        // Advance PC by 4
+        let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
+        self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
     fn handle_psci(&mut self) -> Result<Option<VcpuExitStatus>, String> {
         let func_id = self.get_reg(HV_REG_X0).map_err(|e| e.to_string())?;
 
@@ -193,11 +283,26 @@ impl Vcpu {
                 self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
                 Ok(None)
             }
+            // PSCI_FEATURES (0x8400000a)
+            0x8400000a => {
+                // Return 0 (NOT_SUPPORTED) for unknown features
+                self.set_reg(HV_REG_X0, 0).map_err(|e| e.to_string())?;
+                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
+                Ok(None)
+            }
             // PSCI SYSTEM_OFF (0x84000008)
             0x84000008 => Ok(Some(VcpuExitStatus::Shutdown)),
             // PSCI SYSTEM_RESET (0x84000009)
             0x84000009 => Ok(Some(VcpuExitStatus::Reset)),
-            _ => Err(format!("Unhandled PSCI function ID: 0x{:08x}", func_id)),
+            _ => {
+                eprintln!("[VMM Warning] Unhandled PSCI function ID: 0x{:08x}", func_id);
+                // Return NOT_SUPPORTED (-1)
+                self.set_reg(HV_REG_X0, (-1i64) as u64).map_err(|e| e.to_string())?;
+                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
+                Ok(None)
+            }
         }
     }
 }

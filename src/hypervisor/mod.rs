@@ -158,4 +158,19 @@ unsafe extern "C" {
 
     pub fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> hv_return_t;
+
+    // GIC v3 In-Kernel Device APIs (macOS 15+)
+    pub fn hv_gic_config_create() -> *mut core::ffi::c_void;
+    pub fn hv_gic_config_set_distributor_base(
+        config: *mut core::ffi::c_void,
+        distributor_base_address: u64,
+    ) -> hv_return_t;
+    pub fn hv_gic_config_set_redistributor_base(
+        config: *mut core::ffi::c_void,
+        redistributor_base_address: u64,
+    ) -> hv_return_t;
+    pub fn hv_gic_create(config: *mut core::ffi::c_void) -> hv_return_t;
+    pub fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t;
+
+    pub fn os_release(object: *mut core::ffi::c_void);
 }
