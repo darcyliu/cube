@@ -3,6 +3,7 @@ mod elf;
 mod fdt;
 mod hypervisor;
 mod memory;
+mod terminal;
 mod vcpu;
 mod vm;
 
@@ -22,15 +23,12 @@ const MMIO_GICD_BASE: u64 = 0x0800_0000;
 const MMIO_GICR_BASE: u64 = 0x080a_0000;
 const MMIO_UART_BASE: u64 = 0x0900_0000;
 const MMIO_UART_SIZE: u64 = 0x1000;
+const UART_IRQ: u32 = 33; // SPI 1 (intid 33)
 
 // Embedded default payload built by build.rs
 const DEFAULT_PAYLOAD: &[u8] = include_bytes!("../guest/payload.bin");
 
 fn main() {
-    println!("\x1b[1;36m==================================================\x1b[0m");
-    println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
-    println!("\x1b[1;36m==================================================\x1b[0m");
-
     let args: Vec<String> = env::args().collect();
 
     // Check if running an OS kernel or baremetal test
@@ -41,7 +39,6 @@ fn main() {
         if args[1] == "--freebsd" || args[1] == "-f" {
             is_freebsd = true;
             kernel_path = args.get(2).cloned().or_else(|| {
-                // Auto-detect boot/kernel/kernel if not specified
                 if std::path::Path::new("boot/kernel/kernel").exists() {
                     Some("boot/kernel/kernel".to_string())
                 } else {
@@ -56,7 +53,6 @@ fn main() {
     }
 
     if let Some(ref path) = kernel_path {
-        // Read file to inspect if it is an ELF
         let file_data = match fs::read(path) {
             Ok(data) => data,
             Err(e) => {
@@ -71,18 +67,23 @@ fn main() {
             boot_os_kernel(path, &file_data);
             return;
         } else {
-            // Flat raw binary
             boot_flat_binary(path, &file_data);
             return;
         }
     }
 
     // Default: run built-in baremetal test payload
+    println!("\x1b[1;36m==================================================\x1b[0m");
+    println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
+    println!("\x1b[1;36m==================================================\x1b[0m");
     boot_flat_binary("embedded EL1 baremetal test suite", DEFAULT_PAYLOAD);
 }
 
 /// Boots an OS kernel ELF (such as FreeBSD ARM64) with GICv3 and Device Tree.
 fn boot_os_kernel(kernel_path: &str, elf_data: &[u8]) {
+    println!("\x1b[1;36m==================================================\x1b[0m");
+    println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
+    println!("\x1b[1;36m==================================================\x1b[0m");
     println!("[VMM] Preparing to boot OS kernel from '{}'...", kernel_path);
     println!("[VMM] Allocating 512MB RAM at GPA 0x{:08x}...", DEFAULT_RAM_BASE);
 
@@ -97,35 +98,22 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8]) {
 
     // Initialize native in-kernel ARM GICv3
     println!("[VMM] Initializing in-kernel ARM GICv3 device...");
-    println!(
-        "  -> GICD (Distributor) at GPA 0x{:08x}",
-        MMIO_GICD_BASE
-    );
-    println!(
-        "  -> GICR (Redistributor) at GPA 0x{:08x}",
-        MMIO_GICR_BASE
-    );
     if let Err(e) = vm.init_gic(MMIO_GICD_BASE, MMIO_GICR_BASE) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to create GICv3 device: {}\x1b[0m", e);
         process::exit(1);
     }
     println!("\x1b[1;32m[VMM] In-kernel GICv3 initialized successfully.\x1b[0m");
 
-    // Attach PL011 UART console
+    // Attach interactive PL011 UART console
     vm.mmio_mut()
-        .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::new()));
+        .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::new(UART_IRQ, true)));
     println!(
-        "[VMM] Registered PL011 UART console at GPA 0x{:08x}..0x{:08x}",
-        MMIO_UART_BASE,
-        MMIO_UART_BASE + MMIO_UART_SIZE
+        "[VMM] Registered interactive PL011 UART console at GPA 0x{:08x} (IRQ {})",
+        MMIO_UART_BASE, UART_IRQ
     );
 
     // Load kernel ELF: FreeBSD locore requires 2MB alignment from RAM base
     let kernel_phys_load = DEFAULT_RAM_BASE + 0x0020_0000; // 0x40200000
-    println!(
-        "[VMM] Loading kernel ELF segments at physical base 0x{:08x}...",
-        kernel_phys_load
-    );
     let loaded = match elf::load_elf64(elf_data, vm.memory_mut(), kernel_phys_load) {
         Ok(l) => l,
         Err(e) => {
@@ -137,7 +125,6 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8]) {
     // Generate and load Device Tree Blob (DTB)
     let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000; // 0x48000000 (128MB offset)
     let bootargs = "boot_verbose=1 boot_single=1 console=ttyAMA0 earlycon=pl011,0x09000000";
-    println!("[VMM] Generating Device Tree (DTB) with bootargs: \"{}\"...", bootargs);
     let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, OS_RAM_SIZE as u64, bootargs) {
         Ok(b) => b,
         Err(e) => {
@@ -150,14 +137,8 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8]) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m", e);
         process::exit(1);
     }
-    println!(
-        "[VMM] Placed DTB ({} bytes) at GPA 0x{:08x}",
-        dtb_bytes.len(),
-        dtb_addr
-    );
 
     // Create vCPU #0
-    println!("[VMM] Creating and configuring vCPU #0 for OS boot...");
     let mut vcpu = match Vcpu::new() {
         Ok(v) => v,
         Err(e) => {
@@ -171,12 +152,11 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8]) {
         process::exit(1);
     }
 
-    println!(
-        "[VMM] vCPU #0 boot state configured: PC=0x{:08x}, X0(DTB)=0x{:08x}, CPSR=0x3c5",
-        loaded.entry_point, dtb_addr
-    );
-    println!("[VMM] Handing control to FreeBSD kernel...");
+    println!("[VMM] Entering interactive console (raw terminal). Press Ctrl-] to quit.");
     println!("--------------------------------------------------");
+
+    // Set terminal to raw mode so keystrokes are sent immediately to the guest
+    let _term_guard = terminal::TerminalGuard::enter_raw_mode();
 
     run_loop(&mut vcpu, vm.mmio_mut());
 }
@@ -192,7 +172,7 @@ fn boot_flat_binary(name: &str, payload_data: &[u8]) {
     };
 
     vm.mmio_mut()
-        .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::new()));
+        .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::new(UART_IRQ, false)));
 
     if let Err(e) = vm.memory_mut().write(DEFAULT_RAM_BASE, payload_data) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to load payload: {}\x1b[0m", e);
