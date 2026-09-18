@@ -162,3 +162,49 @@ ssh root@192.168.18.2
 ssh -p 2222 root@localhost
 ```
 
+---
+
+## 7. Multi-Disk Storage & Copy-On-Write (COW) Overlays
+
+### Attaching Multiple Disks
+The VMM supports attaching multiple block devices simultaneously. Each disk appears sequentially inside FreeBSD (`vtbd0`, `vtbd1`, `vtbd2`...):
+
+```bash
+# Example: Boot OS on vtbd0 and attach a secondary data disk on vtbd1
+sudo ./target/debug/vmm --freebsd boot/kernel/kernel \
+    --disk mini-memstick.img \
+    --disk /path/to/secondary_data.img \
+    --net vmnet --cpus 2 --multiuser --ssh-port 2222
+```
+
+Inside FreeBSD, verify disks with:
+```sh
+geom disk list
+# Format and mount secondary disk:
+gpart create -s gpt vtbd1
+gpart add -t freebsd-ufs -l data0 vtbd1
+newfs -U /dev/vtbd1p1
+mkdir -p /mnt/data && mount /dev/vtbd1p1 /mnt/data
+```
+
+### Attaching Read-Only ISOs or Cloud-Init Seed Drives
+To attach an installer ISO or cloud-init config drive:
+```bash
+sudo ./target/debug/vmm --freebsd boot/kernel/kernel \
+    --disk mini-memstick.img \
+    --cdrom seed.iso \
+    --net vmnet --cpus 2 --multiuser
+```
+
+### Copy-On-Write (COW) Overlays (Safe Disposable Testing)
+To experiment or test changes without modifying your base image, enable COW:
+```bash
+# Enables COW for all attached disks (creates <disk>.cow overlay file)
+sudo ./target/debug/vmm --freebsd boot/kernel/kernel \
+    --disk mini-memstick.img \
+    --cow \
+    --net vmnet --cpus 2 --multiuser
+```
+The base image `mini-memstick.img` remains untouched (read-only). All sector modifications are written to `mini-memstick.img.cow`. Deleting the `.cow` file instantly resets the VM to its clean base state.
+
+

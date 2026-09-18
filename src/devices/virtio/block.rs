@@ -1,7 +1,7 @@
 //! VirtIO Block Device (`virtio-blk`) implementation over Modern MMIO.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -30,13 +30,291 @@ const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
-/// Match the last combination that booted and finished fsck: 1MB segments,
-/// 128-entry queue. (bhyve uses queue_size-2; we can tighten after fsck works.)
+/// Match the combination: 1MB segments, 128-entry queue.
 const VTBLK_QUEUE_SIZE: u32 = 128;
 const VTBLK_SEG_MAX: u32 = 126;
 
+/// Storage backend abstraction for raw files, COW overlays, and read-only images.
+pub trait BlockBackend: Send {
+    fn size_bytes(&self) -> u64;
+    fn is_read_only(&self) -> bool;
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+    fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+}
+
+/// Standard raw disk file backend.
+pub struct RawFileBackend {
+    file: File,
+    size: u64,
+    read_only: bool,
+}
+
+impl RawFileBackend {
+    pub fn open(path: &str, read_only: bool) -> Result<Self, String> {
+        let (file, ro) = if read_only {
+            let f = OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|e| format!("Failed to open '{}' read-only: {}", path, e))?;
+            (f, true)
+        } else {
+            match OpenOptions::new().read(true).write(true).open(path) {
+                Ok(f) => (f, false),
+                Err(_) => {
+                    let f = OpenOptions::new()
+                        .read(true)
+                        .open(path)
+                        .map_err(|e| format!("Failed to open '{}': {}", path, e))?;
+                    (f, true)
+                }
+            }
+        };
+
+        let size = file
+            .metadata()
+            .map_err(|e| format!("Failed to query metadata for '{}': {}", path, e))?
+            .len();
+
+        Ok(Self {
+            file,
+            size,
+            read_only: ro,
+        })
+    }
+}
+
+impl BlockBackend for RawFileBackend {
+    fn size_bytes(&self) -> u64 {
+        self.size
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let n = self.file.read(buf)?;
+        if n < buf.len() {
+            buf[n..].fill(0);
+        }
+        Ok(())
+    }
+
+    fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Disk image is opened read-only",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.read_only {
+            self.file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+const COW_MAGIC: &[u8; 8] = b"VMMCOW01";
+const COW_CLUSTER_SIZE: u64 = 65536; // 64 KB clusters
+
+/// Copy-On-Write overlay backend. The base image is kept strictly read-only.
+/// Any sector writes are redirected to cluster blocks in an overlay file.
+pub struct CowBackend {
+    base_file: File,
+    overlay_file: File,
+    base_size: u64,
+    cluster_table: Vec<u64>,
+}
+
+impl CowBackend {
+    pub fn open(base_path: &str, overlay_path: &str) -> Result<Self, String> {
+        let base_file = OpenOptions::new()
+            .read(true)
+            .open(base_path)
+            .map_err(|e| format!("Failed to open base disk '{}': {}", base_path, e))?;
+
+        let base_size = base_file
+            .metadata()
+            .map_err(|e| format!("Failed to query base disk metadata: {}", e))?
+            .len();
+
+        let num_clusters = ((base_size + COW_CLUSTER_SIZE - 1) / COW_CLUSTER_SIZE) as usize;
+
+        let mut overlay_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(overlay_path)
+            .map_err(|e| format!("Failed to open overlay file '{}': {}", overlay_path, e))?;
+
+        let overlay_len = overlay_file
+            .metadata()
+            .map_err(|e| format!("Failed to query overlay metadata: {}", e))?
+            .len();
+
+        let table_start = 32u64;
+        let table_bytes = (num_clusters * 8) as u64;
+        let initial_header_size = table_start + table_bytes;
+
+        let mut cluster_table = vec![0u64; num_clusters];
+
+        if overlay_len >= initial_header_size {
+            let mut magic = [0u8; 8];
+            overlay_file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            overlay_file.read_exact(&mut magic).map_err(|e| e.to_string())?;
+            if &magic != COW_MAGIC {
+                return Err(format!("Invalid COW overlay magic in '{}'", overlay_path));
+            }
+
+            overlay_file.seek(SeekFrom::Start(table_start)).map_err(|e| e.to_string())?;
+            for entry in cluster_table.iter_mut() {
+                let mut buf = [0u8; 8];
+                overlay_file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+                *entry = u64::from_le_bytes(buf);
+            }
+        } else {
+            overlay_file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            overlay_file.write_all(COW_MAGIC).map_err(|e| e.to_string())?;
+            overlay_file.write_all(&(COW_CLUSTER_SIZE as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+            overlay_file.write_all(&0u32.to_le_bytes()).map_err(|e| e.to_string())?;
+            overlay_file.write_all(&base_size.to_le_bytes()).map_err(|e| e.to_string())?;
+            overlay_file.write_all(&(num_clusters as u64).to_le_bytes()).map_err(|e| e.to_string())?;
+
+            let zero_table = vec![0u8; table_bytes as usize];
+            overlay_file.write_all(&zero_table).map_err(|e| e.to_string())?;
+            overlay_file.flush().map_err(|e| e.to_string())?;
+        }
+
+        println!(
+            "[VirtIO-Blk] Initialized COW overlay '{}' on base '{}' ({:.2} MB, {} clusters)",
+            overlay_path,
+            base_path,
+            base_size as f64 / (1024.0 * 1024.0),
+            num_clusters
+        );
+
+        Ok(Self {
+            base_file,
+            overlay_file,
+            base_size,
+            cluster_table,
+        })
+    }
+}
+
+impl BlockBackend for CowBackend {
+    fn size_bytes(&self) -> u64 {
+        self.base_size
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let mut curr_offset = offset;
+        let mut buf_pos = 0;
+
+        while buf_pos < buf.len() {
+            let cluster_idx = (curr_offset / COW_CLUSTER_SIZE) as usize;
+            let intra_cluster = curr_offset % COW_CLUSTER_SIZE;
+            let chunk = std::cmp::min(
+                (buf.len() - buf_pos) as u64,
+                COW_CLUSTER_SIZE - intra_cluster,
+            ) as usize;
+
+            if cluster_idx < self.cluster_table.len() && self.cluster_table[cluster_idx] != 0 {
+                let overlay_offset = self.cluster_table[cluster_idx] + intra_cluster;
+                self.overlay_file.seek(SeekFrom::Start(overlay_offset))?;
+                self.overlay_file.read_exact(&mut buf[buf_pos..buf_pos + chunk])?;
+            } else {
+                if curr_offset < self.base_size {
+                    self.base_file.seek(SeekFrom::Start(curr_offset))?;
+                    let n = self.base_file.read(&mut buf[buf_pos..buf_pos + chunk])?;
+                    if n < chunk {
+                        buf[buf_pos + n..buf_pos + chunk].fill(0);
+                    }
+                } else {
+                    buf[buf_pos..buf_pos + chunk].fill(0);
+                }
+            }
+
+            curr_offset += chunk as u64;
+            buf_pos += chunk;
+        }
+
+        Ok(())
+    }
+
+    fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        let mut curr_offset = offset;
+        let mut buf_pos = 0;
+
+        while buf_pos < buf.len() {
+            let cluster_idx = (curr_offset / COW_CLUSTER_SIZE) as usize;
+            if cluster_idx >= self.cluster_table.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Write out of bounds",
+                ));
+            }
+
+            let intra_cluster = curr_offset % COW_CLUSTER_SIZE;
+            let chunk = std::cmp::min(
+                (buf.len() - buf_pos) as u64,
+                COW_CLUSTER_SIZE - intra_cluster,
+            ) as usize;
+
+            if self.cluster_table[cluster_idx] == 0 {
+                let new_cluster_offset = self.overlay_file.seek(SeekFrom::End(0))?;
+
+                let mut cluster_buf = vec![0u8; COW_CLUSTER_SIZE as usize];
+                let base_cluster_start = (cluster_idx as u64) * COW_CLUSTER_SIZE;
+                if base_cluster_start < self.base_size {
+                    self.base_file.seek(SeekFrom::Start(base_cluster_start))?;
+                    let n = self.base_file.read(&mut cluster_buf)?;
+                    if n < cluster_buf.len() {
+                        cluster_buf[n..].fill(0);
+                    }
+                }
+
+                cluster_buf[intra_cluster as usize..intra_cluster as usize + chunk]
+                    .copy_from_slice(&buf[buf_pos..buf_pos + chunk]);
+
+                self.overlay_file.write_all(&cluster_buf)?;
+                self.cluster_table[cluster_idx] = new_cluster_offset;
+
+                let entry_pos = 32 + (cluster_idx as u64) * 8;
+                self.overlay_file.seek(SeekFrom::Start(entry_pos))?;
+                self.overlay_file.write_all(&new_cluster_offset.to_le_bytes())?;
+            } else {
+                let target_offset = self.cluster_table[cluster_idx] + intra_cluster;
+                self.overlay_file.seek(SeekFrom::Start(target_offset))?;
+                self.overlay_file.write_all(&buf[buf_pos..buf_pos + chunk])?;
+            }
+
+            curr_offset += chunk as u64;
+            buf_pos += chunk;
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.overlay_file.flush()
+    }
+}
+
 pub struct VirtioBlock {
-    file: Option<File>,
+    backend: Option<Box<dyn BlockBackend>>,
     capacity_sectors: u64,
     status: u32,
     device_features_sel: u32,
@@ -47,38 +325,20 @@ pub struct VirtioBlock {
     used_idx: u16,
     interrupt_status: u32,
     irq_num: u32,
+    serial_id: String,
     mem: Arc<GuestMemory>,
 }
 
 impl VirtioBlock {
-    pub fn new(disk_path: Option<&str>, irq_num: u32, mem: Arc<GuestMemory>) -> Result<Self, String> {
-        let (file, capacity_sectors) = if let Some(path) = disk_path {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .or_else(|_| OpenOptions::new().read(true).open(path))
-                .map_err(|e| format!("Failed to open disk image '{}': {}", path, e))?;
-
-            let file_size = file
-                .metadata()
-                .map_err(|e| format!("Failed to query disk metadata: {}", e))?
-                .len();
-            let sectors = file_size / 512;
-            println!(
-                "[VirtIO-Blk] Opened disk '{}': {:.2} MB ({} sectors)",
-                path,
-                file_size as f64 / (1024.0 * 1024.0),
-                sectors
-            );
-            (Some(file), sectors)
-        } else {
-            println!("[VirtIO-Blk] Initialized empty mock disk (0 sectors)");
-            (None, 0)
-        };
-
-        Ok(Self {
-            file,
+    pub fn new(
+        backend: Option<Box<dyn BlockBackend>>,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+    ) -> Self {
+        let capacity_sectors = backend.as_ref().map(|b| b.size_bytes() / 512).unwrap_or(0);
+        Self {
+            backend,
             capacity_sectors,
             status: 0,
             device_features_sel: 0,
@@ -93,8 +353,39 @@ impl VirtioBlock {
             used_idx: 0,
             interrupt_status: 0,
             irq_num,
+            serial_id: serial_id.to_string(),
             mem,
-        })
+        }
+    }
+
+    pub fn from_raw(
+        path: &str,
+        read_only: bool,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+    ) -> Result<Self, String> {
+        let backend = RawFileBackend::open(path, read_only)?;
+        let size_mb = backend.size_bytes() as f64 / (1024.0 * 1024.0);
+        println!(
+            "[VirtIO-Blk] Opened disk '{}' ({}): {:.2} MB ({} sectors)",
+            path,
+            if backend.is_read_only() { "read-only" } else { "read-write" },
+            size_mb,
+            backend.size_bytes() / 512
+        );
+        Ok(Self::new(Some(Box::new(backend)), irq_num, serial_id, mem))
+    }
+
+    pub fn from_cow(
+        base_path: &str,
+        overlay_path: &str,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+    ) -> Result<Self, String> {
+        let backend = CowBackend::open(base_path, overlay_path)?;
+        Ok(Self::new(Some(Box::new(backend)), irq_num, serial_id, mem))
     }
 
     fn process_queue(&mut self) {
@@ -213,9 +504,6 @@ impl VirtioBlock {
         if max == 0 {
             return descriptors;
         }
-        // FreeBSD virtqueue_init_indirect_list pre-links next=i+1, then
-        // vq_ring_enqueue_segments overwrites the first `needed` entries
-        // (qemu/hw/virtio/virtio.c virtqueue_split_pop does the same walk).
         let mut i = 0u16;
         for _ in 0..max {
             let Some((addr, len, flags, next)) = self.read_desc(table, i) else {
@@ -225,8 +513,6 @@ impl VirtioBlock {
             if (flags & VRING_DESC_F_NEXT) == 0 {
                 break;
             }
-            // VQ_RING_DESC_CHAIN_END is 32768; treat anything out of range
-            // as end-of-chain rather than looping.
             if next >= max {
                 break;
             }
@@ -237,23 +523,6 @@ impl VirtioBlock {
 
     fn handle_request(&mut self, head_desc: u16, q_size: u32) -> u32 {
         let descriptors = self.collect_descriptors(head_desc, q_size);
-        let n = BLK_IOS.load(Ordering::Relaxed);
-        if n < 8 {
-            if let Ok(mut f) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/vmm-blk.log")
-            {
-                let _ = writeln!(
-                    f,
-                    "req head={} ndesc={} first_flags={:#x}",
-                    head_desc,
-                    descriptors.len(),
-                    descriptors.first().map(|d| d.2).unwrap_or(0)
-                );
-            }
-        }
-
         if descriptors.len() < 2 {
             return 0;
         }
@@ -275,25 +544,15 @@ impl VirtioBlock {
 
         match req_type {
             VIRTIO_BLK_T_IN => {
-                // Read from disk image into guest memory
-                if let Some(ref mut file) = self.file {
+                if let Some(ref mut backend) = self.backend {
                     let mut file_offset = sector * 512;
                     for i in 1..descriptors.len() - 1 {
                         let (buf_addr, buf_len, _) = descriptors[i];
-                        if file.seek(SeekFrom::Start(file_offset)).is_ok() {
-                            let mut temp_buf = vec![0u8; buf_len as usize];
-                            if let Ok(n) = file.read(&mut temp_buf) {
-                                if n < temp_buf.len() {
-                                    // Zero remaining
-                                    temp_buf[n..].fill(0);
-                                }
-                                let _ = self.mem.write(buf_addr, &temp_buf);
-                                total_bytes += buf_len;
-                                file_offset += buf_len as u64;
-                            } else {
-                                status = VIRTIO_BLK_S_IOERR;
-                                break;
-                            }
+                        let mut temp_buf = vec![0u8; buf_len as usize];
+                        if backend.read_exact_at(file_offset, &mut temp_buf).is_ok() {
+                            let _ = self.mem.write(buf_addr, &temp_buf);
+                            total_bytes += buf_len;
+                            file_offset += buf_len as u64;
                         } else {
                             status = VIRTIO_BLK_S_IOERR;
                             break;
@@ -304,16 +563,13 @@ impl VirtioBlock {
                 }
             }
             VIRTIO_BLK_T_OUT => {
-                // Write from guest memory into disk image
-                if let Some(ref mut file) = self.file {
+                if let Some(ref mut backend) = self.backend {
                     let mut file_offset = sector * 512;
                     for i in 1..descriptors.len() - 1 {
                         let (buf_addr, buf_len, _) = descriptors[i];
                         let mut temp_buf = vec![0u8; buf_len as usize];
                         if self.mem.read(buf_addr, &mut temp_buf).is_ok() {
-                            if file.seek(SeekFrom::Start(file_offset)).is_ok()
-                                && file.write_all(&temp_buf).is_ok()
-                            {
+                            if backend.write_all_at(file_offset, &temp_buf).is_ok() {
                                 total_bytes += buf_len;
                                 file_offset += buf_len as u64;
                             } else {
@@ -330,17 +586,19 @@ impl VirtioBlock {
                 }
             }
             VIRTIO_BLK_T_FLUSH => {
-                if let Some(ref mut file) = self.file {
-                    let _ = file.flush();
+                if let Some(ref mut backend) = self.backend {
+                    let _ = backend.flush();
                 }
             }
             VIRTIO_BLK_T_GET_ID => {
-                // Device serial number string (up to 20 ASCII characters)
-                let id_str = b"vmm-virtio-blk0\0\0\0\0\0";
+                let mut id_bytes = [0u8; 20];
+                let s_bytes = self.serial_id.as_bytes();
+                let copy_len = s_bytes.len().min(20);
+                id_bytes[..copy_len].copy_from_slice(&s_bytes[..copy_len]);
                 for i in 1..descriptors.len() - 1 {
                     let (buf_addr, buf_len, _) = descriptors[i];
-                    let copy_len = (buf_len as usize).min(id_str.len());
-                    let _ = self.mem.write(buf_addr, &id_str[..copy_len]);
+                    let copy_len = (buf_len as usize).min(id_bytes.len());
+                    let _ = self.mem.write(buf_addr, &id_bytes[..copy_len]);
                     total_bytes += copy_len as u32;
                 }
             }
@@ -364,13 +622,16 @@ impl MmioDevice for VirtioBlock {
             VIRTIO_MMIO_DEVICE_ID => VIRTIO_DEV_BLOCK as u64,
             VIRTIO_MMIO_VENDOR_ID => VIRTIO_MMIO_VENDOR as u64,
             VIRTIO_MMIO_DEVICE_FEATURES => {
-                // Do not advertise SIZE_MAX: FreeBSD vtblk_attach fails with
-                // ENOTSUP if size_max < maxphys, which is how we got ENODEV.
-                let features = VIRTIO_BLK_F_SEG_MAX
+                let mut features = VIRTIO_BLK_F_SEG_MAX
                     | VIRTIO_BLK_F_BLK_SIZE
                     | VIRTIO_BLK_F_FLUSH
                     | VIRTIO_RING_F_INDIRECT_DESC
                     | VIRTIO_F_VERSION_1;
+                if let Some(ref b) = self.backend {
+                    if b.is_read_only() {
+                        features |= VIRTIO_BLK_F_RO;
+                    }
+                }
                 if self.device_features_sel == 0 {
                     features & 0xffff_ffff
                 } else if self.device_features_sel == 1 {
@@ -395,7 +656,6 @@ impl MmioDevice for VirtioBlock {
             }
             VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status as u64,
             VIRTIO_MMIO_STATUS => self.status as u64,
-            // struct virtio_blk_config: capacity, size_max, seg_max, geometry, blk_size
             off if off >= VIRTIO_MMIO_CONFIG => {
                 let config_offset = (off - VIRTIO_MMIO_CONFIG) as usize;
                 let mut cfg = [0u8; 32];
@@ -498,7 +758,6 @@ impl MmioDevice for VirtioBlock {
             VIRTIO_MMIO_STATUS => {
                 self.status = data as u32;
                 if data == 0 {
-                    // Reset
                     self.queue = VirtQueue {
                         max_size: VTBLK_QUEUE_SIZE,
                         size: VTBLK_QUEUE_SIZE,

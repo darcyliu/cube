@@ -49,6 +49,13 @@ const MMIO_VIRTIO_RNG_BASE: u64 = 0x0a00_0400;
 const MMIO_VIRTIO_RNG_SIZE: u64 = 0x0200;
 const VIRTIO_RNG_IRQ: u32 = 37; // SPI 5 (intid 37)
 
+#[derive(Clone)]
+pub struct DiskConfig {
+    pub path: String,
+    pub cow: bool,
+    pub read_only: bool,
+}
+
 // Embedded default payload built by build.rs
 const DEFAULT_PAYLOAD: &[u8] = include_bytes!("../guest/payload.bin");
 
@@ -57,7 +64,8 @@ fn main() {
 
     // Parse command line arguments
     let mut kernel_path: Option<String> = None;
-    let mut disk_path: Option<String> = None;
+    let mut disk_configs: Vec<DiskConfig> = Vec::new();
+    let mut global_cow = false;
     let mut root_dev: Option<String> = None;
     let mut custom_bootargs: Option<String> = None;
     let mut ram_mb: Option<usize> = None;
@@ -103,8 +111,35 @@ fn main() {
             "--disk" | "-d" => {
                 if i + 1 < args.len() {
                     i += 1;
-                    disk_path = Some(args[i].clone());
+                    let arg = &args[i];
+                    let parts: Vec<&str> = arg.split(',').collect();
+                    let path = parts[0].to_string();
+                    let mut cow = false;
+                    let mut read_only = false;
+                    for opt in &parts[1..] {
+                        match *opt {
+                            "cow" => cow = true,
+                            "ro" | "readonly" => read_only = true,
+                            _ => {
+                                eprintln!("\x1b[1;33m[VMM Warning] Unknown disk option '{}'\x1b[0m", opt);
+                            }
+                        }
+                    }
+                    disk_configs.push(DiskConfig { path, cow, read_only });
                 }
+            }
+            "--cdrom" | "--iso" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    disk_configs.push(DiskConfig {
+                        path: args[i].clone(),
+                        cow: false,
+                        read_only: true,
+                    });
+                }
+            }
+            "--cow" => {
+                global_cow = true;
             }
             "--root" | "-r" => {
                 if i + 1 < args.len() {
@@ -170,7 +205,9 @@ fn main() {
                 println!("      --ssh-port <PORT>    Forward host TCP port to guest SSH (e.g. 2222 -> 192.168.18.2:22)");
                 println!("  -k, --kernel <PATH>      Boot specified ELF kernel");
                 println!("  -c, --cpus <N>           Number of virtual CPUs (default: 1)");
-                println!("  -d, --disk <PATH>        Attach raw disk image as VirtIO block device");
+                println!("  -d, --disk <PATH>[,cow][,ro] Attach disk image (can be specified multiple times)");
+                println!("      --cdrom, --iso <PATH>    Attach read-only ISO image as VirtIO block device");
+                println!("      --cow                Enable Copy-On-Write overlay for all attached disks");
                 println!("  -r, --root <DEV>         Root filesystem device (e.g. ufs:/dev/vtbd0p2)");
                 println!("  -b, --bootargs <ARGS>    Custom kernel boot arguments");
                 println!("  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)");
@@ -191,12 +228,18 @@ fn main() {
         i += 1;
     }
 
+    if global_cow {
+        for d in &mut disk_configs {
+            d.cow = true;
+        }
+    }
+
     if is_freebsd && kernel_path.is_none() && std::path::Path::new("boot/kernel/kernel").exists() {
         kernel_path = Some("boot/kernel/kernel".to_string());
     }
 
     // Default root device when disk is provided but --root is not specified
-    if disk_path.is_some() && root_dev.is_none() {
+    if !disk_configs.is_empty() && root_dev.is_none() {
         root_dev = Some("ufs:/dev/vtbd0p2".to_string());
     }
 
@@ -237,7 +280,7 @@ fn main() {
             boot_os_kernel(
                 path,
                 &file_data,
-                disk_path.as_deref(),
+                &disk_configs,
                 ram_size,
                 &bootargs,
                 net_mode.as_deref(),
@@ -277,7 +320,7 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 fn boot_os_kernel(
     kernel_path: &str,
     elf_data: &[u8],
-    disk_path: Option<&str>,
+    disk_configs: &[DiskConfig],
     ram_size: usize,
     bootargs: &str,
     net_mode: Option<&str>,
@@ -329,26 +372,53 @@ fn boot_os_kernel(
         MMIO_RTC_BASE, RTC_IRQ
     );
 
-    // Attach VirtIO-MMIO Block Device
-    let virtio_blk = match VirtioBlock::new(disk_path, VIRTIO_BLK_IRQ, vm.memory()) {
-        Ok(blk) => blk,
-        Err(e) => {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to initialize VirtIO block device: {}\x1b[0m", e);
-            process::exit(1);
+    let mut virtio_devices: Vec<fdt::VirtioMmioDevice> = Vec::new();
+
+    // Attach VirtIO-MMIO Block Devices
+    for (idx, disk) in disk_configs.iter().enumerate() {
+        let (base, irq) = if idx == 0 {
+            (MMIO_VIRTIO_BLK_BASE, VIRTIO_BLK_IRQ)
+        } else {
+            (0x0a00_0400 + (idx as u64) * 0x0200, 37 + (idx as u32))
+        };
+        let serial_id = format!("vmm-disk-{}", idx);
+        let blk_res = if disk.cow {
+            let overlay_path = format!("{}.cow", disk.path);
+            VirtioBlock::from_cow(&disk.path, &overlay_path, irq, &serial_id, vm.memory())
+        } else {
+            VirtioBlock::from_raw(&disk.path, disk.read_only, irq, &serial_id, vm.memory())
+        };
+
+        match blk_res {
+            Ok(blk) => {
+                vm.mmio_mut().register(base, MMIO_VIRTIO_BLK_SIZE, Box::new(blk));
+                virtio_devices.push(fdt::VirtioMmioDevice {
+                    base,
+                    size: MMIO_VIRTIO_BLK_SIZE,
+                    irq,
+                });
+                println!(
+                    "[VMM] Registered VirtIO-MMIO block device '{}' (disk {}) at GPA 0x{:08x} (IRQ {})",
+                    disk.path, idx, base, irq
+                );
+            }
+            Err(e) => {
+                eprintln!("\x1b[1;31m[VMM Error] Failed to initialize VirtIO block device '{}': {}\x1b[0m", disk.path, e);
+                process::exit(1);
+            }
         }
-    };
-    vm.mmio_mut()
-        .register(MMIO_VIRTIO_BLK_BASE, MMIO_VIRTIO_BLK_SIZE, Box::new(virtio_blk));
-    println!(
-        "[VMM] Registered VirtIO-MMIO block device at GPA 0x{:08x} (IRQ {})",
-        MMIO_VIRTIO_BLK_BASE, VIRTIO_BLK_IRQ
-    );
+    }
 
     // Attach VirtIO-MMIO Network Device
     if net_mode != Some("none") {
         let virtio_net = VirtioNet::new(mac_addr, VIRTIO_NET_IRQ, vm.memory(), net_mode.unwrap_or("vmnet"));
         vm.mmio_mut()
             .register(MMIO_VIRTIO_NET_BASE, MMIO_VIRTIO_NET_SIZE, Box::new(virtio_net));
+        virtio_devices.push(fdt::VirtioMmioDevice {
+            base: MMIO_VIRTIO_NET_BASE,
+            size: MMIO_VIRTIO_NET_SIZE,
+            irq: VIRTIO_NET_IRQ,
+        });
         println!(
             "[VMM] Registered VirtIO-MMIO network device at GPA 0x{:08x} (IRQ {})",
             MMIO_VIRTIO_NET_BASE, VIRTIO_NET_IRQ
@@ -359,6 +429,11 @@ fn boot_os_kernel(
     let virtio_rng = VirtioRng::new(VIRTIO_RNG_IRQ, vm.memory());
     vm.mmio_mut()
         .register(MMIO_VIRTIO_RNG_BASE, MMIO_VIRTIO_RNG_SIZE, Box::new(virtio_rng));
+    virtio_devices.push(fdt::VirtioMmioDevice {
+        base: MMIO_VIRTIO_RNG_BASE,
+        size: MMIO_VIRTIO_RNG_SIZE,
+        irq: VIRTIO_RNG_IRQ,
+    });
     println!(
         "[VMM] Registered VirtIO-MMIO RNG device at GPA 0x{:08x} (IRQ {})",
         MMIO_VIRTIO_RNG_BASE, VIRTIO_RNG_IRQ
@@ -376,7 +451,7 @@ fn boot_os_kernel(
 
     // Generate and load Device Tree Blob (DTB)
     let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000; // 0x48000000 (128MB offset)
-    let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, ram_size as u64, bootargs, cpus) {
+    let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, ram_size as u64, bootargs, cpus, &virtio_devices) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("\x1b[1;31m[VMM Error] Failed to generate DTB: {}\x1b[0m", e);

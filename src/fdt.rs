@@ -5,11 +5,19 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[derive(Clone, Copy)]
+pub struct VirtioMmioDevice {
+    pub base: u64,
+    pub size: u64,
+    pub irq: u32,
+}
+
 pub fn generate_dtb(
     ram_base: u64,
     ram_size: u64,
     bootargs: &str,
     num_cpus: usize,
+    virtio_devices: &[VirtioMmioDevice],
 ) -> Result<Vec<u8>, String> {
     let cpus_count = num_cpus.max(1);
     let mut cpus_dts = String::new();
@@ -27,6 +35,23 @@ pub fn generate_dtb(
 
     // In GICv3, each vCPU has a 128KB (0x20000) Redistributor region (RD_base + SGI_base)
     let redist_size = (cpus_count as u64) * 0x20000;
+
+    let mut virtio_dts = String::new();
+    for dev in virtio_devices {
+        let spi_num = dev.irq.saturating_sub(32);
+        virtio_dts.push_str(&format!(
+            r#"    virtio_mmio@{base:08x} {{
+        compatible = "virtio,mmio";
+        reg = <0x0 0x{base:08x} 0x0 0x{size:x}>;
+        interrupt-parent = <&intc>;
+        interrupts = <0 {spi_num} 4>;
+    }};
+"#,
+            base = dev.base,
+            size = dev.size,
+            spi_num = spi_num,
+        ));
+    }
 
     let dts = format!(
         r#"/dts-v1/;
@@ -89,27 +114,7 @@ pub fn generate_dtb(
         interrupts = <0 4 4>; /* SPI 4 (interrupt ID 36) */
     }};
 
-    virtio_mmio@0a000000 {{
-        compatible = "virtio,mmio";
-        reg = <0x0 0x0a000000 0x0 0x200>;
-        interrupt-parent = <&intc>;
-        interrupts = <0 2 4>; /* SPI 2 (interrupt ID 34) */
-    }};
-
-    virtio_mmio@0a000200 {{
-        compatible = "virtio,mmio";
-        reg = <0x0 0x0a000200 0x0 0x200>;
-        interrupt-parent = <&intc>;
-        interrupts = <0 3 4>; /* SPI 3 (interrupt ID 35) */
-    }};
-
-    virtio_mmio@0a000400 {{
-        compatible = "virtio,mmio";
-        reg = <0x0 0x0a000400 0x0 0x200>;
-        interrupt-parent = <&intc>;
-        interrupts = <0 5 4>; /* SPI 5 (interrupt ID 37) */
-    }};
-}};
+{virtio_dts}}};
 "#,
         bootargs = bootargs,
         ram_base = ram_base,
@@ -117,6 +122,7 @@ pub fn generate_dtb(
         ram_base_lo = (ram_base & 0xffff_ffff) as u32,
         ram_size_hi = (ram_size >> 32) as u32,
         ram_size_lo = (ram_size & 0xffff_ffff) as u32,
+        virtio_dts = virtio_dts,
     );
 
     // Invoke dtc
