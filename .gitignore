@@ -3,3 +3,4 @@ guest/*.o
 guest/*.bin
 /boot
 *.txz
+*.img

@@ -12,6 +12,7 @@ use std::fs;
 use std::process;
 
 use devices::uart::Pl011Uart;
+use devices::virtio::block::VirtioBlock;
 use vcpu::{Vcpu, VcpuExitStatus};
 use vm::Vm;
 
@@ -25,31 +26,69 @@ const MMIO_UART_BASE: u64 = 0x0900_0000;
 const MMIO_UART_SIZE: u64 = 0x1000;
 const UART_IRQ: u32 = 33; // SPI 1 (intid 33)
 
+const MMIO_VIRTIO_BLK_BASE: u64 = 0x0a00_0000;
+const MMIO_VIRTIO_BLK_SIZE: u64 = 0x0200;
+const VIRTIO_BLK_IRQ: u32 = 34; // SPI 2 (intid 34)
+
 // Embedded default payload built by build.rs
 const DEFAULT_PAYLOAD: &[u8] = include_bytes!("../guest/payload.bin");
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Check if running an OS kernel or baremetal test
+    // Parse command line arguments
     let mut kernel_path: Option<String> = None;
+    let mut disk_path: Option<String> = None;
     let mut is_freebsd = false;
 
-    if args.len() > 1 {
-        if args[1] == "--freebsd" || args[1] == "-f" {
-            is_freebsd = true;
-            kernel_path = args.get(2).cloned().or_else(|| {
-                if std::path::Path::new("boot/kernel/kernel").exists() {
-                    Some("boot/kernel/kernel".to_string())
-                } else {
-                    None
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--freebsd" | "-f" => {
+                is_freebsd = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    kernel_path = Some(args[i].clone());
+                } else if std::path::Path::new("boot/kernel/kernel").exists() {
+                    kernel_path = Some("boot/kernel/kernel".to_string());
                 }
-            });
-        } else if args[1] == "--kernel" || args[1] == "-k" {
-            kernel_path = args.get(2).cloned();
-        } else if !args[1].starts_with('-') {
-            kernel_path = Some(args[1].clone());
+            }
+            "--kernel" | "-k" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    kernel_path = Some(args[i].clone());
+                }
+            }
+            "--disk" | "-d" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    disk_path = Some(args[i].clone());
+                }
+            }
+            "--help" | "-h" => {
+                println!("Usage: vmm [OPTIONS] [PAYLOAD/KERNEL]");
+                println!();
+                println!("Options:");
+                println!("  -f, --freebsd [PATH]   Boot FreeBSD kernel (defaults to boot/kernel/kernel)");
+                println!("  -k, --kernel <PATH>    Boot specified ELF kernel");
+                println!("  -d, --disk <PATH>      Attach raw disk image as VirtIO block device");
+                println!("  -h, --help             Display this help message");
+                return;
+            }
+            arg if !arg.starts_with('-') => {
+                if kernel_path.is_none() {
+                    kernel_path = Some(arg.to_string());
+                }
+            }
+            _ => {
+                eprintln!("\x1b[1;33m[VMM Warning] Unknown argument '{}'\x1b[0m", args[i]);
+            }
         }
+        i += 1;
+    }
+
+    if is_freebsd && kernel_path.is_none() && std::path::Path::new("boot/kernel/kernel").exists() {
+        kernel_path = Some("boot/kernel/kernel".to_string());
     }
 
     if let Some(ref path) = kernel_path {
@@ -64,7 +103,7 @@ fn main() {
         let is_elf = file_data.len() >= 4 && &file_data[0..4] == b"\x7fELF";
 
         if is_elf || is_freebsd {
-            boot_os_kernel(path, &file_data);
+            boot_os_kernel(path, &file_data, disk_path.as_deref());
             return;
         } else {
             boot_flat_binary(path, &file_data);
@@ -80,7 +119,7 @@ fn main() {
 }
 
 /// Boots an OS kernel ELF (such as FreeBSD ARM64) with GICv3 and Device Tree.
-fn boot_os_kernel(kernel_path: &str, elf_data: &[u8]) {
+fn boot_os_kernel(kernel_path: &str, elf_data: &[u8], disk_path: Option<&str>) {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
@@ -112,9 +151,24 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8]) {
         MMIO_UART_BASE, UART_IRQ
     );
 
+    // Attach VirtIO-MMIO Block Device
+    let virtio_blk = match VirtioBlock::new(disk_path, VIRTIO_BLK_IRQ, vm.memory()) {
+        Ok(blk) => blk,
+        Err(e) => {
+            eprintln!("\x1b[1;31m[VMM Error] Failed to initialize VirtIO block device: {}\x1b[0m", e);
+            process::exit(1);
+        }
+    };
+    vm.mmio_mut()
+        .register(MMIO_VIRTIO_BLK_BASE, MMIO_VIRTIO_BLK_SIZE, Box::new(virtio_blk));
+    println!(
+        "[VMM] Registered VirtIO-MMIO block device at GPA 0x{:08x} (IRQ {})",
+        MMIO_VIRTIO_BLK_BASE, VIRTIO_BLK_IRQ
+    );
+
     // Load kernel ELF: FreeBSD locore requires 2MB alignment from RAM base
     let kernel_phys_load = DEFAULT_RAM_BASE + 0x0020_0000; // 0x40200000
-    let loaded = match elf::load_elf64(elf_data, vm.memory_mut(), kernel_phys_load) {
+    let loaded = match elf::load_elf64(elf_data, &vm.memory(), kernel_phys_load) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("\x1b[1;31m[VMM Error] Failed to load kernel ELF: {}\x1b[0m", e);
@@ -133,7 +187,7 @@ fn boot_os_kernel(kernel_path: &str, elf_data: &[u8]) {
         }
     };
 
-    if let Err(e) = vm.memory_mut().write(dtb_addr, &dtb_bytes) {
+    if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m", e);
         process::exit(1);
     }
@@ -174,7 +228,7 @@ fn boot_flat_binary(name: &str, payload_data: &[u8]) {
     vm.mmio_mut()
         .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::new(UART_IRQ, false)));
 
-    if let Err(e) = vm.memory_mut().write(DEFAULT_RAM_BASE, payload_data) {
+    if let Err(e) = vm.memory().write(DEFAULT_RAM_BASE, payload_data) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to load payload: {}\x1b[0m", e);
         process::exit(1);
     }

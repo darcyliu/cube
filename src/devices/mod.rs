@@ -1,6 +1,7 @@
 //! MMIO subsystem and device bus.
 
 pub mod uart;
+pub mod virtio;
 
 pub trait MmioDevice: Send {
     fn read(&mut self, offset: u64, size: usize) -> u64;

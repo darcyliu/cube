@@ -19,6 +19,9 @@ pub struct GuestMemory {
     size: usize,
 }
 
+unsafe impl Send for GuestMemory {}
+unsafe impl Sync for GuestMemory {}
+
 impl GuestMemory {
     /// Allocates and maps a block of guest physical memory at `guest_base`.
     /// `size` will be rounded up to the nearest 16KB page multiple.
@@ -60,7 +63,7 @@ impl GuestMemory {
     }
 
     /// Writes raw bytes into guest memory at the specified guest physical address.
-    pub fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), String> {
+    pub fn write(&self, gpa: u64, data: &[u8]) -> Result<(), String> {
         if gpa < self.guest_base || gpa + (data.len() as u64) > self.guest_base + (self.size as u64)
         {
             return Err(format!(
@@ -99,6 +102,36 @@ impl GuestMemory {
             std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
         }
         Ok(())
+    }
+
+    pub fn read_u16(&self, gpa: u64) -> Result<u16, String> {
+        let mut bytes = [0u8; 2];
+        self.read(gpa, &mut bytes)?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    pub fn read_u32(&self, gpa: u64) -> Result<u32, String> {
+        let mut bytes = [0u8; 4];
+        self.read(gpa, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    pub fn read_u64(&self, gpa: u64) -> Result<u64, String> {
+        let mut bytes = [0u8; 8];
+        self.read(gpa, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    pub fn write_u16(&self, gpa: u64, val: u16) -> Result<(), String> {
+        self.write(gpa, &val.to_le_bytes())
+    }
+
+    pub fn write_u32(&self, gpa: u64, val: u32) -> Result<(), String> {
+        self.write(gpa, &val.to_le_bytes())
+    }
+
+    pub fn write_u64(&self, gpa: u64, val: u64) -> Result<(), String> {
+        self.write(gpa, &val.to_le_bytes())
     }
 }
 

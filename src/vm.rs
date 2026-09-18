@@ -2,12 +2,14 @@
 
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use crate::devices::MmioBus;
 use crate::hypervisor::*;
 use crate::memory::GuestMemory;
 
 pub struct Vm {
-    memory: GuestMemory,
+    memory: Arc<GuestMemory>,
     mmio: MmioBus,
     gic_enabled: bool,
 }
@@ -19,7 +21,7 @@ impl Vm {
             check_hv(hv_vm_create(std::ptr::null()))?;
         }
 
-        let memory = GuestMemory::new(ram_base, ram_size)?;
+        let memory = Arc::new(GuestMemory::new(ram_base, ram_size)?);
         let mmio = MmioBus::new();
 
         Ok(Self {
@@ -62,12 +64,8 @@ impl Vm {
         self.gic_enabled
     }
 
-    pub fn memory(&self) -> &GuestMemory {
-        &self.memory
-    }
-
-    pub fn memory_mut(&mut self) -> &mut GuestMemory {
-        &mut self.memory
+    pub fn memory(&self) -> Arc<GuestMemory> {
+        self.memory.clone()
     }
 
     pub fn mmio(&self) -> &MmioBus {

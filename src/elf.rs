@@ -13,7 +13,7 @@ pub struct LoadedElf {
 
 pub fn load_elf64(
     elf_data: &[u8],
-    guest_mem: &mut GuestMemory,
+    guest_mem: &GuestMemory,
     phys_load_base: u64,
 ) -> Result<LoadedElf, String> {
     if elf_data.len() < 64 {
