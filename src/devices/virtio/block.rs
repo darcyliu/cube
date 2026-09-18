@@ -2,7 +2,10 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static BLK_IOS: AtomicU64 = AtomicU64::new(0);
 
 use super::*;
 use crate::devices::MmioDevice;
@@ -20,9 +23,17 @@ const VIRTIO_BLK_S_IOERR: u8 = 1;
 const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
 // VirtIO Feature Bits
+const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
+const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
+const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+
+/// Match the last combination that booted and finished fsck: 1MB segments,
+/// 128-entry queue. (bhyve uses queue_size-2; we can tighten after fsck works.)
+const VTBLK_QUEUE_SIZE: u32 = 128;
+const VTBLK_SEG_MAX: u32 = 126;
 
 pub struct VirtioBlock {
     file: Option<File>,
@@ -33,6 +44,7 @@ pub struct VirtioBlock {
     driver_features: u64,
     queue: VirtQueue,
     queue_sel: u32,
+    used_idx: u16,
     interrupt_status: u32,
     irq_num: u32,
     mem: Arc<GuestMemory>,
@@ -73,11 +85,12 @@ impl VirtioBlock {
             driver_features_sel: 0,
             driver_features: 0,
             queue: VirtQueue {
-                max_size: 128,
-                size: 128,
+                max_size: VTBLK_QUEUE_SIZE,
+                size: VTBLK_QUEUE_SIZE,
                 ..Default::default()
             },
             queue_sel: 0,
+            used_idx: 0,
             interrupt_status: 0,
             irq_num,
             mem,
@@ -94,20 +107,26 @@ impl VirtioBlock {
             return;
         }
 
-        // Read available ring idx (at offset 2 of avail_ring GPA)
-        let avail_idx = match self.mem.read_u16(self.queue.avail_ring + 2) {
-            Ok(idx) => idx,
-            Err(e) => {
-                eprintln!("[VirtIO-Blk Error] Failed to read avail ring idx: {}", e);
-                return;
-            }
-        };
-
-        let mut curr_idx = self.queue.last_avail_idx;
+        // Drain the avail ring until it stops moving. Publish used.idx with a
+        // SeqCst fence so the other vCPU cannot observe the index before the
+        // used-ring slot (fsck Phase 1 hangs without this on SMP).
         let mut processed_any = false;
+        loop {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            let avail_idx = match self.mem.read_u16(self.queue.avail_ring + 2) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    eprintln!("[VirtIO-Blk Error] Failed to read avail ring idx: {}", e);
+                    break;
+                }
+            };
+            if self.queue.last_avail_idx == avail_idx {
+                break;
+            }
 
-        while curr_idx != avail_idx {
-            let ring_elem_offset = self.queue.avail_ring + 4 + 2 * (curr_idx as u64 % q_size as u64);
+            let ring_elem_offset = self.queue.avail_ring
+                + 4
+                + 2 * (self.queue.last_avail_idx as u64 % q_size as u64);
             let head_desc = match self.mem.read_u16(ring_elem_offset) {
                 Ok(h) => h,
                 Err(e) => {
@@ -117,63 +136,121 @@ impl VirtioBlock {
             };
 
             let bytes_transferred = self.handle_request(head_desc, q_size);
-
-            // Add to used ring:
-            // Used ring format: flags (u16), idx (u16), ring[u32 id, u32 len]
-            if let Ok(used_idx) = self.mem.read_u16(self.queue.used_ring + 2) {
-                let elem_offset = self.queue.used_ring + 4 + 8 * (used_idx as u64 % q_size as u64);
-                let _ = self.mem.write_u32(elem_offset, head_desc as u32);
-                let _ = self.mem.write_u32(elem_offset + 4, bytes_transferred);
-                let _ = self.mem.write_u16(self.queue.used_ring + 2, used_idx.wrapping_add(1));
-            }
-
-            curr_idx = curr_idx.wrapping_add(1);
+            publish_used(&self.mem, &mut self.queue, head_desc, bytes_transferred);
+            self.used_idx = self.queue.used_idx;
+            self.queue.last_avail_idx = self.queue.last_avail_idx.wrapping_add(1);
             processed_any = true;
+            let n = BLK_IOS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 256 == 0 {
+                if let Ok(mut f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/vmm-blk.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "ios={} last_avail={} used_idx={} qsize={}",
+                        n, self.queue.last_avail_idx, self.used_idx, q_size
+                    );
+                }
+            }
         }
 
-        self.queue.last_avail_idx = curr_idx;
-
         if processed_any {
-            // Signal interrupt (used buffer notification)
             self.interrupt_status |= 1;
+            // Always raise: vtblk_ident() busy-polls GET_ID but later bios
+            // wait on the IRQ. Skipping for NO_INTERRUPT wedged attach.
             unsafe {
                 crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
             }
+            crate::vcpu::kick_vcpu();
         }
     }
 
-    fn handle_request(&mut self, head_desc: u16, q_size: u32) -> u32 {
-        // Collect descriptors in the chain
-        let mut desc_idx = head_desc;
-        let mut descriptors = Vec::new();
-        let mut steps = 0;
+    fn read_desc(&self, table: u64, idx: u16) -> Option<(u64, u32, u16, u16)> {
+        let da = table + (idx as u64 * 16);
+        let addr = self.mem.read_u64(da).ok()?;
+        let len = self.mem.read_u32(da + 8).ok()?;
+        let flags = self.mem.read_u16(da + 12).ok()?;
+        let next = self.mem.read_u16(da + 14).ok()?;
+        Some((addr, len, flags, next))
+    }
 
-        while steps < q_size {
-            let desc_addr = self.queue.desc_table + (desc_idx as u64 * 16);
-            let addr = match self.mem.read_u64(desc_addr) {
-                Ok(a) => a,
-                Err(_) => break,
-            };
-            let len = match self.mem.read_u32(desc_addr + 8) {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            let flags = match self.mem.read_u16(desc_addr + 12) {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            let next = match self.mem.read_u16(desc_addr + 14) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+    /// Walk a descriptor chain. Matches QEMU virtqueue_split_pop: if the head
+    /// has VRING_DESC_F_INDIRECT, `next` indexes the indirect table, not the
+    /// virtqueue (see qemu/hw/virtio/virtio.c).
+    fn collect_descriptors(&self, head_desc: u16, q_size: u32) -> Vec<(u64, u32, u16)> {
+        let Some((addr, len, flags, next)) = self.read_desc(self.queue.desc_table, head_desc)
+        else {
+            return Vec::new();
+        };
 
-            descriptors.push((addr, len, flags));
+        if (flags & VRING_DESC_F_INDIRECT) != 0 {
+            if len == 0 || len % 16 != 0 {
+                return Vec::new();
+            }
+            return self.walk_desc_table(addr, (len / 16) as u16);
+        }
 
-            if (flags & VRING_DESC_F_NEXT) != 0 {
-                desc_idx = next;
-                steps += 1;
-            } else {
+        let mut descriptors = vec![(addr, len, flags)];
+        let mut desc_idx = next;
+        let mut steps = 1u32;
+        let mut has_next = (flags & VRING_DESC_F_NEXT) != 0;
+        while has_next && steps < q_size {
+            let Some((a, l, f, n)) = self.read_desc(self.queue.desc_table, desc_idx) else {
                 break;
+            };
+            descriptors.push((a, l, f));
+            has_next = (f & VRING_DESC_F_NEXT) != 0;
+            desc_idx = n;
+            steps += 1;
+        }
+        descriptors
+    }
+
+    fn walk_desc_table(&self, table: u64, max: u16) -> Vec<(u64, u32, u16)> {
+        let mut descriptors = Vec::new();
+        if max == 0 {
+            return descriptors;
+        }
+        // FreeBSD virtqueue_init_indirect_list pre-links next=i+1, then
+        // vq_ring_enqueue_segments overwrites the first `needed` entries
+        // (qemu/hw/virtio/virtio.c virtqueue_split_pop does the same walk).
+        let mut i = 0u16;
+        for _ in 0..max {
+            let Some((addr, len, flags, next)) = self.read_desc(table, i) else {
+                break;
+            };
+            descriptors.push((addr, len, flags));
+            if (flags & VRING_DESC_F_NEXT) == 0 {
+                break;
+            }
+            // VQ_RING_DESC_CHAIN_END is 32768; treat anything out of range
+            // as end-of-chain rather than looping.
+            if next >= max {
+                break;
+            }
+            i = next;
+        }
+        descriptors
+    }
+
+    fn handle_request(&mut self, head_desc: u16, q_size: u32) -> u32 {
+        let descriptors = self.collect_descriptors(head_desc, q_size);
+        let n = BLK_IOS.load(Ordering::Relaxed);
+        if n < 8 {
+            if let Ok(mut f) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/vmm-blk.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "req head={} ndesc={} first_flags={:#x}",
+                    head_desc,
+                    descriptors.len(),
+                    descriptors.first().map(|d| d.2).unwrap_or(0)
+                );
             }
         }
 
@@ -287,7 +364,13 @@ impl MmioDevice for VirtioBlock {
             VIRTIO_MMIO_DEVICE_ID => VIRTIO_DEV_BLOCK as u64,
             VIRTIO_MMIO_VENDOR_ID => VIRTIO_MMIO_VENDOR as u64,
             VIRTIO_MMIO_DEVICE_FEATURES => {
-                let features = VIRTIO_BLK_F_FLUSH | VIRTIO_F_VERSION_1;
+                // Do not advertise SIZE_MAX: FreeBSD vtblk_attach fails with
+                // ENOTSUP if size_max < maxphys, which is how we got ENODEV.
+                let features = VIRTIO_BLK_F_SEG_MAX
+                    | VIRTIO_BLK_F_BLK_SIZE
+                    | VIRTIO_BLK_F_FLUSH
+                    | VIRTIO_RING_F_INDIRECT_DESC
+                    | VIRTIO_F_VERSION_1;
                 if self.device_features_sel == 0 {
                     features & 0xffff_ffff
                 } else if self.device_features_sel == 1 {
@@ -312,16 +395,21 @@ impl MmioDevice for VirtioBlock {
             }
             VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status as u64,
             VIRTIO_MMIO_STATUS => self.status as u64,
-            // Config Space: offset 0x100 is capacity (u64 in 512-byte sectors)
+            // struct virtio_blk_config: capacity, size_max, seg_max, geometry, blk_size
             off if off >= VIRTIO_MMIO_CONFIG => {
-                let config_offset = off - VIRTIO_MMIO_CONFIG;
-                match (config_offset, size) {
-                    (0, 8) => self.capacity_sectors,
-                    (0, 4) => self.capacity_sectors & 0xffff_ffff,
-                    (4, 4) => (self.capacity_sectors >> 32) & 0xffff_ffff,
-                    (0, 1) => self.capacity_sectors & 0xff,
-                    (1, 1) => (self.capacity_sectors >> 8) & 0xff,
-                    _ => 0,
+                let config_offset = (off - VIRTIO_MMIO_CONFIG) as usize;
+                let mut cfg = [0u8; 32];
+                cfg[0..8].copy_from_slice(&self.capacity_sectors.to_le_bytes());
+                cfg[12..16].copy_from_slice(&VTBLK_SEG_MAX.to_le_bytes());
+                cfg[20..24].copy_from_slice(&512u32.to_le_bytes());
+                if config_offset + size <= cfg.len() {
+                    let mut val = 0u64;
+                    for (i, &b) in cfg[config_offset..config_offset + size].iter().enumerate() {
+                        val |= (b as u64) << (i * 8);
+                    }
+                    val
+                } else {
+                    0
                 }
             }
             _ => 0,
@@ -412,10 +500,11 @@ impl MmioDevice for VirtioBlock {
                 if data == 0 {
                     // Reset
                     self.queue = VirtQueue {
-                        max_size: 128,
-                        size: 128,
+                        max_size: VTBLK_QUEUE_SIZE,
+                        size: VTBLK_QUEUE_SIZE,
                         ..Default::default()
                     };
+                    self.used_idx = 0;
                     self.interrupt_status = 0;
                     unsafe {
                         crate::hypervisor::hv_gic_set_spi(self.irq_num, false);

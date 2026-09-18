@@ -2,12 +2,12 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::devices::MmioDevice;
@@ -20,6 +20,45 @@ const VIRTIO_F_VERSION_1_BIT: u64 = 1 << 32;
 
 // VirtIO Network Status
 const VIRTIO_NET_S_LINK_UP_VAL: u16 = 1;
+
+struct NetDebugStats {
+    tx_pkts: AtomicU64,
+    tx_bytes: AtomicU64,
+    rx_pkts: AtomicU64,
+    rx_bytes: AtomicU64,
+    rx_drop: AtomicU64,
+    rx_nomem: AtomicU64,
+    irq_raise: AtomicU64,
+    irq_ack: AtomicU64,
+    irq_defer: AtomicU64,
+    tx_notify: AtomicU64,
+    vmnet_err: AtomicU64,
+}
+
+static NET_STATS: NetDebugStats = NetDebugStats {
+    tx_pkts: AtomicU64::new(0),
+    tx_bytes: AtomicU64::new(0),
+    rx_pkts: AtomicU64::new(0),
+    rx_bytes: AtomicU64::new(0),
+    rx_drop: AtomicU64::new(0),
+    rx_nomem: AtomicU64::new(0),
+    irq_raise: AtomicU64::new(0),
+    irq_ack: AtomicU64::new(0),
+    irq_defer: AtomicU64::new(0),
+    tx_notify: AtomicU64::new(0),
+    vmnet_err: AtomicU64::new(0),
+};
+
+fn net_log(msg: &str) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/vmm-net.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+        let _ = f.flush();
+    }
+}
 
 /// Network backend trait for sending and receiving Ethernet frames.
 pub trait NetBackend: Send {
@@ -275,6 +314,7 @@ impl NetBackend for VmnetBackend {
         if ret == VMNET_SUCCESS {
             Ok(())
         } else {
+            NET_STATS.vmnet_err.fetch_add(1, Ordering::Relaxed);
             Err(format!("vmnet_write error: {}", ret))
         }
     }
@@ -362,8 +402,14 @@ pub struct VirtioNetInner {
     interrupt_status: u32,
     irq_num: u32,
     mem: Arc<GuestMemory>,
-    backend: Box<dyn NetBackend>,
+    backend: Arc<Mutex<Box<dyn NetBackend>>>,
     rx_backlog: VecDeque<Vec<u8>>,
+    /// GIC SPI line currently driven high.
+    irq_asserted: bool,
+    /// Used-buffer event arrived while the SPI was already high. Re-raise after ACK.
+    irq_pending_after_ack: bool,
+    /// Time of the last INTERRUPT_ACK. Re-assert is deferred until the guest ERETs.
+    last_ack: std::time::Instant,
 }
 
 impl VirtioNetInner {
@@ -380,37 +426,111 @@ impl VirtioNetInner {
             driver_features_sel: 0,
             driver_features: 0,
             rx_queue: VirtQueue {
-                max_size: 128,
-                size: 128,
+                max_size: 1024,
+                size: 1024,
                 ..Default::default()
             },
             tx_queue: VirtQueue {
-                max_size: 128,
-                size: 128,
+                max_size: 1024,
+                size: 1024,
                 ..Default::default()
             },
             queue_sel: 0,
             interrupt_status: 0,
             irq_num,
             mem,
-            backend,
+            backend: Arc::new(Mutex::new(backend)),
             rx_backlog: VecDeque::new(),
+            irq_asserted: false,
+            irq_pending_after_ack: false,
+            last_ack: std::time::Instant::now()
+                .checked_sub(Duration::from_millis(10))
+                .unwrap_or_else(std::time::Instant::now),
         }
+    }
+
+    fn notify_used(&mut self, avail_ring: u64) {
+        self.interrupt_status |= 1;
+        std::sync::atomic::fence(Ordering::SeqCst);
+        // QEMU virtio_split_should_notify: do not interrupt while the driver
+        // has VRING_AVAIL_F_NO_INTERRUPT set (it will poll used.idx).
+        if !avail_wants_interrupt(&self.mem, avail_ring) {
+            return;
+        }
+        if self.irq_asserted {
+            self.irq_pending_after_ack = true;
+            NET_STATS.irq_defer.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.raise_irq();
+    }
+
+    fn irq_needs_raise(&self) -> bool {
+        !self.irq_asserted && ((self.interrupt_status & 1) != 0 || self.irq_pending_after_ack)
+    }
+
+    fn raise_irq(&mut self) {
+        if self.irq_asserted {
+            return;
+        }
+        self.irq_asserted = true;
+        self.irq_pending_after_ack = false;
+        self.interrupt_status |= 1;
+        NET_STATS.irq_raise.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
+        }
+        crate::vcpu::kick_vcpu();
+    }
+
+    fn try_assert_irq(&mut self) {
+        if !self.irq_needs_raise() {
+            return;
+        }
+        self.raise_irq();
+    }
+
+    fn handle_interrupt_ack(&mut self, data: u32) {
+        NET_STATS.irq_ack.fetch_add(1, Ordering::Relaxed);
+        self.interrupt_status &= !data;
+        self.last_ack = std::time::Instant::now();
+        if self.irq_asserted {
+            self.irq_asserted = false;
+            unsafe {
+                crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
+            }
+        }
+        if self.irq_pending_after_ack {
+            self.interrupt_status |= 1;
+        }
+        // QEMU virtio_mmio ACK only clears ISR then update_irq. Re-raise
+        // from the RX worker if used buffers were added during the ISR.
+    }
+
+    /// Raise a deferred used-buffer IRQ once the ACK holdoff has expired.
+    pub fn flush_deferred_interrupt(&mut self) {
+        self.try_assert_irq();
     }
 
     /// Receives an Ethernet frame from the network backend and delivers it into the guest RX queue.
     pub fn receive_packet(&mut self, packet: &[u8]) {
+        self.drain_rx_backlog();
+
         if !self.rx_queue.ready || self.rx_queue.avail_ring == 0 || self.rx_queue.desc_table == 0 {
-            if self.rx_backlog.len() < 256 {
+            if self.rx_backlog.len() < 64 {
                 self.rx_backlog.push_back(packet.to_vec());
+            } else {
+                NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
 
-        if !self.deliver_to_rx_queue(packet) {
-            // Buffer in backlog if queue was full
-            if self.rx_backlog.len() < 256 {
+        if !self.rx_backlog.is_empty() || !self.deliver_to_rx_queue(packet) {
+            // Buffer in backlog if queue was full or prior backlog exists (preserve in-order delivery)
+            if self.rx_backlog.len() < 64 {
                 self.rx_backlog.push_back(packet.to_vec());
+            } else {
+                NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -425,8 +545,10 @@ impl VirtioNetInner {
             Ok(idx) => idx,
             Err(_) => return false,
         };
+        std::sync::atomic::fence(Ordering::SeqCst);
 
         if self.rx_queue.last_avail_idx == avail_idx {
+            NET_STATS.rx_nomem.fetch_add(1, Ordering::Relaxed);
             return false; // No empty buffers available
         }
 
@@ -495,27 +617,24 @@ impl VirtioNetInner {
             total_written += to_write;
         }
 
-        // Write used ring entry
-        if let Ok(used_idx) = self.mem.read_u16(self.rx_queue.used_ring + 2) {
-            let elem_offset = self.rx_queue.used_ring + 4 + 8 * (used_idx as u64 % q_size as u64);
-            let _ = self.mem.write_u32(elem_offset, head_desc as u32);
-            let _ = self.mem.write_u32(elem_offset + 4, total_written as u32);
-            let _ = self.mem.write_u16(self.rx_queue.used_ring + 2, used_idx.wrapping_add(1));
-        }
-
+        publish_used(
+            &self.mem,
+            &mut self.rx_queue,
+            head_desc,
+            total_written as u32,
+        );
         self.rx_queue.last_avail_idx = self.rx_queue.last_avail_idx.wrapping_add(1);
 
-        // Raise interrupt and kick vCPU
-        self.interrupt_status |= 1;
-        unsafe {
-            crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
-        }
-        crate::vcpu::kick_vcpu();
-
+        NET_STATS.rx_pkts.fetch_add(1, Ordering::Relaxed);
+        NET_STATS.rx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+        self.notify_used(self.rx_queue.avail_ring);
         true
     }
 
     fn drain_rx_backlog(&mut self) {
+        if !self.rx_queue.ready || self.rx_queue.avail_ring == 0 || self.rx_queue.desc_table == 0 {
+            return;
+        }
         while let Some(pkt) = self.rx_backlog.pop_front() {
             if !self.deliver_to_rx_queue(&pkt) {
                 self.rx_backlog.push_front(pkt);
@@ -524,19 +643,20 @@ impl VirtioNetInner {
         }
     }
 
-    fn process_tx(&mut self) {
+    fn process_tx(&mut self) -> Vec<Vec<u8>> {
+        let mut to_send = Vec::new();
         if !self.tx_queue.ready || self.tx_queue.avail_ring == 0 || self.tx_queue.desc_table == 0 {
-            return;
+            return to_send;
         }
 
         let q_size = self.tx_queue.size;
         if q_size == 0 {
-            return;
+            return to_send;
         }
 
         let avail_idx = match self.mem.read_u16(self.tx_queue.avail_ring + 2) {
             Ok(idx) => idx,
-            Err(_) => return,
+            Err(_) => return to_send,
         };
 
         let mut curr_idx = self.tx_queue.last_avail_idx;
@@ -587,19 +707,16 @@ impl VirtioNetInner {
                 }
             }
 
-            // Strip 12-byte VirtIO Net header and transmit payload
+            // Strip 12-byte VirtIO Net header and transmit payload after dropping
+            // the device lock, so RX/ACK MMIO is not blocked on vmnet_write.
             if full_data.len() > VIRTIO_NET_HDR_SIZE {
-                let packet = &full_data[VIRTIO_NET_HDR_SIZE..];
-                let _ = self.backend.send_packet(packet);
+                let payload = &full_data[VIRTIO_NET_HDR_SIZE..];
+                NET_STATS.tx_pkts.fetch_add(1, Ordering::Relaxed);
+                NET_STATS.tx_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                to_send.push(payload.to_vec());
             }
 
-            // Update used ring
-            if let Ok(used_idx) = self.mem.read_u16(self.tx_queue.used_ring + 2) {
-                let elem_offset = self.tx_queue.used_ring + 4 + 8 * (used_idx as u64 % q_size as u64);
-                let _ = self.mem.write_u32(elem_offset, head_desc as u32);
-                let _ = self.mem.write_u32(elem_offset + 4, 0); // 0 bytes written to guest memory on TX
-                let _ = self.mem.write_u16(self.tx_queue.used_ring + 2, used_idx.wrapping_add(1));
-            }
+            publish_used(&self.mem, &mut self.tx_queue, head_desc, 0);
 
             curr_idx = curr_idx.wrapping_add(1);
             processed_any = true;
@@ -608,11 +725,9 @@ impl VirtioNetInner {
         self.tx_queue.last_avail_idx = curr_idx;
 
         if processed_any {
-            self.interrupt_status |= 1;
-            unsafe {
-                crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
-            }
+            self.notify_used(self.tx_queue.avail_ring);
         }
+        to_send
     }
 }
 
@@ -669,7 +784,73 @@ impl VirtioNet {
                 .name("vmm-vmnet-rx".into())
                 .spawn(move || {
                     let mut buf = [0u8; 2048];
+                    let mut last_stats = Instant::now();
+                    let _ = File::create("/tmp/vmm-net.log");
+                    net_log("[net] rx thread started");
                     while running_clone.load(Ordering::Relaxed) {
+                        // Flush deferred IRQs before potentially blocking in vmnet_read.
+                        // Otherwise a burst can sit in the used ring with SPI low while
+                        // we wait for the next packet, and TCP stalls at 0 Bps.
+                        let defer_read = {
+                            let mut inner = inner_clone.lock().unwrap();
+                            if !inner.rx_backlog.is_empty() {
+                                inner.drain_rx_backlog();
+                            }
+                            inner.flush_deferred_interrupt();
+                            inner.irq_needs_raise()
+                        };
+                        if last_stats.elapsed() >= Duration::from_secs(1) {
+                            last_stats = Instant::now();
+                            let inner = inner_clone.lock().unwrap();
+                            let rx_avail = inner
+                                .mem
+                                .read_u16(inner.rx_queue.avail_ring + 2)
+                                .unwrap_or(0);
+                            let rx_used = inner
+                                .mem
+                                .read_u16(inner.rx_queue.used_ring + 2)
+                                .unwrap_or(0);
+                            let tx_avail = inner
+                                .mem
+                                .read_u16(inner.tx_queue.avail_ring + 2)
+                                .unwrap_or(0);
+                            let tx_used = inner
+                                .mem
+                                .read_u16(inner.tx_queue.used_ring + 2)
+                                .unwrap_or(0);
+                            net_log(&format!(
+                                "tx_pkts={} tx_bytes={} rx_pkts={} rx_bytes={} rx_drop={} rx_nomem={} irq_raise={} irq_ack={} irq_defer={} tx_notify={} vmnet_err={} backlog={} irq_asserted={} isr={:#x} pending_ack={} rx_last={} rx_avail={} rx_used={} tx_last={} tx_avail={} tx_used={} rx_ready={} tx_ready={}",
+                                NET_STATS.tx_pkts.load(Ordering::Relaxed),
+                                NET_STATS.tx_bytes.load(Ordering::Relaxed),
+                                NET_STATS.rx_pkts.load(Ordering::Relaxed),
+                                NET_STATS.rx_bytes.load(Ordering::Relaxed),
+                                NET_STATS.rx_drop.load(Ordering::Relaxed),
+                                NET_STATS.rx_nomem.load(Ordering::Relaxed),
+                                NET_STATS.irq_raise.load(Ordering::Relaxed),
+                                NET_STATS.irq_ack.load(Ordering::Relaxed),
+                                NET_STATS.irq_defer.load(Ordering::Relaxed),
+                                NET_STATS.tx_notify.load(Ordering::Relaxed),
+                                NET_STATS.vmnet_err.load(Ordering::Relaxed),
+                                inner.rx_backlog.len(),
+                                inner.irq_asserted,
+                                inner.interrupt_status,
+                                inner.irq_pending_after_ack,
+                                inner.rx_queue.last_avail_idx,
+                                rx_avail,
+                                rx_used,
+                                inner.tx_queue.last_avail_idx,
+                                tx_avail,
+                                tx_used,
+                                inner.rx_queue.ready,
+                                inner.tx_queue.ready,
+                            ));
+                        }
+
+                        if defer_read {
+                            thread::sleep(Duration::from_micros(50));
+                            continue;
+                        }
+
                         let mut iov = Iovec {
                             iov_base: buf.as_mut_ptr() as *mut c_void,
                             iov_len: buf.len(),
@@ -686,10 +867,11 @@ impl VirtioNet {
                         if ret == VMNET_SUCCESS && pktcnt > 0 && desc.vm_pkt_size > 0 {
                             let pkt_len = desc.vm_pkt_size as usize;
                             let packet = &buf[..pkt_len];
-                            inner_clone.lock().unwrap().receive_packet(packet);
+                            let mut inner = inner_clone.lock().unwrap();
+                            inner.receive_packet(packet);
+                            inner.flush_deferred_interrupt();
                         } else {
-                            // Sleep briefly when no packets available
-                            thread::sleep(Duration::from_micros(500));
+                            thread::sleep(Duration::from_micros(100));
                         }
                     }
                 })
@@ -725,7 +907,7 @@ impl MmioDevice for VirtioNet {
             }
             VIRTIO_MMIO_QUEUE_NUM_MAX => {
                 if inner.queue_sel < 2 {
-                    128
+                    1024
                 } else {
                     0
                 }
@@ -757,6 +939,7 @@ impl MmioDevice for VirtioNet {
 
     fn write(&mut self, offset: u64, data: u64, _size: usize) {
         let mut inner = self.inner.lock().unwrap();
+        let mut tx_packets: Option<Vec<Vec<u8>>> = None;
         match offset {
             VIRTIO_MMIO_DEVICE_FEATURES_SEL => {
                 inner.device_features_sel = data as u32;
@@ -803,18 +986,15 @@ impl MmioDevice for VirtioNet {
                 if q_idx == 0 {
                     // Guest added RX buffers
                     inner.drain_rx_backlog();
+                    inner.flush_deferred_interrupt();
                 } else if q_idx == 1 {
                     // Guest queued packets to transmit
-                    inner.process_tx();
+                    NET_STATS.tx_notify.fetch_add(1, Ordering::Relaxed);
+                    tx_packets = Some(inner.process_tx());
                 }
             }
             VIRTIO_MMIO_INTERRUPT_ACK => {
-                inner.interrupt_status &= !(data as u32);
-                if inner.interrupt_status == 0 {
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(inner.irq_num, false);
-                    }
-                }
+                inner.handle_interrupt_ack(data as u32);
             }
             VIRTIO_MMIO_STATUS => {
                 inner.status = data as u32;
@@ -847,6 +1027,15 @@ impl MmioDevice for VirtioNet {
                 q.used_ring = (q.used_ring & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
             }
             _ => {}
+        }
+
+        let backend = tx_packets.as_ref().map(|_| Arc::clone(&inner.backend));
+        drop(inner);
+        if let (Some(pkts), Some(backend)) = (tx_packets, backend) {
+            let mut b = backend.lock().unwrap();
+            for p in pkts {
+                let _ = b.send_packet(&p);
+            }
         }
     }
 }

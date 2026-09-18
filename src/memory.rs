@@ -123,11 +123,30 @@ impl GuestMemory {
     }
 
     pub fn write_u16(&self, gpa: u64, val: u16) -> Result<(), String> {
-        self.write(gpa, &val.to_le_bytes())
+        if gpa < self.guest_base || gpa + 2 > self.guest_base + self.size as u64 {
+            return Err(format!("Address out of bounds: GPA 0x{gpa:x}"));
+        }
+        let offset = (gpa - self.guest_base) as usize;
+        let bytes = val.to_le_bytes();
+        unsafe {
+            self.ptr.as_ptr().add(offset).write_volatile(bytes[0]);
+            self.ptr.as_ptr().add(offset + 1).write_volatile(bytes[1]);
+        }
+        Ok(())
     }
 
     pub fn write_u32(&self, gpa: u64, val: u32) -> Result<(), String> {
-        self.write(gpa, &val.to_le_bytes())
+        if gpa < self.guest_base || gpa + 4 > self.guest_base + self.size as u64 {
+            return Err(format!("Address out of bounds: GPA 0x{gpa:x}"));
+        }
+        let offset = (gpa - self.guest_base) as usize;
+        let bytes = val.to_le_bytes();
+        unsafe {
+            for (i, b) in bytes.iter().enumerate() {
+                self.ptr.as_ptr().add(offset + i).write_volatile(*b);
+            }
+        }
+        Ok(())
     }
 
     pub fn write_u64(&self, gpa: u64, val: u64) -> Result<(), String> {
