@@ -54,19 +54,19 @@ route add default 192.168.18.1
 rm -f /etc/resolv.conf
 echo "nameserver 1.1.1.1" > /etc/resolv.conf
 
-# 4. Set system date (required for cryptographic verification)
-date 202609181755
+# 4. Verify system date (synchronized automatically via PL031 RTC)
+date
 ```
 
 ---
 
 ## 3. Bootstrapping & Updating `pkg`
 
-### Why `pkg bootstrap` Hangs
-The default `/usr/sbin/pkg` bootstrap utility reads `/etc/pkg/FreeBSD.conf` (which specifies `pkg+https://`) and ignores `PACKAGESITE`. Without root CA certificates (`ca_root_nss`) or an RTC clock, the TLS handshake and SRV DNS query stall indefinitely.
+### Why `pkg bootstrap` Initially Hangs
+The default `/usr/sbin/pkg` bootstrap utility reads `/etc/pkg/FreeBSD.conf` (which specifies `pkg+https://`) and ignores `PACKAGESITE`. Until root CA certificates (`ca_root_nss`) are installed, the TLS handshake fails to verify the FreeBSD repository certificate. Now that the VM has an emulated PL031 RTC, clock skew is eliminated, but root CA certificates are still required for HTTPS.
 
 ### The Solution: Direct Download & HTTP Repository Override
-We fetch the pre-built `pkg` tarball directly via HTTP and extract it. FreeBSD packages are cryptographically signed with local keys in `/usr/share/keys/pkg`, so HTTP is completely secure.
+We fetch the pre-built `pkg` tarball directly via HTTP and extract it. FreeBSD packages are cryptographically signed with local keys in `/usr/share/keys/pkg`, so HTTP is completely secure. Once `ca_root_nss` is installed, HTTPS works everywhere.
 
 ```sh
 # 1. Download and install pkg directly (resumable with -r -o)

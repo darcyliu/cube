@@ -14,9 +14,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 
+use devices::rtc::Pl031Rtc;
 use devices::uart::Pl011Uart;
 use devices::virtio::block::VirtioBlock;
 use devices::virtio::net::VirtioNet;
+use devices::virtio::rng::VirtioRng;
 use vcpu::{Vcpu, VcpuExitStatus, VcpuManager};
 use vm::Vm;
 
@@ -30,6 +32,10 @@ const MMIO_UART_BASE: u64 = 0x0900_0000;
 const MMIO_UART_SIZE: u64 = 0x1000;
 const UART_IRQ: u32 = 33; // SPI 1 (intid 33)
 
+const MMIO_RTC_BASE: u64 = 0x0901_0000;
+const MMIO_RTC_SIZE: u64 = 0x1000;
+const RTC_IRQ: u32 = 36; // SPI 4 (intid 36)
+
 const MMIO_VIRTIO_BLK_BASE: u64 = 0x0a00_0000;
 const MMIO_VIRTIO_BLK_SIZE: u64 = 0x0200;
 const VIRTIO_BLK_IRQ: u32 = 34; // SPI 2 (intid 34)
@@ -37,6 +43,10 @@ const VIRTIO_BLK_IRQ: u32 = 34; // SPI 2 (intid 34)
 const MMIO_VIRTIO_NET_BASE: u64 = 0x0a00_0200;
 const MMIO_VIRTIO_NET_SIZE: u64 = 0x0200;
 const VIRTIO_NET_IRQ: u32 = 35; // SPI 3 (intid 35)
+
+const MMIO_VIRTIO_RNG_BASE: u64 = 0x0a00_0400;
+const MMIO_VIRTIO_RNG_SIZE: u64 = 0x0200;
+const VIRTIO_RNG_IRQ: u32 = 37; // SPI 5 (intid 37)
 
 // Embedded default payload built by build.rs
 const DEFAULT_PAYLOAD: &[u8] = include_bytes!("../guest/payload.bin");
@@ -285,6 +295,14 @@ fn boot_os_kernel(
         MMIO_UART_BASE, UART_IRQ
     );
 
+    // Attach ARM PL031 Real-Time Clock
+    vm.mmio_mut()
+        .register(MMIO_RTC_BASE, MMIO_RTC_SIZE, Box::new(Pl031Rtc::new(RTC_IRQ)));
+    println!(
+        "[VMM] Registered ARM PL031 RTC at GPA 0x{:08x} (IRQ {})",
+        MMIO_RTC_BASE, RTC_IRQ
+    );
+
     // Attach VirtIO-MMIO Block Device
     let virtio_blk = match VirtioBlock::new(disk_path, VIRTIO_BLK_IRQ, vm.memory()) {
         Ok(blk) => blk,
@@ -310,6 +328,15 @@ fn boot_os_kernel(
             MMIO_VIRTIO_NET_BASE, VIRTIO_NET_IRQ
         );
     }
+
+    // Attach VirtIO-MMIO Random Number Generator
+    let virtio_rng = VirtioRng::new(VIRTIO_RNG_IRQ, vm.memory());
+    vm.mmio_mut()
+        .register(MMIO_VIRTIO_RNG_BASE, MMIO_VIRTIO_RNG_SIZE, Box::new(virtio_rng));
+    println!(
+        "[VMM] Registered VirtIO-MMIO RNG device at GPA 0x{:08x} (IRQ {})",
+        MMIO_VIRTIO_RNG_BASE, VIRTIO_RNG_IRQ
+    );
 
     // Load kernel ELF: FreeBSD locore requires 2MB alignment from RAM base
     let kernel_phys_load = DEFAULT_RAM_BASE + 0x0020_0000; // 0x40200000

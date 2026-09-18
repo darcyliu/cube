@@ -4,6 +4,7 @@
 
 pub mod block;
 pub mod net;
+pub mod rng;
 
 // VirtIO MMIO Register Offsets (Modern, Version 2)
 pub const VIRTIO_MMIO_MAGIC_VALUE: u64 = 0x000;
@@ -39,6 +40,7 @@ pub const VIRTIO_MMIO_VENDOR: u32 = 0x554d4551;  // 'QEMU'
 pub const VIRTIO_DEV_NET: u32 = 1;
 pub const VIRTIO_DEV_BLOCK: u32 = 2;
 pub const VIRTIO_DEV_CONSOLE: u32 = 3;
+pub const VIRTIO_DEV_RNG: u32 = 4;
 
 // VirtIO Device Status Bits
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;

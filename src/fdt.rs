@@ -82,6 +82,13 @@ pub fn generate_dtb(
         interrupts = <0 1 4>; /* SPI 1 (interrupt ID 33) */
     }};
 
+    rtc@09010000 {{
+        compatible = "arm,pl031", "arm,primecell";
+        reg = <0x0 0x09010000 0x0 0x1000>;
+        interrupt-parent = <&intc>;
+        interrupts = <0 4 4>; /* SPI 4 (interrupt ID 36) */
+    }};
+
     virtio_mmio@0a000000 {{
         compatible = "virtio,mmio";
         reg = <0x0 0x0a000000 0x0 0x200>;
@@ -94,6 +101,13 @@ pub fn generate_dtb(
         reg = <0x0 0x0a000200 0x0 0x200>;
         interrupt-parent = <&intc>;
         interrupts = <0 3 4>; /* SPI 3 (interrupt ID 35) */
+    }};
+
+    virtio_mmio@0a000400 {{
+        compatible = "virtio,mmio";
+        reg = <0x0 0x0a000400 0x0 0x200>;
+        interrupt-parent = <&intc>;
+        interrupts = <0 5 4>; /* SPI 5 (interrupt ID 37) */
     }};
 }};
 "#,

@@ -1,5 +1,6 @@
 //! MMIO subsystem and device bus.
 
+pub mod rtc;
 pub mod uart;
 pub mod virtio;
 
