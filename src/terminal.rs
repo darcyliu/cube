@@ -1,5 +1,4 @@
-//! POSIX terminal raw-mode manager for interactive console input.
-
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[repr(C)]
@@ -122,6 +121,10 @@ impl Drop for TerminalGuard {
             unsafe {
                 tcsetattr(0, TCSANOW, &self.orig_termios);
             }
+            // Ensure cursor returns to column 0 upon returning to cooked mode
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(b"\r");
+            let _ = stdout.flush();
         }
     }
 }

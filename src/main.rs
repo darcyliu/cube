@@ -675,9 +675,9 @@ fn boot_os_kernel(
     println!("--------------------------------------------------");
 
     // Set terminal to raw mode so keystrokes are sent immediately to the guest
-    let _term_guard = terminal::TerminalGuard::enter_raw_mode();
+    let term_guard = terminal::TerminalGuard::enter_raw_mode();
 
-    run_loop(&mut vcpu0, vm.mmio());
+    run_loop(&mut vcpu0, vm.mmio(), Some(term_guard));
 
     // Signal shutdown to secondary vCPUs and join threads
     vcpu_mgr.request_shutdown();
@@ -727,11 +727,21 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model:
     println!("[VMM] Entering guest execution loop...");
     println!("--------------------------------------------------");
 
-    run_loop(&mut vcpu, vm.mmio());
+    run_loop(&mut vcpu, vm.mmio(), None);
 }
 
-fn run_loop(vcpu: &mut Vcpu, mmio: &devices::MmioBus) {
-    match vcpu.run(mmio) {
+fn run_loop(vcpu: &mut Vcpu, mmio: &devices::MmioBus, term_guard: Option<terminal::TerminalGuard>) {
+    let result = vcpu.run(mmio);
+
+    // Drop terminal guard immediately to restore cooked mode before printing exit messages.
+    // This ensures \r\n expansion is active so exit lines align cleanly to the left margin.
+    drop(term_guard);
+
+    use std::io::Write;
+    print!("\r\n");
+    let _ = std::io::stdout().flush();
+
+    match result {
         Ok(status) => {
             println!("--------------------------------------------------");
             match status {
