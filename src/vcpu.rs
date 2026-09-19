@@ -13,6 +13,128 @@ use crate::hypervisor::*;
 static VCPU_ID: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_VCPU_MANAGER: Mutex<Option<Weak<VcpuManager>>> = Mutex::new(None);
 
+/// Represents an ARM64 CPU Model identifying Main ID Register (MIDR_EL1).
+///
+/// In FreeBSD ARM64 (identcpu.c), the CPU name and hw.model are derived
+/// directly from MIDR_EL1 (Implementer, Architecture, Part Number, Revision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuModel {
+    pub midr: u64,
+    pub name: &'static str,
+}
+
+impl CpuModel {
+    // Recognized Apple Silicon cores (FreeBSD arm64/identcpu.c)
+    pub const APPLE_M1_FIRESTORM: Self = Self { midr: 0x610f_0230, name: "Apple M1 Firestorm" };
+    pub const APPLE_M1_ICESTORM: Self = Self { midr: 0x610f_0220, name: "Apple M1 Icestorm" };
+    pub const APPLE_M1_PRO: Self = Self { midr: 0x610f_0250, name: "Apple M1 Pro Firestorm" };
+    pub const APPLE_M1_MAX: Self = Self { midr: 0x610f_0290, name: "Apple M1 Max Firestorm" };
+    pub const APPLE_M2_AVALANCHE: Self = Self { midr: 0x610f_0330, name: "Apple M2 Avalanche" };
+    pub const APPLE_M2_BLIZZARD: Self = Self { midr: 0x610f_0320, name: "Apple M2 Blizzard" };
+    pub const APPLE_M2_PRO: Self = Self { midr: 0x610f_0350, name: "Apple M2 Pro Avalanche" };
+    pub const APPLE_M2_MAX: Self = Self { midr: 0x610f_0390, name: "Apple M2 Max Avalanche" };
+
+    // Standard ARM Neoverse & Cortex server cores
+    pub const ARM_NEOVERSE_N2: Self = Self { midr: 0x410f_d490, name: "ARM Neoverse-N2" };
+    pub const ARM_NEOVERSE_N1: Self = Self { midr: 0x410f_d0c0, name: "ARM Neoverse-N1" };
+    pub const ARM_NEOVERSE_V1: Self = Self { midr: 0x410f_d400, name: "ARM Neoverse-V1" };
+    pub const ARM_CORTEX_A78: Self = Self { midr: 0x410f_d410, name: "ARM Cortex-A78" };
+    pub const ARM_CORTEX_A72: Self = Self { midr: 0x410f_d080, name: "ARM Cortex-A72" };
+    pub const ARM_CORTEX_A53: Self = Self { midr: 0x410f_d030, name: "ARM Cortex-A53" };
+    pub const AMPERE_ONE: Self = Self { midr: 0xc00f_ac30, name: "Ampere AmpereOne AC03" };
+
+    /// Automatically detects host Apple Silicon model via macOS sysctl.
+    pub fn detect_host() -> Self {
+        if let Some(brand) = get_host_brand_string() {
+            let b = brand.to_lowercase();
+            if b.contains("m1 max") || b.contains("m1 ultra") {
+                return Self::APPLE_M1_MAX;
+            } else if b.contains("m1 pro") {
+                return Self::APPLE_M1_PRO;
+            } else if b.contains("m1") {
+                return Self::APPLE_M1_FIRESTORM;
+            } else if b.contains("m2 max") || b.contains("m2 ultra") {
+                return Self::APPLE_M2_MAX;
+            } else if b.contains("m2 pro") {
+                return Self::APPLE_M2_PRO;
+            } else if b.contains("m2") {
+                return Self::APPLE_M2_AVALANCHE;
+            } else if b.contains("m3") || b.contains("m4") {
+                // FreeBSD 14.x recognizes up to M2; Avalanche is the best modern Apple match
+                return Self::APPLE_M2_AVALANCHE;
+            }
+        }
+        // Default to Apple M1 Max / Apple Silicon
+        Self::APPLE_M1_MAX
+    }
+
+    /// Parses user-provided CPU model alias or hex MIDR value.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let lower = s.trim().to_lowercase();
+        match lower.as_str() {
+            "auto" | "host" => Ok(Self::detect_host()),
+            "m1" | "m1-firestorm" | "firestorm" => Ok(Self::APPLE_M1_FIRESTORM),
+            "m1-icestorm" | "icestorm" => Ok(Self::APPLE_M1_ICESTORM),
+            "m1-pro" | "m1-pro-firestorm" => Ok(Self::APPLE_M1_PRO),
+            "m1-max" | "m1-max-firestorm" => Ok(Self::APPLE_M1_MAX),
+            "m2" | "m2-avalanche" | "avalanche" => Ok(Self::APPLE_M2_AVALANCHE),
+            "m2-blizzard" | "blizzard" => Ok(Self::APPLE_M2_BLIZZARD),
+            "m2-pro" | "m2-pro-avalanche" => Ok(Self::APPLE_M2_PRO),
+            "m2-max" | "m2-max-avalanche" => Ok(Self::APPLE_M2_MAX),
+            "neoverse-n2" | "n2" => Ok(Self::ARM_NEOVERSE_N2),
+            "neoverse-n1" | "n1" => Ok(Self::ARM_NEOVERSE_N1),
+            "neoverse-v1" | "v1" => Ok(Self::ARM_NEOVERSE_V1),
+            "cortex-a78" | "a78" => Ok(Self::ARM_CORTEX_A78),
+            "cortex-a72" | "a72" => Ok(Self::ARM_CORTEX_A72),
+            "cortex-a53" | "a53" => Ok(Self::ARM_CORTEX_A53),
+            "ampere-one" | "ampereone" => Ok(Self::AMPERE_ONE),
+            other => {
+                let hex_str = other.strip_prefix("0x").unwrap_or(other);
+                if let Ok(val) = u64::from_str_radix(hex_str, 16) {
+                    Ok(Self {
+                        midr: val,
+                        name: "Custom MIDR",
+                    })
+                } else {
+                    Err(format!(
+                        "Unknown CPU model '{}'. Supported: auto, host, m1, m1-pro, m1-max, m2, m2-pro, m2-max, neoverse-n2, neoverse-n1, neoverse-v1, cortex-a78, cortex-a72, cortex-a53, ampere-one, or 0x<hex>",
+                        s
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Reads the host CPU brand string via macOS sysctl machdep.cpu.brand_string without external crates.
+fn get_host_brand_string() -> Option<String> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::os::raw::c_char,
+            oldp: *mut std::os::raw::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::os::raw::c_void,
+            newlen: usize,
+        ) -> std::os::raw::c_int;
+    }
+
+    let name = c"machdep.cpu.brand_string";
+    let mut size: usize = 0;
+    unsafe {
+        if sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut size, std::ptr::null(), 0) != 0 || size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        if sysctlbyname(name.as_ptr(), buf.as_mut_ptr() as *mut _, &mut size, std::ptr::null(), 0) != 0 {
+            return None;
+        }
+        while buf.last() == Some(&0) {
+            buf.pop();
+        }
+        String::from_utf8(buf).ok()
+    }
+}
+
 /// Parameters passed to a secondary vCPU when booted via PSCI CPU_ON
 #[derive(Debug, Clone, Copy)]
 pub struct SecondaryBootArgs {
@@ -32,6 +154,7 @@ pub struct SecondaryVcpuSlot {
 /// Multi-vCPU manager coordinating secondary core boot, shutdown, and interrupt kicking.
 pub struct VcpuManager {
     num_cpus: usize,
+    cpu_model: CpuModel,
     slots: Vec<Arc<SecondaryVcpuSlot>>,
     active_vcpu_ids: Mutex<Vec<u64>>,
     shutdown_requested: AtomicBool,
@@ -42,7 +165,7 @@ pub struct VcpuManager {
 }
 
 impl VcpuManager {
-    pub fn new(num_cpus: usize) -> Arc<Self> {
+    pub fn new(num_cpus: usize, cpu_model: CpuModel) -> Arc<Self> {
         let count = num_cpus.max(1);
         let mut slots = Vec::new();
         for i in 1..count {
@@ -57,6 +180,7 @@ impl VcpuManager {
 
         let mgr = Arc::new(Self {
             num_cpus: count,
+            cpu_model,
             slots,
             active_vcpu_ids: Mutex::new(Vec::new()),
             shutdown_requested: AtomicBool::new(false),
@@ -72,6 +196,10 @@ impl VcpuManager {
 
     pub fn num_cpus(&self) -> usize {
         self.num_cpus
+    }
+
+    pub fn cpu_model(&self) -> CpuModel {
+        self.cpu_model
     }
 
     pub fn slots(&self) -> &[Arc<SecondaryVcpuSlot>] {
@@ -249,13 +377,14 @@ impl Vcpu {
     }
 
     /// Sets initial state for booting at Exception Level 1 (EL1) for baremetal tests.
-    pub fn setup_boot_state(&self, entry_point: u64, stack_pointer: u64) -> HvResult<()> {
+    pub fn setup_boot_state(&self, entry_point: u64, stack_pointer: u64, midr: u64) -> HvResult<()> {
         self.set_reg(HV_REG_PC, entry_point)?;
         self.set_reg(HV_REG_CPSR, 0x3c5)?; // EL1h, DAIF masked
         self.set_sys_reg(HV_SYS_REG_SP_EL1, stack_pointer)?;
         self.set_sys_reg(HV_SYS_REG_SCTLR_EL1, 0x00000000)?;
         self.set_sys_reg(HV_SYS_REG_CPACR_EL1, 3 << 20)?;
         self.set_sys_reg(HV_SYS_REG_MPIDR_EL1, 0x8000_0000)?;
+        self.set_sys_reg(HV_SYS_REG_MIDR_EL1, midr)?;
         Ok(())
     }
 
@@ -265,11 +394,13 @@ impl Vcpu {
     /// - PC = kernel entry point
     /// - CPSR = EL1h with DAIF interrupts masked (0x3c5)
     /// - MPIDR_EL1 = affinity value for vCPU
+    /// - MIDR_EL1 = CPU identification register (VPIDR_EL2)
     pub fn setup_os_boot_state(
         &mut self,
         kernel_entry: u64,
         dtb_phys_addr: u64,
         vcpu_index: u64,
+        midr: u64,
     ) -> HvResult<()> {
         self.wfi_halts_vm = false; // Don't terminate on kernel idle WFI
 
@@ -286,6 +417,9 @@ impl Vcpu {
         let mpidr = 0x8000_0000 | (vcpu_index & 0xff);
         self.set_sys_reg(HV_SYS_REG_MPIDR_EL1, mpidr)?;
 
+        // Set CPU identification register (MIDR_EL1 / VPIDR_EL2)
+        self.set_sys_reg(HV_SYS_REG_MIDR_EL1, midr)?;
+
         // Standard MMU off at boot
         self.set_sys_reg(HV_SYS_REG_SCTLR_EL1, 0x0000_0000)?;
 
@@ -296,7 +430,12 @@ impl Vcpu {
     }
 
     /// Configures state for secondary vCPUs upon PSCI CPU_ON release
-    pub fn setup_secondary_boot_state(&mut self, entry_point: u64, context_id: u64) -> HvResult<()> {
+    pub fn setup_secondary_boot_state(
+        &mut self,
+        entry_point: u64,
+        context_id: u64,
+        midr: u64,
+    ) -> HvResult<()> {
         self.wfi_halts_vm = false;
         self.set_reg(HV_REG_PC, entry_point)?;
         self.set_reg(HV_REG_X0, context_id)?;
@@ -306,6 +445,7 @@ impl Vcpu {
         self.set_reg(HV_REG_CPSR, 0x3c5)?;
         let mpidr = 0x8000_0000 | (self.vcpu_index as u64 & 0xff);
         self.set_sys_reg(HV_SYS_REG_MPIDR_EL1, mpidr)?;
+        self.set_sys_reg(HV_SYS_REG_MIDR_EL1, midr)?;
         self.set_sys_reg(HV_SYS_REG_SCTLR_EL1, 0x0000_0000)?;
         self.set_sys_reg(HV_SYS_REG_CPACR_EL1, 3 << 20)?;
         Ok(())

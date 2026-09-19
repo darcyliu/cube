@@ -1,4 +1,4 @@
-.PHONY: all build sign run freebsd fetch-freebsd release clean
+.PHONY: all build sign run freebsd fetch-freebsd release clean clean-vm install-iso install-seed
 
 all: build sign
 
@@ -50,6 +50,12 @@ sudo-freebsd-net: all fetch-freebsd fetch-image
 	fi
 	sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus $(CPUS)
 
+install-iso: all
+	./scripts/install-from-iso.sh
+
+install-seed: all
+	./scripts/unattended-install.sh
+
 release:
 	cargo build --release
 	codesign --entitlements entitlements.plist --force -s - target/release/vmm
@@ -57,3 +63,6 @@ release:
 clean:
 	cargo clean
 	rm -f guest/payload.o guest/payload.bin
+
+clean-vm:
+	./scripts/clean-vms.sh

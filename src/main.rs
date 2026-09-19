@@ -12,7 +12,7 @@ use std::env;
 use std::fs;
 use std::process;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use devices::rtc::Pl031Rtc;
@@ -20,7 +20,8 @@ use devices::uart::Pl011Uart;
 use devices::virtio::block::VirtioBlock;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::rng::VirtioRng;
-use vcpu::{Vcpu, VcpuExitStatus, VcpuManager};
+use devices::virtio::VirtioConsole;
+use vcpu::{CpuModel, Vcpu, VcpuExitStatus, VcpuManager};
 use vm::Vm;
 
 const DEFAULT_RAM_BASE: u64 = 0x4000_0000;
@@ -49,11 +50,75 @@ const MMIO_VIRTIO_RNG_BASE: u64 = 0x0a00_0400;
 const MMIO_VIRTIO_RNG_SIZE: u64 = 0x0200;
 const VIRTIO_RNG_IRQ: u32 = 37; // SPI 5 (intid 37)
 
+const MMIO_VIRTIO_CONSOLE_BASE: u64 = 0x0a00_0600;
+const MMIO_VIRTIO_CONSOLE_SIZE: u64 = 0x0200;
+const VIRTIO_CONSOLE_IRQ: u32 = 38; // SPI 6 (intid 38)
+
 #[derive(Clone)]
 pub struct DiskConfig {
     pub path: String,
     pub cow: bool,
     pub read_only: bool,
+}
+
+/// Scans the primary disk's GPT partition table to locate a FreeBSD UFS root partition.
+/// Warns if a Root-on-ZFS partition is found, as direct ELF booting requires UFS.
+fn detect_root_partition(disk_path: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(disk_path).ok()?;
+    let mut sector = [0u8; 512];
+    file.seek(SeekFrom::Start(512)).ok()?;
+    file.read_exact(&mut sector).ok()?;
+    if &sector[0..8] != b"EFI PART" {
+        return None;
+    }
+    let part_lba = u64::from_le_bytes(sector[72..80].try_into().ok()?);
+    let num_entries = u32::from_le_bytes(sector[80..84].try_into().ok()?);
+    let entry_size = u32::from_le_bytes(sector[84..88].try_into().ok()?) as usize;
+    if entry_size < 128 || num_entries == 0 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(part_lba * 512)).ok()?;
+    let read_entries = (num_entries as usize).min(128);
+    let mut entries_buf = vec![0u8; read_entries * entry_size];
+    file.read_exact(&mut entries_buf).ok()?;
+
+    // FreeBSD UFS GUID: 516e7cb6-6ecf-11d6-8ff8-00022d09712b (little-endian bytes)
+    const FREEBSD_UFS_GUID: [u8; 16] = [
+        0xb6, 0x7c, 0x6e, 0x51, 0xcf, 0x6e, 0xd6, 0x11, 0x8f, 0xf8, 0x00, 0x02, 0x2d, 0x09, 0x71, 0x2b,
+    ];
+    // FreeBSD ZFS GUID: 516e7cba-6ecf-11d6-8ff8-00022d09712b
+    const FREEBSD_ZFS_GUID: [u8; 16] = [
+        0xba, 0x7c, 0x6e, 0x51, 0xcf, 0x6e, 0xd6, 0x11, 0x8f, 0xf8, 0x00, 0x02, 0x2d, 0x09, 0x71, 0x2b,
+    ];
+
+    let mut found_zfs = None;
+    for idx in 0..read_entries {
+        let entry = &entries_buf[idx * entry_size..(idx + 1) * entry_size];
+        let type_guid: [u8; 16] = match entry[0..16].try_into() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        if type_guid == FREEBSD_UFS_GUID {
+            return Some(format!("ufs:/dev/vtbd0p{}", idx + 1));
+        } else if type_guid == FREEBSD_ZFS_GUID {
+            found_zfs = Some(idx + 1);
+        }
+    }
+
+    if let Some(zfs_idx) = found_zfs {
+        eprintln!(
+            "\x1b[1;33m[VMM Warning] Detected Root-on-ZFS partition (part {}) on '{}'.\x1b[0m",
+            zfs_idx, disk_path
+        );
+        eprintln!(
+            "\x1b[1;33m[VMM Hint] Direct ELF kernel booting requires an 'Auto (UFS)' root filesystem (in-kernel ufs_mount).\x1b[0m"
+        );
+        eprintln!(
+            "\x1b[1;33m[VMM Hint] If you installed with Auto (ZFS), please reinstall using 'Auto (UFS) Guided Partitioning'.\x1b[0m"
+        );
+    }
+    None
 }
 
 // Embedded default payload built by build.rs
@@ -75,6 +140,8 @@ fn main() {
     let mut net_mode: Option<String> = None;
     let mut mac_addr: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     let mut cpus: usize = 1;
+    let mut cpu_model = CpuModel::detect_host();
+    let mut serial_log: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -179,10 +246,28 @@ fn main() {
                     }
                 }
             }
+            "--cpu-model" | "--cpu-type" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    match CpuModel::parse(&args[i]) {
+                        Ok(model) => cpu_model = model,
+                        Err(e) => {
+                            eprintln!("\x1b[1;31m[VMM Error] {}\x1b[0m", e);
+                            process::exit(1);
+                        }
+                    }
+                }
+            }
             "--net" | "-n" => {
                 if i + 1 < args.len() {
                     i += 1;
                     net_mode = Some(args[i].clone());
+                }
+            }
+            "--serial-log" | "--console-log" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    serial_log = Some(args[i].clone());
                 }
             }
             "--mac" => {
@@ -205,6 +290,8 @@ fn main() {
                 println!("      --ssh-port <PORT>    Forward host TCP port to guest SSH (e.g. 2222 -> 192.168.18.2:22)");
                 println!("  -k, --kernel <PATH>      Boot specified ELF kernel");
                 println!("  -c, --cpus <N>           Number of virtual CPUs (default: 1)");
+                println!("      --cpu-model <MODEL>  CPU model/MIDR spoofing: auto/host (default), m1, m1-pro, m1-max, m2, m2-pro, m2-max, neoverse-n2, cortex-a78, or 0x<hex>");
+                println!("      --serial-log <PATH>  Mirror guest serial console output to specified log file");
                 println!("  -d, --disk <PATH>[,cow][,ro] Attach disk image (can be specified multiple times)");
                 println!("      --cdrom, --iso <PATH>    Attach read-only ISO image as VirtIO block device");
                 println!("      --cow                Enable Copy-On-Write overlay for all attached disks");
@@ -238,9 +325,14 @@ fn main() {
         kernel_path = Some("boot/kernel/kernel".to_string());
     }
 
-    // Default root device when disk is provided but --root is not specified
+    // Default root device: auto-detect from primary disk GPT partition table, or fall back to ufs:/dev/vtbd0p2
     if !disk_configs.is_empty() && root_dev.is_none() {
-        root_dev = Some("ufs:/dev/vtbd0p2".to_string());
+        if let Some(detected) = detect_root_partition(&disk_configs[0].path) {
+            println!("[VMM] Auto-detected root partition: {}", detected);
+            root_dev = Some(detected);
+        } else {
+            root_dev = Some("ufs:/dev/vtbd0p2".to_string());
+        }
     }
 
     if let Some(ref path) = kernel_path {
@@ -286,13 +378,15 @@ fn main() {
                 net_mode.as_deref(),
                 mac_addr,
                 cpus,
+                cpu_model,
+                serial_log.as_deref(),
             );
             return;
         } else {
             let ram_size = ram_mb
                 .map(|mb| mb * 1024 * 1024)
                 .unwrap_or(DEFAULT_BAREMETAL_RAM_SIZE);
-            boot_flat_binary(path, &file_data, ram_size);
+            boot_flat_binary(path, &file_data, ram_size, cpu_model);
             return;
         }
     }
@@ -301,7 +395,7 @@ fn main() {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
-    boot_flat_binary("embedded EL1 baremetal test suite", DEFAULT_PAYLOAD, DEFAULT_BAREMETAL_RAM_SIZE);
+    boot_flat_binary("embedded EL1 baremetal test suite", DEFAULT_PAYLOAD, DEFAULT_BAREMETAL_RAM_SIZE, cpu_model);
 }
 
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -326,6 +420,8 @@ fn boot_os_kernel(
     net_mode: Option<&str>,
     mac_addr: [u8; 6],
     cpus: usize,
+    cpu_model: CpuModel,
+    serial_log: Option<&str>,
 ) {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
@@ -358,7 +454,7 @@ fn boot_os_kernel(
 
     // Attach interactive PL011 UART console
     vm.mmio_mut()
-        .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::new(UART_IRQ, true)));
+        .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::with_log(UART_IRQ, true, serial_log)));
     println!(
         "[VMM] Registered interactive PL011 UART console at GPA 0x{:08x} (IRQ {})",
         MMIO_UART_BASE, UART_IRQ
@@ -379,7 +475,7 @@ fn boot_os_kernel(
         let (base, irq) = if idx == 0 {
             (MMIO_VIRTIO_BLK_BASE, VIRTIO_BLK_IRQ)
         } else {
-            (0x0a00_0400 + (idx as u64) * 0x0200, 37 + (idx as u32))
+            (0x0a00_0800 + ((idx - 1) as u64) * 0x0200, 39 + ((idx - 1) as u32))
         };
         let serial_id = format!("vmm-disk-{}", idx);
         let blk_res = if disk.cow {
@@ -439,6 +535,49 @@ fn boot_os_kernel(
         MMIO_VIRTIO_RNG_BASE, VIRTIO_RNG_IRQ
     );
 
+    // Attach VirtIO-MMIO Console Device (Dynamic Window Geometry & Resize Forwarding)
+    let term_size = terminal::get_terminal_size();
+    let virtio_console = Arc::new(Mutex::new(VirtioConsole::new(
+        VIRTIO_CONSOLE_IRQ,
+        vm.memory(),
+        term_size.ws_col,
+        term_size.ws_row,
+    )));
+    vm.mmio_mut()
+        .register_shared(MMIO_VIRTIO_CONSOLE_BASE, MMIO_VIRTIO_CONSOLE_SIZE, virtio_console.clone());
+    virtio_devices.push(fdt::VirtioMmioDevice {
+        base: MMIO_VIRTIO_CONSOLE_BASE,
+        size: MMIO_VIRTIO_CONSOLE_SIZE,
+        irq: VIRTIO_CONSOLE_IRQ,
+    });
+    println!(
+        "[VMM] Registered VirtIO-MMIO console device at GPA 0x{:08x} (IRQ {}, {}x{})",
+        MMIO_VIRTIO_CONSOLE_BASE, VIRTIO_CONSOLE_IRQ, term_size.ws_col, term_size.ws_row
+    );
+
+    // Spawn SIGWINCH resize watcher thread to forward host terminal size changes
+    terminal::install_sigwinch_handler();
+    let console_watcher = virtio_console.clone();
+    thread::Builder::new()
+        .name("vmm-sigwinch".into())
+        .spawn(move || {
+            loop {
+                thread::sleep(std::time::Duration::from_millis(100));
+                if let Some(new_ws) = terminal::check_and_clear_resize() {
+                    let mut con = console_watcher.lock().unwrap();
+                    let (old_cols, old_rows) = con.get_size();
+                    if old_cols != new_ws.ws_col || old_rows != new_ws.ws_row {
+                        con.update_size(new_ws.ws_col, new_ws.ws_row);
+                        eprintln!(
+                            "\r\n[VMM] Terminal window resized: {}x{} -> {}x{} (forwarded SIGWINCH to guest)\r\n",
+                            old_cols, old_rows, new_ws.ws_col, new_ws.ws_row
+                        );
+                    }
+                }
+            }
+        })
+        .expect("Failed to spawn sigwinch thread");
+
     // Load kernel ELF: FreeBSD locore requires 2MB alignment from RAM base
     let kernel_phys_load = DEFAULT_RAM_BASE + 0x0020_0000; // 0x40200000
     let loaded = match elf::load_elf64(elf_data, &vm.memory(), kernel_phys_load) {
@@ -464,8 +603,13 @@ fn boot_os_kernel(
         process::exit(1);
     }
 
+    println!(
+        "[VMM] CPU Model: {} (MIDR: 0x{:08x})",
+        cpu_model.name, cpu_model.midr
+    );
+
     // Set up Multi-vCPU manager
-    let vcpu_mgr = VcpuManager::new(cpus);
+    let vcpu_mgr = VcpuManager::new(cpus, cpu_model);
     let mut secondary_threads = Vec::new();
     let mmio_shared = vm.mmio().clone();
 
@@ -501,7 +645,7 @@ fn boot_os_kernel(
                 };
 
                 if let Some(args) = boot_args {
-                    if let Err(e) = vcpu.setup_secondary_boot_state(args.entry_point, args.context_id) {
+                    if let Err(e) = vcpu.setup_secondary_boot_state(args.entry_point, args.context_id, cpu_model.midr) {
                         eprintln!("\x1b[1;31m[VMM Error] Failed to setup secondary vCPU {} boot state: {}\x1b[0m", cpu_idx, e);
                         return;
                     }
@@ -522,7 +666,7 @@ fn boot_os_kernel(
         }
     };
 
-    if let Err(e) = vcpu0.setup_os_boot_state(loaded.entry_point, dtb_addr, 0) {
+    if let Err(e) = vcpu0.setup_os_boot_state(loaded.entry_point, dtb_addr, 0, cpu_model.midr) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to setup OS boot registers: {}\x1b[0m", e);
         process::exit(1);
     }
@@ -543,7 +687,7 @@ fn boot_os_kernel(
 }
 
 /// Boots a raw flat binary payload (like the baremetal test).
-fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize) {
+fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model: CpuModel) {
     let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
         Ok(vm) => vm,
         Err(e) => {
@@ -575,7 +719,7 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize) {
     };
 
     let stack_top = DEFAULT_RAM_BASE + 0x0100_0000;
-    if let Err(e) = vcpu.setup_boot_state(DEFAULT_RAM_BASE, stack_top) {
+    if let Err(e) = vcpu.setup_boot_state(DEFAULT_RAM_BASE, stack_top, cpu_model.midr) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to configure vCPU: {}\x1b[0m", e);
         process::exit(1);
     }

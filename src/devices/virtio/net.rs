@@ -270,6 +270,7 @@ impl VmnetBackend {
         match status {
             Some(VMNET_SUCCESS) => {
                 println!("[VirtIO-Net] macOS vmnet NAT interface started successfully.");
+                Self::setup_host_nat();
                 Ok(Self {
                     interface,
                     dispatch_queue: queue,
@@ -290,6 +291,54 @@ impl VmnetBackend {
                 unsafe { dispatch_release(queue) };
                 Err("Timed out waiting for vmnet_start_interface completion handler".into())
             }
+        }
+    }
+
+    /// Automatically configure macOS PF NAT packet forwarding for guest internet access.
+    fn setup_host_nat() {
+        // Enable host IPv4 packet forwarding
+        let _ = std::process::Command::new("sysctl")
+            .args(["-w", "net.inet.ip.forwarding=1"])
+            .output();
+
+        // Detect default outbound host network interface (e.g. en0)
+        let iface = std::process::Command::new("netstat")
+            .args(["-rn", "-f", "inet"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                for line in stdout.lines() {
+                    if line.starts_with("default") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 4 {
+                            return Some(parts[parts.len() - 1].to_string());
+                        }
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| "en0".to_string());
+
+        // Configure macOS Packet Filter NAT anchor com.apple/vmm
+        let rules = format!(
+            "nat on {} from 192.168.18.0/24 to any -> ({})\npass in quick on bridge100 all\npass out quick on {} all\n",
+            iface, iface, iface
+        );
+
+        if let Ok(mut child) = std::process::Command::new("pfctl")
+            .args(["-a", "com.apple/vmm", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(rules.as_bytes());
+            }
+            let _ = child.wait();
+            println!("[VirtIO-Net] Configured macOS PF NAT packet forwarding on {}.", iface);
         }
     }
 }
@@ -866,7 +915,8 @@ impl VirtioNet {
                         let ret = unsafe { vmnet_read(iface_ptr.get(), &mut desc, &mut pktcnt) };
                         if ret == VMNET_SUCCESS && pktcnt > 0 && desc.vm_pkt_size > 0 {
                             let pkt_len = desc.vm_pkt_size as usize;
-                            let packet = &buf[..pkt_len];
+                            let packet = &mut buf[..pkt_len];
+                            patch_dhcp_response(packet);
                             let mut inner = inner_clone.lock().unwrap();
                             inner.receive_packet(packet);
                             inner.flush_deferred_interrupt();
@@ -879,6 +929,100 @@ impl VirtioNet {
         }
 
         Self { inner, running }
+    }
+}
+
+/// Inspects incoming packets from vmnet. If the packet is a DHCP Offer or Ack (UDP 67 -> 68),
+/// replaces macOS's non-functional internal DNS server IP (192.168.18.1 or any 192.168.x.1)
+/// with Cloudflare public DNS (1.1.1.1).
+fn patch_dhcp_response(buf: &mut [u8]) {
+    // Minimum Ethernet (14) + IPv4 (20) + UDP (8) + DHCP fixed headers (236) + cookie (4) = 282 bytes
+    if buf.len() < 282 {
+        return;
+    }
+    // Check EtherType == IPv4 (0x0800)
+    if buf[12] != 0x08 || buf[13] != 0x00 {
+        return;
+    }
+    // Check IPv4 protocol == UDP (17)
+    if buf[23] != 17 {
+        return;
+    }
+    // Check IPv4 header length
+    let ihl = (buf[14] & 0x0f) as usize * 4;
+    if ihl < 20 || 14 + ihl + 8 > buf.len() {
+        return;
+    }
+    let udp_offset = 14 + ihl;
+    let src_port = u16::from_be_bytes([buf[udp_offset], buf[udp_offset + 1]]);
+    let dst_port = u16::from_be_bytes([buf[udp_offset + 2], buf[udp_offset + 3]]);
+
+    // DHCP server to client: port 67 -> port 68
+    if src_port != 67 || dst_port != 68 {
+        return;
+    }
+
+    let dhcp_offset = udp_offset + 8;
+    if dhcp_offset + 240 > buf.len() {
+        return;
+    }
+
+    // Check op == 2 (BOOTREPLY)
+    if buf[dhcp_offset] != 2 {
+        return;
+    }
+
+    // Check DHCP magic cookie at offset 236: 0x63, 0x82, 0x53, 0x63
+    let cookie_offset = dhcp_offset + 236;
+    if &buf[cookie_offset..cookie_offset + 4] != [0x63, 0x82, 0x53, 0x63] {
+        return;
+    }
+
+    // Scan DHCP options starting at offset 240
+    let mut opt_idx = cookie_offset + 4;
+    let mut modified = false;
+
+    while opt_idx < buf.len() {
+        let opt_type = buf[opt_idx];
+        if opt_type == 0 {
+            // Pad
+            opt_idx += 1;
+            continue;
+        }
+        if opt_type == 255 {
+            // End
+            break;
+        }
+        if opt_idx + 1 >= buf.len() {
+            break;
+        }
+        let opt_len = buf[opt_idx + 1] as usize;
+        let opt_val = opt_idx + 2;
+        if opt_val + opt_len > buf.len() {
+            break;
+        }
+
+        // Option 6: Domain Name Server
+        if opt_type == 6 && opt_len >= 4 {
+            for chunk in (0..opt_len).step_by(4) {
+                if chunk + 4 <= opt_len {
+                    let dns_ip = &mut buf[opt_val + chunk..opt_val + chunk + 4];
+                    // If macOS offers 192.168.18.1 (or 192.168.x.1), rewrite to 1.1.1.1
+                    if dns_ip[0] == 192 && dns_ip[1] == 168 && dns_ip[3] == 1 {
+                        dns_ip.copy_from_slice(&[1, 1, 1, 1]);
+                        modified = true;
+                    }
+                }
+            }
+        }
+        opt_idx = opt_val + opt_len;
+    }
+
+    if modified {
+        // Clear UDP checksum (0x0000 = disabled/not computed in IPv4 UDP, per RFC 768)
+        buf[udp_offset + 6] = 0;
+        buf[udp_offset + 7] = 0;
+        println!("[VirtIO-Net] Rewrote DHCP DNS server option from macOS host IP to 1.1.1.1");
     }
 }
 

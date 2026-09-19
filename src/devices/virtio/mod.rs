@@ -3,8 +3,11 @@
 #![allow(dead_code)]
 
 pub mod block;
+pub mod console;
 pub mod net;
 pub mod rng;
+
+pub use console::VirtioConsole;
 
 // VirtIO MMIO Register Offsets (Modern, Version 2)
 pub const VIRTIO_MMIO_MAGIC_VALUE: u64 = 0x000;

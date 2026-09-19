@@ -5,4 +5,6 @@ guest/*.bin
 *.txz
 *.img
 *.cow
-
+*.iso
+/.iso-boot
+/target_root

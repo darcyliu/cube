@@ -44,6 +44,7 @@ pub struct Pl011Uart {
     tx_int: u32,
     rx_queue: Arc<Mutex<VecDeque<u8>>>,
     irq_num: u32,
+    log_file: Option<std::fs::File>,
 }
 
 impl Pl011Uart {
@@ -65,7 +66,19 @@ impl Pl011Uart {
     }
 
     pub fn new(irq_num: u32, interactive_stdin: bool) -> Self {
+        Self::with_log(irq_num, interactive_stdin, None)
+    }
+
+    pub fn with_log(irq_num: u32, interactive_stdin: bool, log_path: Option<&str>) -> Self {
         let rx_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let log_file = log_path.and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(p)
+                .ok()
+        });
 
         if interactive_stdin {
             let q_clone = Arc::clone(&rx_queue);
@@ -86,27 +99,24 @@ impl Pl011Uart {
                 })
                 .expect("Failed to spawn stdin thread");
 
-            // Optional host-side command injector used by automated tests.
+            // Optional host-side command injector used by automated tests and installers.
             // Bytes written to /tmp/vmm-uart-in are pushed into the PL011 RX FIFO.
             let q_inject = Arc::clone(&rx_queue);
             thread::Builder::new()
                 .name("vmm-uart-inject".into())
                 .spawn(move || {
                     let path = "/tmp/vmm-uart-in";
+                    let _ = std::fs::remove_file(path);
                     loop {
-                        match std::fs::File::open(path) {
-                            Ok(mut f) => {
-                                let mut buf = [0u8; 256];
-                                loop {
-                                    match f.read(&mut buf) {
-                                        Ok(0) => break,
-                                        Ok(n) => Self::push_bytes(&q_inject, irq_num, &buf[..n]),
-                                        Err(_) => break,
-                                    }
+                        if std::path::Path::new(path).exists() {
+                            if let Ok(data) = std::fs::read(path) {
+                                if !data.is_empty() {
+                                    Self::push_bytes(&q_inject, irq_num, &data);
                                 }
                             }
-                            Err(_) => thread::sleep(std::time::Duration::from_millis(200)),
+                            let _ = std::fs::remove_file(path);
                         }
+                        thread::sleep(std::time::Duration::from_millis(50));
                     }
                 })
                 .expect("Failed to spawn uart inject thread");
@@ -118,6 +128,7 @@ impl Pl011Uart {
             tx_int: INT_TX, // TX FIFO starts empty
             rx_queue,
             irq_num,
+            log_file,
         }
     }
 
@@ -177,6 +188,10 @@ impl MmioDevice for Pl011Uart {
                     let _ = stdout.write_all(&[ch]);
                 }
                 let _ = stdout.flush();
+                if let Some(ref mut f) = self.log_file {
+                    let _ = f.write_all(&[ch]);
+                    let _ = f.flush();
+                }
                 // Data was sent immediately, transmit FIFO is ready for more
                 self.tx_int = INT_TX;
                 self.update_irq();
