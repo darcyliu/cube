@@ -1,4 +1,46 @@
-# VirtIO-Net Networking Architecture & Troubleshooting Guide
+# VirtIO-Net & host networking
+
+## Real NIC quick start (vmnet)
+
+Default `--net vmnet` tries macOS **vmnet.framework** (shared/NAT). Without
+root or the restricted `com.apple.vm.networking` entitlement it fails and the
+VMM **falls back to mock** (packets dropped).
+
+**Working path today:**
+
+```sh
+make all
+# UEFI + ZFS disk with a real NIC:
+sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img
+```
+
+Inside FreeBSD (multi-user usually gets DHCP automatically):
+
+```sh
+ifconfig vtnet0
+# if needed:
+dhclient vtnet0
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+ping -c 2 1.1.1.1
+```
+
+Guest traffic uses the vmnet shared subnet (documented below as
+`192.168.18.0/24`). The `sudo-*` Makefile targets also install a PF NAT anchor
+so that subnet can reach the internet.
+
+**Bridged (LAN DHCP, no host PF NAT):**
+```sh
+sudo ./target/debug/vmm ... --net bridge        # default outbound iface (route get default)
+sudo ./target/debug/vmm ... --net bridge:en0    # explicit iface
+```
+Guest gets an address from your LAN router. Still needs `sudo` (or `com.apple.vm.networking`) to *create* the vmnet interface — bridge only removes the PF NAT step.
+
+**Force mock** (no sudo, no external routing): `--net mock`  
+**Disable NIC:** `--net none`
+
+Codesigning details: [entitlements.md](entitlements.md).
+
+---
 
 This document describes the modern VirtIO Network (virtio-net) device implementation in `vmm`, its integration with macOS `vmnet.framework`, the root causes of common single-user live media networking issues, and strategies to make the user experience (UX) seamless.
 

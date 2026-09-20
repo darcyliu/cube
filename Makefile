@@ -1,16 +1,24 @@
-.PHONY: all build sign run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed
+.PHONY: all build sign sign-networking run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed
 
 all: build sign
 
-# Avoid root-owned ./target from earlier sudo cargo runs.
-CARGO_TARGET_DIR ?= /tmp/vmm-target-$(USER)
-VMM_BIN := $(CARGO_TARGET_DIR)/debug/vmm
+VMM_BIN := target/debug/vmm
 
 build:
-	CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) cargo build
+	cargo build
 
 sign:
 	codesign --entitlements entitlements.plist --force -s - $(VMM_BIN)
+
+# Restricted com.apple.vm.networking — needs Apple-granted App ID + provisioning profile.
+# Example:
+#   IDENTITY="Apple Development: You (TEAMID)" \
+#   PROFILE="$$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/….provisionprofile" \
+#   BUNDLE_ID=com.example.vmm \
+#   make sign-networking
+sign-networking: build
+	IDENTITY="$(IDENTITY)" PROFILE="$(PROFILE)" BUNDLE_ID="$(BUNDLE_ID)" \
+		VMM_BIN="$(VMM_BIN)" ./scripts/sign-networking.sh
 
 run: all
 	$(VMM_BIN)
@@ -45,16 +53,25 @@ freebsd-root: all fetch-freebsd fetch-image
 
 CPUS ?= 2
 
+
+# Shared-mode vmnet needs root. Also install a small PF NAT anchor so the
+# guest subnet (192.168.18.0/24) can reach the internet via the default iface.
+define setup-vmnet-nat
+	@IF="$$(route get default 2>/dev/null | awk '/interface:/{print $$2}')"; \
+	if [ -n "$$IF" ]; then \
+		echo "[VMM] PF NAT on $$IF for vmnet guest subnet 192.168.18.0/24..."; \
+		sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null; \
+		printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$$IF" "$$IF" "$$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true; \
+	else \
+		echo "[VMM] Warning: no default interface; skipping PF NAT setup"; \
+	fi
+endef
+
 freebsd-net: all fetch-freebsd fetch-image
 	$(VMM_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus $(CPUS)
 
 sudo-freebsd-net: all fetch-freebsd fetch-image
-	@IF="$$(route get default 2>/dev/null | awk '/interface:/{print $$2}')"; \
-	if [ -n "$$IF" ]; then \
-		echo "[VMM] Setting up macOS PF NAT forwarding on $$IF..."; \
-		sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null; \
-		printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$$IF" "$$IF" "$$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true; \
-	fi
+	$(setup-vmnet-nat)
 	sudo $(VMM_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus $(CPUS)
 
 install-iso: all
@@ -100,6 +117,8 @@ freebsd-zfs-uefi: all fetch-uefi
 
 sudo-freebsd-zfs-uefi: all fetch-uefi
 	@if [ ! -f "$(DISK)" ]; then echo "[VMM] Missing $(DISK)"; exit 1; fi
+	@echo "[VMM] UEFI + ZFS with real vmnet NIC (requires sudo)"
+	$(setup-vmnet-nat)
 	sudo $(VMM_BIN) --uefi --disk "$(DISK)" --net vmnet --cpus $(CPUS)
 
 # Strategy 1 (experimental): direct ELF + zfs.ko preload — often hangs after MODINFO.
@@ -115,11 +134,12 @@ freebsd-zfs: all fetch-freebsd
 
 sudo-freebsd-zfs: all fetch-freebsd
 	@if [ ! -f "$(DISK)" ]; then echo "[VMM] Missing $(DISK)"; exit 1; fi
+	@echo "[VMM] Direct kernel + ZFS with real vmnet NIC (requires sudo)"
+	$(setup-vmnet-nat)
 	sudo $(VMM_BIN) --freebsd boot/kernel/kernel --disk "$(DISK)" --net vmnet --cpus $(CPUS)
 
 clean:
 	cargo clean
-	rm -f guest/payload.o guest/payload.bin
 
 clean-vm:
 	./scripts/clean-vms.sh

@@ -166,6 +166,12 @@ unsafe extern "C" {
         value: u64,
     );
 
+    fn xpc_dictionary_set_string(
+        dictionary: *mut c_void,
+        key: *const i8,
+        value: *const i8,
+    );
+
     fn xpc_release(object: *mut c_void);
 
     fn dispatch_queue_create(
@@ -176,10 +182,16 @@ unsafe extern "C" {
     fn dispatch_release(object: *mut c_void);
 }
 
-const VMNET_SHARED_MODE: u64 = 1000;
+// From <vmnet/vmnet.h> operating_modes_t / vmnet_return_t
+const VMNET_HOST_MODE: u64 = 1000;
+const VMNET_SHARED_MODE: u64 = 1001;
+const VMNET_BRIDGED_MODE: u64 = 1002;
 const VMNET_SUCCESS: u32 = 1000;
 const VMNET_FAILURE: u32 = 1001;
 const VMNET_INTERFACE_PACKETS_AVAILABLE: u32 = 1;
+
+#[allow(dead_code)]
+const _: () = assert!(VMNET_HOST_MODE == 1000);
 
 static VMNET_INIT_STATUS: Mutex<Option<u32>> = Mutex::new(None);
 
@@ -208,7 +220,20 @@ pub struct VmnetBackend {
 unsafe impl Send for VmnetBackend {}
 
 impl VmnetBackend {
+    /// Shared/NAT mode (guest on 192.168.x via vmnet + optional host PF NAT).
     pub fn new() -> Result<Self, String> {
+        Self::start(VMNET_SHARED_MODE, None)
+    }
+
+    /// Bridged onto a host NIC (e.g. "en0"). Guest uses LAN DHCP — no PF NAT needed.
+    pub fn new_bridged(host_if: &str) -> Result<Self, String> {
+        if host_if.is_empty() {
+            return Err("bridge mode requires a host interface name (e.g. bridge:en0)".into());
+        }
+        Self::start(VMNET_BRIDGED_MODE, Some(host_if))
+    }
+
+    fn start(mode: u64, bridge_if: Option<&str>) -> Result<Self, String> {
         let desc = unsafe { xpc_dictionary_create(std::ptr::null(), std::ptr::null(), 0) };
         if desc.is_null() {
             return Err("Failed to create XPC dictionary for vmnet".into());
@@ -218,8 +243,18 @@ impl VmnetBackend {
             xpc_dictionary_set_uint64(
                 desc,
                 b"vmnet_operation_mode\0".as_ptr() as *const i8,
-                VMNET_SHARED_MODE,
+                mode,
             );
+            if let Some(iface) = bridge_if {
+                // vmnet_shared_interface_name_key — physical iface to bridge onto
+                let c_iface = std::ffi::CString::new(iface)
+                    .map_err(|_| "bridge interface name contains interior NUL".to_string())?;
+                xpc_dictionary_set_string(
+                    desc,
+                    b"shared_interface_name\0".as_ptr() as *const i8,
+                    c_iface.as_ptr(),
+                );
+            }
         }
 
         let queue = unsafe {
@@ -253,7 +288,6 @@ impl VmnetBackend {
             return Err("vmnet_start_interface returned null".into());
         }
 
-        // Wait up to 1 second for completion handler
         let start = std::time::Instant::now();
         let mut status = None;
         while start.elapsed() < Duration::from_millis(1000) {
@@ -269,8 +303,21 @@ impl VmnetBackend {
 
         match status {
             Some(VMNET_SUCCESS) => {
-                println!("[VirtIO-Net] macOS vmnet NAT interface started successfully.");
-                Self::setup_host_nat();
+                match mode {
+                    VMNET_BRIDGED_MODE => {
+                        let iface = bridge_if.unwrap_or("?");
+                        println!(
+                            "[VirtIO-Net] macOS vmnet BRIDGED on {iface} — guest uses LAN DHCP (no host PF NAT)."
+                        );
+                    }
+                    VMNET_SHARED_MODE => {
+                        println!("[VirtIO-Net] macOS vmnet SHARED/NAT interface started.");
+                        Self::setup_host_nat();
+                    }
+                    _ => {
+                        println!("[VirtIO-Net] macOS vmnet interface started (mode={mode}).");
+                    }
+                }
                 Ok(Self {
                     interface,
                     dispatch_queue: queue,
@@ -279,13 +326,13 @@ impl VmnetBackend {
             Some(VMNET_FAILURE) => {
                 unsafe { dispatch_release(queue) };
                 Err(format!(
-                    "vmnet_start_interface failed with status {} (Permission Denied). On macOS, vmnet.framework requires root privileges (sudo) or the 'com.apple.vm.networking' entitlement.",
+                    "vmnet_start_interface failed with status {} (Permission Denied). On macOS, vmnet.framework requires root (sudo) or the 'com.apple.vm.networking' entitlement.",
                     VMNET_FAILURE
                 ))
             }
             Some(s) => {
                 unsafe { dispatch_release(queue) };
-                Err(format!("vmnet_start_interface failed with status {}", s))
+                Err(format!("vmnet_start_interface failed with status {s}"))
             }
             None => {
                 unsafe { dispatch_release(queue) };
@@ -780,6 +827,28 @@ impl VirtioNetInner {
     }
 }
 
+
+fn default_host_iface() -> String {
+    std::process::Command::new("route")
+        .args(["get", "default"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            for line in stdout.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("interface:") {
+                    let name = rest.trim();
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| "en0".to_string())
+}
+
 pub struct VirtioNet {
     inner: Arc<Mutex<VirtioNetInner>>,
     running: Arc<AtomicBool>,
@@ -793,14 +862,45 @@ impl VirtioNet {
         backend_choice: &str,
     ) -> Self {
         let (backend, vmnet_iface) = match backend_choice {
+            s if s == "bridge" || s.starts_with("bridge:") || s == "bridged" || s.starts_with("bridged:") => {
+                let host_if = if let Some(rest) = s.strip_prefix("bridge:").or_else(|| s.strip_prefix("bridged:")) {
+                    if rest.is_empty() {
+                        default_host_iface()
+                    } else {
+                        rest.to_string()
+                    }
+                } else {
+                    default_host_iface()
+                };
+                match VmnetBackend::new_bridged(&host_if) {
+                    Ok(b) => {
+                        let iface = b.interface;
+                        (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)))
+                    }
+                    Err(e) => {
+                        eprintln!("[1;33m[VirtIO-Net Warning] vmnet bridge ({host_if}) unavailable: {e}[0m");
+                        eprintln!("[1;33m[VirtIO-Net] Falling back to MOCK — no LAN/Internet.[0m");
+                        eprintln!("[VirtIO-Net] Bridged mode still needs sudo (or com.apple.vm.networking),");
+                        eprintln!("            but does not need host PF NAT. Example:");
+                        eprintln!("            sudo ./target/debug/vmm ... --net bridge:{host_if}");
+                        (Box::new(UserMockBackend::new()) as Box<dyn NetBackend>, None)
+                    }
+                }
+            }
             "vmnet" => match VmnetBackend::new() {
                 Ok(b) => {
                     let iface = b.interface;
                     (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)))
                 }
                 Err(e) => {
-                    eprintln!("\x1b[1;33m[VirtIO-Net Warning] {}\x1b[0m", e);
-                    eprintln!("[VirtIO-Net] Continuing with user-mode mock backend (no external routing).");
+                    eprintln!("\x1b[1;33m[VirtIO-Net Warning] vmnet unavailable: {}\x1b[0m", e);
+                    eprintln!("\x1b[1;33m[VirtIO-Net] Falling back to MOCK backend — guest packets are dropped (no LAN/Internet).\x1b[0m");
+                    eprintln!("[VirtIO-Net] Real NIC: re-run under sudo, e.g.");
+                    eprintln!("            sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img");
+                    eprintln!("         or: sudo ./target/debug/vmm --uefi --disk <img> --net vmnet");
+                    eprintln!("[VirtIO-Net] Or codesign with a provisioning profile that includes");
+                    eprintln!("            com.apple.vm.networking (see docs/entitlements.md).");
+                    eprintln!("            Ad-hoc signing (codesign -s -) does not grant that entitlement.");
                     (Box::new(UserMockBackend::new()) as Box<dyn NetBackend>, None)
                 }
             },

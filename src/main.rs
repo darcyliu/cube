@@ -85,7 +85,7 @@ fn module_name_from_path(path: &str) -> String {
 }
 
 // Embedded default payload built by build.rs
-const DEFAULT_PAYLOAD: &[u8] = include_bytes!("../guest/payload.bin");
+const DEFAULT_PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payload.bin"));
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -279,7 +279,7 @@ fn main() {
                 println!("      --module <PATH>      Preload a FreeBSD .ko (repeatable; zfs.ko is auto-loaded for ZFS root)");
                 println!("  -b, --bootargs <ARGS>    Custom kernel boot arguments");
                 println!("  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)");
-                println!("  -n, --net <MODE>         Network mode: vmnet (default), tap:<dev>, mock, none");
+                println!("  -n, --net <MODE>         Network mode: vmnet (default NAT), bridge[:iface], tap:<dev>, mock, none");
                 println!("      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)");
                 println!("  -h, --help               Display this help message");
                 return;

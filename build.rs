@@ -5,27 +5,44 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Hypervisor");
     println!("cargo:rerun-if-changed=guest/payload.S");
 
-    // Assemble guest payload using clang targeting aarch64
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let out_bin = std::path::Path::new(&out_dir).join("payload.bin");
+    let out_obj = std::path::Path::new(&out_dir).join("payload.o");
+
+    // Assemble the tiny bare-metal test payload (include_bytes! in main.rs).
+    // guest/*.bin is gitignored — this step must succeed on every clean build.
     let status = Command::new("clang")
         .args([
             "-target",
-            "aarch64-linux-gnu",
+            "aarch64-unknown-none",
             "-c",
             "guest/payload.S",
             "-o",
-            "guest/payload.o",
+            out_obj.to_str().unwrap(),
         ])
-        .status();
-
-    if let Ok(st) = status {
-        if st.success() {
-            if let Ok(elf_bytes) = fs::read("guest/payload.o") {
-                if let Some(text_section) = extract_elf_text_section(&elf_bytes) {
-                    let _ = fs::write("guest/payload.bin", text_section);
-                }
-            }
-        }
+        .status()
+        .unwrap_or_else(|e| {
+            panic!(
+                "build.rs: failed to run clang to assemble guest/payload.S: {e}
+                 Install Xcode CLT / clang, or create guest/payload.bin another way."
+            )
+        });
+    if !status.success() {
+        panic!(
+            "build.rs: clang failed assembling guest/payload.S (status {status}).
+             Need an aarch64-capable clang (Xcode CLT)."
+        );
     }
+
+    let elf_bytes = fs::read(out_obj.to_str().unwrap()).unwrap_or_else(|e| {
+        panic!("build.rs: could not read guest/payload.o after clang: {e}")
+    });
+    let text_section = extract_elf_text_section(&elf_bytes).unwrap_or_else(|| {
+        panic!("build.rs: no .text section in guest/payload.o (expected 64-bit ELF)")
+    });
+    fs::write(&out_bin, text_section).unwrap_or_else(|e| {
+        panic!("build.rs: could not write guest/payload.bin: {e}")
+    });
 }
 
 fn extract_elf_text_section(data: &[u8]) -> Option<&[u8]> {
