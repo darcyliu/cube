@@ -118,8 +118,14 @@ if ! tar -xf "$ISO_PATH" -C "$EXTRACT_DIR" boot/kernel/kernel 2>/dev/null; then
     echo -e "${YELLOW}Please ensure this is a standard FreeBSD installation ISO.${RESET}"
     exit 1
 fi
-
 EXTRACTED_KERNEL="${EXTRACT_DIR}/boot/kernel/kernel"
+
+# Same ISO also ships zfs.ko. Cache it next to the kernel so a later Auto (ZFS)
+# install can boot. This is not a filesystem choice; UFS ignores the file.
+mkdir -p boot/kernel
+if tar -xf "$ISO_PATH" -C . boot/kernel/zfs.ko 2>/dev/null; then
+    echo -e "${GREEN}[VMM] Cached boot/kernel/zfs.ko from ISO (used only if the disk GPT is ZFS).${RESET}"
+fi
 
 # Inspect architecture with file
 KERNEL_INFO=$(file "$EXTRACTED_KERNEL")
@@ -160,7 +166,9 @@ echo -e "  vCPUs / RAM : ${CPUS} vCPUs, ${RAM_MB} MB"
 echo -e "------------------------------------------------------"
 echo -e "${YELLOW}Inside the installer:${RESET}"
 echo -e "  1. Select 'Install' and proceed with standard bsdinstall."
-echo -e "  2. When prompted for partitioning, select ${BOLD}Auto (UFS)${RESET} on ${BOLD}/dev/vtbd0${RESET}."
+echo -e "  2. When prompted for partitioning, select ${BOLD}Auto (UFS)${RESET} on ${BOLD}/dev/vtbd0${RESET}"
+echo -e "     (recommended). ${BOLD}Auto (ZFS)${RESET} works if ${BOLD}boot/kernel/zfs.ko${RESET} is present"
+echo -e "     (run ${CYAN}make fetch-freebsd${RESET}); the VMM preloads it and boots ${CYAN}zfs:zroot/ROOT/default${RESET}."
 echo -e "  3. When configuring Network: select ${BOLD}vtnet0${RESET} -> IPv4 -> ${BOLD}DHCP${RESET}."
 echo -e "  4. At 'Manual Configuration' before exit, choose ${BOLD}Yes${RESET} (Shell) and run:"
 echo -e "     ${CYAN}echo 'supersede domain-name-servers 1.1.1.1, 8.8.8.8;' >> /etc/dhclient.conf${RESET}"
@@ -177,6 +185,7 @@ IF=$(netstat -rn -f inet 2>/dev/null | awk '/default/{print $4; exit}')
 if [[ -n "$IF" ]]; then
     sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
     printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$IF" "$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+fi
 CPU_MODEL_ARGS=()
 if [[ -n "$CPU_MODEL" ]]; then
     CPU_MODEL_ARGS=(--cpu-model "$CPU_MODEL")
@@ -195,7 +204,9 @@ sudo ./target/debug/vmm \
 
 echo -e "\n${BOLD}${GREEN}Installation session ended.${RESET}"
 echo -e "To boot your installed FreeBSD VM from ${BOLD}${TARGET_DISK}${RESET} in the future:"
-echo -e "${CYAN}sudo ./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}\n"
+echo -e "${CYAN}sudo ./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}"
+echo -e "GPT auto-detects UFS vs ZFS. ${BOLD}--module zfs.ko${RESET} is only needed for Auto (ZFS);"
+echo -e "if you chose ZFS, keep ${CYAN}boot/kernel/zfs.ko${RESET} (cached from the ISO above).\n"
 echo -e "${YELLOW}[Network Troubleshooting Tip]${RESET}"
 echo -e "If the installed VM has 'No route to host' or cannot resolve domain names, run inside the VM:"
 echo -e "${CYAN}echo 'supersede domain-name-servers 1.1.1.1, 8.8.8.8;' >> /etc/dhclient.conf${RESET}"

@@ -1,7 +1,9 @@
 //! MMIO subsystem and device bus.
 
+pub mod fw_cfg;
 pub mod rtc;
 pub mod uart;
+pub mod pflash;
 pub mod virtio;
 
 use std::sync::{Arc, Mutex};

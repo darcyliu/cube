@@ -115,7 +115,9 @@ impl BlockBackend for RawFileBackend {
 
     fn flush(&mut self) -> io::Result<()> {
         if !self.read_only {
+            // ZFS/UFS durability: virtio FLUSH must reach stable storage, not only userspace buffers.
             self.file.flush()?;
+            self.file.sync_all()?;
         }
         Ok(())
     }
@@ -309,7 +311,8 @@ impl BlockBackend for CowBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.overlay_file.flush()
+        self.overlay_file.flush()?;
+        self.overlay_file.sync_all()
     }
 }
 
@@ -587,7 +590,9 @@ impl VirtioBlock {
             }
             VIRTIO_BLK_T_FLUSH => {
                 if let Some(ref mut backend) = self.backend {
-                    let _ = backend.flush();
+                    if backend.flush().is_err() {
+                        status = VIRTIO_BLK_S_IOERR;
+                    }
                 }
             }
             VIRTIO_BLK_T_GET_ID => {

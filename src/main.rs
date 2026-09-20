@@ -2,8 +2,10 @@ mod devices;
 mod elf;
 mod fdt;
 mod forward;
+mod gpt;
 mod hypervisor;
 mod memory;
+mod preload;
 mod terminal;
 mod vcpu;
 mod vm;
@@ -15,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use devices::fw_cfg::FwCfg;
 use devices::rtc::Pl031Rtc;
 use devices::uart::Pl011Uart;
 use devices::virtio::block::VirtioBlock;
@@ -37,6 +40,10 @@ const UART_IRQ: u32 = 33; // SPI 1 (intid 33)
 const MMIO_RTC_BASE: u64 = 0x0901_0000;
 const MMIO_RTC_SIZE: u64 = 0x1000;
 const RTC_IRQ: u32 = 36; // SPI 4 (intid 36)
+
+const MMIO_FW_CFG_BASE: u64 = 0x0902_0000;
+const MMIO_FW_CFG_SIZE: u64 = 0x18;
+const DEFAULT_UEFI_FW: &str = "firmware/QEMU_EFI.fd";
 
 const MMIO_VIRTIO_BLK_BASE: u64 = 0x0a00_0000;
 const MMIO_VIRTIO_BLK_SIZE: u64 = 0x0200;
@@ -61,64 +68,20 @@ pub struct DiskConfig {
     pub read_only: bool,
 }
 
-/// Scans the primary disk's GPT partition table to locate a FreeBSD UFS root partition.
-/// Warns if a Root-on-ZFS partition is found, as direct ELF booting requires UFS.
 fn detect_root_partition(disk_path: &str) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = fs::File::open(disk_path).ok()?;
-    let mut sector = [0u8; 512];
-    file.seek(SeekFrom::Start(512)).ok()?;
-    file.read_exact(&mut sector).ok()?;
-    if &sector[0..8] != b"EFI PART" {
-        return None;
-    }
-    let part_lba = u64::from_le_bytes(sector[72..80].try_into().ok()?);
-    let num_entries = u32::from_le_bytes(sector[80..84].try_into().ok()?);
-    let entry_size = u32::from_le_bytes(sector[84..88].try_into().ok()?) as usize;
-    if entry_size < 128 || num_entries == 0 {
-        return None;
-    }
-    file.seek(SeekFrom::Start(part_lba * 512)).ok()?;
-    let read_entries = (num_entries as usize).min(128);
-    let mut entries_buf = vec![0u8; read_entries * entry_size];
-    file.read_exact(&mut entries_buf).ok()?;
+    gpt::detect_freebsd_root_from_disk(disk_path).map(|r| gpt::freebsd_root_to_mountfrom(&r))
+}
 
-    // FreeBSD UFS GUID: 516e7cb6-6ecf-11d6-8ff8-00022d09712b (little-endian bytes)
-    const FREEBSD_UFS_GUID: [u8; 16] = [
-        0xb6, 0x7c, 0x6e, 0x51, 0xcf, 0x6e, 0xd6, 0x11, 0x8f, 0xf8, 0x00, 0x02, 0x2d, 0x09, 0x71, 0x2b,
-    ];
-    // FreeBSD ZFS GUID: 516e7cba-6ecf-11d6-8ff8-00022d09712b
-    const FREEBSD_ZFS_GUID: [u8; 16] = [
-        0xba, 0x7c, 0x6e, 0x51, 0xcf, 0x6e, 0xd6, 0x11, 0x8f, 0xf8, 0x00, 0x02, 0x2d, 0x09, 0x71, 0x2b,
-    ];
+fn align_up(addr: u64, align: u64) -> u64 {
+    (addr + align - 1) & !(align - 1)
+}
 
-    let mut found_zfs = None;
-    for idx in 0..read_entries {
-        let entry = &entries_buf[idx * entry_size..(idx + 1) * entry_size];
-        let type_guid: [u8; 16] = match entry[0..16].try_into() {
-            Ok(g) => g,
-            Err(_) => continue,
-        };
-        if type_guid == FREEBSD_UFS_GUID {
-            return Some(format!("ufs:/dev/vtbd0p{}", idx + 1));
-        } else if type_guid == FREEBSD_ZFS_GUID {
-            found_zfs = Some(idx + 1);
-        }
-    }
-
-    if let Some(zfs_idx) = found_zfs {
-        eprintln!(
-            "\x1b[1;33m[VMM Warning] Detected Root-on-ZFS partition (part {}) on '{}'.\x1b[0m",
-            zfs_idx, disk_path
-        );
-        eprintln!(
-            "\x1b[1;33m[VMM Hint] Direct ELF kernel booting requires an 'Auto (UFS)' root filesystem (in-kernel ufs_mount).\x1b[0m"
-        );
-        eprintln!(
-            "\x1b[1;33m[VMM Hint] If you installed with Auto (ZFS), please reinstall using 'Auto (UFS) Guided Partitioning'.\x1b[0m"
-        );
-    }
-    None
+fn module_name_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module")
+        .to_string()
 }
 
 // Embedded default payload built by build.rs
@@ -135,6 +98,8 @@ fn main() {
     let mut custom_bootargs: Option<String> = None;
     let mut ram_mb: Option<usize> = None;
     let mut is_freebsd = false;
+    let mut is_uefi = false;
+    let mut firmware_path: Option<String> = None;
     let mut is_multiuser = false;
     let mut ssh_port: Option<u16> = None;
     let mut net_mode: Option<String> = None;
@@ -142,10 +107,18 @@ fn main() {
     let mut cpus: usize = 1;
     let mut cpu_model = CpuModel::detect_host();
     let mut serial_log: Option<String> = None;
+    let mut module_paths: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--uefi" | "--firmware" => {
+                is_uefi = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    firmware_path = Some(args[i].clone());
+                }
+            }
             "--freebsd" | "-f" => {
                 is_freebsd = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
@@ -270,6 +243,12 @@ fn main() {
                     serial_log = Some(args[i].clone());
                 }
             }
+            "--module" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    module_paths.push(args[i].clone());
+                }
+            }
             "--mac" => {
                 if i + 1 < args.len() {
                     i += 1;
@@ -285,7 +264,8 @@ fn main() {
                 println!("Usage: vmm [OPTIONS] [PAYLOAD/KERNEL]");
                 println!();
                 println!("Options:");
-                println!("  -f, --freebsd [PATH]     Boot FreeBSD kernel (defaults to boot/kernel/kernel)");
+                println!("  -f, --freebsd [PATH]     Boot FreeBSD kernel ELF (defaults to boot/kernel/kernel)");
+                println!("      --uefi [PATH]        Boot EDK2/UEFI firmware (defaults to firmware/QEMU_EFI.fd); loader.efi handles ZFS");
                 println!("  -u, --multiuser          Boot FreeBSD into multi-user mode (omits single-user -s)");
                 println!("      --ssh-port <PORT>    Forward host TCP port to guest SSH (e.g. 2222 -> 192.168.18.2:22)");
                 println!("  -k, --kernel <PATH>      Boot specified ELF kernel");
@@ -295,7 +275,8 @@ fn main() {
                 println!("  -d, --disk <PATH>[,cow][,ro] Attach disk image (can be specified multiple times)");
                 println!("      --cdrom, --iso <PATH>    Attach read-only ISO image as VirtIO block device");
                 println!("      --cow                Enable Copy-On-Write overlay for all attached disks");
-                println!("  -r, --root <DEV>         Root filesystem device (e.g. ufs:/dev/vtbd0p2)");
+                println!("  -r, --root <DEV>         Root filesystem (e.g. ufs:/dev/vtbd0p2 or zfs:zroot/ROOT/default)");
+                println!("      --module <PATH>      Preload a FreeBSD .ko (repeatable; zfs.ko is auto-loaded for ZFS root)");
                 println!("  -b, --bootargs <ARGS>    Custom kernel boot arguments");
                 println!("  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)");
                 println!("  -n, --net <MODE>         Network mode: vmnet (default), tap:<dev>, mock, none");
@@ -321,18 +302,103 @@ fn main() {
         }
     }
 
+    if is_uefi && firmware_path.is_none() {
+        firmware_path = Some(DEFAULT_UEFI_FW.to_string());
+    }
+
     if is_freebsd && kernel_path.is_none() && std::path::Path::new("boot/kernel/kernel").exists() {
         kernel_path = Some("boot/kernel/kernel".to_string());
     }
 
-    // Default root device: auto-detect from primary disk GPT partition table, or fall back to ufs:/dev/vtbd0p2
+    // Default root: GPT UFS or zfs:zroot/ROOT/default. Never guess ufs p2 on a ZFS disk
+    // (bsdinstall Auto (ZFS) puts swap on p2 — that superblock error is swap, not UFS).
     if !disk_configs.is_empty() && root_dev.is_none() {
-        if let Some(detected) = detect_root_partition(&disk_configs[0].path) {
+        let disk0 = &disk_configs[0].path;
+        if let Some(layout) = gpt::describe_freebsd_gpt(disk0) {
+            println!("[VMM] GPT on '{}': {}", disk0, layout);
+        }
+        if let Some(detected) = detect_root_partition(disk0) {
             println!("[VMM] Auto-detected root partition: {}", detected);
             root_dev = Some(detected);
         } else {
-            root_dev = Some("ufs:/dev/vtbd0p2".to_string());
+            eprintln!(
+                "\x1b[1;33m[VMM Warning] No FreeBSD UFS/ZFS GPT partition on '{}'; not assuming ufs:/dev/vtbd0p2 (that is often swap).\x1b[0m",
+                disk0
+            );
         }
+    }
+
+    if !is_uefi {
+        if let Some(ref root) = root_dev {
+            if root.starts_with("zfs:") {
+                eprintln!("\x1b[1;33m[VMM] ZFS root selected. Direct ELF+zfs.ko (Strategy 1) often hangs after MODINFO.");
+                eprintln!("[VMM] Recommended Strategy 2: make fetch-uefi && make freebsd-zfs-uefi DISK=<img>\x1b[0m");
+            }
+        }
+    }
+
+    let needs_zfs = root_dev
+        .as_deref()
+        .is_some_and(|r| r.starts_with("zfs:"))
+        || module_paths.iter().any(|p| p.ends_with("zfs.ko") || p.ends_with("/zfs"));
+    if needs_zfs
+        && !is_uefi
+        && !module_paths.iter().any(|p| {
+            std::path::Path::new(p)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                == Some("zfs")
+        })
+    {
+        let default_zfs = "boot/kernel/zfs.ko";
+        if std::path::Path::new(default_zfs).exists() {
+            module_paths.push(default_zfs.to_string());
+        } else {
+            eprintln!(
+                "\x1b[1;31m[VMM Error] Root-on-ZFS requires preloaded zfs.ko, but '{default_zfs}' was not found.\x1b[0m"
+            );
+            eprintln!(
+                "\x1b[1;33m[VMM Hint] Run 'make fetch-freebsd' to extract boot/kernel/kernel and boot/kernel/zfs.ko from kernel.txz.\x1b[0m"
+            );
+            eprintln!(
+                "\x1b[1;33m[VMM Hint] Or pass --module /path/to/zfs.ko (and --root zfs:pool/ROOT/default if the dataset is not zroot/ROOT/default).\x1b[0m"
+            );
+            process::exit(1);
+        }
+    }
+
+    if is_uefi {
+        let path = firmware_path.unwrap_or_else(|| DEFAULT_UEFI_FW.to_string());
+        let fw = match fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("\x1b[1;31m[VMM Error] Failed to read UEFI firmware '{path}': {e}\x1b[0m");
+                eprintln!("\x1b[1;33m[VMM Hint] Run 'make fetch-uefi' to download firmware/QEMU_EFI.fd.\x1b[0m");
+                process::exit(1);
+            }
+        };
+        let ram_size = ram_mb.map(|mb| mb * 1024 * 1024).unwrap_or(DEFAULT_OS_RAM_SIZE);
+        let bootargs = custom_bootargs.unwrap_or_else(|| "console=ttyAMA0".to_string());
+        if let Some(port) = ssh_port {
+            forward::start_port_forward(port, "192.168.18.2:22".to_string());
+        }
+        boot_os_kernel(
+            &path,
+            &[],
+            &disk_configs,
+            ram_size,
+            &bootargs,
+            net_mode.as_deref(),
+            mac_addr,
+            cpus,
+            cpu_model,
+            serial_log.as_deref(),
+            &[],
+            is_multiuser,
+            None,
+            Some(&fw),
+        );
+        return;
     }
 
     if let Some(ref path) = kernel_path {
@@ -380,6 +446,10 @@ fn main() {
                 cpus,
                 cpu_model,
                 serial_log.as_deref(),
+                &module_paths,
+                is_multiuser,
+                root_dev.as_deref(),
+                None,
             );
             return;
         } else {
@@ -422,11 +492,19 @@ fn boot_os_kernel(
     cpus: usize,
     cpu_model: CpuModel,
     serial_log: Option<&str>,
+    module_paths: &[String],
+    is_multiuser: bool,
+    root_dev: Option<&str>,
+    uefi_firmware: Option<&[u8]>,
 ) {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
-    println!("[VMM] Preparing to boot OS kernel from '{}'...", kernel_path);
+    if uefi_firmware.is_some() {
+        println!("[VMM] Preparing UEFI/EDK2 boot from '{}'...", kernel_path);
+    } else {
+        println!("[VMM] Preparing to boot OS kernel from '{}'...", kernel_path);
+    }
     println!(
         "[VMM] Allocating {}MB RAM at GPA 0x{:08x}...",
         ram_size / (1024 * 1024),
@@ -578,18 +656,6 @@ fn boot_os_kernel(
         })
         .expect("Failed to spawn sigwinch thread");
 
-    // Load kernel ELF: FreeBSD locore requires 2MB alignment from RAM base
-    let kernel_phys_load = DEFAULT_RAM_BASE + 0x0020_0000; // 0x40200000
-    let loaded = match elf::load_elf64(elf_data, &vm.memory(), kernel_phys_load) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to load kernel ELF: {}\x1b[0m", e);
-            process::exit(1);
-        }
-    };
-
-    // Generate and load Device Tree Blob (DTB)
-    let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000; // 0x48000000 (128MB offset)
     let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, ram_size as u64, bootargs, cpus, &virtio_devices) {
         Ok(b) => b,
         Err(e) => {
@@ -598,10 +664,192 @@ fn boot_os_kernel(
         }
     };
 
-    if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
-        eprintln!("\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m", e);
-        process::exit(1);
-    }
+    // -------------------------------------------------------------------
+    // Boot path dispatch: UEFI firmware vs direct ELF kernel
+    // -------------------------------------------------------------------
+    let (entry_point, x0_addr) = if let Some(fw) = uefi_firmware {
+        // ---- UEFI / EDK2 boot ----
+        // Map firmware at GPA 0, serve DTB via fw_cfg, also place DTB in RAM
+        // so EDK2 can find it either way.  PC starts at 0, X0 = 0 (DTB via fw_cfg etc/fdt).
+        // ArmVirtQemu PCD PcdDeviceTreeInitialBaseAddress is 0x40000000 (RAM base).
+        // EDK2 ASSERTs fdt_check_header() on that address before fw_cfg is used.
+        let dtb_addr = DEFAULT_RAM_BASE;
+        if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
+            eprintln!("[1;31m[VMM Error] Failed to write DTB to RAM: {e}[0m");
+            process::exit(1);
+        }
+        let fw_cfg = FwCfg::new(vm.memory(), dtb_bytes);
+        vm.mmio_mut()
+            .register(MMIO_FW_CFG_BASE, MMIO_FW_CFG_SIZE, Box::new(fw_cfg));
+        println!(
+            "[VMM] Registered QEMU fw_cfg at GPA 0x{MMIO_FW_CFG_BASE:08x}"
+        );
+        if let Err(e) = vm.map_firmware(0, fw) {
+            eprintln!("\x1b[1;31m[VMM Error] {e}\x1b[0m");
+            process::exit(1);
+        }
+        println!(
+            "[VMM] Mapped EDK2 firmware ({:.2} MB) at GPA 0x00000000; PC=0, X0=0 (DTB at RAM base 0x{dtb_addr:08x} for PCD + fw_cfg etc/fdt)",
+            fw.len() as f64 / (1024.0 * 1024.0)
+        );
+        // QEMU virt flash1: EFI NVRAM at 64MiB — CFI MMIO (not raw RAM).
+        // NorFlashDxe issues CFI commands; a plain RAM map hangs Variable services.
+        {
+            const EFI_VARS_GPA: u64 = 0x0400_0000;
+            let vars_path = std::path::Path::new("firmware/QEMU_VARS.fd");
+            let vars = match std::fs::read(vars_path) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("\x1b[1;33m[VMM Warning] Could not read firmware/QEMU_VARS.fd ({e}); using erased 64MiB\x1b[0m");
+                    vec![0xffu8; 64 * 1024 * 1024]
+                }
+            };
+            let vars_len = vars.len() as u64;
+            let pflash = devices::pflash::CfiPflash::new(vars);
+            vm.mmio_mut().register(EFI_VARS_GPA, vars_len, Box::new(pflash));
+            println!(
+                "[VMM] EFI vars CFI pflash ({:.2} MB) at GPA 0x{EFI_VARS_GPA:08x} (MMIO)",
+                vars_len as f64 / (1024.0 * 1024.0)
+            );
+        }
+        // QEMU starts EDK2 with X0=0; DTB is discovered via fw_cfg `etc/fdt`
+        // (and we still plant a copy in RAM). Passing X0=DTB can confuse SEC/PrePi.
+        (0u64, 0u64)
+    } else {
+        // ---- Direct ELF kernel boot (FreeBSD / Linux) ----
+        // Load kernel ELF: FreeBSD locore requires 2MB alignment from RAM base
+        let kernel_phys_load = DEFAULT_RAM_BASE + 0x0020_0000; // 0x40200000
+        let loaded = match elf::load_elf64(elf_data, &vm.memory(), kernel_phys_load) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("\x1b[1;31m[VMM Error] Failed to load kernel ELF: {}\x1b[0m", e);
+                process::exit(1);
+            }
+        };
+
+        // UFS: X0 = DTB GPA at 128MB (proven FDT locore path).
+        //
+        // ZFS: locore treats X0 < KERNBASE as a *physical* FDT/metadata pointer and
+        // maps TTBR1 as only (kernel_end - KERNBASE + 3*L2) 2MiB blocks, rounded
+        // down. 2MiB-aligning zfs.ko put DTB at +22MiB — the first byte *not*
+        // mapped (11 blocks × 2MiB). Silent abort, no UART.
+        // Pack DTB + .ko + MODINFO immediately after the kernel (16KiB) so the
+        // offset stays inside that window (~20MiB). X0 = MODINFO KVA so locore's
+        // cmp x0, KERNBASE takes the module path; DTBP/ADDR/KERNEND stay KVAs.
+        let x0 = if module_paths.is_empty() {
+            let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000;
+            if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
+                eprintln!("\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m", e);
+                process::exit(1);
+            }
+            println!(
+                "[VMM] DTB at GPA 0x{dtb_addr:08x} ({} bytes); X0=DTB",
+                dtb_bytes.len()
+            );
+            dtb_addr
+        } else {
+            let kernbase = loaded.base_vaddr;
+            let to_kva = |gpa: u64| kernbase + (gpa - kernel_phys_load);
+            let page = 0x4000u64;
+            let mut next = align_up(kernel_phys_load + loaded.total_memory_size, page);
+
+            let dtb_gpa = next;
+            if let Err(e) = vm.memory().write(dtb_gpa, &dtb_bytes) {
+                eprintln!("\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m", e);
+                process::exit(1);
+            }
+            next = align_up(dtb_gpa + dtb_bytes.len() as u64, page);
+
+            let mut preload_files = vec![preload::PreloadedFile {
+                name: "kernel".to_string(),
+                kind: preload::ModuleKind::Kernel,
+                gpa: kernel_phys_load,
+                size: loaded.total_memory_size,
+            }];
+            for path in module_paths {
+                let data = match fs::read(path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("\x1b[1;31m[VMM Error] Failed to read module '{path}': {e}\x1b[0m");
+                        process::exit(1);
+                    }
+                };
+                let name = module_name_from_path(path);
+                if next + data.len() as u64 > DEFAULT_RAM_BASE + ram_size as u64 {
+                    eprintln!(
+                        "\x1b[1;31m[VMM Error] Module '{path}' ({:.2} MB) does not fit in guest RAM\x1b[0m",
+                        data.len() as f64 / (1024.0 * 1024.0)
+                    );
+                    process::exit(1);
+                }
+                if let Err(e) = vm.memory().write(next, &data) {
+                    eprintln!("\x1b[1;31m[VMM Error] Failed to write module '{path}' to RAM: {e}\x1b[0m");
+                    process::exit(1);
+                }
+                println!(
+                    "[VMM] Preloaded module '{name}' ({:.2} MB) at GPA 0x{next:08x} (KVA 0x{:016x}) from '{path}'",
+                    data.len() as f64 / (1024.0 * 1024.0),
+                    to_kva(next)
+                );
+                preload_files.push(preload::PreloadedFile {
+                    name,
+                    kind: preload::ModuleKind::Module,
+                    gpa: next,
+                    size: data.len() as u64,
+                });
+                next = align_up(next + data.len() as u64, page);
+            }
+
+            let metadata_gpa = align_up(next, 8);
+            let mut files_kva = preload_files.clone();
+            for f in &mut files_kva {
+                f.gpa = to_kva(f.gpa);
+            }
+            let mut kenv_vars = vec!["boot_serial=YES", "console=comconsole"];
+            let mountfrom;
+            if let Some(root) = root_dev {
+                mountfrom = format!("vfs.root.mountfrom={root}");
+                kenv_vars.insert(0, mountfrom.as_str());
+            }
+            let kenv = preload::encode_kenv(&kenv_vars);
+            let mut howto = preload::RB_VERBOSE | preload::RB_SERIAL;
+            if !is_multiuser {
+                howto |= preload::RB_SINGLE;
+            }
+            let blob = preload::build_preload(
+                &files_kva,
+                to_kva(dtb_gpa),
+                &kenv,
+                howto,
+                to_kva(metadata_gpa),
+            );
+            if metadata_gpa + blob.len() as u64 > DEFAULT_RAM_BASE + ram_size as u64 {
+                eprintln!("\x1b[1;31m[VMM Error] Preload metadata does not fit in guest RAM\x1b[0m");
+                process::exit(1);
+            }
+            if let Err(e) = vm.memory().write(metadata_gpa, &blob) {
+                eprintln!("\x1b[1;31m[VMM Error] Failed to write preload metadata: {e}\x1b[0m");
+                process::exit(1);
+            }
+            let packed = metadata_gpa + blob.len() as u64 - kernel_phys_load;
+            println!(
+                "[VMM] DTB at GPA 0x{dtb_gpa:08x} (KVA 0x{:016x}, {} bytes)",
+                to_kva(dtb_gpa),
+                dtb_bytes.len()
+            );
+            println!(
+                "[VMM] FreeBSD MODINFO at GPA 0x{metadata_gpa:08x} (KVA 0x{:016x}, {} bytes, {} files); packed +{:.2} MB; X0=KVA; KERNEND KVA 0x{:016x}",
+                to_kva(metadata_gpa),
+                blob.len(),
+                files_kva.len(),
+                packed as f64 / (1024.0 * 1024.0),
+                to_kva(metadata_gpa) + blob.len() as u64
+            );
+            to_kva(metadata_gpa)
+        };
+
+        (loaded.entry_point, x0)
+    };
 
     println!(
         "[VMM] CPU Model: {} (MIDR: 0x{:08x})",
@@ -666,10 +914,21 @@ fn boot_os_kernel(
         }
     };
 
-    if let Err(e) = vcpu0.setup_os_boot_state(loaded.entry_point, dtb_addr, 0, cpu_model.midr) {
+    if let Err(e) = vcpu0.setup_os_boot_state(entry_point, x0_addr, 0, cpu_model.midr) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to setup OS boot registers: {}\x1b[0m", e);
         process::exit(1);
     }
+
+    // Temporary EL1 stack in guest RAM for UEFI SEC (EDK2 replaces it quickly).
+    if entry_point == 0 {
+        let early_sp = DEFAULT_RAM_BASE + 0x0008_0000;
+        if let Err(e) = vcpu0.set_sys_reg(crate::hypervisor::HV_SYS_REG_SP_EL1, early_sp) {
+            eprintln!("[1;33m[VMM Warning] UEFI early SP_EL1 failed: {e}[0m");
+        } else {
+            println!("[VMM] UEFI early SP_EL1 at GPA 0x{early_sp:08x}");
+        }
+    }
+
 
     println!("[VMM] Entering interactive console (raw terminal). Press Ctrl-] to quit.");
     println!("--------------------------------------------------");

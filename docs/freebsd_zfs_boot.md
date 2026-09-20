@@ -1,5 +1,9 @@
 # FreeBSD ZFS Booting Architecture & Implementation Guide
 
+> **Status (2026-09):** Strategy 2 (UEFI/EDK2) is the supported root-on-ZFS path.
+> Use `make fetch-uefi && make freebsd-zfs-uefi DISK=<img>`.
+> Strategy 1 (MODINFO + zfs.ko) remains in tree but often hangs with no UART after preload.
+
 This document explains why FreeBSD fails to boot from OpenZFS (`zroot`) under direct ELF kernel loaders, the underlying technical constraints of FreeBSD's modular kernel architecture on ARM64, and three concrete implementation strategies for adding native ZFS support to our lightweight AArch64 VMM.
 
 ---
@@ -62,73 +66,42 @@ In the official FreeBSD ARM64 release (`GENERIC` kernel):
 
 ## 3. Implementation Strategies
 
-### Strategy 1: Pre-load `zfs.ko` via FreeBSD Loader Metadata (Recommended)
+### Strategy 1: Pre-load `zfs.ko` via FreeBSD Loader Metadata (**experimental — often hangs**)
 
-This strategy retains our instant, crate-free, zero-firmware ELF booting architecture by teaching the VMM to construct FreeBSD's native loader metadata table in RAM.
+This strategy retains direct ELF boot: the VMM copies `zfs.ko` into guest RAM and builds a loader MODINFO table. FreeBSD 14 ARM64 `machdep_boot.c` does **not** read a DTB `freebsd,module-metadata` property. `parse_boot_param()` either:
 
-#### How FreeBSD Expects Preloaded Modules on ARM64
-When booted via FDT (Device Tree), FreeBSD's `locore.S` and `subr_module.c` look for preloaded modules defined in memory.
+- sees an FDT header in **X0** and *fakes* a kernel-only preload table (UFS path, unchanged), or
+- treats **X0 as a MODINFO blob** (`freebsd_parse_boot_param`), taking the DTB from `MODINFOMD_DTBP` (`0x8000|0x1000` on arm64).
 
-1. **Physical Memory Layout**:
+UFS boots keep X0 = DTB. ZFS (or any `--module`) sets X0 = MODINFO.
+
+#### How it is wired
+
+1. **Physical Memory Layout** (packed after the kernel so locore’s TTBR1 window covers it).
+   locore treats X0 **&lt; KERNBASE** as a physical FDT. Module boot must pass
+   X0 = `KERNBASE + (metadata_gpa - kernel_gpa)` and the same KVA translation
+   in every MODINFO pointer (ADDR, DTBP, ENVP, KERNEND).
    ```text
-   GPA 0x4000_0000 +---------------------------------------+
-                   | Reserved / Page Tables                |
-   GPA 0x4020_0000 +---------------------------------------+
-                   | FreeBSD Kernel (boot/kernel/kernel)   |
-   GPA 0x4200_0000 +---------------------------------------+
-                   | ZFS Module (boot/kernel/zfs.ko)       |
-   GPA 0x4400_0000 +---------------------------------------+
-                   | FreeBSD Loader Metadata Table         |
-   GPA 0x4800_0000 +---------------------------------------+
-                   | Device Tree Blob (DTB)                |
-                   +---------------------------------------+
+   GPA 0x4020_0000  kernel ELF          VA 0xffff000000000000
+                    DTB
+                    zfs.ko
+                    MODINFO             X0 = KVA of this blob
    ```
 
-2. **The Loader Metadata Format (`sys/sys/linker.h`)**:
-   FreeBSD uses a serialized stream of Type-Length-Value (TLV) records:
-   ```c
-   struct mod_metadata {
-       uint32_t type;  /* MODINFO_NAME, MODINFO_TYPE, MODINFO_ADDR, etc. */
-       uint32_t size;  /* Size of value payload */
-       uint8_t  val[]; /* Value bytes */
-   };
-   ```
-
-   The required metadata entries for booting with ZFS are:
+2. **MODINFO** (`src/preload.rs`, `sys/sys/linker.h`): 8-byte-aligned `{u32 type; u32 size; u8 val[]}`.
    ```text
-   [MODINFO_NAME]     -> "kernel"
-   [MODINFO_TYPE]     -> "elf64 kernel"
-   [MODINFO_ADDR]     -> 0x4020_0000 (Kernel GPA)
-   [MODINFO_SIZE]     -> <Kernel size>
-
-   [MODINFO_NAME]     -> "zfs"
-   [MODINFO_TYPE]     -> "elf64 module"
-   [MODINFO_ADDR]     -> 0x4200_0000 (zfs.ko GPA)
-   [MODINFO_SIZE]     -> <zfs.ko size>
-
-   [MODINFO_METADATA | MODINFOMD_ENVP] -> Kernel environment (kenv):
-       "vfs.root.mountfrom=zfs:zroot/ROOT/default\0"
-       "boot_serial=YES\0"
-       "console=comconsole\0"
-
-   [MODINFO_END]      -> 0x0000_0000
+   NAME/TYPE/ADDR/SIZE  kernel   ("elf kernel")
+   METADATA|DTBP/HOWTO/KERNEND/ENVP   (must be before the next NAME)
+   NAME/TYPE/ADDR/SIZE  zfs      ("elf64 module")
+   END
    ```
 
-3. **Device Tree Registration**:
-   In the DTB `/chosen` node, pass the address and size of the metadata table:
-   ```dts
-   chosen {
-       bootargs = "FreeBSD: -v -h console=comconsole vfs.root.mountfrom=zfs:zroot/ROOT/default";
-       freebsd,module-metadata = <0x00000000 0x44000000 0x00000000 0x00002000>;
-   };
-   ```
-
-4. **Boot Execution**:
-   When the kernel boots, its module loader unpacks `zfs.ko`, links it into the running kernel symbol table, and mounts `zfs:zroot/ROOT/default` without error.
+3. **Boot Execution**:
+   `make fetch-freebsd` extracts `boot/kernel/kernel` **and** `boot/kernel/zfs.ko`. GPT ZFS GUID → `vfs.root.mountfrom=zfs:zroot/ROOT/default`. Override with `--root zfs:otherpool/ROOT/default`. Extra modules: `--module path/to/foo.ko`.
 
 ---
 
-### Strategy 2: Boot via EDK2 / UEFI Firmware (Standard Virtualization)
+### Strategy 2 (recommended): Boot via EDK2 / UEFI Firmware (Standard Virtualization)
 
 This approach brings our VMM in line with standard PC virtualization (QEMU, UTM, VirtualBox).
 
@@ -196,7 +169,7 @@ sudo ./target/debug/vmm --freebsd ./kernel-zfs \
 | :--- | :--- | :--- | :--- |
 | **Boot Speed** | Instant (< 0.5s) | Fast (~1.5s - 2.0s) | Instant (< 0.5s) |
 | **Firmware Blobs** | None (pure Rust) | EDK2 `QEMU_EFI.fd` (2MB) | None |
-| **VMM Changes** | ~150 lines (MODINFO serializer) | ~200 lines (Flash/ROM mapping) | None |
+| **VMM Changes** | Implemented (`src/preload.rs`) | ~200 lines (Flash/ROM mapping) | None |
 | **Stock ISO Support** | Yes (extracts `zfs.ko`) | Yes (boots EFI partition) | No (custom build) |
 | **Multi-OS Support** | FreeBSD only | Universal (Linux/BSD/Win) | FreeBSD only |
 
@@ -204,6 +177,17 @@ sudo ./target/debug/vmm --freebsd ./kernel-zfs \
 
 ## 5. Current Recommendation & Status
 
-Until Strategy 1 or 2 is implemented in the codebase:
-1. **Always use `Auto (UFS)`** when installing FreeBSD manually (Option 1) or via automated seed (Option 2).
-2. The VMM automatically scans the GPT partition table and warns if a ZFS partition (`516E7CBA-6ECF-11D6-8FF8-00022D09712B`) is selected, preventing unbootable configurations.
+**Strategy 1 is implemented** (`src/preload.rs`, `src/gpt.rs`, FreeBSD branch of `boot_os_kernel`).
+
+1. **Auto (UFS)** still needs no extra files; X0 remains the DTB.
+2. **Auto (ZFS)** requires `boot/kernel/zfs.ko` (`make fetch-freebsd`). The VMM preloads it, sets X0 to MODINFO, and mounts `zfs:zroot/ROOT/default`.
+3. Missing `zfs.ko` on a ZFS disk is a hard error with a fetch hint (no more silent ENODEV).
+4. Strategies 2 (EDK2) and 3 (static `options ZFS`) remain optional alternatives; they are not required for stock GENERIC root-on-ZFS.
+
+```bash
+make fetch-freebsd   # kernel + zfs.ko
+sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk freebsd-zfs.img --net vmnet --cpus 2
+# Auto-detects zfs:zroot/ROOT/default and preloads boot/kernel/zfs.ko
+# Override dataset: --root zfs:mypool/ROOT/default
+# Extra modules:    --module boot/kernel/opensolaris.ko
+```

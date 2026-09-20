@@ -8,3 +8,6 @@ guest/*.bin
 *.iso
 /.iso-boot
 /target_root
+
+# EDK2 flash images (make fetch-uefi)
+firmware/*.fd

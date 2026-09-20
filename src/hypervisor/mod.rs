@@ -70,6 +70,7 @@ pub const HV_REG_CPSR: u32 = 34;
 // System registers (HV_SYS_REG_*)
 pub const HV_SYS_REG_MIDR_EL1: u16 = 0xc000;
 pub const HV_SYS_REG_MPIDR_EL1: u16 = 0xc005;
+pub const HV_SYS_REG_ID_AA64ISAR0_EL1: u16 = 0xc030;
 pub const HV_SYS_REG_SCTLR_EL1: u16 = 0xc080;
 pub const HV_SYS_REG_CPACR_EL1: u16 = 0xc082;
 pub const HV_SYS_REG_TTBR0_EL1: u16 = 0xc100;
@@ -196,6 +197,20 @@ pub const PSCI_MIGRATE_INFO_TYPE: u64 = 0x8400_0006;
 pub const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 pub const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 pub const PSCI_FEATURES: u64 = 0x8400_000a;
+
+// ARM SMCCC (Firmware Calls) — probed by EDK2 RngDxe / ArmTrngLib before PSCI
+pub const SMCCC_VERSION: u64 = 0x8000_0000;
+pub const SMCCC_ARCH_FEATURES: u64 = 0x8000_0001;
+pub const SMCCC_ARCH_SOC_ID: u64 = 0x8000_0002;
+pub const SMCCC_ARCH_WORKAROUND_1: u64 = 0x8000_8000;
+pub const SMCCC_ARCH_WORKAROUND_2: u64 = 0x8000_7fff;
+
+// ARM TRNG (True RNG via SMC) — return NOT_SUPPORTED so EDK2 skips it
+pub const SMCCC_TRNG_VERSION: u64 = 0x8400_0050;
+pub const SMCCC_TRNG_FEATURES: u64 = 0x8400_0051;
+pub const SMCCC_TRNG_GET_UUID: u64 = 0x8400_0052;
+pub const SMCCC_TRNG_RND32: u64 = 0x8400_0053;
+pub const SMCCC_TRNG_RND64: u64 = 0xc400_0053;
 
 pub const PSCI_SUCCESS: i64 = 0;
 pub const PSCI_NOT_SUPPORTED: i64 = -1;

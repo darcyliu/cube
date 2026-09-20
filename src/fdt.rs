@@ -45,6 +45,7 @@ pub fn generate_dtb(
         reg = <0x0 0x{base:08x} 0x0 0x{size:x}>;
         interrupt-parent = <&intc>;
         interrupts = <0 {spi_num} 4>;
+        dma-coherent;
     }};
 "#,
             base = dev.base,
@@ -59,12 +60,33 @@ pub fn generate_dtb(
 / {{
     #address-cells = <2>;
     #size-cells = <2>;
-    compatible = "freebsd,arm64", "linux,dummy-virt";
-    model = "macOS Hypervisor Virtual Machine";
+    compatible = "linux,dummy-virt";
+    model = "linux,dummy-virt";
+    interrupt-parent = <&intc>;
+    dma-coherent;
 
     chosen {{
         bootargs = "{bootargs}";
-        stdout-path = "/pl011@09000000";
+        stdout-path = "serial0";
+    }};
+
+    aliases {{
+        serial0 = "/pl011@09000000";
+    }};
+
+    clocks {{
+        apb_pclk: apb-pclk {{
+            compatible = "fixed-clock";
+            #clock-cells = <0>;
+            clock-frequency = <24000000>;
+            clock-output-names = "clk24mhz";
+        }};
+    }};
+
+    flash@0 {{
+        compatible = "cfi-flash";
+        reg = <0x0 0x0 0x0 0x4000000 0x0 0x4000000 0x0 0x4000000>;
+        bank-width = <4>;
     }};
 
     cpus {{
@@ -85,26 +107,29 @@ pub fn generate_dtb(
     intc: interrupt-controller@08000000 {{
         compatible = "arm,gic-v3";
         #interrupt-cells = <3>;
+        #address-cells = <2>;
+        #size-cells = <2>;
         interrupt-controller;
+        #redistributor-regions = <1>;
         reg = <0x0 0x08000000 0x0 0x10000>,
               <0x0 0x080a0000 0x0 0x{redist_size:x}>;
     }};
 
     timer {{
-        compatible = "arm,armv8-timer";
-        interrupt-parent = <&intc>;
-        interrupts = <1 13 0xf08>,
-                     <1 14 0xf08>,
-                     <1 11 0xf08>,
-                     <1 10 0xf08>;
+        compatible = "arm,armv8-timer", "arm,armv7-timer";
+        interrupts = <1 13 4>,
+                     <1 14 4>,
+                     <1 11 4>,
+                     <1 10 4>;
         always-on;
     }};
 
     pl011@09000000 {{
         compatible = "arm,pl011", "arm,primecell";
         reg = <0x0 0x09000000 0x0 0x1000>;
-        interrupt-parent = <&intc>;
         interrupts = <0 1 4>; /* SPI 1 (interrupt ID 33) */
+        clocks = <&apb_pclk>, <&apb_pclk>;
+        clock-names = "uartclk", "apb_pclk";
     }};
 
     rtc@09010000 {{
@@ -112,6 +137,12 @@ pub fn generate_dtb(
         reg = <0x0 0x09010000 0x0 0x1000>;
         interrupt-parent = <&intc>;
         interrupts = <0 4 4>; /* SPI 4 (interrupt ID 36) */
+    }};
+
+    fw-cfg@09020000 {{
+        compatible = "qemu,fw-cfg-mmio";
+        reg = <0x0 0x09020000 0x0 0x18>;
+        dma-coherent;
     }};
 
 {virtio_dts}}};

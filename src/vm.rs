@@ -10,6 +10,8 @@ use crate::memory::GuestMemory;
 
 pub struct Vm {
     memory: Arc<GuestMemory>,
+    flash: Option<GuestMemory>,
+    flash_vars: Option<GuestMemory>,
     mmio: MmioBus,
     gic_enabled: bool,
 }
@@ -26,9 +28,29 @@ impl Vm {
 
         Ok(Self {
             memory,
+            flash: None,
+            flash_vars: None,
             mmio,
             gic_enabled: false,
         })
+    }
+
+    /// Map a ROM/flash image at `base` (typically GPA 0 for EDK2).
+    pub fn map_firmware(&mut self, base: u64, data: &[u8]) -> Result<(), String> {
+        let flash = GuestMemory::new(base, data.len())
+            .map_err(|e| format!("Failed to map firmware at 0x{base:x}: {e}"))?;
+        flash.write(base, data)?;
+        self.flash = Some(flash);
+        Ok(())
+    }
+
+    /// Map writable EFI variable store (QEMU virt flash1 at 0x0400_0000).
+    pub fn map_firmware_vars(&mut self, base: u64, data: &[u8]) -> Result<(), String> {
+        let flash = GuestMemory::new(base, data.len())
+            .map_err(|e| format!("Failed to map EFI vars at 0x{base:x}: {e}"))?;
+        flash.write(base, data)?;
+        self.flash_vars = Some(flash);
+        Ok(())
     }
 
     /// Initializes native in-kernel ARM GICv3 device (macOS 15+).

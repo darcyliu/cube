@@ -346,7 +346,7 @@ Our hypervisor executes on Apple Silicon using hardware virtualization (`Hypervi
 3. When prompted for partitioning, choose **`Auto (UFS)`** on **`/dev/vtbd0`**.
 
 > [!IMPORTANT]
-> **Filesystem Selection:** Choose **Auto (UFS)** for direct ELF kernel booting. Stock FreeBSD release kernels (`boot/kernel/kernel`) build OpenZFS as a dynamic kernel module (`zfs.ko`), which requires the second-stage loader. For full architectural details and our implementation roadmap for native ZFS support, see [docs/freebsd_zfs_boot.md](file:///Users/darcy/Dev/vmm/docs/freebsd_zfs_boot.md).
+> **Filesystem Selection:** **Auto (UFS)** is the default and does not need extra modules. **Auto (ZFS)** is supported when `boot/kernel/zfs.ko` is present (`make fetch-freebsd`): the VMM preloads it via FreeBSD MODINFO and sets `vfs.root.mountfrom=zfs:zroot/ROOT/default`. Architecture: [docs/freebsd_zfs_boot.md](freebsd_zfs_boot.md).
 
 4. Complete the installation wizard (set hostname, root password, and network).
 5. When finished, choose **Reboot** or press **`Ctrl-]`** to return to macOS.

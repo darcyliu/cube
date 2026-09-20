@@ -389,7 +389,7 @@ impl Vcpu {
     }
 
     /// Sets initial state for booting an OS kernel (FreeBSD / Linux) according to the ARM64 boot specification:
-    /// - X0 = physical address of Device Tree Blob (DTB)
+    /// - X0 = DTB GPA (Linux / FreeBSD UFS) or FreeBSD loader MODINFO GPA (preloaded .ko / ZFS)
     /// - X1 = 0, X2 = 0, X3 = 0
     /// - PC = kernel entry point
     /// - CPSR = EL1h with DAIF interrupts masked (0x3c5)
@@ -426,6 +426,22 @@ impl Vcpu {
         // Enable FP/NEON
         self.set_sys_reg(HV_SYS_REG_CPACR_EL1, 3 << 20)?;
 
+        // HVF advertises host FEAT_RNG via ID_AA64ISAR0 but does not emulate RNDR.
+        // EDK2 RngDxe then executes RNDR and takes a Synchronous Exception. Clear
+        // the RNDR field (bits 63:60) so firmware uses virtio-rng / other backends.
+        match self.get_sys_reg(HV_SYS_REG_ID_AA64ISAR0_EL1) {
+            Ok(isar0) => {
+                let masked = isar0 & !(0xfu64 << 60);
+                eprintln!("[VMM] ID_AA64ISAR0_EL1={isar0:#x} (RNDR field cleared -> {masked:#x})");
+                if let Err(e) = self.set_sys_reg(HV_SYS_REG_ID_AA64ISAR0_EL1, masked) {
+                    eprintln!("[VMM] Warning: failed to set ID_AA64ISAR0_EL1: {e}");
+                } else if let Ok(v) = self.get_sys_reg(HV_SYS_REG_ID_AA64ISAR0_EL1) {
+                    eprintln!("[VMM] ID_AA64ISAR0_EL1 readback={v:#x}");
+                }
+            }
+            Err(e) => eprintln!("[VMM] Warning: get ID_AA64ISAR0_EL1: {e}"),
+        }
+
         Ok(())
     }
 
@@ -453,6 +469,26 @@ impl Vcpu {
 
     /// Runs the vCPU until it exits, dispatching MMIO, PSCI calls, and exceptions.
     pub fn run(&mut self, mmio: &MmioBus) -> Result<VcpuExitStatus, String> {
+        let trace_boot = std::env::var_os("VMM_TRACE_BOOT").is_some();
+        let mut exits: u64 = 0;
+        let mut last_trace = std::time::Instant::now();
+        if trace_boot {
+            let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+            let x0 = self.get_reg(HV_REG_X0).unwrap_or(0);
+            eprintln!("[VMM TRACE] enter run PC=0x{pc:016x} X0=0x{x0:016x}");
+            // Force periodic exits so we can sample PC if the guest spins with no traps.
+            let vcpu_id = self.id;
+            std::thread::spawn(move || {
+                for i in 1..=20 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    unsafe {
+                        let ids = [vcpu_id];
+                        let _ = crate::hypervisor::hv_vcpus_exit(ids.as_ptr(), 1);
+                    }
+                    eprintln!("[VMM TRACE] kick #{i} sent");
+                }
+            });
+        }
         loop {
             if let Some(ref mgr) = self.manager {
                 if mgr.is_shutdown_requested() {
@@ -470,6 +506,19 @@ impl Vcpu {
             }
 
             let exit = unsafe { *self.exit_ptr };
+            exits = exits.wrapping_add(1);
+            if trace_boot && (exits <= 30 || last_trace.elapsed().as_millis() >= 400) {
+                let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+                let x0 = self.get_reg(HV_REG_X0).unwrap_or(0);
+                let syndrome = exit.exception.syndrome;
+                let ec = (syndrome >> 26) & 0x3f;
+                let ipa = exit.exception.physical_address;
+                eprintln!(
+                    "[VMM TRACE] exit#{exits} reason={} EC=0x{ec:02x} PC=0x{pc:016x} IPA=0x{ipa:016x} X0=0x{x0:016x}",
+                    exit.reason as u32
+                );
+                last_trace = std::time::Instant::now();
+            }
 
             match exit.reason {
                 HV_EXIT_REASON_EXCEPTION => {
@@ -481,8 +530,8 @@ impl Vcpu {
                         0x24 => {
                             self.handle_data_abort(syndrome, exit.exception.physical_address, mmio)?;
                         }
-                        // EC 0x16: Hypervisor Call (HVC) -> PSCI emulation
-                        0x16 => {
+                        // EC 0x16 / 0x17: HVC / SMC -> PSCI + SMCCC + TRNG
+                        0x16 | 0x17 => {
                             if let Some(status) = self.handle_psci()? {
                                 return Ok(status);
                             }
@@ -528,6 +577,18 @@ impl Vcpu {
                     }
                 }
                 HV_EXIT_REASON_CANCELED => {
+                    if trace_boot {
+                        let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+                        let x0 = self.get_reg(HV_REG_X0).unwrap_or(0);
+                        let x1 = self.get_reg(HV_REG_X1).unwrap_or(0);
+                        let x19 = self.get_reg(HV_REG_X0 + 19).unwrap_or(0);
+                        let lr = self.get_reg(HV_REG_X0 + 30).unwrap_or(0);
+                        let sp = self.get_sys_reg(HV_SYS_REG_SP_EL1).unwrap_or(0);
+                        let cpsr = self.get_reg(HV_REG_CPSR).unwrap_or(0);
+                        eprintln!(
+                            "[VMM TRACE] kick-sample PC={pc:#x} X0={x0:#x} X1={x1:#x} X19={x19:#x} LR={lr:#x} SP={sp:#x} CPSR={cpsr:#x}"
+                        );
+                    }
                     // vCPU was kicked by another thread (hv_vcpus_exit) to process interrupts
                     continue;
                 }
@@ -621,6 +682,24 @@ impl Vcpu {
         let crm = (syndrome >> 1) & 0xf;
         let is_read = (syndrome & 1) == 1; // 1 = MRS (read), 0 = MSR (write)
 
+        // CurrentEL (S3_0_C4_C2_2) must read as EL1(=4). HVF may trap it; RAZ would
+        // make EDK2 think EL0 and CpuDeadLoop (see firmware at 0x5a18).
+        if is_read && op0 == 3 && op1 == 0 && crn == 4 && crm == 2 && op2 == 2 {
+            if rt != 31 {
+                self.set_reg(HV_REG_X0 + rt, 0x4).map_err(|e| e.to_string())?;
+            }
+            let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
+            self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
+
+        if std::env::var_os("VMM_TRACE_BOOT").is_some() {
+            let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+            eprintln!(
+                "[VMM TRACE] sysreg-trap PC={pc:#x} op0={op0} op1={op1} CRn={crn} CRm={crm} op2={op2} Rt={rt} read={is_read}"
+            );
+        }
         // op0 == 2 is ARM Debug register space (OSLAR_EL1, OSLSR_EL1, MDSCR_EL1, etc.)
         if op0 == 2 {
             if is_read && rt != 31 {
@@ -629,12 +708,16 @@ impl Vcpu {
             }
             // Writes to debug registers (like OSLAR_EL1 lock/unlock) are safely ignored
         } else {
-            let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
-            return Err(format!(
-                "Unhandled System Register access (EC 0x18) at PC=0x{:016x}: \
-                op0={}, op1={}, CRn={}, CRm={}, op2={}, Rt={}, is_read={}",
-                pc, op0, op1, crn, crm, op2, rt, is_read
-            ));
+            // RAZ/WI unknown sysregs (EDK2 probes many; QEMU does not kill the guest).
+            if std::env::var_os("VMM_TRACE_BOOT").is_some() {
+                let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+                eprintln!(
+                    "[VMM TRACE] sysreg-RAZWI PC={pc:#x} op0={op0} op1={op1} CRn={crn} CRm={crm} op2={op2} Rt={rt} read={is_read}"
+                );
+            }
+            if is_read && rt != 31 {
+                self.set_reg(HV_REG_X0 + rt, 0).map_err(|e| e.to_string())?;
+            }
         }
 
         // Advance PC by 4
@@ -644,15 +727,74 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Handle HVC/SMC (PSCI + SMCCC + TRNG). Do not advance PC: HVF already points past the insn.
     fn handle_psci(&mut self) -> Result<Option<VcpuExitStatus>, String> {
         let func_id = self.get_reg(HV_REG_X0).map_err(|e| e.to_string())?;
+        if std::env::var_os("VMM_TRACE_BOOT").is_some() {
+            let x1 = self.get_reg(HV_REG_X1).unwrap_or(0);
+            eprintln!("[VMM TRACE] SMCCC/PSCI call id={func_id:#x} x1={x1:#x}");
+        }
 
         match func_id {
+            // SMCCC_VERSION (0x80000000): Return SMCCC 1.1 (required by EDK2 ArmTrngLib/RngDxe)
+            SMCCC_VERSION => {
+                // HVF leaves PC past the HVC/SMC insn — do not +4 or we skip the return path.
+                self.set_reg(HV_REG_X0, 0x0001_0001).map_err(|e| e.to_string())?;
+                Ok(None)
+            }
+            // SMCCC_ARCH_FEATURES / WORKAROUNDS: not implemented
+            SMCCC_ARCH_FEATURES
+            | SMCCC_ARCH_SOC_ID
+            | SMCCC_ARCH_WORKAROUND_1
+            | SMCCC_ARCH_WORKAROUND_2 => {
+                self.set_reg(HV_REG_X0, PSCI_NOT_SUPPORTED as u64)
+                    .map_err(|e| e.to_string())?;
+                Ok(None)
+            }
+            // ARM TRNG (DEN0098) — EDK2 RngDxe uses this when FEAT_RNG is absent.
+            SMCCC_TRNG_VERSION => {
+                // Version 1.0
+                self.set_reg(HV_REG_X0, 0x0001_0000).map_err(|e| e.to_string())?;
+                Ok(None)
+            }
+            SMCCC_TRNG_FEATURES => {
+                // DEN0098: for RND*, success returns max entropy bits per call (32..192).
+                // Returning 0 made EDK2 ArmTrngLib miscompute buffer sizes and data-abort.
+                let fid = self.get_reg(HV_REG_X1).map_err(|e| e.to_string())?;
+                let ret = match fid {
+                    SMCCC_TRNG_RND32 | SMCCC_TRNG_RND64 => 192i64,
+                    SMCCC_TRNG_VERSION
+                    | SMCCC_TRNG_FEATURES
+                    | SMCCC_TRNG_GET_UUID => 0i64,
+                    _ => PSCI_NOT_SUPPORTED,
+                };
+                self.set_reg(HV_REG_X0, ret as u64).map_err(|e| e.to_string())?;
+                Ok(None)
+            }
+            SMCCC_TRNG_GET_UUID => {
+                // RFC-4122 UUID for "VMM TRNG" (made-up, stable)
+                self.set_reg(HV_REG_X0, 0x564d_4d54_524e_4701).map_err(|e| e.to_string())?; // "VMMTRNG"
+                self.set_reg(HV_REG_X1, 0x0000_4000_8000_0000u64).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X2, 0xa000_0000_0000_0001u64).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X3, 0x0000_0000_0000_0001u64).map_err(|e| e.to_string())?;
+                Ok(None)
+            }
+            SMCCC_TRNG_RND32 | SMCCC_TRNG_RND64 => {
+                // x1 = number of entropy bits requested (32..192). Fill x1..x3.
+                let mut buf = [0u8; 24];
+                getrandom::getrandom(&mut buf).map_err(|e| format!("TRNG getrandom: {e}"))?;
+                let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+                let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                let w2 = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+                self.set_reg(HV_REG_X0, 0).map_err(|e| e.to_string())?; // SUCCESS
+                self.set_reg(HV_REG_X1, w0).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X2, w1).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X3, w2).map_err(|e| e.to_string())?;
+                Ok(None)
+            }
             // PSCI_VERSION (0x84000000): Return PSCI v0.2
             PSCI_VERSION => {
                 self.set_reg(HV_REG_X0, 0x0002).map_err(|e| e.to_string())?;
-                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
-                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
                 Ok(None)
             }
             // PSCI_FEATURES (0x8400000a)
@@ -668,8 +810,6 @@ impl Vcpu {
                     _ => PSCI_NOT_SUPPORTED,
                 };
                 self.set_reg(HV_REG_X0, ret as u64).map_err(|e| e.to_string())?;
-                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
-                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
                 Ok(None)
             }
             // PSCI CPU_ON (0xc4000003 for 64-bit, 0x84000003 for 32-bit)
@@ -706,8 +846,6 @@ impl Vcpu {
                 };
 
                 self.set_reg(HV_REG_X0, ret as u64).map_err(|e| e.to_string())?;
-                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
-                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
                 Ok(None)
             }
             // PSCI CPU_OFF (0x84000002)
@@ -717,15 +855,11 @@ impl Vcpu {
                         slot.is_online.store(false, Ordering::Relaxed);
                     }
                 }
-                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
-                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
                 Ok(Some(VcpuExitStatus::Halted))
             }
             // PSCI MIGRATE_INFO_TYPE (0x84000006): Return 2 (Trusted OS not present)
             PSCI_MIGRATE_INFO_TYPE => {
                 self.set_reg(HV_REG_X0, 2).map_err(|e| e.to_string())?;
-                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
-                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
                 Ok(None)
             }
             // PSCI SYSTEM_OFF (0x84000008)
@@ -745,8 +879,6 @@ impl Vcpu {
             _ => {
                 eprintln!("[VMM Warning] Unhandled PSCI function ID: 0x{:08x}", func_id);
                 self.set_reg(HV_REG_X0, PSCI_NOT_SUPPORTED as u64).map_err(|e| e.to_string())?;
-                let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
-                self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
                 Ok(None)
             }
         }
