@@ -106,7 +106,38 @@ fetch --no-verify-peer -o - https://www.freebsd.org | head -n 15
 
 For complete architectural details, troubleshooting steps, and NAT forwarding explanations, see [docs/networking.md](docs/networking.md).
 
-Press `Ctrl-]` at any time to detach from the guest and return to the host terminal.
+Press `Ctrl-]` to stop the VM and return to the host terminal. This joins VM workers
+and flushes disk backends, but does not shut down the guest OS; shut down inside
+the guest first when possible. Host SIGTERM also requests this cleanup. Guest
+PSCI reboot restarts the VM with the same command-line arguments.
+
+VNC accepts one client at a time and binds only to loopback addresses, for example
+`--vnc 127.0.0.1:5900`. For remote access, use an SSH tunnel. Disconnecting releases
+held keys and pointer buttons. Rectangle updates and RGB565 clients are supported.
+
+UEFI variables persist in `<first-disk>.vars.fd`, or `<firmware>.vars.fd` when
+there is no disk. Use `--efi-vars PATH` for an explicit per-VM store. Writable
+disk images, COW overlays, and variable stores are exclusively locked while open;
+read-only images and COW base images use shared locks. Malformed or truncated
+nonempty COW overlays are rejected rather than reinitialized.
+
+UART file injection is opt-in: set `VMM_UART_IN` to a dedicated file path.
+`scripts/unattended-install.sh` configures this automatically with a private
+mailbox for each run, and prints the retained console-log path. Prompt timeouts
+stop automation without dispatching installer commands.
+
+Run `cargo test` and `cargo test --release` for device regression tests. On Apple
+Silicon macOS, after building and signing the VMM, run the diskless integration
+checks with:
+
+```sh
+python3 scripts/check_vm_lifecycle.py target/debug/vmm \
+  --kernel .iso-boot/boot/kernel/kernel --firmware firmware/QEMU_EFI.fd
+```
+
+The kernel and firmware arguments are optional. The checks cover parked CPUs,
+CPU off/on, reboot, and (when supplied) FreeBSD VNC input and UEFI shutdown. They
+use temporary kernels and variable stores without opening guest disks.
 
 ---
 

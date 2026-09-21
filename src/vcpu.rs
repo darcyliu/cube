@@ -25,23 +25,68 @@ pub struct CpuModel {
 
 impl CpuModel {
     // Recognized Apple Silicon cores (FreeBSD arm64/identcpu.c)
-    pub const APPLE_M1_FIRESTORM: Self = Self { midr: 0x610f_0230, name: "Apple M1 Firestorm" };
-    pub const APPLE_M1_ICESTORM: Self = Self { midr: 0x610f_0220, name: "Apple M1 Icestorm" };
-    pub const APPLE_M1_PRO: Self = Self { midr: 0x610f_0250, name: "Apple M1 Pro Firestorm" };
-    pub const APPLE_M1_MAX: Self = Self { midr: 0x610f_0290, name: "Apple M1 Max Firestorm" };
-    pub const APPLE_M2_AVALANCHE: Self = Self { midr: 0x610f_0330, name: "Apple M2 Avalanche" };
-    pub const APPLE_M2_BLIZZARD: Self = Self { midr: 0x610f_0320, name: "Apple M2 Blizzard" };
-    pub const APPLE_M2_PRO: Self = Self { midr: 0x610f_0350, name: "Apple M2 Pro Avalanche" };
-    pub const APPLE_M2_MAX: Self = Self { midr: 0x610f_0390, name: "Apple M2 Max Avalanche" };
+    pub const APPLE_M1_FIRESTORM: Self = Self {
+        midr: 0x610f_0230,
+        name: "Apple M1 Firestorm",
+    };
+    pub const APPLE_M1_ICESTORM: Self = Self {
+        midr: 0x610f_0220,
+        name: "Apple M1 Icestorm",
+    };
+    pub const APPLE_M1_PRO: Self = Self {
+        midr: 0x610f_0250,
+        name: "Apple M1 Pro Firestorm",
+    };
+    pub const APPLE_M1_MAX: Self = Self {
+        midr: 0x610f_0290,
+        name: "Apple M1 Max Firestorm",
+    };
+    pub const APPLE_M2_AVALANCHE: Self = Self {
+        midr: 0x610f_0330,
+        name: "Apple M2 Avalanche",
+    };
+    pub const APPLE_M2_BLIZZARD: Self = Self {
+        midr: 0x610f_0320,
+        name: "Apple M2 Blizzard",
+    };
+    pub const APPLE_M2_PRO: Self = Self {
+        midr: 0x610f_0350,
+        name: "Apple M2 Pro Avalanche",
+    };
+    pub const APPLE_M2_MAX: Self = Self {
+        midr: 0x610f_0390,
+        name: "Apple M2 Max Avalanche",
+    };
 
     // Standard ARM Neoverse & Cortex server cores
-    pub const ARM_NEOVERSE_N2: Self = Self { midr: 0x410f_d490, name: "ARM Neoverse-N2" };
-    pub const ARM_NEOVERSE_N1: Self = Self { midr: 0x410f_d0c0, name: "ARM Neoverse-N1" };
-    pub const ARM_NEOVERSE_V1: Self = Self { midr: 0x410f_d400, name: "ARM Neoverse-V1" };
-    pub const ARM_CORTEX_A78: Self = Self { midr: 0x410f_d410, name: "ARM Cortex-A78" };
-    pub const ARM_CORTEX_A72: Self = Self { midr: 0x410f_d080, name: "ARM Cortex-A72" };
-    pub const ARM_CORTEX_A53: Self = Self { midr: 0x410f_d030, name: "ARM Cortex-A53" };
-    pub const AMPERE_ONE: Self = Self { midr: 0xc00f_ac30, name: "Ampere AmpereOne AC03" };
+    pub const ARM_NEOVERSE_N2: Self = Self {
+        midr: 0x410f_d490,
+        name: "ARM Neoverse-N2",
+    };
+    pub const ARM_NEOVERSE_N1: Self = Self {
+        midr: 0x410f_d0c0,
+        name: "ARM Neoverse-N1",
+    };
+    pub const ARM_NEOVERSE_V1: Self = Self {
+        midr: 0x410f_d400,
+        name: "ARM Neoverse-V1",
+    };
+    pub const ARM_CORTEX_A78: Self = Self {
+        midr: 0x410f_d410,
+        name: "ARM Cortex-A78",
+    };
+    pub const ARM_CORTEX_A72: Self = Self {
+        midr: 0x410f_d080,
+        name: "ARM Cortex-A72",
+    };
+    pub const ARM_CORTEX_A53: Self = Self {
+        midr: 0x410f_d030,
+        name: "ARM Cortex-A53",
+    };
+    pub const AMPERE_ONE: Self = Self {
+        midr: 0xc00f_ac30,
+        name: "Ampere AmpereOne AC03",
+    };
 
     /// Automatically detects host Apple Silicon model via macOS sysctl.
     pub fn detect_host() -> Self {
@@ -121,11 +166,26 @@ fn get_host_brand_string() -> Option<String> {
     let name = c"machdep.cpu.brand_string";
     let mut size: usize = 0;
     unsafe {
-        if sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut size, std::ptr::null(), 0) != 0 || size == 0 {
+        if sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null(),
+            0,
+        ) != 0
+            || size == 0
+        {
             return None;
         }
         let mut buf = vec![0u8; size];
-        if sysctlbyname(name.as_ptr(), buf.as_mut_ptr() as *mut _, &mut size, std::ptr::null(), 0) != 0 {
+        if sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut _,
+            &mut size,
+            std::ptr::null(),
+            0,
+        ) != 0
+        {
             return None;
         }
         while buf.last() == Some(&0) {
@@ -158,6 +218,8 @@ pub struct VcpuManager {
     slots: Vec<Arc<SecondaryVcpuSlot>>,
     active_vcpu_ids: Mutex<Vec<u64>>,
     shutdown_requested: AtomicBool,
+    reset_requested: AtomicBool,
+    failure: Mutex<Option<String>>,
     /// Generation counter + condvar used to wake vCPUs that trapped WFI.
     /// `hv_vcpus_exit` only interrupts `hv_vcpu_run`; it does not wake `thread::sleep`.
     wfi_gen: Mutex<u64>,
@@ -184,6 +246,8 @@ impl VcpuManager {
             slots,
             active_vcpu_ids: Mutex::new(Vec::new()),
             shutdown_requested: AtomicBool::new(false),
+            reset_requested: AtomicBool::new(false),
+            failure: Mutex::new(None),
             wfi_gen: Mutex::new(0),
             wfi_cv: Condvar::new(),
         });
@@ -252,12 +316,18 @@ impl VcpuManager {
 
     pub fn get_slot_by_mpidr(&self, mpidr: u64) -> Option<Arc<SecondaryVcpuSlot>> {
         let target_aff = mpidr & 0xff;
-        self.slots.iter().find(|s| (s.mpidr & 0xff) == target_aff).cloned()
+        self.slots
+            .iter()
+            .find(|s| (s.mpidr & 0xff) == target_aff)
+            .cloned()
     }
 
     pub fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Relaxed);
         for slot in &self.slots {
+            // Use the waiter's mutex so a notification cannot be lost between
+            // checking the predicate and entering the condvar wait.
+            let _guard = slot.boot_args.lock().unwrap();
             slot.condvar.notify_all();
         }
         self.kick_all();
@@ -265,6 +335,42 @@ impl VcpuManager {
 
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::Relaxed)
+    }
+
+    pub fn wait_for_boot(&self, slot: &SecondaryVcpuSlot) -> Option<SecondaryBootArgs> {
+        let mut args = slot.boot_args.lock().unwrap();
+        while args.is_none() && !self.is_shutdown_requested() {
+            args = slot.condvar.wait(args).unwrap();
+        }
+        if self.is_shutdown_requested() {
+            None
+        } else {
+            args.take()
+        }
+    }
+
+    pub fn reset_requested(&self) -> bool {
+        self.reset_requested.load(Ordering::Relaxed)
+    }
+
+    pub fn fail(&self, error: String) {
+        *self.failure.lock().unwrap() = Some(error);
+        self.request_shutdown();
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().unwrap().clone()
+    }
+}
+
+pub fn request_host_shutdown() {
+    let manager = GLOBAL_VCPU_MANAGER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(Weak::upgrade);
+    if let Some(manager) = manager {
+        manager.request_shutdown();
     }
 }
 
@@ -377,7 +483,12 @@ impl Vcpu {
     }
 
     /// Sets initial state for booting at Exception Level 1 (EL1) for baremetal tests.
-    pub fn setup_boot_state(&self, entry_point: u64, stack_pointer: u64, midr: u64) -> HvResult<()> {
+    pub fn setup_boot_state(
+        &self,
+        entry_point: u64,
+        stack_pointer: u64,
+        midr: u64,
+    ) -> HvResult<()> {
         self.set_reg(HV_REG_PC, entry_point)?;
         self.set_reg(HV_REG_CPSR, 0x3c5)?; // EL1h, DAIF masked
         self.set_sys_reg(HV_SYS_REG_SP_EL1, stack_pointer)?;
@@ -528,7 +639,11 @@ impl Vcpu {
                     match ec {
                         // EC 0x24: Data Abort from lower or same EL (e.g. MMIO)
                         0x24 => {
-                            self.handle_data_abort(syndrome, exit.exception.physical_address, mmio)?;
+                            self.handle_data_abort(
+                                syndrome,
+                                exit.exception.physical_address,
+                                mmio,
+                            )?;
                         }
                         // EC 0x16 / 0x17: HVC / SMC -> PSCI + SMCCC + TRNG
                         0x16 | 0x17 => {
@@ -662,7 +777,8 @@ impl Vcpu {
             // MMIO Read
             let val = mmio.read(fault_ipa, access_size)?;
             if srt != 31 {
-                self.set_reg(HV_REG_X0 + srt, val).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0 + srt, val)
+                    .map_err(|e| e.to_string())?;
             }
         }
 
@@ -686,13 +802,13 @@ impl Vcpu {
         // make EDK2 think EL0 and CpuDeadLoop (see firmware at 0x5a18).
         if is_read && op0 == 3 && op1 == 0 && crn == 4 && crm == 2 && op2 == 2 {
             if rt != 31 {
-                self.set_reg(HV_REG_X0 + rt, 0x4).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0 + rt, 0x4)
+                    .map_err(|e| e.to_string())?;
             }
             let pc = self.get_reg(HV_REG_PC).map_err(|e| e.to_string())?;
             self.set_reg(HV_REG_PC, pc + 4).map_err(|e| e.to_string())?;
             return Ok(());
         }
-
 
         if std::env::var_os("VMM_TRACE_BOOT").is_some() {
             let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
@@ -739,7 +855,8 @@ impl Vcpu {
             // SMCCC_VERSION (0x80000000): Return SMCCC 1.1 (required by EDK2 ArmTrngLib/RngDxe)
             SMCCC_VERSION => {
                 // HVF leaves PC past the HVC/SMC insn — do not +4 or we skip the return path.
-                self.set_reg(HV_REG_X0, 0x0001_0001).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0, 0x0001_0001)
+                    .map_err(|e| e.to_string())?;
                 Ok(None)
             }
             // SMCCC_ARCH_FEATURES / WORKAROUNDS: not implemented
@@ -754,7 +871,8 @@ impl Vcpu {
             // ARM TRNG (DEN0098) — EDK2 RngDxe uses this when FEAT_RNG is absent.
             SMCCC_TRNG_VERSION => {
                 // Version 1.0
-                self.set_reg(HV_REG_X0, 0x0001_0000).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0, 0x0001_0000)
+                    .map_err(|e| e.to_string())?;
                 Ok(None)
             }
             SMCCC_TRNG_FEATURES => {
@@ -763,20 +881,23 @@ impl Vcpu {
                 let fid = self.get_reg(HV_REG_X1).map_err(|e| e.to_string())?;
                 let ret = match fid {
                     SMCCC_TRNG_RND32 | SMCCC_TRNG_RND64 => 192i64,
-                    SMCCC_TRNG_VERSION
-                    | SMCCC_TRNG_FEATURES
-                    | SMCCC_TRNG_GET_UUID => 0i64,
+                    SMCCC_TRNG_VERSION | SMCCC_TRNG_FEATURES | SMCCC_TRNG_GET_UUID => 0i64,
                     _ => PSCI_NOT_SUPPORTED,
                 };
-                self.set_reg(HV_REG_X0, ret as u64).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0, ret as u64)
+                    .map_err(|e| e.to_string())?;
                 Ok(None)
             }
             SMCCC_TRNG_GET_UUID => {
                 // RFC-4122 UUID for "VMM TRNG" (made-up, stable)
-                self.set_reg(HV_REG_X0, 0x564d_4d54_524e_4701).map_err(|e| e.to_string())?; // "VMMTRNG"
-                self.set_reg(HV_REG_X1, 0x0000_4000_8000_0000u64).map_err(|e| e.to_string())?;
-                self.set_reg(HV_REG_X2, 0xa000_0000_0000_0001u64).map_err(|e| e.to_string())?;
-                self.set_reg(HV_REG_X3, 0x0000_0000_0000_0001u64).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0, 0x564d_4d54_524e_4701)
+                    .map_err(|e| e.to_string())?; // "VMMTRNG"
+                self.set_reg(HV_REG_X1, 0x0000_4000_8000_0000u64)
+                    .map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X2, 0xa000_0000_0000_0001u64)
+                    .map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X3, 0x0000_0000_0000_0001u64)
+                    .map_err(|e| e.to_string())?;
                 Ok(None)
             }
             SMCCC_TRNG_RND32 | SMCCC_TRNG_RND64 => {
@@ -809,7 +930,8 @@ impl Vcpu {
                     | PSCI_MIGRATE_INFO_TYPE => PSCI_SUCCESS,
                     _ => PSCI_NOT_SUPPORTED,
                 };
-                self.set_reg(HV_REG_X0, ret as u64).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0, ret as u64)
+                    .map_err(|e| e.to_string())?;
                 Ok(None)
             }
             // PSCI CPU_ON (0xc4000003 for 64-bit, 0x84000003 for 32-bit)
@@ -820,7 +942,11 @@ impl Vcpu {
 
                 let ret = if let Some(ref mgr) = self.manager {
                     if let Some(slot) = mgr.get_slot_by_mpidr(target_cpu) {
-                        if slot.is_online.load(Ordering::Relaxed) {
+                        if slot
+                            .is_online
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
                             PSCI_ALREADY_ON
                         } else {
                             {
@@ -830,7 +956,6 @@ impl Vcpu {
                                     context_id,
                                 });
                             }
-                            slot.is_online.store(true, Ordering::Relaxed);
                             slot.condvar.notify_one();
                             println!(
                                 "[PSCI] CPU_ON target 0x{:x} (core {}) -> entry 0x{:016x}, ctx 0x{:016x}",
@@ -845,7 +970,8 @@ impl Vcpu {
                     PSCI_INVALID_PARAMETERS
                 };
 
-                self.set_reg(HV_REG_X0, ret as u64).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0, ret as u64)
+                    .map_err(|e| e.to_string())?;
                 Ok(None)
             }
             // PSCI CPU_OFF (0x84000002)
@@ -872,13 +998,18 @@ impl Vcpu {
             // PSCI SYSTEM_RESET (0x84000009)
             PSCI_SYSTEM_RESET => {
                 if let Some(ref mgr) = self.manager {
+                    mgr.reset_requested.store(true, Ordering::Relaxed);
                     mgr.request_shutdown();
                 }
                 Ok(Some(VcpuExitStatus::Reset))
             }
             _ => {
-                eprintln!("[VMM Warning] Unhandled PSCI function ID: 0x{:08x}", func_id);
-                self.set_reg(HV_REG_X0, PSCI_NOT_SUPPORTED as u64).map_err(|e| e.to_string())?;
+                eprintln!(
+                    "[VMM Warning] Unhandled PSCI function ID: 0x{:08x}",
+                    func_id
+                );
+                self.set_reg(HV_REG_X0, PSCI_NOT_SUPPORTED as u64)
+                    .map_err(|e| e.to_string())?;
                 Ok(None)
             }
         }
@@ -893,5 +1024,54 @@ impl Drop for Vcpu {
         unsafe {
             let _ = hv_vcpu_destroy(self.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn shutdown_wakes_a_cpu_that_was_never_started() {
+        let manager = VcpuManager::new(
+            2,
+            CpuModel {
+                midr: 0,
+                name: "test",
+            },
+        );
+        let slot = manager.slots()[0].clone();
+        let worker_manager = manager.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            tx.send(worker_manager.wait_for_boot(&slot).is_none())
+                .unwrap();
+        });
+        manager.request_shutdown();
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+    }
+    #[test]
+    fn secondary_slot_can_be_released_more_than_once() {
+        let manager = VcpuManager::new(
+            2,
+            CpuModel {
+                midr: 0,
+                name: "test",
+            },
+        );
+        let slot = &manager.slots()[0];
+        for entry_point in [0x4000, 0x8000] {
+            *slot.boot_args.lock().unwrap() = Some(SecondaryBootArgs {
+                entry_point,
+                context_id: 1,
+            });
+            assert_eq!(
+                manager.wait_for_boot(slot).unwrap().entry_point,
+                entry_point
+            );
+            assert!(slot.boot_args.lock().unwrap().is_none());
+        }
+        manager.request_shutdown();
+        assert!(manager.wait_for_boot(slot).is_none());
     }
 }

@@ -7,6 +7,8 @@ mod hypervisor;
 mod memory;
 mod preload;
 mod terminal;
+#[cfg(test)]
+mod test_support;
 mod vcpu;
 mod vm;
 
@@ -20,18 +22,18 @@ use std::thread;
 use devices::fw_cfg::FwCfg;
 use devices::rtc::Pl031Rtc;
 use devices::uart::Pl011Uart;
+use devices::usb::xhci::{XhciController, MMIO_XHCI_SIZE};
 use devices::virtio::block::VirtioBlock;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::rng::VirtioRng;
 use devices::virtio::VirtioConsole;
 use devices::virtio::VirtioInput;
-use devices::usb::xhci::{XhciController, MMIO_XHCI_SIZE};
 use vcpu::{CpuModel, Vcpu, VcpuExitStatus, VcpuManager};
 use vm::Vm;
 
 const DEFAULT_RAM_BASE: u64 = 0x4000_0000;
 const DEFAULT_BAREMETAL_RAM_SIZE: usize = 64 * 1024 * 1024; // 64 MB
-const DEFAULT_OS_RAM_SIZE: usize = 1024 * 1024 * 1024;      // 1024 MB (1GB) for FreeBSD/Linux
+const DEFAULT_OS_RAM_SIZE: usize = 1024 * 1024 * 1024; // 1024 MB (1GB) for FreeBSD/Linux
 
 const MMIO_GICD_BASE: u64 = 0x0800_0000;
 const MMIO_GICR_BASE: u64 = 0x080a_0000;
@@ -115,6 +117,7 @@ fn main() {
     let mut is_freebsd = false;
     let mut is_uefi = false;
     let mut firmware_path: Option<String> = None;
+    let mut efi_vars_path: Option<String> = None;
     let mut is_multiuser = false;
     let mut ssh_port: Option<u16> = None;
     let mut net_mode: Option<String> = None;
@@ -128,6 +131,13 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--efi-vars" => {
+                i += 1;
+                efi_vars_path = Some(args.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("--efi-vars requires a path");
+                    process::exit(1);
+                }));
+            }
             "--uefi" | "--firmware" => {
                 is_uefi = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
@@ -153,7 +163,10 @@ fn main() {
                     if let Ok(port) = args[i].parse::<u16>() {
                         ssh_port = Some(port);
                     } else {
-                        eprintln!("\x1b[1;31m[VMM Error] Invalid SSH port: '{}'\x1b[0m", args[i]);
+                        eprintln!(
+                            "\x1b[1;31m[VMM Error] Invalid SSH port: '{}'\x1b[0m",
+                            args[i]
+                        );
                         process::exit(1);
                     }
                 }
@@ -177,11 +190,18 @@ fn main() {
                             "cow" => cow = true,
                             "ro" | "readonly" => read_only = true,
                             _ => {
-                                eprintln!("\x1b[1;33m[VMM Warning] Unknown disk option '{}'\x1b[0m", opt);
+                                eprintln!(
+                                    "\x1b[1;33m[VMM Warning] Unknown disk option '{}'\x1b[0m",
+                                    opt
+                                );
                             }
                         }
                     }
-                    disk_configs.push(DiskConfig { path, cow, read_only });
+                    disk_configs.push(DiskConfig {
+                        path,
+                        cow,
+                        read_only,
+                    });
                 }
             }
             "--cdrom" | "--iso" => {
@@ -215,7 +235,10 @@ fn main() {
                     if let Ok(mb) = args[i].parse::<usize>() {
                         ram_mb = Some(mb);
                     } else {
-                        eprintln!("\x1b[1;31m[VMM Error] Invalid RAM size: '{}'\x1b[0m", args[i]);
+                        eprintln!(
+                            "\x1b[1;31m[VMM Error] Invalid RAM size: '{}'\x1b[0m",
+                            args[i]
+                        );
                         process::exit(1);
                     }
                 }
@@ -225,12 +248,17 @@ fn main() {
                     i += 1;
                     if let Ok(c) = args[i].parse::<usize>() {
                         if c == 0 || c > 16 {
-                            eprintln!("\x1b[1;31m[VMM Error] CPU count must be between 1 and 16\x1b[0m");
+                            eprintln!(
+                                "\x1b[1;31m[VMM Error] CPU count must be between 1 and 16\x1b[0m"
+                            );
                             process::exit(1);
                         }
                         cpus = c;
                     } else {
-                        eprintln!("\x1b[1;31m[VMM Error] Invalid CPU count: '{}'\x1b[0m", args[i]);
+                        eprintln!(
+                            "\x1b[1;31m[VMM Error] Invalid CPU count: '{}'\x1b[0m",
+                            args[i]
+                        );
                         process::exit(1);
                     }
                 }
@@ -271,7 +299,10 @@ fn main() {
                     if let Some(mac) = parse_mac(&args[i]) {
                         mac_addr = mac;
                     } else {
-                        eprintln!("\x1b[1;31m[VMM Error] Invalid MAC address: '{}'\x1b[0m", args[i]);
+                        eprintln!(
+                            "\x1b[1;31m[VMM Error] Invalid MAC address: '{}'\x1b[0m",
+                            args[i]
+                        );
                         process::exit(1);
                     }
                 }
@@ -303,10 +334,15 @@ fn main() {
                 println!("  -r, --root <DEV>         Root filesystem (e.g. ufs:/dev/vtbd0p2 or zfs:zroot/ROOT/default)");
                 println!("      --module <PATH>      Preload a FreeBSD .ko (repeatable; zfs.ko is auto-loaded for ZFS root)");
                 println!("  -b, --bootargs <ARGS>    Custom kernel boot arguments");
-                println!("  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)");
+                println!(
+                    "  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)"
+                );
                 println!("  -n, --net <MODE>         Network mode: vmnet (default NAT), bridge[:iface], tap:<dev>, mock, none");
-                println!("      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)");
+                println!(
+                    "      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)"
+                );
                 println!("      --vnc [ADDR]          Enable simple-framebuffer + VNC + USB HID (default 127.0.0.1:5900)");
+                println!("      --efi-vars <PATH>     Persistent per-VM EFI variable store (default <disk>.vars.fd)");
                 println!("  -h, --help               Display this help message");
                 return;
             }
@@ -316,7 +352,10 @@ fn main() {
                 }
             }
             _ => {
-                eprintln!("\x1b[1;33m[VMM Warning] Unknown argument '{}'\x1b[0m", args[i]);
+                eprintln!(
+                    "\x1b[1;33m[VMM Warning] Unknown argument '{}'\x1b[0m",
+                    args[i]
+                );
             }
         }
         i += 1;
@@ -363,18 +402,15 @@ fn main() {
         }
     }
 
-    let needs_zfs = root_dev
-        .as_deref()
-        .is_some_and(|r| r.starts_with("zfs:"))
-        || module_paths.iter().any(|p| p.ends_with("zfs.ko") || p.ends_with("/zfs"));
+    let needs_zfs = root_dev.as_deref().is_some_and(|r| r.starts_with("zfs:"))
+        || module_paths
+            .iter()
+            .any(|p| p.ends_with("zfs.ko") || p.ends_with("/zfs"));
     if needs_zfs
         && !is_uefi
-        && !module_paths.iter().any(|p| {
-            std::path::Path::new(p)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                == Some("zfs")
-        })
+        && !module_paths
+            .iter()
+            .any(|p| std::path::Path::new(p).file_stem().and_then(|s| s.to_str()) == Some("zfs"))
     {
         let default_zfs = "boot/kernel/zfs.ko";
         if std::path::Path::new(default_zfs).exists() {
@@ -398,17 +434,21 @@ fn main() {
         let fw = match fs::read(&path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("\x1b[1;31m[VMM Error] Failed to read UEFI firmware '{path}': {e}\x1b[0m");
+                eprintln!(
+                    "\x1b[1;31m[VMM Error] Failed to read UEFI firmware '{path}': {e}\x1b[0m"
+                );
                 eprintln!("\x1b[1;33m[VMM Hint] Run 'make fetch-uefi' to download firmware/QEMU_EFI.fd.\x1b[0m");
                 process::exit(1);
             }
         };
-        let ram_size = ram_mb.map(|mb| mb * 1024 * 1024).unwrap_or(DEFAULT_OS_RAM_SIZE);
+        let ram_size = ram_mb
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(DEFAULT_OS_RAM_SIZE);
         let bootargs = custom_bootargs.unwrap_or_else(|| "console=ttyAMA0".to_string());
         if let Some(port) = ssh_port {
             forward::start_port_forward(port, "192.168.18.2:22".to_string());
         }
-        boot_os_kernel(
+        finish_boot(boot_os_kernel(
             &path,
             &[],
             &disk_configs,
@@ -424,7 +464,8 @@ fn main() {
             None,
             Some(&fw),
             vnc_bind.as_deref(),
-        );
+            efi_vars_path.as_deref(),
+        ));
         return;
     }
 
@@ -432,7 +473,10 @@ fn main() {
         let file_data = match fs::read(path) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("\x1b[1;31m[VMM Error] Failed to read file '{}': {}\x1b[0m", path, e);
+                eprintln!(
+                    "\x1b[1;31m[VMM Error] Failed to read file '{}': {}\x1b[0m",
+                    path, e
+                );
                 process::exit(1);
             }
         };
@@ -454,9 +498,9 @@ fn main() {
                         "-h boot_serial=YES console=comconsole"
                     };
                     match root_dev {
-                        Some(ref root) => format!(
-                            "FreeBSD: -v{s_flag} {console} vfs.root.mountfrom={root}"
-                        ),
+                        Some(ref root) => {
+                            format!("FreeBSD: -v{s_flag} {console} vfs.root.mountfrom={root}")
+                        }
                         None => format!("FreeBSD: -v{s_flag} {console}"),
                     }
                 }
@@ -466,7 +510,7 @@ fn main() {
                 forward::start_port_forward(port, "192.168.18.2:22".to_string());
             }
 
-            boot_os_kernel(
+            finish_boot(boot_os_kernel(
                 path,
                 &file_data,
                 &disk_configs,
@@ -482,7 +526,8 @@ fn main() {
                 root_dev.as_deref(),
                 None,
                 vnc_bind.as_deref(),
-            );
+                efi_vars_path.as_deref(),
+            ));
             return;
         } else {
             let ram_size = ram_mb
@@ -497,7 +542,12 @@ fn main() {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
-    boot_flat_binary("embedded EL1 baremetal test suite", DEFAULT_PAYLOAD, DEFAULT_BAREMETAL_RAM_SIZE, cpu_model);
+    boot_flat_binary(
+        "embedded EL1 baremetal test suite",
+        DEFAULT_PAYLOAD,
+        DEFAULT_BAREMETAL_RAM_SIZE,
+        cpu_model,
+    );
 }
 
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -529,14 +579,18 @@ fn boot_os_kernel(
     root_dev: Option<&str>,
     uefi_firmware: Option<&[u8]>,
     vnc_bind: Option<&str>,
-) {
+    efi_vars_path: Option<&str>,
+) -> Result<bool, String> {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
     if uefi_firmware.is_some() {
         println!("[VMM] Preparing UEFI/EDK2 boot from '{}'...", kernel_path);
     } else {
-        println!("[VMM] Preparing to boot OS kernel from '{}'...", kernel_path);
+        println!(
+            "[VMM] Preparing to boot OS kernel from '{}'...",
+            kernel_path
+        );
     }
     println!(
         "[VMM] Allocating {}MB RAM at GPA 0x{:08x}...",
@@ -549,7 +603,10 @@ fn boot_os_kernel(
     let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
         Ok(vm) => vm,
         Err(e) => {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m", e);
+            eprintln!(
+                "\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m",
+                e
+            );
             eprintln!("[VMM Hint] Ensure binary is signed with 'com.apple.security.hypervisor' entitlement.");
             process::exit(1);
         }
@@ -558,22 +615,33 @@ fn boot_os_kernel(
     // Initialize native in-kernel ARM GICv3
     println!("[VMM] Initializing in-kernel ARM GICv3 device...");
     if let Err(e) = vm.init_gic(MMIO_GICD_BASE, MMIO_GICR_BASE) {
-        eprintln!("\x1b[1;31m[VMM Error] Failed to create GICv3 device: {}\x1b[0m", e);
+        eprintln!(
+            "\x1b[1;31m[VMM Error] Failed to create GICv3 device: {}\x1b[0m",
+            e
+        );
         process::exit(1);
     }
     println!("\x1b[1;32m[VMM] In-kernel GICv3 initialized successfully.\x1b[0m");
+    let vcpu_mgr = VcpuManager::new(cpus, cpu_model);
+    terminal::install_shutdown_handlers();
 
     // Attach interactive PL011 UART console
-    vm.mmio_mut()
-        .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::with_log(UART_IRQ, true, serial_log)));
+    vm.mmio_mut().register(
+        MMIO_UART_BASE,
+        MMIO_UART_SIZE,
+        Box::new(Pl011Uart::with_log(UART_IRQ, true, serial_log)),
+    );
     println!(
         "[VMM] Registered interactive PL011 UART console at GPA 0x{:08x} (IRQ {})",
         MMIO_UART_BASE, UART_IRQ
     );
 
     // Attach ARM PL031 Real-Time Clock
-    vm.mmio_mut()
-        .register(MMIO_RTC_BASE, MMIO_RTC_SIZE, Box::new(Pl031Rtc::new(RTC_IRQ)));
+    vm.mmio_mut().register(
+        MMIO_RTC_BASE,
+        MMIO_RTC_SIZE,
+        Box::new(Pl031Rtc::new(RTC_IRQ)),
+    );
     println!(
         "[VMM] Registered ARM PL031 RTC at GPA 0x{:08x} (IRQ {})",
         MMIO_RTC_BASE, RTC_IRQ
@@ -586,7 +654,10 @@ fn boot_os_kernel(
         let (base, irq) = if idx == 0 {
             (MMIO_VIRTIO_BLK_BASE, VIRTIO_BLK_IRQ)
         } else {
-            (0x0a00_0800 + ((idx - 1) as u64) * 0x0200, 39 + ((idx - 1) as u32))
+            (
+                0x0a00_0800 + ((idx - 1) as u64) * 0x0200,
+                39 + ((idx - 1) as u32),
+            )
         };
         let serial_id = format!("vmm-disk-{}", idx);
         let blk_res = if disk.cow {
@@ -598,7 +669,8 @@ fn boot_os_kernel(
 
         match blk_res {
             Ok(blk) => {
-                vm.mmio_mut().register(base, MMIO_VIRTIO_BLK_SIZE, Box::new(blk));
+                vm.mmio_mut()
+                    .register(base, MMIO_VIRTIO_BLK_SIZE, Box::new(blk));
                 virtio_devices.push(fdt::VirtioMmioDevice {
                     base,
                     size: MMIO_VIRTIO_BLK_SIZE,
@@ -618,9 +690,17 @@ fn boot_os_kernel(
 
     // Attach VirtIO-MMIO Network Device
     if net_mode != Some("none") {
-        let virtio_net = VirtioNet::new(mac_addr, VIRTIO_NET_IRQ, vm.memory(), net_mode.unwrap_or("vmnet"));
-        vm.mmio_mut()
-            .register(MMIO_VIRTIO_NET_BASE, MMIO_VIRTIO_NET_SIZE, Box::new(virtio_net));
+        let virtio_net = VirtioNet::new(
+            mac_addr,
+            VIRTIO_NET_IRQ,
+            vm.memory(),
+            net_mode.unwrap_or("vmnet"),
+        );
+        vm.mmio_mut().register(
+            MMIO_VIRTIO_NET_BASE,
+            MMIO_VIRTIO_NET_SIZE,
+            Box::new(virtio_net),
+        );
         virtio_devices.push(fdt::VirtioMmioDevice {
             base: MMIO_VIRTIO_NET_BASE,
             size: MMIO_VIRTIO_NET_SIZE,
@@ -634,8 +714,11 @@ fn boot_os_kernel(
 
     // Attach VirtIO-MMIO Random Number Generator
     let virtio_rng = VirtioRng::new(VIRTIO_RNG_IRQ, vm.memory());
-    vm.mmio_mut()
-        .register(MMIO_VIRTIO_RNG_BASE, MMIO_VIRTIO_RNG_SIZE, Box::new(virtio_rng));
+    vm.mmio_mut().register(
+        MMIO_VIRTIO_RNG_BASE,
+        MMIO_VIRTIO_RNG_SIZE,
+        Box::new(virtio_rng),
+    );
     virtio_devices.push(fdt::VirtioMmioDevice {
         base: MMIO_VIRTIO_RNG_BASE,
         size: MMIO_VIRTIO_RNG_SIZE,
@@ -654,8 +737,11 @@ fn boot_os_kernel(
         term_size.ws_col,
         term_size.ws_row,
     )));
-    vm.mmio_mut()
-        .register_shared(MMIO_VIRTIO_CONSOLE_BASE, MMIO_VIRTIO_CONSOLE_SIZE, virtio_console.clone());
+    vm.mmio_mut().register_shared(
+        MMIO_VIRTIO_CONSOLE_BASE,
+        MMIO_VIRTIO_CONSOLE_SIZE,
+        virtio_console.clone(),
+    );
     virtio_devices.push(fdt::VirtioMmioDevice {
         base: MMIO_VIRTIO_CONSOLE_BASE,
         size: MMIO_VIRTIO_CONSOLE_SIZE,
@@ -669,11 +755,18 @@ fn boot_os_kernel(
     // Spawn SIGWINCH resize watcher thread to forward host terminal size changes
     terminal::install_sigwinch_handler();
     let console_watcher = virtio_console.clone();
-    thread::Builder::new()
+    let resize_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resize_stop_worker = resize_stop.clone();
+    let resize_manager = vcpu_mgr.clone();
+    let resize_worker = thread::Builder::new()
         .name("vmm-sigwinch".into())
         .spawn(move || {
-            loop {
+            while !resize_stop_worker.load(Ordering::Relaxed) {
                 thread::sleep(std::time::Duration::from_millis(100));
+                if terminal::shutdown_requested() {
+                    resize_manager.request_shutdown();
+                    break;
+                }
                 if let Some(new_ws) = terminal::check_and_clear_resize() {
                     let mut con = console_watcher.lock().unwrap();
                     let (old_cols, old_rows) = con.get_size();
@@ -701,7 +794,8 @@ fn boot_os_kernel(
             devices::display::FB_WIDTH as u16,
             devices::display::FB_HEIGHT as u16,
         )));
-        vm.mmio_mut().register_shared(MMIO_XHCI_BASE, MMIO_XHCI_SIZE, xhci.clone());
+        vm.mmio_mut()
+            .register_shared(MMIO_XHCI_BASE, MMIO_XHCI_SIZE, xhci.clone());
         println!(
             "[VMM] Registered platform xHCI (generic-xhci) at GPA 0x{:08x} size 0x{:x} (IRQ {})",
             MMIO_XHCI_BASE, MMIO_XHCI_SIZE, XHCI_IRQ
@@ -798,13 +892,12 @@ fn boot_os_kernel(
         }
     };
 
+    let mut vnc_server = None;
     if let Some(bind_str) = vnc_bind {
-        let addr: std::net::SocketAddr = bind_str
-            .parse()
-            .unwrap_or_else(|_| {
-                eprintln!("\x1b[1;31m[VMM Error] Invalid --vnc address '{bind_str}'\x1b[0m");
-                process::exit(1);
-            });
+        let addr: std::net::SocketAddr = bind_str.parse().unwrap_or_else(|_| {
+            eprintln!("\x1b[1;31m[VMM Error] Invalid --vnc address '{bind_str}'\x1b[0m");
+            process::exit(1);
+        });
         let fb = fb_cfg.expect("fb_cfg set when vnc_bind is Some");
         match devices::display::vnc::spawn(
             vm.memory(),
@@ -814,14 +907,15 @@ fn boot_os_kernel(
             vnc_tablet.clone(),
             vnc_usb.clone(),
         ) {
-            Ok(_) => {}
+            Ok(server) => {
+                vnc_server = Some(server);
+            }
             Err(e) => {
                 eprintln!("\x1b[1;31m[VMM Error] VNC server failed: {e}\x1b[0m");
                 process::exit(1);
             }
         }
     }
-
 
     // -------------------------------------------------------------------
     // Boot path dispatch: UEFI firmware vs direct ELF kernel
@@ -840,9 +934,7 @@ fn boot_os_kernel(
         let fw_cfg = FwCfg::new(vm.memory(), dtb_bytes);
         vm.mmio_mut()
             .register(MMIO_FW_CFG_BASE, MMIO_FW_CFG_SIZE, Box::new(fw_cfg));
-        println!(
-            "[VMM] Registered QEMU fw_cfg at GPA 0x{MMIO_FW_CFG_BASE:08x}"
-        );
+        println!("[VMM] Registered QEMU fw_cfg at GPA 0x{MMIO_FW_CFG_BASE:08x}");
         if let Err(e) = vm.map_firmware(0, fw) {
             eprintln!("\x1b[1;31m[VMM Error] {e}\x1b[0m");
             process::exit(1);
@@ -864,8 +956,17 @@ fn boot_os_kernel(
                 }
             };
             let vars_len = vars.len() as u64;
-            let pflash = devices::pflash::CfiPflash::new(vars);
-            vm.mmio_mut().register(EFI_VARS_GPA, vars_len, Box::new(pflash));
+            let default_store = disk_configs
+                .first()
+                .map(|d| format!("{}.vars.fd", d.path))
+                .unwrap_or_else(|| format!("{kernel_path}.vars.fd"));
+            let store = std::path::Path::new(efi_vars_path.unwrap_or(&default_store));
+            let pflash = devices::pflash::CfiPflash::open(store, vars).unwrap_or_else(|e| {
+                eprintln!("[VMM Error] {e}");
+                process::exit(1);
+            });
+            vm.mmio_mut()
+                .register(EFI_VARS_GPA, vars_len, Box::new(pflash));
             println!(
                 "[VMM] EFI vars CFI pflash ({:.2} MB) at GPA 0x{EFI_VARS_GPA:08x} (MMIO)",
                 vars_len as f64 / (1024.0 * 1024.0)
@@ -881,7 +982,10 @@ fn boot_os_kernel(
         let loaded = match elf::load_elf64(elf_data, &vm.memory(), kernel_phys_load) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("\x1b[1;31m[VMM Error] Failed to load kernel ELF: {}\x1b[0m", e);
+                eprintln!(
+                    "\x1b[1;31m[VMM Error] Failed to load kernel ELF: {}\x1b[0m",
+                    e
+                );
                 process::exit(1);
             }
         };
@@ -898,7 +1002,10 @@ fn boot_os_kernel(
         let x0 = if module_paths.is_empty() {
             let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000;
             if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
-                eprintln!("\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m", e);
+                eprintln!(
+                    "\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m",
+                    e
+                );
                 process::exit(1);
             }
             println!(
@@ -914,7 +1021,10 @@ fn boot_os_kernel(
 
             let dtb_gpa = next;
             if let Err(e) = vm.memory().write(dtb_gpa, &dtb_bytes) {
-                eprintln!("\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m", e);
+                eprintln!(
+                    "\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m",
+                    e
+                );
                 process::exit(1);
             }
             next = align_up(dtb_gpa + dtb_bytes.len() as u64, page);
@@ -929,7 +1039,9 @@ fn boot_os_kernel(
                 let data = match fs::read(path) {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!("\x1b[1;31m[VMM Error] Failed to read module '{path}': {e}\x1b[0m");
+                        eprintln!(
+                            "\x1b[1;31m[VMM Error] Failed to read module '{path}': {e}\x1b[0m"
+                        );
                         process::exit(1);
                     }
                 };
@@ -942,7 +1054,9 @@ fn boot_os_kernel(
                     process::exit(1);
                 }
                 if let Err(e) = vm.memory().write(next, &data) {
-                    eprintln!("\x1b[1;31m[VMM Error] Failed to write module '{path}' to RAM: {e}\x1b[0m");
+                    eprintln!(
+                        "\x1b[1;31m[VMM Error] Failed to write module '{path}' to RAM: {e}\x1b[0m"
+                    );
                     process::exit(1);
                 }
                 println!(
@@ -975,11 +1089,12 @@ fn boot_os_kernel(
                 kenv_vars.insert(0, mountfrom.as_str());
             }
             let kenv = preload::encode_kenv(&kenv_vars);
-            let mut howto = preload::RB_VERBOSE | if vnc_bind.is_some() {
-                preload::RB_MULTIPLE
-            } else {
-                preload::RB_SERIAL
-            };
+            let mut howto = preload::RB_VERBOSE
+                | if vnc_bind.is_some() {
+                    preload::RB_MULTIPLE
+                } else {
+                    preload::RB_SERIAL
+                };
             if !is_multiuser {
                 howto |= preload::RB_SINGLE;
             }
@@ -991,7 +1106,9 @@ fn boot_os_kernel(
                 to_kva(metadata_gpa),
             );
             if metadata_gpa + blob.len() as u64 > DEFAULT_RAM_BASE + ram_size as u64 {
-                eprintln!("\x1b[1;31m[VMM Error] Preload metadata does not fit in guest RAM\x1b[0m");
+                eprintln!(
+                    "\x1b[1;31m[VMM Error] Preload metadata does not fit in guest RAM\x1b[0m"
+                );
                 process::exit(1);
             }
             if let Err(e) = vm.memory().write(metadata_gpa, &blob) {
@@ -1024,7 +1141,6 @@ fn boot_os_kernel(
     );
 
     // Set up Multi-vCPU manager
-    let vcpu_mgr = VcpuManager::new(cpus, cpu_model);
     let mut secondary_threads = Vec::new();
     let mmio_shared = vm.mmio().clone();
 
@@ -1038,33 +1154,26 @@ fn boot_os_kernel(
         let handle = thread::Builder::new()
             .name(format!("vmm-vcpu-{}", cpu_idx))
             .spawn(move || {
+                while let Some(args) = mgr_clone.wait_for_boot(&slot_clone) {
                 // Initialize secondary vCPU on its own OS thread (Apple Hypervisor affinity requirement)
-                let mut vcpu = match Vcpu::with_manager(cpu_idx, Some(mgr_clone)) {
+                let mut vcpu = match Vcpu::with_manager(cpu_idx, Some(mgr_clone.clone())) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("\x1b[1;31m[VMM Error] Failed to create secondary vCPU {}: {}\x1b[0m", cpu_idx, e);
+                        mgr_clone.fail(format!("Failed to create CPU {cpu_idx}: {e}"));
                         return;
                     }
                 };
 
-                // Park on condvar until PSCI CPU_ON release
-                let boot_args = {
-                    let mut guard = slot_clone.boot_args.lock().unwrap();
-                    while guard.is_none() {
-                        if slot_clone.is_online.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        guard = slot_clone.condvar.wait(guard).unwrap();
-                    }
-                    guard.take()
-                };
-
-                if let Some(args) = boot_args {
                     if let Err(e) = vcpu.setup_secondary_boot_state(args.entry_point, args.context_id, cpu_model.midr) {
                         eprintln!("\x1b[1;31m[VMM Error] Failed to setup secondary vCPU {} boot state: {}\x1b[0m", cpu_idx, e);
+                        mgr_clone.fail(format!("Failed to initialize CPU {cpu_idx}: {e}"));
                         return;
                     }
-                    let _ = vcpu.run(&mmio_clone);
+                    if let Err(e) = vcpu.run(&mmio_clone) {
+                        crate::host_log!("[VMM] Secondary CPU {cpu_idx} failed: {e}");
+                        mgr_clone.fail(format!("CPU {cpu_idx} failed: {e}"));
+                    }
                 }
             })
             .expect("Failed to spawn secondary vCPU thread");
@@ -1076,13 +1185,19 @@ fn boot_os_kernel(
     let mut vcpu0 = match Vcpu::with_manager(0, Some(Arc::clone(&vcpu_mgr))) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to create boot vCPU 0: {}\x1b[0m", e);
+            eprintln!(
+                "\x1b[1;31m[VMM Error] Failed to create boot vCPU 0: {}\x1b[0m",
+                e
+            );
             process::exit(1);
         }
     };
 
     if let Err(e) = vcpu0.setup_os_boot_state(entry_point, x0_addr, 0, cpu_model.midr) {
-        eprintln!("\x1b[1;31m[VMM Error] Failed to setup OS boot registers: {}\x1b[0m", e);
+        eprintln!(
+            "\x1b[1;31m[VMM Error] Failed to setup OS boot registers: {}\x1b[0m",
+            e
+        );
         process::exit(1);
     }
 
@@ -1096,19 +1211,52 @@ fn boot_os_kernel(
         }
     }
 
-
     println!("[VMM] Entering interactive console (raw terminal). Press Ctrl-] to quit.");
     println!("--------------------------------------------------");
 
     // Set terminal to raw mode so keystrokes are sent immediately to the guest
     let term_guard = terminal::TerminalGuard::enter_raw_mode();
 
-    run_loop(&mut vcpu0, vm.mmio(), Some(term_guard));
+    let result = run_loop(&mut vcpu0, vm.mmio(), Some(term_guard));
 
     // Signal shutdown to secondary vCPUs and join threads
     vcpu_mgr.request_shutdown();
     for handle in secondary_threads {
         let _ = handle.join();
+    }
+    drop(vnc_server);
+    resize_stop.store(true, Ordering::Relaxed);
+    let _ = resize_worker.join();
+    let flush_result = vm.mmio().shutdown();
+    result?;
+    flush_result?;
+    if let Some(error) = vcpu_mgr.failure() {
+        return Err(error);
+    }
+    Ok(vcpu_mgr.reset_requested())
+}
+
+fn finish_boot(result: Result<bool, String>) {
+    match result {
+        Ok(false) => {}
+        Ok(true) => {
+            // All vCPUs, devices and mappings have been dropped before exec.
+            // Re-exec preserves the launch configuration and starts fresh HVF state.
+            use std::os::unix::process::CommandExt;
+            let exe = env::current_exe().unwrap_or_else(|e| {
+                eprintln!("{e}");
+                process::exit(1);
+            });
+            let error = process::Command::new(exe)
+                .args(env::args_os().skip(1))
+                .exec();
+            eprintln!("[VMM] Restart failed: {error}");
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("[VMM Error] {e}");
+            process::exit(1);
+        }
     }
 }
 
@@ -1117,13 +1265,19 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model:
     let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
         Ok(vm) => vm,
         Err(e) => {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m", e);
+            eprintln!(
+                "\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m",
+                e
+            );
             process::exit(1);
         }
     };
 
-    vm.mmio_mut()
-        .register(MMIO_UART_BASE, MMIO_UART_SIZE, Box::new(Pl011Uart::new(UART_IRQ, false)));
+    vm.mmio_mut().register(
+        MMIO_UART_BASE,
+        MMIO_UART_SIZE,
+        Box::new(Pl011Uart::new(UART_IRQ, false)),
+    );
 
     if let Err(e) = vm.memory().write(DEFAULT_RAM_BASE, payload_data) {
         eprintln!("\x1b[1;31m[VMM Error] Failed to load payload: {}\x1b[0m", e);
@@ -1146,17 +1300,28 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model:
 
     let stack_top = DEFAULT_RAM_BASE + 0x0100_0000;
     if let Err(e) = vcpu.setup_boot_state(DEFAULT_RAM_BASE, stack_top, cpu_model.midr) {
-        eprintln!("\x1b[1;31m[VMM Error] Failed to configure vCPU: {}\x1b[0m", e);
+        eprintln!(
+            "\x1b[1;31m[VMM Error] Failed to configure vCPU: {}\x1b[0m",
+            e
+        );
         process::exit(1);
     }
 
     println!("[VMM] Entering guest execution loop...");
     println!("--------------------------------------------------");
 
-    run_loop(&mut vcpu, vm.mmio(), None);
+    let result = run_loop(&mut vcpu, vm.mmio(), None);
+    let flush = vm.mmio().shutdown();
+    if let Err(e) = result.and(flush.map(|_| VcpuExitStatus::Shutdown)) {
+        eprintln!("[VMM Error] {e}");
+    }
 }
 
-fn run_loop(vcpu: &mut Vcpu, mmio: &devices::MmioBus, term_guard: Option<terminal::TerminalGuard>) {
+fn run_loop(
+    vcpu: &mut Vcpu,
+    mmio: &devices::MmioBus,
+    term_guard: Option<terminal::TerminalGuard>,
+) -> Result<VcpuExitStatus, String> {
     let result = vcpu.run(mmio);
 
     // Drop terminal guard immediately to restore cooked mode before printing exit messages.
@@ -1167,7 +1332,7 @@ fn run_loop(vcpu: &mut Vcpu, mmio: &devices::MmioBus, term_guard: Option<termina
     print!("\r\n");
     let _ = std::io::stdout().flush();
 
-    match result {
+    match &result {
         Ok(status) => {
             println!("--------------------------------------------------");
             match status {
@@ -1175,10 +1340,14 @@ fn run_loop(vcpu: &mut Vcpu, mmio: &devices::MmioBus, term_guard: Option<termina
                     println!("\x1b[1;32m[VMM] VM exited: Guest requested PSCI SYSTEM_OFF.\x1b[0m");
                 }
                 VcpuExitStatus::Reset => {
-                    println!("\x1b[1;33m[VMM] VM exited: Guest requested PSCI SYSTEM_RESET.\x1b[0m");
+                    println!(
+                        "\x1b[1;33m[VMM] VM exited: Guest requested PSCI SYSTEM_RESET.\x1b[0m"
+                    );
                 }
                 VcpuExitStatus::Halted => {
-                    println!("\x1b[1;34m[VMM] VM execution stopped: Guest executed WFI (Halted).\x1b[0m");
+                    println!(
+                        "\x1b[1;34m[VMM] VM execution stopped: Guest executed WFI (Halted).\x1b[0m"
+                    );
                 }
                 VcpuExitStatus::Canceled => {
                     println!("\x1b[1;33m[VMM] VM execution canceled.\x1b[0m");
@@ -1188,9 +1357,11 @@ fn run_loop(vcpu: &mut Vcpu, mmio: &devices::MmioBus, term_guard: Option<termina
         Err(e) => {
             println!("--------------------------------------------------");
             eprintln!("\x1b[1;31m[VMM Error] Guest execution fault: {}\x1b[0m", e);
-            process::exit(1);
         }
     }
 
-    println!("\x1b[1;32m[VMM] Virtual machine terminated cleanly.\x1b[0m");
+    if result.is_ok() {
+        println!("[VMM] Guest execution stopped; shutting down devices.");
+    }
+    result
 }

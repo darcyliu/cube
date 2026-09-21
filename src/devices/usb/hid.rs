@@ -88,18 +88,20 @@ impl HidFrontend {
 
     /// Absolute pointer in framebuffer pixels; buttons: bit0=L bit1=M bit2=R (RFB).
     pub fn pointer_event(&mut self, x: u16, y: u16, buttons: u8) {
-        let x = x.min(self.abs_max_x);
-        let y = y.min(self.abs_max_y);
+        let max_x = self.abs_max_x.saturating_sub(1).max(1);
+        let max_y = self.abs_max_y.saturating_sub(1).max(1);
+        let x = x.min(max_x);
+        let y = y.min(max_y);
         // Scale to QEMU tablet logical max 0x7fff.
         let sx = if self.abs_max_x == 0 {
             0
         } else {
-            ((x as u32) * 0x7fff / self.abs_max_x as u32) as u16
+            ((x as u32) * 0x7fff / max_x as u32) as u16
         };
         let sy = if self.abs_max_y == 0 {
             0
         } else {
-            ((y as u32) * 0x7fff / self.abs_max_y as u32) as u16
+            ((y as u32) * 0x7fff / max_y as u32) as u16
         };
         // RFB: 1=left, 2=middle, 4=right → HID: bit0=left, bit1=right, bit2=middle
         let hid_btn = (buttons & 1) | ((buttons & 4) >> 1) | ((buttons & 2) << 1);
@@ -107,6 +109,15 @@ impl HidFrontend {
         self.tablet_x = sx;
         self.tablet_y = sy;
         self.push_tablet_report();
+        if let Some(report) = self.tablet_pending.back_mut() {
+            report[5] = if buttons & 8 != 0 {
+                1
+            } else if buttons & 16 != 0 {
+                (-1i8) as u8
+            } else {
+                0
+            };
+        }
     }
 
     fn push_kbd_report(&mut self) {
@@ -498,6 +509,17 @@ pub fn handle_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tablet_reaches_screen_edges_and_reports_wheel() {
+        let mut hid = HidFrontend::new(1280, 720);
+        hid.pointer_event(1279, 719, 8);
+        assert_eq!(
+            hid.take_tablet_report().unwrap(),
+            [0, 255, 127, 255, 127, 1]
+        );
+        hid.pointer_event(0, 0, 16 | 4);
+        assert_eq!(hid.take_tablet_report().unwrap(), [2, 0, 0, 0, 0, 255]);
+    }
     #[test]
     fn standard_interface_request_returns_hid_descriptors() {
         for kind in [HidKind::Keyboard, HidKind::Tablet] {

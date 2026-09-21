@@ -108,13 +108,23 @@ impl VirtioConsole {
             return;
         }
 
+        let count = match self.tx_queue.pending_count(&self.mem) {
+            Ok(n) => n,
+            Err(_) => {
+                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                return;
+            }
+        };
         let mut processed_any = false;
-        loop {
+        for _ in 0..count {
             std::sync::atomic::fence(Ordering::SeqCst);
             let avail_idx = match self.mem.read_u16(self.tx_queue.avail_ring + 2) {
                 Ok(idx) => idx,
                 Err(e) => {
-                    eprintln!("[VirtIO-Console Error] Failed to read avail ring idx: {}", e);
+                    eprintln!(
+                        "[VirtIO-Console Error] Failed to read avail ring idx: {}",
+                        e
+                    );
                     break;
                 }
             };
@@ -124,7 +134,9 @@ impl VirtioConsole {
             }
 
             let head = match self.mem.read_u16(
-                self.tx_queue.avail_ring + 4 + 2 * (self.tx_queue.last_avail_idx as u64 % q_size as u64),
+                self.tx_queue.avail_ring
+                    + 4
+                    + 2 * (self.tx_queue.last_avail_idx as u64 % q_size as u64),
             ) {
                 Ok(h) => h,
                 Err(e) => {
@@ -135,66 +147,35 @@ impl VirtioConsole {
 
             self.tx_queue.last_avail_idx = self.tx_queue.last_avail_idx.wrapping_add(1);
 
-            let mut curr = head;
-            let mut total_read = 0u32;
-            let mut tx_buf = [0u8; 512];
-
-            loop {
-                if curr as u32 >= q_size {
+            let descriptors = match self
+                .tx_queue
+                .descriptors(&self.mem, head, false, 1024 * 1024)
+            {
+                Ok(d) if d.iter().all(|d| d.flags & VRING_DESC_F_WRITE == 0) => d,
+                _ => {
+                    self.status |= VIRTIO_STATUS_NEEDS_RESET;
                     break;
                 }
-
-                let desc_addr = self.tx_queue.desc_table + (curr as u64) * 16;
-                let addr = match self.mem.read_u64(desc_addr) {
-                    Ok(a) => a,
-                    Err(_) => break,
-                };
-                let len = match self.mem.read_u32(desc_addr + 8) {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
-                let flags = match self.mem.read_u16(desc_addr + 12) {
-                    Ok(f) => f,
-                    Err(_) => break,
-                };
-                let next = match self.mem.read_u16(desc_addr + 14) {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-
-                // Device reads data from driver (driver writes)
-                let is_write = (flags & VRING_DESC_F_WRITE) != 0;
-                if !is_write {
-                    let mut offset = 0;
-                    while offset < len as usize {
-                        let chunk = (len as usize - offset).min(tx_buf.len());
-                        if self.mem.read(addr + offset as u64, &mut tx_buf[..chunk]).is_ok() {
-                            let _ = io::stdout().write_all(&tx_buf[..chunk]);
-                        }
-                        offset += chunk;
+            };
+            let mut tx_buf = [0; 512];
+            for d in descriptors {
+                let mut offset = 0;
+                while offset < d.len as usize {
+                    let n = (d.len as usize - offset).min(tx_buf.len());
+                    if self
+                        .mem
+                        .read(d.addr + offset as u64, &mut tx_buf[..n])
+                        .is_err()
+                    {
+                        self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                        return;
                     }
-                    let _ = io::stdout().flush();
-                    total_read += len;
-                }
-
-                if (flags & VRING_DESC_F_NEXT) != 0 {
-                    curr = next;
-                } else {
-                    break;
+                    let _ = io::stdout().write_all(&tx_buf[..n]);
+                    offset += n;
                 }
             }
-
-            // Write used descriptor
-            let used_idx = match self.mem.read_u16(self.tx_queue.used_ring + 2) {
-                Ok(idx) => idx,
-                Err(_) => break,
-            };
-            let elem_addr = self.tx_queue.used_ring + 4 + 8 * (used_idx as u64 % q_size as u64);
-            let _ = self.mem.write_u32(elem_addr, head as u32);
-            let _ = self.mem.write_u32(elem_addr + 4, total_read);
-
-            std::sync::atomic::fence(Ordering::SeqCst);
-            let _ = self.mem.write_u16(self.tx_queue.used_ring + 2, used_idx.wrapping_add(1));
+            let _ = io::stdout().flush();
+            publish_used(&self.mem, &mut self.tx_queue, head, 0);
             processed_any = true;
         }
 
@@ -280,7 +261,8 @@ impl MmioDevice for VirtioConsole {
             }
             VIRTIO_MMIO_DRIVER_FEATURES => {
                 if self.driver_features_sel == 0 {
-                    self.driver_features = (self.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
+                    self.driver_features =
+                        (self.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
                 } else if self.driver_features_sel == 1 {
                     self.driver_features = (self.driver_features & 0xffff_ffff) | (data << 32);
                 }

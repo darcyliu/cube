@@ -27,24 +27,29 @@ impl GuestMemory {
     /// Allocates and maps a block of guest physical memory at `guest_base`.
     /// `size` will be rounded up to the nearest 16KB page multiple.
     pub fn new(guest_base: u64, requested_size: usize) -> HvResult<Self> {
-        let size = (requested_size + GUEST_PAGE_SIZE - 1) & !(GUEST_PAGE_SIZE - 1);
+        let size = requested_size
+            .checked_add(GUEST_PAGE_SIZE - 1)
+            .map(|n| n & !(GUEST_PAGE_SIZE - 1))
+            .filter(|&n| n > 0 && guest_base.checked_add(n as u64).is_some())
+            .ok_or(crate::hypervisor::HvError(
+                crate::hypervisor::HV_BAD_ARGUMENT,
+            ))?;
         let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE)
             .map_err(|_| crate::hypervisor::HvError(crate::hypervisor::HV_BAD_ARGUMENT))?;
 
         // Allocate zeroed memory
         let raw_ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(raw_ptr)
-            .ok_or(crate::hypervisor::HvError(crate::hypervisor::HV_NO_RESOURCES))?;
+        let ptr = NonNull::new(raw_ptr).ok_or(crate::hypervisor::HvError(
+            crate::hypervisor::HV_NO_RESOURCES,
+        ))?;
 
         // Map into VM address space with Read, Write, and Execute permissions
         let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
         unsafe {
-            check_hv(hv_vm_map(
-                ptr.as_ptr() as *mut _,
-                guest_base,
-                size,
-                flags,
-            ))?;
+            if let Err(e) = check_hv(hv_vm_map(ptr.as_ptr() as *mut _, guest_base, size, flags)) {
+                dealloc(ptr.as_ptr(), layout);
+                return Err(e);
+            }
         }
 
         Ok(Self {
@@ -60,7 +65,13 @@ impl GuestMemory {
     pub fn new_test(guest_base: u64, size: usize) -> Self {
         let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE).unwrap();
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
-        Self { ptr, layout, guest_base, size, mapped: false }
+        Self {
+            ptr,
+            layout,
+            guest_base,
+            size,
+            mapped: false,
+        }
     }
 
     pub fn guest_base(&self) -> u64 {
@@ -71,44 +82,34 @@ impl GuestMemory {
         self.size
     }
 
-    /// Writes raw bytes into guest memory at the specified guest physical address.
-    pub fn write(&self, gpa: u64, data: &[u8]) -> Result<(), String> {
-        if gpa < self.guest_base || gpa + (data.len() as u64) > self.guest_base + (self.size as u64)
-        {
-            return Err(format!(
-                "Address out of bounds: GPA 0x{:x}..0x{:x} not within 0x{:x}..0x{:x}",
-                gpa,
-                gpa + data.len() as u64,
-                self.guest_base,
-                self.guest_base + self.size as u64
-            ));
-        }
+    /// Validate by subtraction, so even a guest-supplied u64::MAX cannot wrap.
+    pub fn checked_offset(&self, gpa: u64, len: usize) -> Result<usize, String> {
+        let offset = gpa
+            .checked_sub(self.guest_base)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n <= self.size && len <= self.size - n)
+            .ok_or_else(|| {
+                format!("Guest memory range out of bounds: GPA {gpa:#x}, length {len}")
+            })?;
+        Ok(offset)
+    }
 
-        let offset = (gpa - self.guest_base) as usize;
+    pub fn write(&self, gpa: u64, data: &[u8]) -> Result<(), String> {
+        let offset = self.checked_offset(gpa, data.len())?;
         unsafe {
-            let dest = self.ptr.as_ptr().add(offset);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.as_ptr().add(offset), data.len());
         }
         Ok(())
     }
 
-    /// Reads raw bytes from guest memory.
     pub fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<(), String> {
-        if gpa < self.guest_base || gpa + (buf.len() as u64) > self.guest_base + (self.size as u64)
-        {
-            return Err(format!(
-                "Address out of bounds: GPA 0x{:x}..0x{:x} not within 0x{:x}..0x{:x}",
-                gpa,
-                gpa + buf.len() as u64,
-                self.guest_base,
-                self.guest_base + self.size as u64
-            ));
-        }
-
-        let offset = (gpa - self.guest_base) as usize;
+        let offset = self.checked_offset(gpa, buf.len())?;
         unsafe {
-            let src = self.ptr.as_ptr().add(offset);
-            std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
+            std::ptr::copy_nonoverlapping(
+                self.ptr.as_ptr().add(offset),
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
         }
         Ok(())
     }
@@ -132,10 +133,7 @@ impl GuestMemory {
     }
 
     pub fn write_u16(&self, gpa: u64, val: u16) -> Result<(), String> {
-        if gpa < self.guest_base || gpa + 2 > self.guest_base + self.size as u64 {
-            return Err(format!("Address out of bounds: GPA 0x{gpa:x}"));
-        }
-        let offset = (gpa - self.guest_base) as usize;
+        let offset = self.checked_offset(gpa, 2)?;
         let bytes = val.to_le_bytes();
         unsafe {
             self.ptr.as_ptr().add(offset).write_volatile(bytes[0]);
@@ -145,10 +143,7 @@ impl GuestMemory {
     }
 
     pub fn write_u32(&self, gpa: u64, val: u32) -> Result<(), String> {
-        if gpa < self.guest_base || gpa + 4 > self.guest_base + self.size as u64 {
-            return Err(format!("Address out of bounds: GPA 0x{gpa:x}"));
-        }
-        let offset = (gpa - self.guest_base) as usize;
+        let offset = self.checked_offset(gpa, 4)?;
         let bytes = val.to_le_bytes();
         unsafe {
             for (i, b) in bytes.iter().enumerate() {
@@ -166,8 +161,28 @@ impl GuestMemory {
 impl Drop for GuestMemory {
     fn drop(&mut self) {
         unsafe {
-            if self.mapped { let _ = hv_vm_unmap(self.guest_base, self.size); }
+            if self.mapped {
+                let _ = hv_vm_unmap(self.guest_base, self.size);
+            }
             dealloc(self.ptr.as_ptr(), self.layout);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_overflow_and_cross_boundary_accesses() {
+        let m = GuestMemory::new_test(0x4000, 0x4000);
+        for addr in [0, 0x3fff, 0x7fff, u64::MAX] {
+            assert!(m.read_u16(addr).is_err());
+            assert!(m.write_u16(addr, 1).is_err());
+            assert!(m.write_u32(addr, 1).is_err());
+            assert!(m.write_u64(addr, 1).is_err());
+        }
+        m.write_u32(0x7ffc, 0x1234).unwrap();
+        assert_eq!(m.read_u32(0x7ffc).unwrap(), 0x1234);
+        assert!(m.checked_offset(0x4000, usize::MAX).is_err());
     }
 }

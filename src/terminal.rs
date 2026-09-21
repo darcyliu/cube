@@ -49,6 +49,23 @@ pub const SIGWINCH: i32 = 28;
 
 static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_PENDING: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn shutdown_handler(_sig: i32) {
+    SHUTDOWN_PENDING.store(true, Ordering::Relaxed);
+}
+
+pub fn install_shutdown_handlers() {
+    SHUTDOWN_PENDING.store(false, Ordering::Relaxed);
+    unsafe {
+        signal(2, shutdown_handler);
+        signal(15, shutdown_handler);
+    }
+}
+
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_PENDING.load(Ordering::Relaxed)
+}
 
 extern "C" fn sigwinch_handler(_sig: i32) {
     WINCH_PENDING.store(true, Ordering::SeqCst);

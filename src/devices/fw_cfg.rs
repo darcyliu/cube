@@ -122,7 +122,11 @@ impl FwCfg {
         }
 
         let mut err = 0u32;
-        if control & FW_CFG_DMA_CTL_READ != 0 {
+        if control & FW_CFG_DMA_CTL_READ != 0
+            && (length > 16 * 1024 * 1024 || self.ram.checked_offset(dma_buf, length).is_err())
+        {
+            err = FW_CFG_DMA_CTL_ERROR;
+        } else if control & FW_CFG_DMA_CTL_READ != 0 {
             let data = self.current_data();
             let start = self.offset.min(data.len());
             let end = (start + length).min(data.len());
@@ -202,8 +206,8 @@ impl MmioDevice for FwCfg {
                 }
             }
             0x14 => {
-                self.dma_addr = (self.dma_addr & 0xffff_ffff_0000_0000)
-                    | (data as u32).swap_bytes() as u64;
+                self.dma_addr =
+                    (self.dma_addr & 0xffff_ffff_0000_0000) | (data as u32).swap_bytes() as u64;
                 self.do_dma();
             }
             _ => {}

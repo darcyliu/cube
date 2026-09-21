@@ -185,6 +185,9 @@ pub struct XhciController {
     cmd_cycle: bool,
     er_enqueue: u64, // index into segment 0
     er_cycle: bool,
+    er_dequeue: u64,
+    er_used: u64,
+    pending_events: VecDeque<Trb>,
 
     slots: [SlotState; (MAX_SLOTS + 1) as usize], // 1..=MAX_SLOTS
     pending_intr: VecDeque<PendingIntr>,
@@ -234,6 +237,9 @@ impl XhciController {
             cmd_cycle: true,
             er_enqueue: 0,
             er_cycle: true,
+            er_dequeue: 0,
+            er_used: 0,
+            pending_events: VecDeque::new(),
             slots: std::array::from_fn(|_| SlotState::default()),
             pending_intr: VecDeque::new(),
             setup: [None; (MAX_SLOTS + 1) as usize],
@@ -244,6 +250,11 @@ impl XhciController {
     pub fn key_event(&mut self, linux_keycode: u16, down: bool) {
         self.hid.key_event(linux_keycode, down);
         self.try_complete_pending_intr();
+    }
+
+    #[cfg(test)]
+    pub fn keyboard_report(&self) -> [u8; 8] {
+        self.hid.current_keyboard_report()
     }
 
     pub fn pointer_event(&mut self, x: u16, y: u16, buttons: u8) {
@@ -302,6 +313,9 @@ impl XhciController {
         self.cmd_cycle = true;
         self.er_enqueue = 0;
         self.er_cycle = true;
+        self.er_dequeue = 0;
+        self.er_used = 0;
+        self.pending_events.clear();
         self.slots = std::array::from_fn(|_| SlotState::default());
         self.pending_intr.clear();
         self.setup = [None; (MAX_SLOTS + 1) as usize];
@@ -317,6 +331,7 @@ impl XhciController {
     }
 
     fn read_trb(&self, addr: u64) -> Option<Trb> {
+        self.mem.checked_offset(addr, 16).ok()?;
         let ptr = self.mem.read_u64(addr).ok()?;
         let status = self.mem.read_u32(addr + 8).ok()?;
         let control = self.mem.read_u32(addr + 12).ok()?;
@@ -328,6 +343,9 @@ impl XhciController {
     }
 
     fn write_trb(&self, addr: u64, trb: &Trb) -> bool {
+        if self.mem.checked_offset(addr, 16).is_err() {
+            return false;
+        }
         self.mem.write(addr, &trb.ptr.to_le_bytes()).is_ok()
             && self.mem.write(addr + 8, &trb.status.to_le_bytes()).is_ok()
             && self
@@ -336,41 +354,81 @@ impl XhciController {
                 .is_ok()
     }
 
+    fn controller_error(&mut self) {
+        self.usbsts |= USBSTS_HSE | USBSTS_HCH;
+        self.usbcmd &= !USBCMD_RS;
+    }
+
     fn enqueue_event(&mut self, ptr: u64, status: u32, control: u32) {
-        // ERST segment 0 only; local producer index + cycle.
+        if self.pending_events.len() >= 1024 {
+            self.controller_error();
+            return;
+        }
+        self.pending_events.push_back(Trb {
+            ptr,
+            status,
+            control,
+        });
+        self.flush_events();
+    }
+
+    fn flush_events(&mut self) {
         if self.erstsz == 0 || self.erstba == 0 {
             return;
         }
-        let seg_base = match self.mem.read_u64(self.erstba) {
-            Ok(v) => v & !0x3f,
-            Err(_) => return,
-        };
-        let seg_size = match self.mem.read_u16(self.erstba + 8) {
-            Ok(v) => v as u64,
-            Err(_) => return,
-        };
-        if seg_size == 0 {
+        // This controller advertises a single ERST segment (ERST Max = 0).
+        if self.erstsz != 1 || self.mem.checked_offset(self.erstba, 16).is_err() {
+            self.controller_error();
             return;
         }
-        if self.er_enqueue >= seg_size {
-            self.er_enqueue = 0;
-        }
-        if seg_base == 0 {
+        let base = self.mem.read_u64(self.erstba).unwrap() & !0x3f;
+        let size = self.mem.read_u32(self.erstba + 8).unwrap() as u64;
+        if !(16..=4096).contains(&size)
+            || self.mem.checked_offset(base, size as usize * 16).is_err()
+        {
+            self.controller_error();
             return;
         }
-        let addr = seg_base + self.er_enqueue * 16;
-        let trb = Trb {
-            ptr,
-            status,
-            control: control | (self.er_cycle as u32),
-        };
-        let _ = self.write_trb(addr, &trb);
-        self.er_enqueue += 1;
-        if self.er_enqueue >= seg_size {
-            self.er_enqueue = 0;
-            self.er_cycle = !self.er_cycle;
+        // A spare entry disambiguates full and empty after pointer wrap.
+        if let Some(offset) = self.erdp.checked_sub(base) {
+            if offset % 16 == 0 && offset / 16 < size {
+                let next = offset / 16;
+                let consumed = (next + size - self.er_dequeue) % size;
+                if consumed <= self.er_used {
+                    self.er_used -= consumed;
+                    self.er_dequeue = next;
+                }
+            }
         }
-        self.raise_irq();
+        let mut published = false;
+        while self.er_used < size - 1 {
+            let Some(mut event) = self.pending_events.pop_front() else {
+                break;
+            };
+            event.control = (event.control & !1) | self.er_cycle as u32;
+            if !self.write_trb(base + self.er_enqueue * 16, &event) {
+                self.controller_error();
+                return;
+            }
+            self.er_used += 1;
+            self.er_enqueue += 1;
+            if self.er_enqueue == size {
+                self.er_enqueue = 0;
+                self.er_cycle = !self.er_cycle;
+            }
+            published = true;
+        }
+        if published {
+            self.raise_irq();
+        }
+    }
+
+    fn cancel_endpoint(&mut self, sid: usize, epid: Option<usize>) {
+        self.pending_intr
+            .retain(|p| p.slot as usize != sid || epid.is_some_and(|ep| p.epid as usize != ep));
+        if epid.is_none() || epid == Some(1) {
+            self.setup[sid] = None;
+        }
     }
 
     fn post_cmd_completion(&mut self, cmd_trb_addr: u64, slot_id: u32, cc: u32, vf: u32) {
@@ -426,7 +484,10 @@ impl XhciController {
         if !self.running() || self.cmd_ring == 0 {
             return;
         }
-        loop {
+        for _ in 0..4096 {
+            if !self.running() {
+                break;
+            }
             let addr = self.cmd_ring;
             let Some(trb) = self.read_trb(addr) else {
                 break;
@@ -466,6 +527,7 @@ impl XhciController {
                 TRB_DISABLE_SLOT => {
                     let sid = trb.slot_id() as usize;
                     if sid > 0 && sid <= MAX_SLOTS as usize {
+                        self.cancel_endpoint(sid, None);
                         self.slots[sid] = SlotState::default();
                         self.setup[sid] = None;
                     }
@@ -485,12 +547,33 @@ impl XhciController {
                     self.post_cmd_completion(addr, trb.slot_id(), cc, 0);
                 }
                 TRB_RESET_EP | TRB_STOP_EP => {
-                    self.post_cmd_completion(addr, trb.slot_id(), CC_SUCCESS, 0);
+                    let sid = trb.slot_id() as usize;
+                    let ep = trb.epid() as usize;
+                    let cc = if sid > 0
+                        && sid <= MAX_SLOTS as usize
+                        && ep > 0
+                        && ep <= 31
+                        && self.slots[sid].enabled
+                        && self.slots[sid].eps[ep - 1].configured
+                    {
+                        self.cancel_endpoint(sid, Some(ep));
+                        let ctx = self.slots[sid].device_ctx;
+                        if ctx != 0 {
+                            let a = ctx + ep as u64 * 0x40;
+                            let old = self.mem.read_u32(a).unwrap_or(0);
+                            let _ = self.mem.write_u32(a, (old & !7) | 3); // Stopped
+                        }
+                        CC_SUCCESS
+                    } else {
+                        CC_TRB_ERROR
+                    };
+                    self.post_cmd_completion(addr, trb.slot_id(), cc, 0);
                 }
                 TRB_SET_TR_DEQUEUE => {
                     let sid = trb.slot_id() as usize;
                     let epid = trb.epid() as usize;
-                    if sid > 0 && sid <= MAX_SLOTS as usize && epid > 0 && epid < 31 {
+                    if sid > 0 && sid <= MAX_SLOTS as usize && epid > 0 && epid <= 31 {
+                        self.cancel_endpoint(sid, Some(epid));
                         let dq = trb.ptr;
                         self.slots[sid].eps[epid - 1].dequeue = dq & !0xf;
                         self.slots[sid].eps[epid - 1].cycle = dq & 1 != 0;
@@ -498,7 +581,14 @@ impl XhciController {
                         // xHCI: update TR Dequeue Pointer in the output EP context.
                         let mut dcba = self.slots[sid].device_ctx;
                         if dcba == 0 && self.dcbaap != 0 {
-                            dcba = self.mem.read_u64(self.dcbaap + sid as u64 * 8).unwrap_or(0);
+                            dcba = self
+                                .dcbaap
+                                .checked_add(sid as u64 * 8)
+                                .and_then(|addr| self.mem.read_u64(addr).ok())
+                                .unwrap_or(0);
+                            if self.mem.checked_offset(dcba, 32 * 64).is_err() {
+                                dcba = 0;
+                            }
                             self.slots[sid].device_ctx = dcba;
                         }
                         if dcba != 0 {
@@ -524,7 +614,8 @@ impl XhciController {
                 TRB_RESET_DEVICE => {
                     let sid = trb.slot_id() as usize;
                     if sid > 0 && sid <= MAX_SLOTS as usize {
-                        for ep in &mut self.slots[sid].eps {
+                        self.cancel_endpoint(sid, None);
+                        for ep in &mut self.slots[sid].eps[1..] {
                             *ep = EndpointState::default();
                         }
                         self.slots[sid].addressed = false;
@@ -541,10 +632,23 @@ impl XhciController {
             }
             self.cmd_ring = addr + 16;
         }
+        if let Some(next) = self.read_trb(self.cmd_ring) {
+            if next.cycle() == self.cmd_cycle {
+                self.controller_error();
+            }
+        }
     }
 
     fn cmd_address_device(&mut self, sid: usize, input_ctx: u64, bsr: bool) -> u32 {
         if sid == 0 || sid > MAX_SLOTS as usize {
+            return CC_TRB_ERROR;
+        }
+        if self.mem.checked_offset(input_ctx, 0xc0).is_err()
+            || self
+                .mem
+                .checked_offset(self.dcbaap, (MAX_SLOTS as usize + 1) * 8)
+                .is_err()
+        {
             return CC_TRB_ERROR;
         }
         // Input Control Context + Slot + EP0 at input_ctx
@@ -569,7 +673,7 @@ impl XhciController {
                 return CC_TRB_ERROR;
             }
         };
-        if dcba_entry == 0 {
+        if dcba_entry == 0 || self.mem.checked_offset(dcba_entry, 32 * 0x40).is_err() {
             crate::host_log!(
                 "[XHCI] Address Device slot={sid}: DCBAA[{sid}]=0 (dcbaap={:#x})",
                 self.dcbaap
@@ -631,6 +735,9 @@ impl XhciController {
             );
             return CC_TRB_ERROR;
         }
+        if self.mem.checked_offset(input_ctx, 33 * 0x40).is_err() {
+            return CC_TRB_ERROR;
+        }
         // Input Control Context: Dword0 = Drop Flags, Dword1 = Add Flags (xHCI 6.2.5.1)
         let drop = self.mem.read_u32(input_ctx).unwrap_or(0);
         let add = self.mem.read_u32(input_ctx + 4).unwrap_or(0);
@@ -652,6 +759,7 @@ impl XhciController {
                     crate::device_trace!("[XHCI] ConfigureEP ignore lone drop of EP0 slot={sid}");
                 } else {
                     crate::device_trace!("[XHCI] ConfigureEP drop slot={sid} epid={epid}");
+                    self.cancel_endpoint(sid, Some(epid as usize));
                     self.slots[sid].eps[(epid - 1) as usize] = EndpointState::default();
                 }
             }
@@ -671,6 +779,7 @@ impl XhciController {
                     }
                     continue;
                 }
+                self.cancel_endpoint(sid, Some(epid as usize));
                 let in_off = input_ctx + (epid as u64 + 1) * CSZ;
                 let out_off = dcba + (epid as u64) * CSZ;
                 let ctx0 = self.mem.read_u32(in_off).unwrap_or(0);
@@ -747,12 +856,16 @@ impl XhciController {
             return false;
         }
         if self.slots[sid].device_ctx == 0 && self.dcbaap != 0 {
-            if let Ok(ptr) = self.mem.read_u64(self.dcbaap + sid as u64 * 8) {
+            if let Some(ptr) = self
+                .dcbaap
+                .checked_add(sid as u64 * 8)
+                .and_then(|addr| self.mem.read_u64(addr).ok())
+            {
                 self.slots[sid].device_ctx = ptr;
             }
         }
         let dcba = self.slots[sid].device_ctx;
-        if dcba == 0 {
+        if dcba == 0 || self.mem.checked_offset(dcba, 32 * 64).is_err() {
             return false;
         }
         let Ok(tr) = self.mem.read_u64(dcba + 0x48) else {
@@ -779,7 +892,9 @@ impl XhciController {
                 let _ = self.resync_ep0_from_device_ctx(sid);
             }
             if !self.slots[sid].eps[epid - 1].configured {
-                crate::device_trace!("[XHCI] doorbell slot={sid} epid={epid} ignored (EP not configured)");
+                crate::device_trace!(
+                    "[XHCI] doorbell slot={sid} epid={epid} ignored (EP not configured)"
+                );
                 return;
             }
         }
@@ -807,7 +922,7 @@ impl XhciController {
         }
         let mut dequeue = self.slots[sid].eps[epid - 1].dequeue;
         let mut cycle = self.slots[sid].eps[epid - 1].cycle;
-        loop {
+        for _ in 0..4096 {
             let Some(trb) = self.read_trb(dequeue) else {
                 break;
             };
@@ -833,6 +948,10 @@ impl XhciController {
 
             let buf = trb.ptr;
             let len = trb.transfer_len();
+            if self.mem.checked_offset(buf, len as usize).is_err() {
+                self.post_transfer_event(dequeue, len, CC_TRB_ERROR, sid as u32, epid as u32);
+                break;
+            }
             let ioc = trb.ioc();
             let trb_addr = dequeue;
 
@@ -873,8 +992,16 @@ impl XhciController {
     }
 
     fn try_complete_pending_intr(&mut self) {
+        if !self.running() {
+            return;
+        }
         let mut pending = std::mem::take(&mut self.pending_intr);
         while let Some(p) = pending.pop_front() {
+            if !self.slots[p.slot as usize].enabled
+                || !self.slots[p.slot as usize].eps[p.epid as usize - 1].configured
+            {
+                continue;
+            }
             let kind = self.port_kind(self.slots[p.slot as usize].port);
             let report: Option<Vec<u8>> = match kind {
                 HidKind::Keyboard => {
@@ -974,7 +1101,9 @@ impl XhciController {
             }
             TRB_STATUS => self.control_status_only(sid, dequeue, cycle),
             other => {
-                crate::host_log!("[XHCI] EP0 slot={sid} unexpected TRB type={other} dq={dequeue:#x}");
+                crate::host_log!(
+                    "[XHCI] EP0 slot={sid} unexpected TRB type={other} dq={dequeue:#x}"
+                );
                 false
             }
         }
@@ -1170,6 +1299,21 @@ impl XhciController {
         match resp {
             Some(bytes) => {
                 if data_trb_addr != 0 {
+                    if self
+                        .mem
+                        .checked_offset(data_buf, data_len as usize)
+                        .is_err()
+                    {
+                        self.post_transfer_event(
+                            data_trb_addr,
+                            data_len,
+                            CC_TRB_ERROR,
+                            sid as u32,
+                            1,
+                        );
+                        self.setup[sid] = None;
+                        return false;
+                    }
                     let mut rem = 0u32;
                     let mut cc = CC_SUCCESS;
                     if data_buf != 0 && (bm & 0x80) != 0 {
@@ -1184,7 +1328,9 @@ impl XhciController {
                                     "[XHCI] EP0 DATA write failed buf={data_buf:#x} n={n}: {e}"
                                 );
                             } else {
-                                crate::device_trace!("[XHCI] EP0 DATA wrote {n} bytes to {data_buf:#x}");
+                                crate::device_trace!(
+                                    "[XHCI] EP0 DATA wrote {n} bytes to {data_buf:#x}"
+                                );
                             }
                         }
                         rem = data_len.saturating_sub(n as u32);
@@ -1460,13 +1606,27 @@ impl XhciController {
             }
             0x04 => self.imod = data32,
             0x08 => self.erstsz = data32 & 0xffff,
-            0x10 => self.erstba = (self.erstba & !0xffff_ffff) | (data & !0x3f),
+            0x10 => {
+                self.erstba = if size == 8 {
+                    data & !0x3f
+                } else {
+                    (self.erstba & !0xffff_ffff) | (data32 as u64 & !0x3f)
+                }
+            }
             0x14 => self.erstba = (self.erstba & 0xffff_ffff) | (data << 32),
             0x18 => {
-                self.erdp = (self.erdp & !0xffff_ffff) | (data & !0xf);
+                self.erdp = if size == 8 {
+                    data & !0xf
+                } else {
+                    (self.erdp & !0xffff_ffff) | (data32 as u64 & !0xf)
+                };
+                self.flush_events();
                 // EHB clear by writing 1 to bit 3
             }
-            0x1c => self.erdp = (self.erdp & 0xffff_ffff) | (data << 32),
+            0x1c => {
+                self.erdp = (self.erdp & 0xffff_ffff) | (data << 32);
+                self.flush_events();
+            }
             _ => {
                 let _ = size;
             }
@@ -1564,6 +1724,9 @@ mod tests {
     #[test]
     fn repeated_doorbells_do_not_duplicate_pending_report() {
         let mut c = controller();
+        c.usbcmd = USBCMD_RS;
+        c.usbsts = 0;
+        c.slots[1].enabled = true;
         c.slots[1].port = 1;
         c.slots[1].eps[2] = EndpointState {
             dequeue: 0x2000,
@@ -1586,5 +1749,81 @@ mod tests {
         let mut report = [0; 8];
         c.mem.read(0x3000, &mut report).unwrap();
         assert_eq!(report[2], 4);
+    }
+
+    #[test]
+    fn stop_endpoint_cancels_pending_dma() {
+        let mut c = controller();
+        c.slots[1].enabled = true;
+        c.slots[1].port = 1;
+        c.slots[1].eps[2] = EndpointState {
+            dequeue: 0x2000,
+            cycle: true,
+            configured: true,
+        };
+        c.write_trb(
+            0x2000,
+            &Trb {
+                ptr: 0x3000,
+                status: 8,
+                control: (TRB_NORMAL << 10) | 1,
+            },
+        );
+        c.process_intr_in(1, 3, HidKind::Keyboard);
+        c.usbcmd = USBCMD_RS;
+        c.usbsts = 0;
+        c.cmd_ring = 0x4000;
+        c.write_trb(
+            0x4000,
+            &Trb {
+                ptr: 0,
+                status: 0,
+                control: (TRB_STOP_EP << 10) | (1 << 24) | (3 << 16) | 1,
+            },
+        );
+        c.process_command_ring();
+        c.key_event(30, true);
+        assert_eq!(c.mem.read_u64(0x3000).unwrap(), 0);
+        assert!(c.pending_intr.is_empty());
+    }
+
+    #[test]
+    fn full_event_ring_defers_until_consumer_advances() {
+        let mut c = controller();
+        c.erstba = 0x1000;
+        c.erstsz = 1;
+        c.erdp = 0x2000;
+        c.mem.write_u64(0x1000, 0x2000).unwrap();
+        c.mem.write_u16(0x1008, 16).unwrap();
+        for i in 1..=17 {
+            c.enqueue_event(i, CC_SUCCESS << 24, TRB_CMD_COMPLETE << 10);
+        }
+        assert_eq!(c.read_trb(0x2000).unwrap().ptr, 1);
+        assert_eq!(c.pending_events.len(), 2);
+        c.runtime_write(0x38, 0x2018, 8);
+        assert_eq!(c.read_trb(0x20f0).unwrap().ptr, 16);
+        c.runtime_write(0x38, 0x2028, 8);
+        assert_eq!(c.read_trb(0x2000).unwrap().ptr, 17);
+        assert!(!c.read_trb(0x2000).unwrap().cycle());
+        assert!(c.pending_events.is_empty());
+    }
+
+    #[test]
+    fn cyclic_command_ring_is_bounded() {
+        let mut c = controller();
+        c.usbcmd = USBCMD_RS;
+        c.usbsts = 0;
+        c.cmd_ring = 0x1000;
+        c.write_trb(
+            0x1000,
+            &Trb {
+                ptr: 0x1000,
+                status: 0,
+                control: (TRB_LINK << 10) | 1,
+            },
+        );
+        c.process_command_ring();
+        assert_ne!(c.usbsts & USBSTS_HSE, 0);
+        assert!(!c.running());
     }
 }

@@ -6,6 +6,9 @@
 //! table, and programs/erases into a backing buffer.
 
 use super::MmioDevice;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
 
 const CMD_READ_ARRAY: u8 = 0xff;
 const CMD_READ_ARRAY_ALT: u8 = 0x00;
@@ -38,6 +41,8 @@ pub struct CfiPflash {
     cycle: Cycle,
     cfi: [u8; 0x60],
     block_size: u32,
+    backing: Option<File>,
+    persistence_error: Option<String>,
 }
 
 impl CfiPflash {
@@ -79,11 +84,51 @@ impl CfiPflash {
             cycle: Cycle::Read,
             cfi,
             block_size,
+            backing: None,
+            persistence_error: None,
         }
     }
 
-    pub fn storage(&self) -> &[u8] {
-        &self.storage
+    /// Keep the template immutable; each VM owns a separately locked store.
+    pub fn open(path: &std::path::Path, template: Vec<u8>) -> Result<Self, String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| format!("EFI variables {}: {e}", path.display()))?;
+        file.try_lock()
+            .map_err(|e| format!("EFI variable store is in use: {e}"))?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        let storage = if len == 0 {
+            file.write_all(&template)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| e.to_string())?;
+            template
+        } else {
+            if len != template.len() as u64 {
+                return Err("EFI variable store has incorrect size".into());
+            }
+            let mut bytes = vec![0; template.len()];
+            file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+            bytes
+        };
+        let mut flash = Self::new(storage);
+        flash.backing = Some(file);
+        Ok(flash)
+    }
+
+    fn persist(&mut self, start: usize, end: usize) {
+        if let Some(file) = &self.backing {
+            if let Err(e) = file
+                .write_all_at(&self.storage[start..end], start as u64)
+                .and_then(|_| file.sync_data())
+            {
+                self.status |= 0x30;
+                self.persistence_error = Some(format!("EFI variable write failed: {e}"));
+            }
+        }
     }
 
     fn set_read_array(&mut self) {
@@ -104,6 +149,7 @@ impl CfiPflash {
                 self.storage[off + i] &= bytes[i];
             }
         }
+        self.persist(off, (off + size).min(self.storage.len()));
         self.status |= STATUS_READY;
     }
 
@@ -116,6 +162,7 @@ impl CfiPflash {
             for b in &mut self.storage[base..end] {
                 *b = 0xff;
             }
+            self.persist(base, end);
         }
         self.status |= STATUS_READY;
     }
@@ -150,15 +197,20 @@ impl CfiPflash {
 }
 
 impl MmioDevice for CfiPflash {
+    fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(e) = &self.persistence_error {
+            return Err(e.clone());
+        }
+        if let Some(file) = &self.backing {
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
     fn read(&mut self, offset: u64, size: usize) -> u64 {
         let size = size.clamp(1, 8);
         match self.cmd {
             CMD_READ_ARRAY | CMD_READ_ARRAY_ALT => self.read_data(offset, size),
-            CMD_STATUS
-            | CMD_PROGRAM
-            | CMD_PROGRAM_ALT
-            | CMD_ERASE
-            | CMD_CLEAR_STATUS
+            CMD_STATUS | CMD_PROGRAM | CMD_PROGRAM_ALT | CMD_ERASE | CMD_CLEAR_STATUS
             | CMD_WRITE_BUFFER => Self::replicate_byte(self.status, size),
             CMD_CFI_QUERY => Self::replicate_byte(self.cfi_byte(offset), size),
             CMD_DEVICE_ID => {
@@ -271,5 +323,28 @@ impl MmioDevice for CfiPflash {
             0xf0 => self.set_read_array(),
             _ => self.set_read_array(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn variables_survive_reopen_and_store_is_exclusive() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path("vars");
+        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        assert!(CfiPflash::open(&path, vec![0xff; 0x40000]).is_err());
+        flash.write(0, CMD_PROGRAM as u64, 4);
+        flash.write(0x100, 0x12345678, 4);
+        flash.shutdown().unwrap();
+        drop(flash);
+        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        assert_eq!(flash.read(0x100, 4), 0x12345678);
+        flash.write(0, CMD_ERASE as u64, 4);
+        flash.write(0, CMD_CONFIRM as u64, 4);
+        drop(flash);
+        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        assert_eq!(flash.read(0x100, 4), 0xffffffff);
     }
 }

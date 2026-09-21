@@ -83,12 +83,7 @@ impl VirtioInput {
         Self::new(InputKind::Keyboard, "vmm-keyboard", irq_num, mem)
     }
 
-    pub fn new_tablet(
-        irq_num: u32,
-        mem: Arc<GuestMemory>,
-        abs_max_x: u16,
-        abs_max_y: u16,
-    ) -> Self {
+    pub fn new_tablet(irq_num: u32, mem: Arc<GuestMemory>, abs_max_x: u16, abs_max_y: u16) -> Self {
         Self::new(
             InputKind::Tablet {
                 abs_max_x,
@@ -267,8 +262,18 @@ impl VirtioInput {
             return;
         }
 
+        let count = match self.eventq.pending_count(&self.mem) {
+            Ok(n) => n,
+            Err(_) => {
+                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                return;
+            }
+        };
         let mut processed_any = false;
-        while self.pending.front().is_some() {
+        for _ in 0..count {
+            if self.pending.is_empty() {
+                break;
+            }
             std::sync::atomic::fence(Ordering::SeqCst);
             let avail_idx = match self.mem.read_u16(self.eventq.avail_ring + 2) {
                 Ok(i) => i,
@@ -278,7 +283,9 @@ impl VirtioInput {
                 if self.deferred_logs == 0 || self.deferred_logs % 64 == 0 {
                     eprintln!(
                         "[input] {} no eventq buffers (avail.idx={} pending={})",
-                        self.name, avail_idx, self.pending.len()
+                        self.name,
+                        avail_idx,
+                        self.pending.len()
                     );
                 }
                 self.deferred_logs = self.deferred_logs.wrapping_add(1);
@@ -295,45 +302,22 @@ impl VirtioInput {
             };
             self.eventq.last_avail_idx = self.eventq.last_avail_idx.wrapping_add(1);
 
-            // Walk descriptor chain (and one level of INDIRECT) for a writable >=8 buf.
-            let mut write_addr: Option<(u64, u32)> = None;
-            let mut curr = head;
-            let mut hops = 0u32;
-            let mut table = self.eventq.desc_table;
-            let mut table_size = q_size;
-            loop {
-                if hops > 64 || (curr as u32) >= table_size {
+            let descriptors = match self.eventq.descriptors(
+                &self.mem,
+                head,
+                self.driver_features & VIRTIO_RING_F_INDIRECT_DESC != 0,
+                65536,
+            ) {
+                Ok(d) => d,
+                Err(_) => {
+                    self.status |= VIRTIO_STATUS_NEEDS_RESET;
                     break;
                 }
-                hops += 1;
-                let desc_addr = table + (curr as u64 * 16);
-                let Ok(addr) = self.mem.read_u64(desc_addr) else { break; };
-                let Ok(len) = self.mem.read_u32(desc_addr + 8) else { break; };
-                let Ok(flags) = self.mem.read_u16(desc_addr + 12) else { break; };
-                let Ok(next) = self.mem.read_u16(desc_addr + 14) else { break; };
-
-                if (flags & VRING_DESC_F_INDIRECT) != 0 {
-                    // Indirect table: addr/len point at an array of descriptors.
-                    table = addr;
-                    table_size = (len / 16).max(1);
-                    curr = 0;
-                    continue;
-                }
-
-                if (flags & VRING_DESC_F_WRITE) != 0 && len >= 8 {
-                    write_addr = Some((addr, len));
-                    break;
-                }
-                if (flags & VRING_DESC_F_NEXT) != 0 {
-                    curr = next;
-                    continue;
-                }
-                eprintln!(
-                    "[input] {} bad eventq desc head={} flags={:#x} len={} (need WRITE>=8)",
-                    self.name, head, flags, len
-                );
-                break;
-            }
+            };
+            let write_addr = descriptors
+                .iter()
+                .find(|d| d.flags & VRING_DESC_F_WRITE != 0 && d.len >= 8)
+                .map(|d| (d.addr, d.len));
 
             let Some((addr, _len)) = write_addr else {
                 publish_used(&self.mem, &mut self.eventq, head, 0);
@@ -341,7 +325,9 @@ impl VirtioInput {
                 continue;
             };
 
-            let Some(ev) = self.pending.front().copied() else { break; };
+            let Some(ev) = self.pending.front().copied() else {
+                break;
+            };
             if self.mem.write(addr, &ev.to_bytes()).is_err() {
                 eprintln!("[input] {} guest write failed GPA={:#x}", self.name, addr);
                 break;
@@ -365,8 +351,15 @@ impl VirtioInput {
         if q_size == 0 {
             return;
         }
+        let count = match self.statusq.pending_count(&self.mem) {
+            Ok(n) => n,
+            Err(_) => {
+                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                return;
+            }
+        };
         let mut processed_any = false;
-        loop {
+        for _ in 0..count {
             std::sync::atomic::fence(Ordering::SeqCst);
             let avail_idx = match self.mem.read_u16(self.statusq.avail_ring + 2) {
                 Ok(i) => i,
@@ -546,10 +539,7 @@ impl MmioDevice for VirtioInput {
             VIRTIO_MMIO_QUEUE_NUM_MAX => {
                 self.active_queue().map(|q| q.max_size as u64).unwrap_or(0)
             }
-            VIRTIO_MMIO_QUEUE_READY => self
-                .active_queue()
-                .map(|q| u64::from(q.ready))
-                .unwrap_or(0),
+            VIRTIO_MMIO_QUEUE_READY => self.active_queue().map(|q| u64::from(q.ready)).unwrap_or(0),
             VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status as u64,
             VIRTIO_MMIO_STATUS => self.status as u64,
             _ => 0,
@@ -568,8 +558,7 @@ impl MmioDevice for VirtioInput {
                     self.driver_features =
                         (self.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
                 } else if self.driver_features_sel == 1 {
-                    self.driver_features =
-                        (self.driver_features & 0xffff_ffff) | (data << 32);
+                    self.driver_features = (self.driver_features & 0xffff_ffff) | (data << 32);
                 }
             }
             VIRTIO_MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = data as u32,

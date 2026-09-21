@@ -64,8 +64,15 @@ impl VirtioRng {
             return;
         }
 
+        let count = match self.queue.pending_count(&self.mem) {
+            Ok(n) => n,
+            Err(_) => {
+                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                return;
+            }
+        };
         let mut processed_any = false;
-        loop {
+        for _ in 0..count {
             std::sync::atomic::fence(Ordering::SeqCst);
             let avail_idx = match self.mem.read_u16(self.queue.avail_ring + 2) {
                 Ok(idx) => idx,
@@ -91,68 +98,32 @@ impl VirtioRng {
 
             self.queue.last_avail_idx = self.queue.last_avail_idx.wrapping_add(1);
 
-            let mut curr = head;
-            let mut total_written = 0u32;
-            let mut rng_buf = [0u8; 512];
-
-            loop {
-                if curr as u32 >= q_size {
+            let descriptors = match self.queue.descriptors(&self.mem, head, false, 1024 * 1024) {
+                Ok(d) if d.iter().all(|d| d.flags & VRING_DESC_F_WRITE != 0) => d,
+                _ => {
+                    self.status |= VIRTIO_STATUS_NEEDS_RESET;
                     break;
                 }
-                let desc_addr = self.queue.desc_table + (curr as u64 * 16);
-                let addr = match self.mem.read_u64(desc_addr) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        eprintln!("[VirtIO-Rng Error] Failed to read desc addr: {}", e);
-                        break;
+            };
+            let mut total_written = 0;
+            let mut rng_buf = [0; 512];
+            for d in descriptors {
+                let mut offset = 0;
+                while offset < d.len as usize {
+                    let n = (d.len as usize - offset).min(rng_buf.len());
+                    fill_random(&mut rng_buf[..n]);
+                    if self
+                        .mem
+                        .write(d.addr + offset as u64, &rng_buf[..n])
+                        .is_err()
+                    {
+                        self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                        return;
                     }
-                };
-                let len = match self.mem.read_u32(desc_addr + 8) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!("[VirtIO-Rng Error] Failed to read desc len: {}", e);
-                        break;
-                    }
-                };
-                let flags = match self.mem.read_u16(desc_addr + 12) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("[VirtIO-Rng Error] Failed to read desc flags: {}", e);
-                        break;
-                    }
-                };
-                let next = match self.mem.read_u16(desc_addr + 14) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("[VirtIO-Rng Error] Failed to read desc next: {}", e);
-                        break;
-                    }
-                };
-
-                // The guest supplies writable buffers for us to populate with entropy
-                if (flags & VRING_DESC_F_WRITE) != 0 && len > 0 {
-                    let mut remaining = len as usize;
-                    let mut dest_gpa = addr;
-                    while remaining > 0 {
-                        let chunk = remaining.min(rng_buf.len());
-                        fill_random(&mut rng_buf[..chunk]);
-                        if let Err(e) = self.mem.write(dest_gpa, &rng_buf[..chunk]) {
-                            eprintln!("[VirtIO-Rng Error] Failed to write entropy to GPA 0x{:x}: {}", dest_gpa, e);
-                            break;
-                        }
-                        dest_gpa += chunk as u64;
-                        remaining -= chunk;
-                        total_written += chunk as u32;
-                    }
-                }
-
-                if (flags & VRING_DESC_F_NEXT) != 0 {
-                    curr = next;
-                } else {
-                    break;
+                    offset += n;
+                    total_written += n as u32;
                 }
             }
-
             publish_used(&self.mem, &mut self.queue, head, total_written);
             processed_any = true;
         }
@@ -210,7 +181,8 @@ impl MmioDevice for VirtioRng {
             }
             VIRTIO_MMIO_DRIVER_FEATURES => {
                 if self.driver_features_sel == 0 {
-                    self.driver_features = (self.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
+                    self.driver_features =
+                        (self.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
                 } else if self.driver_features_sel == 1 {
                     self.driver_features = (self.driver_features & 0xffff_ffff) | (data << 32);
                 }
@@ -261,7 +233,8 @@ impl MmioDevice for VirtioRng {
             }
             VIRTIO_MMIO_QUEUE_DESC_LOW => {
                 if self.queue_sel == 0 {
-                    self.queue.desc_table = (self.queue.desc_table & !0xffff_ffff) | (data & 0xffff_ffff);
+                    self.queue.desc_table =
+                        (self.queue.desc_table & !0xffff_ffff) | (data & 0xffff_ffff);
                 }
             }
             VIRTIO_MMIO_QUEUE_DESC_HIGH => {
@@ -271,7 +244,8 @@ impl MmioDevice for VirtioRng {
             }
             VIRTIO_MMIO_QUEUE_DRIVER_LOW => {
                 if self.queue_sel == 0 {
-                    self.queue.avail_ring = (self.queue.avail_ring & !0xffff_ffff) | (data & 0xffff_ffff);
+                    self.queue.avail_ring =
+                        (self.queue.avail_ring & !0xffff_ffff) | (data & 0xffff_ffff);
                 }
             }
             VIRTIO_MMIO_QUEUE_DRIVER_HIGH => {
@@ -281,7 +255,8 @@ impl MmioDevice for VirtioRng {
             }
             VIRTIO_MMIO_QUEUE_DEVICE_LOW => {
                 if self.queue_sel == 0 {
-                    self.queue.used_ring = (self.queue.used_ring & !0xffff_ffff) | (data & 0xffff_ffff);
+                    self.queue.used_ring =
+                        (self.queue.used_ring & !0xffff_ffff) | (data & 0xffff_ffff);
                 }
             }
             VIRTIO_MMIO_QUEUE_DEVICE_HIGH => {

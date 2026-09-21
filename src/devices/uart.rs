@@ -1,26 +1,38 @@
 //! Minimal ARM PL011-compatible UART device emulation with bidirectional console I/O.
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::MmioDevice;
 
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, count: u32, timeout_ms: i32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+}
+
 /// PL011 Register Offsets
-const UART_DR: u64 = 0x00;   // Data Register
-const UART_FR: u64 = 0x18;   // Flag Register
+const UART_DR: u64 = 0x00; // Data Register
+const UART_FR: u64 = 0x18; // Flag Register
 #[allow(dead_code)]
 const UART_IBRD: u64 = 0x24; // Integer Baud Rate
 #[allow(dead_code)]
 const UART_FBRD: u64 = 0x28; // Fractional Baud Rate
 #[allow(dead_code)]
-const UART_LCR_H: u64 = 0x2c;// Line Control Register
-const UART_CR: u64 = 0x30;   // Control Register
+const UART_LCR_H: u64 = 0x2c; // Line Control Register
+const UART_CR: u64 = 0x30; // Control Register
 const UART_IMSC: u64 = 0x38; // Interrupt Mask Set/Clear
-const UART_RIS: u64 = 0x3c;  // Raw Interrupt Status
-const UART_MIS: u64 = 0x40;  // Masked Interrupt Status
-const UART_ICR: u64 = 0x44;  // Interrupt Clear Register
+const UART_RIS: u64 = 0x3c; // Raw Interrupt Status
+const UART_MIS: u64 = 0x40; // Masked Interrupt Status
+const UART_ICR: u64 = 0x44; // Interrupt Clear Register
 
 // PL011 Flag Register bits:
 // Bit 7: TXFE (Transmit FIFO empty)
@@ -45,6 +57,8 @@ pub struct Pl011Uart {
     rx_queue: Arc<Mutex<VecDeque<u8>>>,
     irq_num: u32,
     log_file: Option<std::fs::File>,
+    running: Arc<AtomicBool>,
+    workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl Pl011Uart {
@@ -53,10 +67,13 @@ impl Pl011Uart {
         for &b in bytes {
             if b == 0x1d {
                 eprintln!("\r\n[VMM] Escape key Ctrl-] pressed. Exiting VM.\r\n");
-                std::process::exit(0);
+                crate::vcpu::request_host_shutdown();
+                return;
             }
             let byte = if b == b'\r' { b'\n' } else { b };
-            guard.push_back(byte);
+            if guard.len() < 4096 {
+                guard.push_back(byte);
+            }
         }
         drop(guard);
         unsafe {
@@ -71,6 +88,8 @@ impl Pl011Uart {
 
     pub fn with_log(irq_num: u32, interactive_stdin: bool, log_path: Option<&str>) -> Self {
         let rx_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let mut workers = Vec::new();
         let log_file = log_path.and_then(|p| {
             std::fs::OpenOptions::new()
                 .create(true)
@@ -82,44 +101,58 @@ impl Pl011Uart {
 
         if interactive_stdin {
             let q_clone = Arc::clone(&rx_queue);
-            thread::Builder::new()
-                .name("vmm-stdin".into())
-                .spawn(move || {
-                    let mut stdin = io::stdin().lock();
-                    let mut buf = [0u8; 128];
-                    loop {
-                        match stdin.read(&mut buf) {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                Self::push_bytes(&q_clone, irq_num, &buf[..n]);
+            let active = running.clone();
+            workers.push(
+                thread::Builder::new()
+                    .name("vmm-stdin".into())
+                    .spawn(move || {
+                        let mut buf = [0u8; 128];
+                        while active.load(Ordering::Relaxed) {
+                            let mut fd = PollFd {
+                                fd: 0,
+                                events: 1,
+                                revents: 0,
+                            };
+                            if unsafe { poll(&mut fd, 1, 100) } <= 0 {
+                                continue;
                             }
-                            Err(_) => break,
+                            if !active.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let n = unsafe { read(0, buf.as_mut_ptr(), buf.len()) };
+                            if n <= 0 {
+                                break;
+                            }
+                            Self::push_bytes(&q_clone, irq_num, &buf[..n as usize]);
                         }
-                    }
-                })
-                .expect("Failed to spawn stdin thread");
+                    })
+                    .expect("Failed to spawn stdin thread"),
+            );
 
             // Optional host-side command injector used by automated tests and installers.
-            // Bytes written to /tmp/vmm-uart-in are pushed into the PL011 RX FIFO.
-            let q_inject = Arc::clone(&rx_queue);
-            thread::Builder::new()
-                .name("vmm-uart-inject".into())
-                .spawn(move || {
-                    let path = "/tmp/vmm-uart-in";
-                    let _ = std::fs::remove_file(path);
-                    loop {
-                        if std::path::Path::new(path).exists() {
-                            if let Ok(data) = std::fs::read(path) {
-                                if !data.is_empty() {
-                                    Self::push_bytes(&q_inject, irq_num, &data);
+            // Bytes written to VMM_UART_IN are pushed into the PL011 RX FIFO.
+            if let Some(path) = std::env::var_os("VMM_UART_IN") {
+                let q_inject = Arc::clone(&rx_queue);
+                let active = running.clone();
+                workers.push(
+                    thread::Builder::new()
+                        .name("vmm-uart-inject".into())
+                        .spawn(move || {
+                            while active.load(Ordering::Relaxed) {
+                                if std::path::Path::new(&path).exists() {
+                                    if let Ok(data) = std::fs::read(&path) {
+                                        if !data.is_empty() {
+                                            Self::push_bytes(&q_inject, irq_num, &data);
+                                        }
+                                    }
+                                    let _ = std::fs::remove_file(&path);
                                 }
+                                thread::sleep(std::time::Duration::from_millis(50));
                             }
-                            let _ = std::fs::remove_file(path);
-                        }
-                        thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                })
-                .expect("Failed to spawn uart inject thread");
+                        })
+                        .expect("Failed to spawn uart inject thread"),
+                );
+            }
         }
 
         Self {
@@ -129,6 +162,15 @@ impl Pl011Uart {
             rx_queue,
             irq_num,
             log_file,
+            running,
+            workers,
+        }
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
         }
     }
 
@@ -147,6 +189,10 @@ impl Pl011Uart {
 }
 
 impl MmioDevice for Pl011Uart {
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.stop();
+        Ok(())
+    }
     fn read(&mut self, offset: u64, _size: usize) -> u64 {
         match offset {
             UART_DR => {
@@ -210,5 +256,11 @@ impl MmioDevice for Pl011Uart {
             }
             _ => {}
         }
+    }
+}
+
+impl Drop for Pl011Uart {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

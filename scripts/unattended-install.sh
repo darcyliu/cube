@@ -152,46 +152,87 @@ echo -e "  VM Hostname  : ${BOLD}${HOSTNAME}${RESET}"
 echo -e "  Root Password: ${BOLD}${PASSWORD}${RESET}"
 echo -e "------------------------------------------------------\n"
 
-# Console log file for boot tracking
-CONSOLE_LOG="/tmp/vmm-unattended-console.log"
-rm -f "$CONSOLE_LOG" /tmp/vmm-uart-in
+# Give each VM its own log and explicitly enabled UART injection mailbox.
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/vmm-unattended.XXXXXX")
+CONSOLE_LOG="$RUN_DIR/console.log"
+UART_IN="$RUN_DIR/uart-in"
+FEEDER_PID=""
+cleanup() {
+    if [[ -n "$FEEDER_PID" ]]; then
+        kill "$FEEDER_PID" 2>/dev/null || true
+        wait "$FEEDER_PID" 2>/dev/null || true
+    fi
+    rm -f "$UART_IN" "$UART_IN.next"
+}
+trap cleanup EXIT
+
+# The foreground VMM disables terminal output processing. Explicit CRLF keeps
+# background diagnostics aligned, including when the guest left a partial line.
+automator_log() {
+    if [[ -t 1 ]]; then
+        printf '\r\n%b[Automator] %s%b\r\n' "$CYAN" "$1" "$RESET"
+    else
+        printf '[Automator] %s\n' "$1"
+    fi
+}
+
+# Publish each command atomically, so the polling reader cannot consume an
+# empty/partially written file. Never overwrite a command it hasn't consumed.
+send_uart() {
+    local attempt
+    for attempt in {1..100}; do
+        [[ ! -e "$UART_IN" ]] && break
+        sleep 0.1
+    done
+    if [[ -e "$UART_IN" ]]; then
+        automator_log "UART input was not consumed; stopping automation. Log: $CONSOLE_LOG"
+        return 1
+    fi
+    printf '%s\n' "$1" > "$UART_IN.next"
+    mv "$UART_IN.next" "$UART_IN"
+}
+
+shell_ready() {
+    grep -Eq '(^|[[:space:]])([^[:space:]]*root@[^[:space:]]*)?#([[:space:]]|$)' "$CONSOLE_LOG" 2>/dev/null
+}
 
 # Background console automation feeder
 (
-    echo -e "${CYAN}[Automator] Monitoring FreeBSD kernel boot...${RESET}"
+    automator_log "Monitoring FreeBSD kernel boot... Log: $CONSOLE_LOG"
     BOOTED=0
     for i in {1..35}; do
         sleep 1
         if grep -q "RETURN for /bin/sh" "$CONSOLE_LOG" 2>/dev/null; then
-            echo -e "${GREEN}[Automator] Detected single-user prompt at second ${i}!${RESET}"
+            automator_log "Detected single-user prompt at second ${i}!"
             BOOTED=1
             break
         fi
     done
 
-    # Fallback if log buffering delayed the pattern
     if [[ $BOOTED -eq 0 ]]; then
-        echo -e "${YELLOW}[Automator] Kernel boot interval elapsed; engaging shell...${RESET}"
+        automator_log "Single-user prompt timeout; stopping automation. Log: $CONSOLE_LOG"
+        exit 1
     fi
 
     # Send Enter key to accept /bin/sh
     sleep 1
-    printf "\n" > /tmp/vmm-uart-in 2>/dev/null || true
+    send_uart ""
 
     # Wait for /bin/sh to finish reading .profile and for resizewin to complete
-    echo -e "${CYAN}[Automator] Waiting for root shell prompt to initialize...${RESET}"
+    automator_log "Waiting for root shell prompt to initialize..."
     SHELL_READY=0
     for j in {1..20}; do
         sleep 1
-        if grep -q "root@.*#" "$CONSOLE_LOG" 2>/dev/null || grep -q "root@:/" "$CONSOLE_LOG" 2>/dev/null; then
-            echo -e "${GREEN}[Automator] Single-user root shell ready at second ${j}!${RESET}"
+        if shell_ready; then
+            automator_log "Single-user root shell ready at second ${j}!"
             SHELL_READY=1
             break
         fi
     done
 
     if [[ $SHELL_READY -eq 0 ]]; then
-        echo -e "${YELLOW}[Automator] Shell prompt detection timeout; proceeding with caution...${RESET}"
+        automator_log "Shell prompt timeout; stopping automation. Log: $CONSOLE_LOG"
+        exit 1
     fi
 
     # Brief delay for TTY line discipline to settle
@@ -202,8 +243,8 @@ rm -f "$CONSOLE_LOG" /tmp/vmm-uart-in
     # 2. Mount seed ISO (/dev/vtbd1) to /media
     # 3. Execute bsdinstall script non-interactively
     # 4. Power off cleanly when finished
-    echo -e "${GREEN}[Automator] Dispatching unattended bsdinstall from seed drive...${RESET}"
-    printf "mdmfs -s 64M md1 /tmp && mdmfs -s 64M md2 /var && mount -t cd9660 /dev/vtbd1 /media && bsdinstall script /media/installerconfig && poweroff\n" > /tmp/vmm-uart-in 2>/dev/null || true
+    automator_log "Dispatching unattended bsdinstall from seed drive..."
+    send_uart "mdmfs -s 64M md1 /tmp && mdmfs -s 64M md2 /var && mount -t cd9660 /dev/vtbd1 /media && bsdinstall script /media/installerconfig && echo VMM_INSTALL_COMPLETE && poweroff"
 ) &
 FEEDER_PID=$!
 
@@ -220,7 +261,7 @@ if [[ -n "$CPU_MODEL" ]]; then
 fi
 
 # Launch VMM in single-user mode (omitting --multiuser) with direct serial logging
-sudo ./target/debug/vmm \
+sudo /usr/bin/env VMM_UART_IN="$UART_IN" ./target/debug/vmm \
     --freebsd "$EXTRACTED_KERNEL" \
     --disk "$TARGET_DISK" \
     --disk "$SEED_ISO,ro" \
@@ -232,8 +273,16 @@ sudo ./target/debug/vmm \
     --serial-log "$CONSOLE_LOG" \
     "${CPU_MODEL_ARGS[@]}"
 
-wait $FEEDER_PID 2>/dev/null || true
-rm -f "$CONSOLE_LOG" /tmp/vmm-uart-in
+if ! wait "$FEEDER_PID"; then
+    FEEDER_PID=""
+    echo "[Error] Console automation failed. Log: $CONSOLE_LOG" >&2
+    exit 1
+fi
+FEEDER_PID=""
+if ! grep -q '^VMM_INSTALL_COMPLETE' "$CONSOLE_LOG"; then
+    echo "[Error] Installation did not report completion. Log: $CONSOLE_LOG" >&2
+    exit 1
+fi
 
 echo -e "\n${BOLD}${GREEN}======================================================${RESET}"
 echo -e "${BOLD}${GREEN}  Unattended Installation Finished!                   ${RESET}"

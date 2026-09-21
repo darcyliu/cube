@@ -3,18 +3,19 @@
 //! macOS Screen Sharing is picky with third-party servers; prefer TigerVNC
 //! Viewer (`brew install --cask tigervnc-viewer`) if Screen Sharing drops.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::devices::usb::xhci::XhciController;
 use crate::devices::virtio::VirtioInput;
 use crate::memory::GuestMemory;
 
-use super::{FramebufferConfig, keysym};
+use super::{keysym, FramebufferConfig};
 
 const RFB_VERSION: &[u8] = b"RFB 003.008\n";
 
@@ -83,7 +84,70 @@ impl PixelFormat {
     }
 }
 
-/// Start a background VNC server. Returns a stop flag (set true to request shutdown).
+pub struct VncServer {
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for VncServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// A session owns its pressed keys. Drop releases them even after protocol/I/O errors.
+struct SessionInput {
+    keys: BTreeSet<u16>,
+    position: (u16, u16),
+    keyboard: Option<Arc<Mutex<VirtioInput>>>,
+    tablet: Option<Arc<Mutex<VirtioInput>>>,
+    usb: Option<Arc<Mutex<XhciController>>>,
+}
+
+impl SessionInput {
+    fn key(&mut self, code: u16, down: bool) {
+        if down {
+            self.keys.insert(code);
+        } else {
+            self.keys.remove(&code);
+        }
+        if let Some(u) = &self.usb {
+            if let Ok(mut device) = u.lock() {
+                device.key_event(code, down);
+            }
+        } else if let Some(k) = &self.keyboard {
+            if let Ok(mut device) = k.lock() {
+                device.key_event(code, down);
+            }
+        }
+    }
+    fn pointer(&mut self, x: u16, y: u16, buttons: u8) {
+        self.position = (x, y);
+        if let Some(u) = &self.usb {
+            if let Ok(mut device) = u.lock() {
+                device.pointer_event(x, y, buttons);
+            }
+        } else if let Some(t) = &self.tablet {
+            if let Ok(mut device) = t.lock() {
+                device.pointer_event(x, y, buttons);
+            }
+        }
+    }
+}
+
+impl Drop for SessionInput {
+    fn drop(&mut self) {
+        for code in self.keys.clone() {
+            self.key(code, false);
+        }
+        self.pointer(self.position.0, self.position.1, 0);
+    }
+}
+
+/// One session at a time bounds memory, threads, and ownership of guest input.
 pub fn spawn(
     mem: Arc<GuestMemory>,
     fb: FramebufferConfig,
@@ -91,10 +155,16 @@ pub fn spawn(
     keyboard: Option<Arc<Mutex<VirtioInput>>>,
     tablet: Option<Arc<Mutex<VirtioInput>>>,
     usb: Option<Arc<Mutex<XhciController>>>,
-) -> Result<Arc<AtomicBool>, String> {
+) -> Result<VncServer, String> {
+    if !bind.ip().is_loopback() {
+        return Err(
+            "VNC without authentication must bind to loopback; use an SSH tunnel for remote access"
+                .into(),
+        );
+    }
     let listener = TcpListener::bind(bind).map_err(|e| format!("VNC bind {bind}: {e}"))?;
     listener
-        .set_nonblocking(false)
+        .set_nonblocking(true)
         .map_err(|e| format!("VNC set blocking: {e}"))?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -104,7 +174,7 @@ pub fn spawn(
     let tablet_thr = tablet.clone();
     let usb_thr = usb.clone();
 
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("vmm-vnc".into())
         .spawn(move || {
             crate::host_log!(
@@ -124,15 +194,12 @@ pub fn spawn(
                         let tablet_c = tablet_thr.clone();
                         let usb_c = usb_thr.clone();
                         let stop_c = Arc::clone(&stop_thr);
-                        let _ = thread::Builder::new()
-                            .name("vmm-vnc-client".into())
-                            .spawn(move || {
-                                if let Err(e) = handle_client(stream, mem_c, fb, stop_c, keyboard_c, tablet_c, usb_c) {
-                                    crate::host_log!("[VNC] Client session ended: {e}");
-                                } else {
-                                    crate::host_log!("[VNC] Client disconnected cleanly");
-                                }
-                            });
+                        if let Err(e) = handle_client(stream, mem_c, fb, stop_c, keyboard_c, tablet_c, usb_c) {
+                            crate::host_log!("[VNC] Client session ended: {e}");
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
                     }
                     Err(e) => {
                         crate::host_log!("[VNC] accept error: {e}");
@@ -143,7 +210,10 @@ pub fn spawn(
         })
         .map_err(|e| format!("spawn VNC thread: {e}"))?;
 
-    Ok(stop)
+    Ok(VncServer {
+        stop,
+        worker: Some(worker),
+    })
 }
 
 fn handle_client(
@@ -155,9 +225,19 @@ fn handle_client(
     tablet: Option<Arc<Mutex<VirtioInput>>>,
     usb: Option<Arc<Mutex<XhciController>>>,
 ) -> Result<(), String> {
+    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+    let mut input = SessionInput {
+        keys: BTreeSet::new(),
+        position: (0, 0),
+        keyboard: keyboard.clone(),
+        tablet: tablet.clone(),
+        usb: usb.clone(),
+    };
     // Longer timeouts for the handshake — Screen Sharing can be slow.
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
     stream.set_nodelay(true).ok();
 
     // ProtocolVersion
@@ -173,7 +253,10 @@ fn handle_client(
     crate::device_trace!("[VNC] Client version: {}", ver_str.trim());
 
     // Parse minor version: "RFB 003.00X\n"
-    let minor = ver.get(10).copied().unwrap_or(b'8').saturating_sub(b'0');
+    if !matches!(&ver, b"RFB 003.003\n" | b"RFB 003.007\n" | b"RFB 003.008\n") {
+        return Err("Unsupported RFB version".into());
+    }
+    let minor = ver[10] - b'0';
     let use_v3_3 = minor <= 3;
 
     if use_v3_3 {
@@ -239,7 +322,8 @@ fn handle_client(
     stream.flush().ok();
     crate::device_trace!(
         "[VNC] ServerInit sent ({}x{}), waiting for FramebufferUpdateRequest",
-        fb.width, fb.height
+        fb.width,
+        fb.height
     );
 
     // Steady-state: shorter poll timeout so we can notice stop flag.
@@ -249,6 +333,8 @@ fn handle_client(
 
     let mut pixel_format = PixelFormat::native();
     let mut fb_buf = vec![0u8; fb.pixel_bytes()];
+    let mut previous = vec![0u8; fb.pixel_bytes()];
+    let mut have_full_frame = false;
     let mut msg = [0u8; 1];
 
     while !stop.load(Ordering::Relaxed) {
@@ -286,6 +372,7 @@ fn handle_client(
                 let mut rest = [0u8; 19];
                 read_exact_timeout(&mut stream, &mut rest, &stop)?;
                 pixel_format = PixelFormat::parse(&rest[3..])?;
+                have_full_frame = false;
             }
             2 => {
                 // SetEncodings — we only do raw (0); ignore the list
@@ -303,7 +390,26 @@ fn handle_client(
                 read_exact_timeout(&mut stream, &mut rest, &stop)?;
                 mem.read(fb.gpa, &mut fb_buf)
                     .map_err(|e| format!("FB read: {e}"))?;
-                send_full_raw_update(&mut stream, fb, &fb_buf, pixel_format)?;
+                let requested = Rect::from_request(&rest, fb);
+                let rect = if rest[0] != 0 && have_full_frame {
+                    changed_rect(requested, fb.stride as usize, &fb_buf, &previous)
+                } else {
+                    requested
+                };
+                send_raw_update(&mut stream, fb, &fb_buf, pixel_format, rect)?;
+                for y in rect.y..rect.y + rect.height {
+                    let start = y as usize * fb.stride as usize + rect.x as usize * 4;
+                    let end = start + rect.width as usize * 4;
+                    previous[start..end].copy_from_slice(&fb_buf[start..end]);
+                }
+                if rect.x == 0
+                    && rect.y == 0
+                    && rect.width == fb.width as u16
+                    && rect.height == fb.height as u16
+                {
+                    have_full_frame = true;
+                }
+                thread::sleep(Duration::from_millis(16));
             }
             4 => {
                 // KeyEvent: down(u8), pad(u16), keysym(u32 BE)
@@ -317,15 +423,7 @@ fn handle_client(
                     keyboard.is_some()
                 );
                 if let Some(code) = keysym::keysym_to_linux(keysym_val) {
-                    if let Some(ref u) = usb {
-                        if let Ok(mut g) = u.lock() {
-                            g.key_event(code, down);
-                        }
-                    } else if let Some(ref kbd) = keyboard {
-                        if let Ok(mut g) = kbd.lock() {
-                            g.key_event(code, down);
-                        }
-                    }
+                    input.key(code, down);
                 } else {
                     crate::device_trace!("[VNC] unmapped keysym {keysym_val:#x}");
                 }
@@ -337,42 +435,26 @@ fn handle_client(
                 let buttons = rest[0];
                 let x = u16::from_be_bytes([rest[1], rest[2]]);
                 let y = u16::from_be_bytes([rest[3], rest[4]]);
-                if let Some(ref u) = usb {
-                    if let Ok(mut g) = u.lock() {
-                        g.pointer_event(x, y, buttons);
-                    }
-                } else if let Some(ref tab) = tablet {
-                    if let Ok(mut g) = tab.lock() {
-                        g.pointer_event(x, y, buttons);
-                    }
-                }
+                input.pointer(x, y, buttons);
             }
             255 => {
-                // QEMU Extended Key Event: down(u8), pad(u16), keysym(u32), keycode(u32)
+                // QEMU extension: subtype(u8), down(u16), keysym(u32), keycode(u32).
                 let mut rest = [0u8; 11];
                 read_exact_timeout(&mut stream, &mut rest, &stop)?;
-                let down = rest[0] != 0;
+                if rest[0] != 0 {
+                    return Err("Unsupported QEMU VNC subtype".into());
+                }
+                let down = u16::from_be_bytes([rest[1], rest[2]]) != 0;
                 let keysym_val = u32::from_be_bytes([rest[3], rest[4], rest[5], rest[6]]);
                 let keycode = u32::from_be_bytes([rest[7], rest[8], rest[9], rest[10]]);
-                crate::device_trace!("[VNC] ExtKey keysym={keysym_val:#x} keycode={keycode} down={down}");
-                let code = keysym::keysym_to_linux(keysym_val).or_else(|| {
-                    if keycode != 0 {
-                        Some(keycode as u16)
-                    } else {
-                        None
-                    }
-                });
+                crate::device_trace!(
+                    "[VNC] ExtKey keysym={keysym_val:#x} keycode={keycode} down={down}"
+                );
+                // QEMU keycodes are XT scancodes, not Linux evdev codes.
+                let code = keysym::keysym_to_linux(keysym_val);
                 match code {
                     Some(code) => {
-                        if let Some(ref u) = usb {
-                            if let Ok(mut g) = u.lock() {
-                                g.key_event(code, down);
-                            }
-                        } else if let Some(ref kbd) = keyboard {
-                            if let Ok(mut g) = kbd.lock() {
-                                g.key_event(code, down);
-                            }
-                        }
+                        input.key(code, down);
                     }
                     None => crate::device_trace!("[VNC] unmapped ext keysym {keysym_val:#x}"),
                 }
@@ -398,28 +480,81 @@ fn handle_client(
     Ok(())
 }
 
-fn send_full_raw_update(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rect {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+impl Rect {
+    fn from_request(request: &[u8; 9], fb: FramebufferConfig) -> Self {
+        let x = u16::from_be_bytes([request[1], request[2]]).min(fb.width as u16);
+        let y = u16::from_be_bytes([request[3], request[4]]).min(fb.height as u16);
+        let width = u16::from_be_bytes([request[5], request[6]]).min(fb.width as u16 - x);
+        let height = u16::from_be_bytes([request[7], request[8]]).min(fb.height as u16 - y);
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+fn changed_rect(rect: Rect, stride: usize, pixels: &[u8], previous: &[u8]) -> Rect {
+    let mut top = rect.y + rect.height;
+    let mut bottom = rect.y;
+    for y in rect.y..rect.y + rect.height {
+        let start = y as usize * stride + rect.x as usize * 4;
+        let end = start + rect.width as usize * 4;
+        if pixels[start..end] != previous[start..end] {
+            top = top.min(y);
+            bottom = y + 1;
+        }
+    }
+    if bottom <= top {
+        Rect {
+            width: 0,
+            height: 0,
+            ..rect
+        }
+    } else {
+        Rect {
+            y: top,
+            height: bottom - top,
+            ..rect
+        }
+    }
+}
+
+fn send_raw_update(
     stream: &mut TcpStream,
     fb: FramebufferConfig,
     pixels: &[u8],
     format: PixelFormat,
+    rect: Rect,
 ) -> Result<(), String> {
+    if rect.width == 0 || rect.height == 0 {
+        return stream.write_all(&[0, 0, 0, 0]).map_err(|e| e.to_string());
+    }
     let mut hdr = Vec::with_capacity(16);
     hdr.push(0); // FramebufferUpdate
     hdr.push(0); // padding
     hdr.extend_from_slice(&1u16.to_be_bytes());
-    hdr.extend_from_slice(&0u16.to_be_bytes());
-    hdr.extend_from_slice(&0u16.to_be_bytes());
-    hdr.extend_from_slice(&(fb.width as u16).to_be_bytes());
-    hdr.extend_from_slice(&(fb.height as u16).to_be_bytes());
+    hdr.extend_from_slice(&rect.x.to_be_bytes());
+    hdr.extend_from_slice(&rect.y.to_be_bytes());
+    hdr.extend_from_slice(&rect.width.to_be_bytes());
+    hdr.extend_from_slice(&rect.height.to_be_bytes());
     hdr.extend_from_slice(&0i32.to_be_bytes()); // raw encoding
     stream.write_all(&hdr).map_err(|e| e.to_string())?;
 
-    let row = (fb.width * 4) as usize;
+    let row = rect.width as usize * 4;
     let stride = fb.stride as usize;
     let mut encoded = Vec::with_capacity(fb.width as usize * format.bytes);
-    for y in 0..fb.height as usize {
-        let start = y * stride;
+    for y in rect.y as usize..(rect.y + rect.height) as usize {
+        let start = y * stride + rect.x as usize * 4;
         let end = start + row;
         if end > pixels.len() {
             return Err("FB buffer shorter than geometry".into());
@@ -437,7 +572,11 @@ fn read_exact_timeout(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let mut got = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
     while got < buf.len() {
+        if Instant::now() >= deadline {
+            return Err("VNC message/handshake timed out".into());
+        }
         if stop.load(Ordering::Relaxed) {
             return Err("stopped".into());
         }
@@ -459,6 +598,58 @@ fn read_exact_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disconnected_session_releases_held_keys_and_modifiers() {
+        let mem = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let usb = Arc::new(Mutex::new(XhciController::new(41, mem, 1280, 720)));
+        let mut input = SessionInput {
+            keys: BTreeSet::new(),
+            position: (0, 0),
+            keyboard: None,
+            tablet: None,
+            usb: Some(usb.clone()),
+        };
+        input.key(42, true);
+        input.key(30, true);
+        assert_eq!(usb.lock().unwrap().keyboard_report()[0], 2);
+        assert_eq!(usb.lock().unwrap().keyboard_report()[2], 4);
+        drop(input);
+        assert_eq!(usb.lock().unwrap().keyboard_report(), [0; 8]);
+    }
+    #[test]
+    fn clips_requested_rectangle_and_sends_only_changed_rows() {
+        let fb = FramebufferConfig {
+            width: 4,
+            height: 4,
+            stride: 16,
+            gpa: 0,
+            reg_size: 64,
+        };
+        let request = [1, 0, 2, 0, 1, 0, 9, 0, 9];
+        let rect = Rect::from_request(&request, fb);
+        assert_eq!(
+            rect,
+            Rect {
+                x: 2,
+                y: 1,
+                width: 2,
+                height: 3
+            }
+        );
+        let old = [0; 64];
+        let mut pixels = old;
+        pixels[2 * 16 + 2 * 4] = 255;
+        assert_eq!(
+            changed_rect(rect, 16, &pixels, &old),
+            Rect {
+                x: 2,
+                y: 2,
+                width: 2,
+                height: 1
+            }
+        );
+        assert_eq!(changed_rect(rect, 16, &pixels, &pixels).height, 0);
+    }
     #[test]
     fn negotiated_pixel_formats_change_wire_bytes() {
         let mut out = Vec::new();

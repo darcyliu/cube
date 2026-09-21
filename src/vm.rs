@@ -9,7 +9,7 @@ use crate::hypervisor::*;
 use crate::memory::GuestMemory;
 
 pub struct Vm {
-    memory: Arc<GuestMemory>,
+    memory: Option<Arc<GuestMemory>>,
     flash: Option<GuestMemory>,
     flash_vars: Option<GuestMemory>,
     mmio: MmioBus,
@@ -23,11 +23,19 @@ impl Vm {
             check_hv(hv_vm_create(std::ptr::null()))?;
         }
 
-        let memory = Arc::new(GuestMemory::new(ram_base, ram_size)?);
+        let memory = match GuestMemory::new(ram_base, ram_size) {
+            Ok(memory) => Arc::new(memory),
+            Err(e) => {
+                unsafe {
+                    let _ = hv_vm_destroy();
+                }
+                return Err(e);
+            }
+        };
         let mmio = MmioBus::new();
 
         Ok(Self {
-            memory,
+            memory: Some(memory),
             flash: None,
             flash_vars: None,
             mmio,
@@ -87,7 +95,7 @@ impl Vm {
     }
 
     pub fn memory(&self) -> Arc<GuestMemory> {
-        self.memory.clone()
+        self.memory.as_ref().unwrap().clone()
     }
 
     pub fn mmio(&self) -> &MmioBus {
@@ -101,6 +109,10 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        self.mmio.clear();
+        self.flash.take();
+        self.flash_vars.take();
+        self.memory.take();
         unsafe {
             let _ = hv_vm_destroy();
         }
