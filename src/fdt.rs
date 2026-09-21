@@ -12,12 +12,21 @@ pub struct VirtioMmioDevice {
     pub irq: u32,
 }
 
+#[derive(Clone, Copy)]
+pub struct XhciMmioDevice {
+    pub base: u64,
+    pub size: u64,
+    pub irq: u32,
+}
+
 pub fn generate_dtb(
     ram_base: u64,
     ram_size: u64,
     bootargs: &str,
     num_cpus: usize,
     virtio_devices: &[VirtioMmioDevice],
+    framebuffer: Option<crate::devices::display::FramebufferConfig>,
+    xhci: Option<XhciMmioDevice>,
 ) -> Result<Vec<u8>, String> {
     let cpus_count = num_cpus.max(1);
     let mut cpus_dts = String::new();
@@ -54,6 +63,70 @@ pub fn generate_dtb(
         ));
     }
 
+    let xhci_dts = if let Some(x) = xhci {
+        let spi_num = x.irq.saturating_sub(32);
+        format!(
+            r#"    usb@{base:08x} {{
+        compatible = "generic-xhci";
+        reg = <0x0 0x{base:08x} 0x0 0x{size:x}>;
+        interrupt-parent = <&intc>;
+        interrupts = <0 {spi_num} 4>;
+        dma-coherent;
+        status = "okay";
+    }};
+"#,
+            base = x.base,
+            size = x.size,
+            spi_num = spi_num,
+        )
+    } else {
+        String::new()
+    };
+
+
+    // FreeBSD vt_simplefb only probes simple-framebuffer nodes under /chosen
+    // (it is a VT early console driver, not an ofwbus leaf driver).
+    let framebuffer_dts = if let Some(fb) = framebuffer {
+        format!(
+            r#"
+        #address-cells = <2>;
+        #size-cells = <2>;
+        framebuffer@{gpa:x} {{
+            compatible = "simple-framebuffer";
+            reg = <0x0 0x{gpa:08x} 0x0 0x{reg_size:x}>;
+            width = <{width}>;
+            height = <{height}>;
+            stride = <{stride}>;
+            format = "a8r8g8b8";
+            status = "okay";
+        }};
+"#,
+            gpa = fb.gpa,
+            reg_size = fb.reg_size,
+            width = fb.width,
+            height = fb.height,
+            stride = fb.stride,
+        )
+    } else {
+        String::new()
+    };
+
+    // Exclude framebuffer backing from allocatable RAM, including kernels that
+    // do not consume /reserved-memory. The host still maps the entire region.
+    let cells = |base: u64, size: u64| format!(
+        "0x{:x} 0x{:x} 0x{:x} 0x{:x}", base >> 32, base as u32, size >> 32, size as u32);
+    let memory_reg = if let Some(fb) = framebuffer {
+        let end = ram_base.checked_add(ram_size).ok_or("RAM range overflow")?;
+        let fb_end = fb.gpa.checked_add(fb.reg_size).ok_or("Framebuffer range overflow")?;
+        if fb.gpa < ram_base || fb_end > end {
+            return Err("Framebuffer is outside guest RAM".into());
+        }
+        let mut ranges = Vec::new();
+        if fb.gpa > ram_base { ranges.push(cells(ram_base, fb.gpa - ram_base)); }
+        if fb_end < end { ranges.push(cells(fb_end, end - fb_end)); }
+        ranges.join(" ")
+    } else { cells(ram_base, ram_size) };
+
     let dts = format!(
         r#"/dts-v1/;
 
@@ -68,7 +141,7 @@ pub fn generate_dtb(
     chosen {{
         bootargs = "{bootargs}";
         stdout-path = "serial0";
-    }};
+{framebuffer_dts}    }};
 
     aliases {{
         serial0 = "/pl011@09000000";
@@ -101,7 +174,7 @@ pub fn generate_dtb(
 
     memory@{ram_base:x} {{
         device_type = "memory";
-        reg = <0x{ram_base_hi:x} 0x{ram_base_lo:x} 0x{ram_size_hi:x} 0x{ram_size_lo:x}>;
+        reg = <{memory_reg}>;
     }};
 
     intc: interrupt-controller@08000000 {{
@@ -145,15 +218,13 @@ pub fn generate_dtb(
         dma-coherent;
     }};
 
-{virtio_dts}}};
+{virtio_dts}{xhci_dts}}};
 "#,
         bootargs = bootargs,
         ram_base = ram_base,
-        ram_base_hi = (ram_base >> 32) as u32,
-        ram_base_lo = (ram_base & 0xffff_ffff) as u32,
-        ram_size_hi = (ram_size >> 32) as u32,
-        ram_size_lo = (ram_size & 0xffff_ffff) as u32,
         virtio_dts = virtio_dts,
+        xhci_dts = xhci_dts,
+        framebuffer_dts = framebuffer_dts,
     );
 
     // Invoke dtc
@@ -181,4 +252,25 @@ pub fn generate_dtb(
     }
 
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn framebuffer_is_excluded_from_guest_ram() {
+        let fb = crate::devices::display::FramebufferConfig::default();
+        let dtb = generate_dtb(0x40000000, 0x40000000, "", 1, &[], Some(fb), None).unwrap();
+        let mut child = Command::new("dtc").args(["-I", "dtb", "-O", "dts", "-"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&dtb).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let dts = String::from_utf8(output.stdout).unwrap();
+        assert!(dts.contains("reg = <0x00 0x40000000 0x00 0x10000000 0x00 0x50800000 0x00 0x2f800000>"), "{dts}");
+        assert!(dts.contains("framebuffer@50000000"));
+        assert!(generate_dtb(0x40000000, 0x10000000, "", 1, &[], Some(fb), None).is_err());
+        let headless = generate_dtb(0x40000000, 0x40000000, "", 1, &[], None, None).unwrap();
+        assert!(!headless.windows(b"simple-framebuffer".len()).any(|w| w == b"simple-framebuffer"));
+    }
 }

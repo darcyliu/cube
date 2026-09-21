@@ -24,6 +24,8 @@ use devices::virtio::block::VirtioBlock;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::rng::VirtioRng;
 use devices::virtio::VirtioConsole;
+use devices::virtio::VirtioInput;
+use devices::usb::xhci::{XhciController, MMIO_XHCI_SIZE};
 use vcpu::{CpuModel, Vcpu, VcpuExitStatus, VcpuManager};
 use vm::Vm;
 
@@ -60,6 +62,19 @@ const VIRTIO_RNG_IRQ: u32 = 37; // SPI 5 (intid 37)
 const MMIO_VIRTIO_CONSOLE_BASE: u64 = 0x0a00_0600;
 const MMIO_VIRTIO_CONSOLE_SIZE: u64 = 0x0200;
 const VIRTIO_CONSOLE_IRQ: u32 = 38; // SPI 6 (intid 38)
+
+const MMIO_VIRTIO_INPUT_KBD_BASE: u64 = 0x0a00_0800;
+const MMIO_VIRTIO_INPUT_KBD_SIZE: u64 = 0x0200;
+const VIRTIO_INPUT_KBD_IRQ: u32 = 39; // SPI 7 (intid 39)
+
+const MMIO_VIRTIO_INPUT_TBL_BASE: u64 = 0x0a00_0a00;
+const MMIO_VIRTIO_INPUT_TBL_SIZE: u64 = 0x0200;
+const VIRTIO_INPUT_TBL_IRQ: u32 = 40; // SPI 8 (intid 40)
+
+// Platform xHCI (FDT generic-xhci) — FreeBSD GUI input path (no virtio_input).
+// 64 KiB window: caps@0 + oper@0x40 + runtime@0x1000 + doorbell@0x2000.
+const MMIO_XHCI_BASE: u64 = 0x0a01_0000;
+const XHCI_IRQ: u32 = 41; // SPI 9 (intid 41)
 
 #[derive(Clone)]
 pub struct DiskConfig {
@@ -108,6 +123,7 @@ fn main() {
     let mut cpu_model = CpuModel::detect_host();
     let mut serial_log: Option<String> = None;
     let mut module_paths: Vec<String> = Vec::new();
+    let mut vnc_bind: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -260,6 +276,15 @@ fn main() {
                     }
                 }
             }
+            "--vnc" => {
+                // Optional bind addr; default 127.0.0.1:5900
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    vnc_bind = Some(args[i].clone());
+                } else {
+                    vnc_bind = Some("127.0.0.1:5900".to_string());
+                }
+            }
             "--help" | "-h" => {
                 println!("Usage: vmm [OPTIONS] [PAYLOAD/KERNEL]");
                 println!();
@@ -281,6 +306,7 @@ fn main() {
                 println!("  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)");
                 println!("  -n, --net <MODE>         Network mode: vmnet (default NAT), bridge[:iface], tap:<dev>, mock, none");
                 println!("      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)");
+                println!("      --vnc [ADDR]          Enable simple-framebuffer + VNC + USB HID (default 127.0.0.1:5900)");
                 println!("  -h, --help               Display this help message");
                 return;
             }
@@ -397,6 +423,7 @@ fn main() {
             is_multiuser,
             None,
             Some(&fw),
+            vnc_bind.as_deref(),
         );
         return;
     }
@@ -421,12 +448,16 @@ fn main() {
                 Some(b) => b,
                 None => {
                     let s_flag = if is_multiuser { "" } else { " -s" };
+                    let console = if vnc_bind.is_some() {
+                        "-D boot_multicons=YES console=vt,comconsole"
+                    } else {
+                        "-h boot_serial=YES console=comconsole"
+                    };
                     match root_dev {
                         Some(ref root) => format!(
-                            "FreeBSD: -v{} -h boot_serial=YES console=comconsole vfs.root.mountfrom={}",
-                            s_flag, root
+                            "FreeBSD: -v{s_flag} {console} vfs.root.mountfrom={root}"
                         ),
-                        None => format!("FreeBSD: -v{} -h boot_serial=YES console=comconsole", s_flag),
+                        None => format!("FreeBSD: -v{s_flag} {console}"),
                     }
                 }
             };
@@ -450,6 +481,7 @@ fn main() {
                 is_multiuser,
                 root_dev.as_deref(),
                 None,
+                vnc_bind.as_deref(),
             );
             return;
         } else {
@@ -496,6 +528,7 @@ fn boot_os_kernel(
     is_multiuser: bool,
     root_dev: Option<&str>,
     uefi_firmware: Option<&[u8]>,
+    vnc_bind: Option<&str>,
 ) {
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
@@ -656,13 +689,139 @@ fn boot_os_kernel(
         })
         .expect("Failed to spawn sigwinch thread");
 
-    let dtb_bytes = match fdt::generate_dtb(DEFAULT_RAM_BASE, ram_size as u64, bootargs, cpus, &virtio_devices) {
+    // Option A GUI: simple-framebuffer in FDT + optional embedded VNC
+
+    // GUI input when VNC is enabled:
+    // - Platform xHCI + HID kbd/tablet (FreeBSD path; preferred by VNC)
+    // - VirtIO-input kept registered for Linux guests (parked for FreeBSD)
+    let (vnc_keyboard, vnc_tablet, vnc_usb) = if vnc_bind.is_some() {
+        let xhci = Arc::new(Mutex::new(XhciController::new(
+            XHCI_IRQ,
+            vm.memory(),
+            devices::display::FB_WIDTH as u16,
+            devices::display::FB_HEIGHT as u16,
+        )));
+        vm.mmio_mut().register_shared(MMIO_XHCI_BASE, MMIO_XHCI_SIZE, xhci.clone());
+        println!(
+            "[VMM] Registered platform xHCI (generic-xhci) at GPA 0x{:08x} size 0x{:x} (IRQ {})",
+            MMIO_XHCI_BASE, MMIO_XHCI_SIZE, XHCI_IRQ
+        );
+
+        let kbd = Arc::new(Mutex::new(VirtioInput::new_keyboard(
+            VIRTIO_INPUT_KBD_IRQ,
+            vm.memory(),
+        )));
+        let tablet = Arc::new(Mutex::new(VirtioInput::new_tablet(
+            VIRTIO_INPUT_TBL_IRQ,
+            vm.memory(),
+            devices::display::FB_WIDTH as u16,
+            devices::display::FB_HEIGHT as u16,
+        )));
+        vm.mmio_mut().register_shared(
+            MMIO_VIRTIO_INPUT_KBD_BASE,
+            MMIO_VIRTIO_INPUT_KBD_SIZE,
+            kbd.clone(),
+        );
+        virtio_devices.push(fdt::VirtioMmioDevice {
+            base: MMIO_VIRTIO_INPUT_KBD_BASE,
+            size: MMIO_VIRTIO_INPUT_KBD_SIZE,
+            irq: VIRTIO_INPUT_KBD_IRQ,
+        });
+        println!(
+            "[VMM] Registered VirtIO-MMIO keyboard at GPA 0x{:08x} (IRQ {}) [parked for FreeBSD]",
+            MMIO_VIRTIO_INPUT_KBD_BASE, VIRTIO_INPUT_KBD_IRQ
+        );
+        vm.mmio_mut().register_shared(
+            MMIO_VIRTIO_INPUT_TBL_BASE,
+            MMIO_VIRTIO_INPUT_TBL_SIZE,
+            tablet.clone(),
+        );
+        virtio_devices.push(fdt::VirtioMmioDevice {
+            base: MMIO_VIRTIO_INPUT_TBL_BASE,
+            size: MMIO_VIRTIO_INPUT_TBL_SIZE,
+            irq: VIRTIO_INPUT_TBL_IRQ,
+        });
+        println!(
+            "[VMM] Registered VirtIO-MMIO tablet at GPA 0x{:08x} (IRQ {}) [parked for FreeBSD]",
+            MMIO_VIRTIO_INPUT_TBL_BASE, VIRTIO_INPUT_TBL_IRQ
+        );
+        (Some(kbd), Some(tablet), Some(xhci))
+    } else {
+        (None, None, None)
+    };
+
+    let fb_cfg = if vnc_bind.is_some() {
+        let fb = devices::display::FramebufferConfig::default();
+        let need = fb.gpa + fb.reg_size;
+        let ram_end = DEFAULT_RAM_BASE + ram_size as u64;
+        if ram_end < need {
+            eprintln!(
+                "\x1b[1;31m[VMM Error] RAM too small for framebuffer at 0x{:08x} (need >= {}MB)\x1b[0m",
+                fb.gpa,
+                (need - DEFAULT_RAM_BASE).div_ceil(1024 * 1024)
+            );
+            process::exit(1);
+        }
+        // Clear framebuffer to black (avoid rainbow snow under vt)
+        let black = vec![0u8; fb.pixel_bytes()];
+        if let Err(e) = vm.memory().write(fb.gpa, &black) {
+            eprintln!("\x1b[1;31m[VMM Error] Failed to init framebuffer: {e}\x1b[0m");
+            process::exit(1);
+        }
+        println!(
+            "[VMM] Simple-framebuffer {}x{} at GPA 0x{:08x} (stride {})",
+            fb.width, fb.height, fb.gpa, fb.stride
+        );
+        Some(fb)
+    } else {
+        None
+    };
+
+    let xhci_fdt = vnc_usb.as_ref().map(|_| fdt::XhciMmioDevice {
+        base: MMIO_XHCI_BASE,
+        size: MMIO_XHCI_SIZE,
+        irq: XHCI_IRQ,
+    });
+    let dtb_bytes = match fdt::generate_dtb(
+        DEFAULT_RAM_BASE,
+        ram_size as u64,
+        bootargs,
+        cpus,
+        &virtio_devices,
+        fb_cfg,
+        xhci_fdt,
+    ) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("\x1b[1;31m[VMM Error] Failed to generate DTB: {}\x1b[0m", e);
             process::exit(1);
         }
     };
+
+    if let Some(bind_str) = vnc_bind {
+        let addr: std::net::SocketAddr = bind_str
+            .parse()
+            .unwrap_or_else(|_| {
+                eprintln!("\x1b[1;31m[VMM Error] Invalid --vnc address '{bind_str}'\x1b[0m");
+                process::exit(1);
+            });
+        let fb = fb_cfg.expect("fb_cfg set when vnc_bind is Some");
+        match devices::display::vnc::spawn(
+            vm.memory(),
+            fb,
+            addr,
+            vnc_keyboard.clone(),
+            vnc_tablet.clone(),
+            vnc_usb.clone(),
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("\x1b[1;31m[VMM Error] VNC server failed: {e}\x1b[0m");
+                process::exit(1);
+            }
+        }
+    }
+
 
     // -------------------------------------------------------------------
     // Boot path dispatch: UEFI firmware vs direct ELF kernel
@@ -805,14 +964,22 @@ fn boot_os_kernel(
             for f in &mut files_kva {
                 f.gpa = to_kva(f.gpa);
             }
-            let mut kenv_vars = vec!["boot_serial=YES", "console=comconsole"];
+            let mut kenv_vars = if vnc_bind.is_some() {
+                vec!["boot_multicons=YES", "console=vt,comconsole"]
+            } else {
+                vec!["boot_serial=YES", "console=comconsole"]
+            };
             let mountfrom;
             if let Some(root) = root_dev {
                 mountfrom = format!("vfs.root.mountfrom={root}");
                 kenv_vars.insert(0, mountfrom.as_str());
             }
             let kenv = preload::encode_kenv(&kenv_vars);
-            let mut howto = preload::RB_VERBOSE | preload::RB_SERIAL;
+            let mut howto = preload::RB_VERBOSE | if vnc_bind.is_some() {
+                preload::RB_MULTIPLE
+            } else {
+                preload::RB_SERIAL
+            };
             if !is_multiuser {
                 howto |= preload::RB_SINGLE;
             }

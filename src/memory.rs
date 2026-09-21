@@ -17,6 +17,7 @@ pub struct GuestMemory {
     layout: Layout,
     guest_base: u64,
     size: usize,
+    mapped: bool,
 }
 
 unsafe impl Send for GuestMemory {}
@@ -51,7 +52,15 @@ impl GuestMemory {
             layout,
             guest_base,
             size,
+            mapped: true,
         })
+    }
+
+    #[cfg(test)]
+    pub fn new_test(guest_base: u64, size: usize) -> Self {
+        let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE).unwrap();
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
+        Self { ptr, layout, guest_base, size, mapped: false }
     }
 
     pub fn guest_base(&self) -> u64 {
@@ -157,7 +166,7 @@ impl GuestMemory {
 impl Drop for GuestMemory {
     fn drop(&mut self) {
         unsafe {
-            let _ = hv_vm_unmap(self.guest_base, self.size);
+            if self.mapped { let _ = hv_vm_unmap(self.guest_base, self.size); }
             dealloc(self.ptr.as_ptr(), self.layout);
         }
     }

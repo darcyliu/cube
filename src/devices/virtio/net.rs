@@ -1122,7 +1122,7 @@ fn patch_dhcp_response(buf: &mut [u8]) {
         // Clear UDP checksum (0x0000 = disabled/not computed in IPv4 UDP, per RFC 768)
         buf[udp_offset + 6] = 0;
         buf[udp_offset + 7] = 0;
-        println!("[VirtIO-Net] Rewrote DHCP DNS server option from macOS host IP to 1.1.1.1");
+        crate::device_trace!("[VirtIO-Net] Rewrote DHCP DNS server option from macOS host IP to 1.1.1.1");
     }
 }
 

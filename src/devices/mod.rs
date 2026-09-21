@@ -5,6 +5,8 @@ pub mod rtc;
 pub mod uart;
 pub mod pflash;
 pub mod virtio;
+pub mod display;
+pub mod usb;
 
 use std::sync::{Arc, Mutex};
 

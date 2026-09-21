@@ -6,8 +6,10 @@ pub mod block;
 pub mod console;
 pub mod net;
 pub mod rng;
+pub mod input;
 
 pub use console::VirtioConsole;
+pub use input::VirtioInput;
 
 // VirtIO MMIO Register Offsets (Modern, Version 2)
 pub const VIRTIO_MMIO_MAGIC_VALUE: u64 = 0x000;
@@ -44,6 +46,7 @@ pub const VIRTIO_DEV_NET: u32 = 1;
 pub const VIRTIO_DEV_BLOCK: u32 = 2;
 pub const VIRTIO_DEV_CONSOLE: u32 = 3;
 pub const VIRTIO_DEV_RNG: u32 = 4;
+pub const VIRTIO_DEV_INPUT: u32 = 18;
 
 // VirtIO Device Status Bits
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;

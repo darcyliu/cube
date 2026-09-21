@@ -28,6 +28,7 @@ pub const MODINFOMD_DTBP: u32 = 0x1000;
 pub const RB_SINGLE: i32 = 0x0000_0002;
 pub const RB_VERBOSE: i32 = 0x0000_0800;
 pub const RB_SERIAL: i32 = 0x0000_1000;
+pub const RB_MULTIPLE: i32 = 0x2000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleKind {

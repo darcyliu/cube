@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[repr(C)]
@@ -127,4 +127,33 @@ impl Drop for TerminalGuard {
             let _ = stdout.flush();
         }
     }
+}
+
+/// Host diagnostics share the console TTY, whose output processing is disabled
+/// in raw mode. Redirected logs should still use ordinary LF line endings.
+pub fn host_log(args: std::fmt::Arguments<'_>) {
+    let stderr = io::stderr();
+    let raw_tty = RAW_MODE_ACTIVE.load(Ordering::Relaxed) && stderr.is_terminal();
+    let mut out = stderr.lock();
+    let _ = out.write_fmt(args);
+    let _ = out.write_all(if raw_tty { b"\r\n" } else { b"\n" });
+}
+
+pub fn device_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VMM_DEVICE_TRACE").is_ok_and(|v| v == "1"))
+}
+
+#[macro_export]
+macro_rules! host_log {
+    ($($arg:tt)*) => { $crate::terminal::host_log(format_args!($($arg)*)) };
+}
+
+#[macro_export]
+macro_rules! device_trace {
+    ($($arg:tt)*) => {
+        if $crate::terminal::device_trace_enabled() {
+            $crate::host_log!($($arg)*);
+        }
+    };
 }
