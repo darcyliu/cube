@@ -139,6 +139,9 @@ The kernel and firmware arguments are optional. The checks cover parked CPUs,
 CPU off/on, reboot, and (when supplied) FreeBSD VNC input and UEFI shutdown. They
 use temporary kernels and variable stores without opening guest disks.
 
+For a disposable full installation, installed-disk SSH, and reboot/persistence
+check, see [the installation regression runbook](docs/install-regression.md).
+
 ---
 
 ## Project Structure

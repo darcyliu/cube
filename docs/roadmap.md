@@ -2,8 +2,9 @@
 
 Recorded 2026-09-20 after the device/lifecycle hardening and unattended-console
 fixes in `06fb2b3`. Updated 2026-09-21: item 1 is complete with regression coverage
-and user-confirmed guest SSH forwarding. Next is the full installation regression
-test in item 2.
+and user-confirmed guest SSH forwarding. Item 2 is complete with a user-confirmed
+full privileged install → boot → reboot regression run. Next is UEFI/ZFS
+verification in item 3.
 Check off criteria only when supported by tests or a recorded manual run.
 
 ## 1. Reliable networking and configurable forwarding
@@ -37,23 +38,26 @@ See [networking](networking.md) and [entitlements](entitlements.md).
 
 ## 2. Full install → boot → reboot regression test
 
-Current checks cover diskless CPU lifecycle, VNC input, and installer shell
-interaction. They do not verify that an unattended installation produces a
-bootable system with working SSH.
+`scripts/check_install.py` now covers this workflow using disposable resources.
+The user confirmed a successful privileged FreeBSD 14.4 run covering installation,
+clean poweroff, installed-disk SSH without media, reboot with a changed boot time,
+marker persistence, returning SSH, and final clean poweroff.
 
-- [ ] Install FreeBSD onto a newly created disposable disk with isolated seed,
+- [x] Install FreeBSD onto a newly created disposable disk with isolated seed,
   console log, UART mailbox, and EFI store where applicable.
-- [ ] Require an explicit installer success result and clean VM exit.
-- [ ] Boot the installed disk without the installation media and verify SSH
+- [x] Require an explicit installer success result and clean VM exit.
+- [x] Boot the installed disk without the installation media and verify SSH
   command execution through the configured forwarding rule.
-- [ ] Create a marker in the guest, reboot, and verify it persists and SSH returns.
-- [ ] Bound each phase with a timeout, retain diagnostic logs on failure, and
+- [x] Create a marker in the guest, reboot, and verify it persists and SSH returns.
+- [x] Bound each phase with a timeout, retain diagnostic logs on failure, and
   clean up only resources created by the test.
-- [ ] Document prerequisites and a reproducible invocation. Never use an
+- [x] Document prerequisites and a reproducible invocation. Never use an
   existing user disk as the test destination.
 
-Build on `scripts/check_vm_lifecycle.py`, `scripts/check_unattended_console.py`,
-and `scripts/unattended-install.sh`. Depends on item 1 for reliable forwarding.
+See the [installation regression runbook](install-regression.md) for commands,
+scope, and recorded validation. Failure-guard tests cover echoed success markers,
+exit status/poweroff, phase deadlines, early exits, and mailbox protection.
+Depends on item 1 for reliable forwarding. UEFI/ZFS remains in item 3.
 
 ## 3. Complete UEFI/ZFS boot verification
 
