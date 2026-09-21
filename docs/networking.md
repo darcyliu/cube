@@ -4,7 +4,9 @@
 
 Default `--net vmnet` tries macOS **vmnet.framework** (shared/NAT). Without
 root or the restricted `com.apple.vm.networking` entitlement it fails and the
-VMM **falls back to mock** (packets dropped).
+VMM exits with an error. Failed vmnet, bridge, and TAP initialization never
+silently selects mock networking. Use `--net mock` explicitly to discard packets,
+or `--net none` to omit the NIC.
 
 **Working path today:**
 
@@ -39,6 +41,53 @@ Guest gets an address from your LAN router. Still needs `sudo` (or `com.apple.vm
 **Disable NIC:** `--net none`
 
 Codesigning details: [entitlements.md](entitlements.md).
+
+## TCP forwarding
+
+Use a repeatable rule with numeric host and guest addresses:
+
+```sh
+sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk freebsd-installed.img \
+  --multiuser --net vmnet --forward 127.0.0.1:2222=192.168.18.7:22 \
+  --forward 127.0.0.1:8080=192.168.18.7:80
+ssh -p 2222 root@127.0.0.1
+```
+
+Choose the guest address from its actual DHCP lease or static configuration;
+forwarding does not discover it. IPv6 endpoints use brackets, for example
+`--forward '[::1]:2222=[fd00::7]:22'`. Both ports must be nonzero.
+`--ssh-port 2222` forwards from `127.0.0.1:2222` to port 22 at the IPv4 address
+learned from a DHCP ACK for this VM's MAC address. It requires vmnet or bridge
+networking and guest DHCP. Before an ACK arrives, connections fail with an
+explicit diagnostic rather than guessing an address. Subsequent connections
+use any newly learned address; existing connections keep their original target.
+For static guest addresses, use `--forward` instead. For example, a guest at
+`192.168.2.2` needs `--forward 127.0.0.1:2222=192.168.2.2:22`.
+An explicit non-loopback host address exposes the listener on that interface.
+
+An occupied or unavailable host bind address fails startup. A destination
+connection failure reports the rule and OS error; retry the client after the
+guest service is ready. Each rule allows 64 active connections, uses bounded
+buffers, and closes its listener and connections on VM shutdown. These are TCP
+forwards through the host's routing table, not UDP forwarding or a NAT backend.
+
+Regression checks:
+
+```sh
+cargo test
+python3 scripts/check_network.py target/debug/vmm
+# Choose an unused address on your actual vmnet subnet for the guest check:
+sudo python3 scripts/check_network.py target/debug/vmm \
+  --kernel .iso-boot/boot/kernel/kernel \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --guest-cidr 192.168.18.77/24 --host-ip 192.168.18.1
+```
+
+The guest check uses a temporary SSH key and RAM-backed guest scratch files,
+without a writable disk. It checks host connectivity and forwards SSH to guest
+port 22222. It starts vmnet and uses the VMM's existing host PF/NAT setup, so
+sudo is required. The basic CLI checks and TCP unit tests require permission to
+open local sockets, but do not require sudo.
 
 ---
 

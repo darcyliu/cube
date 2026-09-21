@@ -2,8 +2,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static BLK_IOS: AtomicU64 = AtomicU64::new(0);
 
@@ -59,6 +59,14 @@ pub struct RawFileBackend {
     file: File,
     size: u64,
     read_only: bool,
+}
+
+impl Drop for RawFileBackend {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly inherit the descriptor.
+        // Release ownership now rather than waiting for its copy to close.
+        let _ = self.file.unlock();
+    }
 }
 
 impl RawFileBackend {
@@ -149,6 +157,13 @@ pub struct CowBackend {
     overlay_file: File,
     base_size: u64,
     cluster_table: Vec<u64>,
+}
+
+impl Drop for CowBackend {
+    fn drop(&mut self) {
+        let _ = self.overlay_file.unlock();
+        let _ = self.base_file.unlock();
+    }
 }
 
 impl CowBackend {
@@ -858,7 +873,7 @@ impl MmioDevice for VirtioBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{name, TestDir};
+    use crate::test_support::{TestDir, name};
 
     #[test]
     fn raw_bounds_and_exclusive_writer() {
@@ -872,10 +887,12 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024);
         disk.write_all_at(512, &[7; 512]).unwrap();
         disk.flush().unwrap();
+        let inherited = disk.file.try_clone().unwrap();
         drop(disk);
         let a = RawFileBackend::open(name(&path), true).unwrap();
         assert!(RawFileBackend::open(name(&path), true).is_ok());
         drop(a);
+        drop(inherited);
     }
 
     #[test]

@@ -81,8 +81,8 @@ Press `Enter` to access the live FreeBSD root `#` prompt!
 # Run with root privileges to automatically enable macOS vmnet.framework NAT:
 sudo make sudo-freebsd-net
 
-# Or run unprivileged (uses user-mode fallback backend):
-make freebsd-net
+# For offline unprivileged use, explicitly disable networking:
+./target/debug/vmm --freebsd boot/kernel/kernel --net none
 ```
 Inside the FreeBSD single-user shell:
 ```sh
@@ -142,6 +142,10 @@ use temporary kernels and variable stores without opening guest disks.
 ---
 
 ## Project Structure
+
+See the [follow-up roadmap](docs/roadmap.md) for prioritized work and completion
+criteria covering networking, installation tests, UEFI/ZFS, graphics, VM
+management, and disk-overlay tools.
 
 ```
 vmm/

@@ -45,6 +45,14 @@ pub struct CfiPflash {
     persistence_error: Option<String>,
 }
 
+impl Drop for CfiPflash {
+    fn drop(&mut self) {
+        if let Some(file) = &self.backing {
+            let _ = file.unlock();
+        }
+    }
+}
+
 impl CfiPflash {
     pub fn new(storage: Vec<u8>) -> Self {
         let block_size: u32 = 256 * 1024;

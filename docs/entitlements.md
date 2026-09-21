@@ -39,9 +39,9 @@ That target also installs a small PF NAT anchor (`com.apple/vmm`) so the guest
 subnet `192.168.18.0/24` can reach the internet via your default interface.
 See [networking.md](networking.md).
 
-If you start without sudo and vmnet fails, the VMM **falls back to a mock
-backend** and prints a yellow warning — guest `vtnet0` will not reach the LAN
-or Internet until you re-run under sudo (or with a real networking signature).
+If you start without sudo and vmnet fails, the VMM exits with an error. Re-run
+under sudo (or with an authorized networking signature). For offline operation,
+explicitly select `--net mock` to discard packets or `--net none` to omit the NIC.
 
 ## Optional: Developer ID + vm.networking
 

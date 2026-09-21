@@ -22,12 +22,12 @@ use std::thread;
 use devices::fw_cfg::FwCfg;
 use devices::rtc::Pl031Rtc;
 use devices::uart::Pl011Uart;
-use devices::usb::xhci::{XhciController, MMIO_XHCI_SIZE};
+use devices::usb::xhci::{MMIO_XHCI_SIZE, XhciController};
+use devices::virtio::VirtioConsole;
+use devices::virtio::VirtioInput;
 use devices::virtio::block::VirtioBlock;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::rng::VirtioRng;
-use devices::virtio::VirtioConsole;
-use devices::virtio::VirtioInput;
 use vcpu::{CpuModel, Vcpu, VcpuExitStatus, VcpuManager};
 use vm::Vm;
 
@@ -120,6 +120,7 @@ fn main() {
     let mut efi_vars_path: Option<String> = None;
     let mut is_multiuser = false;
     let mut ssh_port: Option<u16> = None;
+    let mut forward_rules = Vec::new();
     let mut net_mode: Option<String> = None;
     let mut mac_addr: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     let mut cpus: usize = 1;
@@ -157,10 +158,21 @@ fn main() {
             "--multiuser" | "--multi-user" | "-u" => {
                 is_multiuser = true;
             }
+            "--forward" => {
+                i += 1;
+                let value = args.get(i).unwrap_or_else(|| {
+                    eprintln!("--forward requires HOST_IP:PORT=GUEST_IP:PORT");
+                    process::exit(1);
+                });
+                forward_rules.push(forward::ForwardRule::parse(value).unwrap_or_else(|e| {
+                    eprintln!("[VMM Error] {e}");
+                    process::exit(1);
+                }));
+            }
             "--ssh-port" => {
                 if i + 1 < args.len() {
                     i += 1;
-                    if let Ok(port) = args[i].parse::<u16>() {
+                    if let Some(port) = args[i].parse::<u16>().ok().filter(|&p| p != 0) {
                         ssh_port = Some(port);
                     } else {
                         eprintln!(
@@ -169,6 +181,9 @@ fn main() {
                         );
                         process::exit(1);
                     }
+                } else {
+                    eprintln!("--ssh-port requires a nonzero port");
+                    process::exit(1);
                 }
             }
             "--kernel" | "-k" => {
@@ -279,6 +294,11 @@ fn main() {
                 if i + 1 < args.len() {
                     i += 1;
                     net_mode = Some(args[i].clone());
+                } else {
+                    eprintln!(
+                        "--net requires vmnet, bridge[:interface], tap:<path>, mock, or none"
+                    );
+                    process::exit(1);
                 }
             }
             "--serial-log" | "--console-log" => {
@@ -320,29 +340,60 @@ fn main() {
                 println!("Usage: vmm [OPTIONS] [PAYLOAD/KERNEL]");
                 println!();
                 println!("Options:");
-                println!("  -f, --freebsd [PATH]     Boot FreeBSD kernel ELF (defaults to boot/kernel/kernel)");
-                println!("      --uefi [PATH]        Boot EDK2/UEFI firmware (defaults to firmware/QEMU_EFI.fd); loader.efi handles ZFS");
-                println!("  -u, --multiuser          Boot FreeBSD into multi-user mode (omits single-user -s)");
-                println!("      --ssh-port <PORT>    Forward host TCP port to guest SSH (e.g. 2222 -> 192.168.18.2:22)");
+                println!(
+                    "  -f, --freebsd [PATH]     Boot FreeBSD kernel ELF (defaults to boot/kernel/kernel)"
+                );
+                println!(
+                    "      --uefi [PATH]        Boot EDK2/UEFI firmware (defaults to firmware/QEMU_EFI.fd); loader.efi handles ZFS"
+                );
+                println!(
+                    "  -u, --multiuser          Boot FreeBSD into multi-user mode (omits single-user -s)"
+                );
+                println!(
+                    "      --ssh-port <PORT>    Forward localhost TCP port to this VM's DHCP IPv4 address:22"
+                );
+                println!(
+                    "      --forward <RULE>     TCP HOST_IP:PORT=GUEST_IP:PORT (repeatable; IPv6 uses brackets)"
+                );
                 println!("  -k, --kernel <PATH>      Boot specified ELF kernel");
                 println!("  -c, --cpus <N>           Number of virtual CPUs (default: 1)");
-                println!("      --cpu-model <MODEL>  CPU model/MIDR spoofing: auto/host (default), m1, m1-pro, m1-max, m2, m2-pro, m2-max, neoverse-n2, cortex-a78, or 0x<hex>");
-                println!("      --serial-log <PATH>  Mirror guest serial console output to specified log file");
-                println!("  -d, --disk <PATH>[,cow][,ro] Attach disk image (can be specified multiple times)");
-                println!("      --cdrom, --iso <PATH>    Attach read-only ISO image as VirtIO block device");
-                println!("      --cow                Enable Copy-On-Write overlay for all attached disks");
-                println!("  -r, --root <DEV>         Root filesystem (e.g. ufs:/dev/vtbd0p2 or zfs:zroot/ROOT/default)");
-                println!("      --module <PATH>      Preload a FreeBSD .ko (repeatable; zfs.ko is auto-loaded for ZFS root)");
+                println!(
+                    "      --cpu-model <MODEL>  CPU model/MIDR spoofing: auto/host (default), m1, m1-pro, m1-max, m2, m2-pro, m2-max, neoverse-n2, cortex-a78, or 0x<hex>"
+                );
+                println!(
+                    "      --serial-log <PATH>  Mirror guest serial console output to specified log file"
+                );
+                println!(
+                    "  -d, --disk <PATH>[,cow][,ro] Attach disk image (can be specified multiple times)"
+                );
+                println!(
+                    "      --cdrom, --iso <PATH>    Attach read-only ISO image as VirtIO block device"
+                );
+                println!(
+                    "      --cow                Enable Copy-On-Write overlay for all attached disks"
+                );
+                println!(
+                    "  -r, --root <DEV>         Root filesystem (e.g. ufs:/dev/vtbd0p2 or zfs:zroot/ROOT/default)"
+                );
+                println!(
+                    "      --module <PATH>      Preload a FreeBSD .ko (repeatable; zfs.ko is auto-loaded for ZFS root)"
+                );
                 println!("  -b, --bootargs <ARGS>    Custom kernel boot arguments");
                 println!(
                     "  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)"
                 );
-                println!("  -n, --net <MODE>         Network mode: vmnet (default NAT), bridge[:iface], tap:<dev>, mock, none");
+                println!(
+                    "  -n, --net <MODE>         Network mode: vmnet (default NAT), bridge[:iface], tap:<dev>, mock, none"
+                );
                 println!(
                     "      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)"
                 );
-                println!("      --vnc [ADDR]          Enable simple-framebuffer + VNC + USB HID (default 127.0.0.1:5900)");
-                println!("      --efi-vars <PATH>     Persistent per-VM EFI variable store (default <disk>.vars.fd)");
+                println!(
+                    "      --vnc [ADDR]          Enable simple-framebuffer + VNC + USB HID (default 127.0.0.1:5900)"
+                );
+                println!(
+                    "      --efi-vars <PATH>     Persistent per-VM EFI variable store (default <disk>.vars.fd)"
+                );
                 println!("  -h, --help               Display this help message");
                 return;
             }
@@ -396,8 +447,12 @@ fn main() {
     if !is_uefi {
         if let Some(ref root) = root_dev {
             if root.starts_with("zfs:") {
-                eprintln!("\x1b[1;33m[VMM] ZFS root selected. Direct ELF+zfs.ko (Strategy 1) often hangs after MODINFO.");
-                eprintln!("[VMM] Recommended Strategy 2: make fetch-uefi && make freebsd-zfs-uefi DISK=<img>\x1b[0m");
+                eprintln!(
+                    "\x1b[1;33m[VMM] ZFS root selected. Direct ELF+zfs.ko (Strategy 1) often hangs after MODINFO."
+                );
+                eprintln!(
+                    "[VMM] Recommended Strategy 2: make fetch-uefi && make freebsd-zfs-uefi DISK=<img>\x1b[0m"
+                );
             }
         }
     }
@@ -437,7 +492,9 @@ fn main() {
                 eprintln!(
                     "\x1b[1;31m[VMM Error] Failed to read UEFI firmware '{path}': {e}\x1b[0m"
                 );
-                eprintln!("\x1b[1;33m[VMM Hint] Run 'make fetch-uefi' to download firmware/QEMU_EFI.fd.\x1b[0m");
+                eprintln!(
+                    "\x1b[1;33m[VMM Hint] Run 'make fetch-uefi' to download firmware/QEMU_EFI.fd.\x1b[0m"
+                );
                 process::exit(1);
             }
         };
@@ -445,9 +502,6 @@ fn main() {
             .map(|mb| mb * 1024 * 1024)
             .unwrap_or(DEFAULT_OS_RAM_SIZE);
         let bootargs = custom_bootargs.unwrap_or_else(|| "console=ttyAMA0".to_string());
-        if let Some(port) = ssh_port {
-            forward::start_port_forward(port, "192.168.18.2:22".to_string());
-        }
         finish_boot(boot_os_kernel(
             &path,
             &[],
@@ -465,6 +519,8 @@ fn main() {
             Some(&fw),
             vnc_bind.as_deref(),
             efi_vars_path.as_deref(),
+            &forward_rules,
+            ssh_port,
         ));
         return;
     }
@@ -506,10 +562,6 @@ fn main() {
                 }
             };
 
-            if let Some(port) = ssh_port {
-                forward::start_port_forward(port, "192.168.18.2:22".to_string());
-            }
-
             finish_boot(boot_os_kernel(
                 path,
                 &file_data,
@@ -527,6 +579,8 @@ fn main() {
                 None,
                 vnc_bind.as_deref(),
                 efi_vars_path.as_deref(),
+                &forward_rules,
+                ssh_port,
             ));
             return;
         } else {
@@ -580,7 +634,19 @@ fn boot_os_kernel(
     uefi_firmware: Option<&[u8]>,
     vnc_bind: Option<&str>,
     efi_vars_path: Option<&str>,
+    forward_rules: &[forward::ForwardRule],
+    ssh_port: Option<u16>,
 ) -> Result<bool, String> {
+    if ssh_port.is_some()
+        && (matches!(net_mode, Some("none" | "mock"))
+            || net_mode.is_some_and(|s| s.starts_with("tap:")))
+    {
+        return Err("--ssh-port requires a DHCP-capable vmnet/bridge NIC; use --forward for an explicit destination".into());
+    }
+    let mut _forwards = forward_rules
+        .iter()
+        .map(forward::start_port_forward)
+        .collect::<Result<Vec<_>, _>>()?;
     println!("\x1b[1;36m==================================================\x1b[0m");
     println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
@@ -607,7 +673,9 @@ fn boot_os_kernel(
                 "\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m",
                 e
             );
-            eprintln!("[VMM Hint] Ensure binary is signed with 'com.apple.security.hypervisor' entitlement.");
+            eprintln!(
+                "[VMM Hint] Ensure binary is signed with 'com.apple.security.hypervisor' entitlement."
+            );
             process::exit(1);
         }
     };
@@ -682,7 +750,10 @@ fn boot_os_kernel(
                 );
             }
             Err(e) => {
-                eprintln!("\x1b[1;31m[VMM Error] Failed to initialize VirtIO block device '{}': {}\x1b[0m", disk.path, e);
+                eprintln!(
+                    "\x1b[1;31m[VMM Error] Failed to initialize VirtIO block device '{}': {}\x1b[0m",
+                    disk.path, e
+                );
                 process::exit(1);
             }
         }
@@ -695,7 +766,13 @@ fn boot_os_kernel(
             VIRTIO_NET_IRQ,
             vm.memory(),
             net_mode.unwrap_or("vmnet"),
-        );
+        )?;
+        if let Some(port) = ssh_port {
+            _forwards.push(forward::start_ssh_forward(
+                port,
+                virtio_net.guest_address(),
+            )?);
+        }
         vm.mmio_mut().register(
             MMIO_VIRTIO_NET_BASE,
             MMIO_VIRTIO_NET_SIZE,
@@ -951,7 +1028,9 @@ fn boot_os_kernel(
             let vars = match std::fs::read(vars_path) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("\x1b[1;33m[VMM Warning] Could not read firmware/QEMU_VARS.fd ({e}); using erased 64MiB\x1b[0m");
+                    eprintln!(
+                        "\x1b[1;33m[VMM Warning] Could not read firmware/QEMU_VARS.fd ({e}); using erased 64MiB\x1b[0m"
+                    );
                     vec![0xffu8; 64 * 1024 * 1024]
                 }
             };

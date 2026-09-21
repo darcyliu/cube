@@ -801,13 +801,23 @@ fn default_host_iface() -> String {
 }
 
 pub struct VirtioNet {
+    guest_address: crate::forward::GuestAddress,
     inner: Arc<Mutex<VirtioNetInner>>,
     running: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl VirtioNet {
-    pub fn new(mac: [u8; 6], irq_num: u32, mem: Arc<GuestMemory>, backend_choice: &str) -> Self {
+    pub fn guest_address(&self) -> crate::forward::GuestAddress {
+        self.guest_address.clone()
+    }
+
+    pub fn new(
+        mac: [u8; 6],
+        irq_num: u32,
+        mem: Arc<GuestMemory>,
+        backend_choice: &str,
+    ) -> Result<Self, String> {
         let (backend, vmnet_iface) = match backend_choice {
             s if s == "bridge"
                 || s.starts_with("bridge:")
@@ -832,17 +842,9 @@ impl VirtioNet {
                         (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)))
                     }
                     Err(e) => {
-                        eprintln!("[1;33m[VirtIO-Net Warning] vmnet bridge ({host_if}) unavailable: {e}[0m");
-                        eprintln!(
-                            "[1;33m[VirtIO-Net] Falling back to MOCK — no LAN/Internet.[0m"
-                        );
-                        eprintln!("[VirtIO-Net] Bridged mode still needs sudo (or com.apple.vm.networking),");
-                        eprintln!("            but does not need host PF NAT. Example:");
-                        eprintln!("            sudo ./target/debug/vmm ... --net bridge:{host_if}");
-                        (
-                            Box::new(UserMockBackend::new()) as Box<dyn NetBackend>,
-                            None,
-                        )
+                        return Err(format!(
+                            "Cannot start bridge:{host_if}: {e}. Check the interface and run with sudo or an authorized networking signature; use --net mock or --net none for offline operation."
+                        ));
                     }
                 }
             }
@@ -852,25 +854,9 @@ impl VirtioNet {
                     (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)))
                 }
                 Err(e) => {
-                    eprintln!(
-                        "\x1b[1;33m[VirtIO-Net Warning] vmnet unavailable: {}\x1b[0m",
-                        e
-                    );
-                    eprintln!("\x1b[1;33m[VirtIO-Net] Falling back to MOCK backend — guest packets are dropped (no LAN/Internet).\x1b[0m");
-                    eprintln!("[VirtIO-Net] Real NIC: re-run under sudo, e.g.");
-                    eprintln!(
-                        "            sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img"
-                    );
-                    eprintln!(
-                        "         or: sudo ./target/debug/vmm --uefi --disk <img> --net vmnet"
-                    );
-                    eprintln!("[VirtIO-Net] Or codesign with a provisioning profile that includes");
-                    eprintln!("            com.apple.vm.networking (see docs/entitlements.md).");
-                    eprintln!("            Ad-hoc signing (codesign -s -) does not grant that entitlement.");
-                    (
-                        Box::new(UserMockBackend::new()) as Box<dyn NetBackend>,
-                        None,
-                    )
+                    return Err(format!(
+                        "Cannot start vmnet: {e}. Run with sudo or an authorized networking signature (docs/entitlements.md); use --net mock or --net none for offline operation."
+                    ));
                 }
             },
             s if s.starts_with("tap:") => {
@@ -878,18 +864,19 @@ impl VirtioNet {
                 match TapBackend::open(path) {
                     Ok(b) => (Box::new(b) as Box<dyn NetBackend>, None),
                     Err(e) => {
-                        eprintln!("\x1b[1;31m[VirtIO-Net Error] {}\x1b[0m", e);
-                        (
-                            Box::new(UserMockBackend::new()) as Box<dyn NetBackend>,
-                            None,
-                        )
+                        return Err(format!("Cannot start tap backend '{path}': {e}"));
                     }
                 }
             }
-            _ => (
+            "mock" => (
                 Box::new(UserMockBackend::new()) as Box<dyn NetBackend>,
                 None,
             ),
+            _ => {
+                return Err(format!(
+                    "Unknown network mode '{backend_choice}'; expected vmnet, bridge[:interface], tap:<path>, mock, or none"
+                ));
+            }
         };
 
         println!(
@@ -899,10 +886,12 @@ impl VirtioNet {
 
         let inner = Arc::new(Mutex::new(VirtioNetInner::new(mac, irq_num, mem, backend)));
         let running = Arc::new(AtomicBool::new(true));
+        let guest_address = Arc::new(Mutex::new(None));
         let mut worker = None;
 
         // If vmnet is active, spawn background packet receiver loop
         if let Some(iface_ptr) = vmnet_iface {
+            let discovered_address = guest_address.clone();
             let inner_clone = Arc::clone(&inner);
             let running_clone = Arc::clone(&running);
             worker = Some(thread::Builder::new()
@@ -992,6 +981,13 @@ impl VirtioNet {
                         if ret == VMNET_SUCCESS && pktcnt > 0 && desc.vm_pkt_size > 0 {
                             let pkt_len = (desc.vm_pkt_size as usize).min(buf.len());
                             let packet = &mut buf[..pkt_len];
+                            if let Some(ip) = dhcp_guest_address(packet, mac) {
+                                let mut address = discovered_address.lock().unwrap();
+                                if *address != Some(ip) {
+                                    *address = Some(ip);
+                                    crate::host_log!("[VirtIO-Net] Guest DHCP address: {ip} (--ssh-port destination)");
+                                }
+                            }
                             patch_dhcp_response(packet);
                             let mut inner = inner_clone.lock().unwrap();
                             inner.receive_packet(packet);
@@ -1004,11 +1000,102 @@ impl VirtioNet {
                 .expect("Failed to spawn vmnet RX thread"));
         }
 
-        Self {
+        Ok(Self {
+            guest_address,
             inner,
             running,
             worker,
+        })
+    }
+}
+
+// Only accept a complete DHCP ACK addressed to this NIC, never another VM's
+// broadcast offer or an old host lease-file entry.
+fn dhcp_guest_address(packet: &[u8], mac: [u8; 6]) -> Option<std::net::Ipv4Addr> {
+    if packet.get(12..14)? != [0x08, 0x00] {
+        return None;
+    }
+    let ip = packet.get(14..)?;
+    let header_len = usize::from(*ip.first()? & 15) * 4;
+    if ip[0] >> 4 != 4 || header_len < 20 || *ip.get(9)? != 17 {
+        return None;
+    }
+    let total_len = u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]) as usize;
+    let fragments = u16::from_be_bytes([*ip.get(6)?, *ip.get(7)?]);
+    if fragments & 0x3fff != 0 {
+        return None;
+    }
+    let udp = ip.get(..total_len)?.get(header_len..)?;
+    if udp.get(..4)? != [0, 67, 0, 68] {
+        return None;
+    }
+    let udp_len = u16::from_be_bytes([*udp.get(4)?, *udp.get(5)?]) as usize;
+    let bootp = udp.get(..udp_len)?.get(8..)?;
+    if bootp.get(..3)? != [2, 1, 6]
+        || bootp.get(28..34)? != mac
+        || bootp.get(236..240)? != [99, 130, 83, 99]
+    {
+        return None;
+    }
+    let mut options = bootp.get(240..)?;
+    let mut ack = false;
+    while let Some((&code, rest)) = options.split_first() {
+        options = rest;
+        if code == 255 {
+            break;
         }
+        if code == 0 {
+            continue;
+        }
+        let (&len, rest) = options.split_first()?;
+        let value = rest.get(..len as usize)?;
+        options = rest.get(len as usize..)?;
+        if code == 53 {
+            ack = value == [5];
+        }
+    }
+    let ip = std::net::Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19]);
+    (ack && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast()).then_some(ip)
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn discovers_only_complete_ack_for_this_guest() {
+        let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+        let mut packet = vec![0; 14 + 20 + 8 + 244];
+        packet[12..14].copy_from_slice(&[8, 0]);
+        packet[14] = 0x45;
+        packet[16..18].copy_from_slice(&272u16.to_be_bytes());
+        packet[23] = 17;
+        packet[34..40].copy_from_slice(&[0, 67, 0, 68, 0, 252]);
+        packet[42..45].copy_from_slice(&[2, 1, 6]);
+        packet[58..62].copy_from_slice(&[192, 168, 2, 2]);
+        packet[70..76].copy_from_slice(&mac);
+        packet[278..286].copy_from_slice(&[99, 130, 83, 99, 53, 1, 5, 255]);
+        assert_eq!(
+            dhcp_guest_address(&packet, mac),
+            Some(std::net::Ipv4Addr::new(192, 168, 2, 2))
+        );
+        assert_eq!(dhcp_guest_address(&packet, [0; 6]), None);
+        for end in 0..packet.len() {
+            assert_eq!(dhcp_guest_address(&packet[..end], mac), None);
+        }
+        packet[284] = 2; // OFFER isn't an assigned lease.
+        assert_eq!(dhcp_guest_address(&packet, mac), None);
+    }
+
+    #[test]
+    fn failed_or_unknown_backends_do_not_become_mock() {
+        let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let dir = crate::test_support::TestDir::new();
+        let missing = format!("tap:{}", dir.path("missing-tap").display());
+        for mode in [missing.as_str(), "typo"] {
+            assert!(VirtioNet::new([0; 6], 35, memory.clone(), mode).is_err());
+        }
+        assert!(VirtioNet::new([0; 6], 35, memory, "mock").is_ok());
     }
 }
 
@@ -1156,11 +1243,7 @@ impl MmioDevice for VirtioNet {
                 } else {
                     return 0;
                 };
-                if q.ready {
-                    1
-                } else {
-                    0
-                }
+                if q.ready { 1 } else { 0 }
             }
             VIRTIO_MMIO_INTERRUPT_STATUS => inner.interrupt_status as u64,
             VIRTIO_MMIO_STATUS => inner.status as u64,
