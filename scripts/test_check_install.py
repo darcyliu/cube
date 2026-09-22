@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Failure guards for the installation runner; no hypervisor or root required."""
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from check_install import Machine, line_present, main
+from check_install import ConsoleSession, Machine, line_present, main
 
 
 class InstallGuards(unittest.TestCase):
@@ -100,6 +101,58 @@ class InstallGuards(unittest.TestCase):
     def test_keep_preserves_success_artifacts(self):
         self.invoke_main(lambda args, directory: None, "--keep")
         self.assertEqual(len(list(self.directory.glob("vmm-install-*/run.json"))), 1)
+
+    def test_console_preserves_output_and_command_status(self):
+        class Terminal:
+            output = ""
+            def text(self, console=False):
+                return self.output
+            def send(self, command, deadline):
+                result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=5)
+                # Include the echoed command: it must not be mistaken for output.
+                self.output += command + "\n" + result.stdout + result.stderr
+            def wait_for(self, predicate, deadline, description):
+                if not predicate():
+                    raise RuntimeError(description)
+        terminal = Terminal()
+        console = ConsoleSession(terminal, "unused")
+        console.logged_in = True
+        for command, expected, status in [("printf exact", "exact", 0),
+                                           ("printf 'two\\nlines\\n'; exit 7", "two\nlines\n", 7)]:
+            result = console.execute(command, time.monotonic() + 5)
+            self.assertEqual(result.stdout, expected)
+            self.assertEqual(result.returncode, status)
+
+    def test_zfs_requires_firmware_before_allocating_disk(self):
+        with self.assertRaises(SystemExit) as error:
+            self.invoke_main(lambda args, directory: self.fail("must not run"), "--filesystem", "zfs")
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(list(self.directory.glob("vmm-install-*")), [])
+
+    def test_seed_selects_ufs_or_efi_zfs(self):
+        # Capture the real seed contents before hdiutil and cleanup, without
+        # building an ISO or referring to user SSH keys.
+        capture = self.directory / "config"
+        stub = self.directory / "hdiutil"
+        stub.write_text('#!/bin/bash\nfor last; do :; done\ncp "$last/installerconfig" "$CAPTURE"\n')
+        stub.chmod(0o755)
+        for filesystem in ("ufs", "zfs"):
+            subprocess.run(["bash", str(Path(__file__).with_name("create-seed.sh").resolve()),
+                "--filesystem", filesystem, "--ssh-key", "ssh-ed25519 test-key",
+                "--password", "test-password"], cwd=self.directory,
+                env=dict(os.environ, PATH=str(self.directory) + os.pathsep + os.environ["PATH"],
+                         CAPTURE=str(capture)), check=True, capture_output=True, timeout=10)
+            config = capture.read_text()
+            self.assertIn('export nonInteractive="YES"', config)
+            if filesystem == "ufs":
+                self.assertIn('PARTITIONS="vtbd0"', config)
+                self.assertNotIn("ZFSBOOT_DISKS", config)
+            else:
+                self.assertNotIn("PARTITIONS=", config)
+                self.assertIn('export ZFSBOOT_DISKS="vtbd0"', config)
+                self.assertIn('export ZFSBOOT_BOOT_TYPE="UEFI"', config)
+                self.assertIn('sysrc zfs_enable="YES"', config)
+                self.assertIn('zfs_load="YES"', config)
 
 
 if __name__ == "__main__":

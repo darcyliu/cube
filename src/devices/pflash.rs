@@ -30,7 +30,7 @@ enum Cycle {
     ProgramData,
     EraseConfirm { offset: u64 },
     BufCount,
-    BufData { remaining: u32, offset: u64 },
+    BufData { remaining: u32 },
     BufConfirm,
 }
 
@@ -43,6 +43,7 @@ pub struct CfiPflash {
     block_size: u32,
     backing: Option<File>,
     persistence_error: Option<String>,
+    buffered_range: Option<(usize, usize)>,
 }
 
 impl Drop for CfiPflash {
@@ -94,6 +95,7 @@ impl CfiPflash {
             block_size,
             backing: None,
             persistence_error: None,
+            buffered_range: None,
         }
     }
 
@@ -157,7 +159,15 @@ impl CfiPflash {
                 self.storage[off + i] &= bytes[i];
             }
         }
-        self.persist(off, (off + size).min(self.storage.len()));
+        let end = (off + size).min(self.storage.len());
+        if matches!(self.cycle, Cycle::BufData { .. }) {
+            self.buffered_range = Some(match self.buffered_range {
+                Some((start, previous_end)) => (start.min(off), previous_end.max(end)),
+                None => (off, end),
+            });
+        } else {
+            self.persist(off, end);
+        }
         self.status |= STATUS_READY;
     }
 
@@ -261,32 +271,28 @@ impl MmioDevice for CfiPflash {
             }
             Cycle::BufCount => {
                 let count = ((data & 0xffff) as u32).saturating_add(1);
-                self.cycle = Cycle::BufData {
-                    remaining: count,
-                    offset,
-                };
+                self.cycle = Cycle::BufData { remaining: count };
                 self.cmd = CMD_WRITE_BUFFER;
                 return;
             }
-            Cycle::BufData {
-                remaining,
-                offset: mut buf_off,
-            } => {
-                self.write_storage(buf_off, data, size);
+            Cycle::BufData { remaining } => {
+                self.write_storage(offset, data, size);
                 let done = remaining.saturating_sub(1);
-                buf_off = buf_off.saturating_add(size as u64);
                 if done == 0 {
                     self.cycle = Cycle::BufConfirm;
                 } else {
-                    self.cycle = Cycle::BufData {
-                        remaining: done,
-                        offset: buf_off,
-                    };
+                    self.cycle = Cycle::BufData { remaining: done };
                 }
                 return;
             }
             Cycle::BufConfirm => {
                 if cmd == CMD_CONFIRM {
+                    // A buffered-program command is one durable operation.
+                    // Syncing every word makes EDK2 variable initialization
+                    // spend minutes in host fsync calls before BDS starts.
+                    if let Some((start, end)) = self.buffered_range.take() {
+                        self.persist(start, end);
+                    }
                     self.status |= STATUS_READY;
                 } else {
                     self.status |= 0x10;
@@ -325,6 +331,7 @@ impl MmioDevice for CfiPflash {
                 self.cycle = Cycle::Read;
             }
             CMD_WRITE_BUFFER => {
+                self.buffered_range = None;
                 self.cmd = CMD_WRITE_BUFFER;
                 self.cycle = Cycle::BufCount;
             }
@@ -337,6 +344,31 @@ impl MmioDevice for CfiPflash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buffered_program_persists_on_confirm_at_data_addresses() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path("buffered-vars");
+        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        // Two x16 chips: EDK2 duplicates the command/count in both lanes.
+        flash.write(0, 0x00e8_00e8, 4);
+        flash.write(0, 0x0001_0001, 4); // two words
+        flash.write(0x100, 0x12345678, 4);
+        flash.write(0x104, 0xabcdef01, 4);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(&before[0x100..0x108], &[0xff; 8]);
+        flash.write(0, 0x00d0_00d0, 4);
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(&after[0..8], &[0xff; 8]);
+        assert_eq!(
+            &after[0x100..0x108],
+            &[0x78, 0x56, 0x34, 0x12, 0x01, 0xef, 0xcd, 0xab]
+        );
+        flash.shutdown().unwrap();
+        drop(flash);
+        let mut reopened = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        assert_eq!(reopened.read(0x100, 8), 0xabcdef0112345678);
+    }
+
     #[test]
     fn variables_survive_reopen_and_store_is_exclusive() {
         let dir = crate::test_support::TestDir::new();

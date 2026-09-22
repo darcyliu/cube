@@ -3,8 +3,9 @@
 Recorded 2026-09-20 after the device/lifecycle hardening and unattended-console
 fixes in `06fb2b3`. Updated 2026-09-21: item 1 is complete with regression coverage
 and user-confirmed guest SSH forwarding. Item 2 is complete with a user-confirmed
-full privileged install → boot → reboot regression run. Next is UEFI/ZFS
-verification in item 3.
+full privileged install → boot → reboot regression run. Item 3 is complete for
+the offline UEFI/ZFS disk-boot path, including EFI persistence and cold start.
+Next is graphical desktop support in item 4.
 Check off criteria only when supported by tests or a recorded manual run.
 
 ## 1. Reliable networking and configurable forwarding
@@ -61,22 +62,29 @@ Depends on item 1 for reliable forwarding. UEFI/ZFS remains in item 3.
 
 ## 3. Complete UEFI/ZFS boot verification
 
-Firmware entry and shutdown pass, and EFI-store persistence has a regression
-test. The tested firmware also reported driver-load errors; a full installed
-UEFI/ZFS boot has not been verified in this work.
+The disposable FreeBSD 14.4 / EDK2 stable202408 regression passes installation,
+installed-disk UEFI/ZFS boot, guest reboot, and cold start. It verifies an ONLINE
+root pool, a persistent guest marker and EFI variable, and unchanged boot order.
+Verification used offline UART commands; ZFS SSH coverage remains optional.
 
-- [ ] Reproduce and explain the firmware driver-load errors; fix failures that
+- [x] Reproduce and explain the firmware driver-load errors; fix failures that
   prevent the supported boot path.
-- [ ] Verify installation and boot of a disposable FreeBSD ZFS system via UEFI.
-- [ ] Verify reboot and cold start with the same EFI store and persistent boot
+- [x] Verify installation and boot of a disposable FreeBSD ZFS system via UEFI.
+- [x] Verify reboot and cold start with the same EFI store and persistent boot
   configuration.
-- [ ] Record firmware and FreeBSD versions, exact commands, and remaining limits.
-- [ ] Add the verified path to the installation regression workflow.
+- [x] Record firmware and FreeBSD versions, exact commands, and remaining limits.
+- [x] Add the verified path to the installation regression workflow.
+
+The boot delay came from syncing EFI buffered writes once per four-byte word;
+the flash backend now persists each buffer at confirmation. All 39 Rust tests
+pass in debug and release; 13 runner tests pass, as do real offline UFS and ZFS
+lifecycle runs. The six firmware driver messages are identified in the runbook.
+Firmware TLS context initialization remains unresolved, outside local disk boot.
 
 See [ZFS implementation plan](zfs_implementation_plan.md),
 [ZFS boot notes](freebsd_zfs_boot.md), and [ZFS runbook](freebsd_zfs_runbook.md).
-Reconcile those documents with the test results rather than assuming every
-previously proposed step is still needed.
+Those documents now reflect the verified path and supersede the old direct
+MODINFO implementation plan.
 
 ## 4. Graphical desktop support
 

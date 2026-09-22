@@ -13,6 +13,7 @@ HOSTNAME="freebsd-vmm"
 PASSWORD="root"
 SSH_PUB_KEY=""
 SEED_DIR=".seed-staging"
+FILESYSTEM="ufs"
 
 # ANSI colors
 BOLD="\033[1m"
@@ -23,6 +24,10 @@ RESET="\033[0m"
 # Parse CLI arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --filesystem)
+            FILESYSTEM="$2"
+            shift 2
+            ;;
         --output|-o)
             OUTPUT_ISO="$2"
             shift 2
@@ -50,10 +55,16 @@ while [[ $# -gt 0 ]]; do
             echo "  -h, --hostname <NAME>   VM Hostname (default: freebsd-vmm)"
             echo "  -p, --password <PASS>   Root password (default: root)"
             echo "  -k, --ssh-key <KEY|FILE> SSH public key or key file to authorize"
+            echo "      --filesystem <FS>   ufs (default) or zfs with an EFI system partition"
             exit 0
             ;;
     esac
 done
+
+case "$FILESYSTEM" in
+    ufs|zfs) ;;
+    *) echo "Invalid filesystem: $FILESYSTEM" >&2; exit 1 ;;
+esac
 
 # If no SSH key was specified, check default ~/.ssh/id_ed25519.pub or id_rsa.pub
 if [[ -z "$SSH_PUB_KEY" ]]; then
@@ -123,6 +134,27 @@ cat << EOF >> "$SEED_DIR/installerconfig"
 mkdir -p /root/.ssh
 echo "${SSH_PUB_KEY}" >> /root/.ssh/authorized_keys
 chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+EOF
+fi
+
+if [[ "$FILESYSTEM" == "zfs" ]]; then
+    # These exported settings are consumed by bsdinstall's zfsboot subprocess.
+    sed -i '' '/^PARTITIONS=/c\
+export ZFSBOOT_DISKS="vtbd0"\
+export ZFSBOOT_VDEV_TYPE="stripe"\
+export ZFSBOOT_POOL_NAME="zroot"\
+export ZFSBOOT_PARTITION_SCHEME="GPT"\
+export ZFSBOOT_BOOT_TYPE="UEFI"\
+export ZFSBOOT_SWAP_SIZE="1g"\
+export ZFSBOOT_CONFIRM_LAYOUT=""\
+' "$SEED_DIR/installerconfig"
+    cat << 'EOF' >> "$SEED_DIR/installerconfig"
+sysrc zfs_enable="YES"
+cat << 'LOADER' >> /boot/loader.conf
+zfs_load="YES"
+boot_serial="YES"
+autoboot_delay="1"
+LOADER
 EOF
 fi
 
