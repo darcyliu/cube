@@ -1,4 +1,5 @@
 /target
+/test-results/
 __pycache__/
 guest/*.o
 guest/*.bin

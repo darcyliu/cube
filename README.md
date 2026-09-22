@@ -126,7 +126,15 @@ UART file injection is opt-in: set `VMM_UART_IN` to a dedicated file path.
 mailbox for each run, and prints the retained console-log path. Prompt timeouts
 stop automation without dispatching installer commands.
 
-Run `cargo test` and `cargo test --release` for device regression tests. On Apple
+Run `python3 -B scripts/verify.py` (or `make verify`) after code changes. This runs
+Rust tests in debug/release, Python tests, and diskless integration checks, with
+retained logs and JSON/JUnit reports. Use `--suite offline` for all media-based
+checks or `--suite full` to also verify real guest networking. See
+[verification suites and CI usage](docs/verification.md) for prerequisites and
+complete commands.
+
+Individual checks remain available. Run `cargo test` and `cargo test --release`
+for device regression tests. On Apple
 Silicon macOS, after building and signing the VMM, run the diskless integration
 checks with:
 

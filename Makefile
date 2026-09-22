@@ -1,8 +1,12 @@
-.PHONY: all build sign sign-networking run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed
+.PHONY: all build sign sign-networking run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify
 
 all: build sign
 
 VMM_BIN := target/debug/vmm
+
+# VERIFY_ARGS can select offline/full suites and supply media paths.
+verify:
+	python3 -B scripts/verify.py $(VERIFY_ARGS)
 
 build:
 	cargo build
