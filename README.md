@@ -120,6 +120,9 @@ there is no disk. Use `--efi-vars PATH` for an explicit per-VM store. Writable
 disk images, COW overlays, and variable stores are exclusively locked while open;
 read-only images and COW base images use shared locks. Malformed or truncated
 nonempty COW overlays are rejected rather than reinitialized.
+Use `vmm-overlay inspect BASE OVERLAY` to validate an offline COW image or
+`vmm-overlay export BASE OVERLAY OUTPUT` to create a standalone raw disk. See
+[offline overlay management](docs/overlay-management.md).
 
 UART file injection is opt-in: set `VMM_UART_IN` to a dedicated file path.
 `scripts/unattended-install.sh` configures this automatically with a private

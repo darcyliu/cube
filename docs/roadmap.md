@@ -1,12 +1,14 @@
 # Follow-up roadmap
 
 Recorded 2026-09-20 after the device/lifecycle hardening and unattended-console
-fixes in `06fb2b3`. Updated 2026-09-21: item 1 is complete with regression coverage
+fixes in `06fb2b3`. Updated through 2026-09-23: item 1 is complete with regression coverage
 and user-confirmed guest SSH forwarding. Item 2 is complete with a user-confirmed
 full privileged install → boot → reboot regression run. Item 3 is complete for
 the offline UEFI/ZFS disk-boot path, including EFI persistence and cold start.
 Item 4 is complete with a user-confirmed FreeBSD 14.4 desktop regression and
-recorded framebuffer timings. The next open work is item 5.
+recorded framebuffer timings. Item 5 added named VM management and was confirmed
+with concurrent guests and guest shutdown. Item 6 adds offline COW inspection
+and export; in-place base writes remain outside the implemented workflow.
 Check off criteria only when supported by tests or a recorded manual run.
 
 ## 1. Reliable networking and configurable forwarding
@@ -149,17 +151,21 @@ shutdown check passed: it reaches SSH and requires the VMM's guest PSCI
 
 ## 6. Offline disk-overlay management
 
-COW overlays have validation and locking, but no dedicated management commands.
+COW overlays can now be inspected and exported with the standalone
+`vmm-overlay` tool. See [offline overlay management](overlay-management.md).
 
-- [ ] Add read-only inspection of geometry, allocation, base association, and
+- [x] Add read-only inspection of geometry, allocation, base association, and
   consistency errors.
-- [ ] Export a base-plus-overlay view to a new standalone image.
-- [ ] Define offline commit semantics and recovery behavior before implementing
+- [x] Export a base-plus-overlay view to a new standalone image.
+- [x] Define offline commit semantics and recovery behavior before implementing
   writes to the base image.
-- [ ] Respect active-image locks and reject incompatible or corrupt inputs.
-- [ ] Test exported contents, partial final clusters, malformed overlays, and
+- [x] Respect active-image locks and reject incompatible or corrupt inputs.
+- [x] Test exported contents, partial final clusters, malformed overlays, and
   failure handling without modifying original images during inspection/export.
 
-Start with the COW backend in `src/devices/virtio/block.rs`. These tools concern
-disk contents; full VM snapshots including memory and device state are outside
-this item's scope.
+The VM backend and offline tool share format validation. Inspection reports
+the format's base-association limit: VMMCOW01 records only size, not identity.
+Export publishes a complete new image without replacing an existing path; an
+in-place commit remains deliberately unimplemented pending the documented
+identity and crash-recovery protocol. These tools concern disk contents; full
+VM snapshots including memory and device state are outside this item's scope.

@@ -10,6 +10,7 @@ static BLK_IOS: AtomicU64 = AtomicU64::new(0);
 use super::*;
 use crate::devices::MmioDevice;
 use crate::memory::GuestMemory;
+use vmm::cow::{self, CLUSTER_SIZE as COW_CLUSTER_SIZE, MAGIC as COW_MAGIC};
 
 // VirtIO Block Request Types
 const VIRTIO_BLK_T_IN: u32 = 0; // Read from disk
@@ -147,9 +148,6 @@ impl BlockBackend for RawFileBackend {
     }
 }
 
-const COW_MAGIC: &[u8; 8] = b"VMMCOW01";
-const COW_CLUSTER_SIZE: u64 = 65536; // 64 KB clusters
-
 /// Copy-On-Write overlay backend. The base image is kept strictly read-only.
 /// Any sector writes are redirected to cluster blocks in an overlay file.
 pub struct CowBackend {
@@ -181,10 +179,8 @@ impl CowBackend {
             .map_err(|e| format!("Failed to query base disk metadata: {}", e))?
             .len();
 
-        let num_clusters = usize::try_from(base_size.div_ceil(COW_CLUSTER_SIZE))
-            .ok()
-            .filter(|&n| n > 0 && n <= (1 << 24))
-            .ok_or("Unsupported COW image size (maximum 1 TiB)")?;
+        let layout = cow::Layout::expected(base_size)?;
+        let num_clusters = layout.table.len();
 
         let mut overlay_file = OpenOptions::new()
             .read(true)
@@ -202,51 +198,9 @@ impl CowBackend {
             .map_err(|e| format!("Failed to query overlay metadata: {}", e))?
             .len();
 
-        let table_start = 32u64;
         let table_bytes = (num_clusters * 8) as u64;
-        let initial_header_size = table_start + table_bytes;
-
-        let mut cluster_table = vec![0u64; num_clusters];
-
-        if overlay_len != 0 {
-            if overlay_len < initial_header_size
-                || (overlay_len - initial_header_size) % COW_CLUSTER_SIZE != 0
-            {
-                return Err("Truncated COW overlay".into());
-            }
-            let mut header = [0; 32];
-            overlay_file
-                .read_exact(&mut header)
-                .map_err(|e| e.to_string())?;
-            if &header[..8] != COW_MAGIC
-                || u32::from_le_bytes(header[8..12].try_into().unwrap()) != COW_CLUSTER_SIZE as u32
-                || u32::from_le_bytes(header[12..16].try_into().unwrap()) != 0
-                || u64::from_le_bytes(header[16..24].try_into().unwrap()) != base_size
-                || u64::from_le_bytes(header[24..32].try_into().unwrap()) != num_clusters as u64
-            {
-                return Err("COW header/geometry does not match base image".into());
-            }
-            let mut allocated = std::collections::HashSet::new();
-            overlay_file
-                .seek(SeekFrom::Start(table_start))
-                .map_err(|e| e.to_string())?;
-            for entry in cluster_table.iter_mut() {
-                let mut buf = [0u8; 8];
-                overlay_file
-                    .read_exact(&mut buf)
-                    .map_err(|e| e.to_string())?;
-                *entry = u64::from_le_bytes(buf);
-                if *entry != 0
-                    && (*entry < initial_header_size
-                        || (*entry - initial_header_size) % COW_CLUSTER_SIZE != 0
-                        || entry
-                            .checked_add(COW_CLUSTER_SIZE)
-                            .is_none_or(|end| end > overlay_len)
-                        || !allocated.insert(*entry))
-                {
-                    return Err("Invalid or overlapping COW cluster offset".into());
-                }
-            }
+        let cluster_table = if overlay_len != 0 {
+            cow::read_layout(&mut overlay_file, base_size)?.table
         } else {
             overlay_file
                 .seek(SeekFrom::Start(0))
@@ -272,7 +226,8 @@ impl CowBackend {
                 .write_all(&zero_table)
                 .map_err(|e| e.to_string())?;
             overlay_file.flush().map_err(|e| e.to_string())?;
-        }
+            layout.table
+        };
 
         println!(
             "[VirtIO-Blk] Initialized COW overlay '{}' on base '{}' ({:.2} MB, {} clusters)",
@@ -947,7 +902,12 @@ mod tests {
         assert!(data[..65000].iter().all(|&b| b == 3));
         assert!(data[65000..66024].iter().all(|&b| b == 7));
         assert!(data[66024..].iter().all(|&b| b == 3));
-        assert!(std::fs::read(base).unwrap().iter().all(|&b| b == 3));
+        assert!(std::fs::read(&base).unwrap().iter().all(|&b| b == 3));
+        drop(disk);
+        let mut image = cow::CowImage::open(&base, &overlay).unwrap();
+        let exported = dir.path("exported");
+        image.export(&exported).unwrap();
+        assert_eq!(std::fs::read(exported).unwrap(), data);
     }
 
     #[test]

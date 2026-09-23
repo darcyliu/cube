@@ -74,6 +74,7 @@ PF NAT anchor; run the full suite on an appropriate test host.
 | Check | quick | offline | full |
 |---|:---:|:---:|:---:|
 | `cargo test --locked` and `--release` | yes | yes | yes |
+| Offline COW inspect/export, malformed-input and lock tests (Rust) | yes | yes | yes |
 | Python `test_*.py` discovery | yes | yes | yes |
 | Build and sign VMM (or verify `--binary`) | yes | yes | yes |
 | `check_vm_lifecycle.py`: diskless CPU/reset | yes | yes | yes |
