@@ -115,6 +115,9 @@ def make_plan(args, directory):
     if args.suite != "quick":
         steps.append(check("installer-console", "check_unattended_console.py",
                            [binary, kernel, args.iso], ready))
+        steps.append(check("vm-management", "check_vm_management.py",
+                           [binary, "--kernel", kernel, "--iso", args.iso], ready,
+                           timeout=240))
         for fs in ("ufs", "zfs"):
             extra = [binary, "--iso", args.iso, "--artifacts", directory,
                      "--filesystem", fs, "--console-only"]

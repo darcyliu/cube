@@ -34,6 +34,7 @@ class VerifyTests(unittest.TestCase):
         names = {s.name for s in steps}
         self.assertTrue({"rust-debug", "rust-release", "python-tests", "lifecycle",
                          "network-errors", "installer-console", "network-guest-ssh",
+                         "vm-management",
                          "install-ufs-offline", "install-zfs-offline",
                          "install-ufs-ssh", "install-zfs-ssh"} <= names)
         seen = set()
@@ -63,6 +64,7 @@ class VerifyTests(unittest.TestCase):
         self.assertIn("--kernel", lifecycle.command)
         self.assertIn("--firmware", lifecycle.command)
         self.assertEqual(sum("--console-only" in s.command for s in steps), 2)
+        self.assertIn("vm-management", [s.name for s in steps])
 
     def test_existing_binary_is_not_rebuilt_or_resigned(self):
         steps = verify.make_plan(self.options("quick", "--binary", sys.executable), self.directory)

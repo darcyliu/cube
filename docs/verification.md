@@ -3,7 +3,8 @@
 Use `scripts/verify.py` as the single entry point after code changes and in CI.
 It builds and signs a debug VMM, runs Rust tests in debug and release, discovers
 all `scripts/test_*.py` tests, and invokes the existing integration scripts.
-Checks run sequentially to avoid competing VMs and network setup.
+Checks run sequentially, except the management check intentionally boots two
+isolated VMs together to exercise concurrent ownership.
 
 ## Quick checks after a code change
 
@@ -79,6 +80,7 @@ PF NAT anchor; run the full suite on an appropriate test host.
 | Lifecycle: custom-resolution FreeBSD VNC, metrics, and firmware | — | yes | yes |
 | `check_network.py`: startup and bind errors | yes | yes | yes |
 | `check_unattended_console.py` | — | yes | yes |
+| Two concurrent managed FreeBSD VMs and listener collision | — | yes | yes |
 | `check_install.py`: UFS offline | — | yes | yes |
 | `check_install.py`: UEFI/ZFS offline, reboot/cold start | — | yes | yes |
 | Network: alternate static address and SSH forwarding | — | — | yes |

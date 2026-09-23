@@ -128,16 +128,24 @@ See [GUI architecture](gui_architecture.md) and the
 
 ## 5. Per-VM configuration and management
 
-VM settings currently require command-line arguments and separate paths. A
-host-side stop flushes backends but does not ask the guest OS to shut down.
+`scripts/vmmctl.py` provides a named JSON configuration and a host-side manager.
+See the [VM management runbook](vm-management.md). The user confirmed the
+privileged SSH-triggered poweroff check passed on 2026-09-23.
 
-- [ ] Define a per-VM configuration for disks, RAM, CPUs, networking, VNC, and
+- [x] Define a per-VM configuration for disks, RAM, CPUs, networking, VNC, and
   EFI variables, with documented command-line override behavior.
-- [ ] Isolate runtime files and identify running VM instances reliably.
-- [ ] Add status reporting and define a guest-coordinated shutdown mechanism.
-- [ ] Distinguish graceful shutdown from forced stop, including timeout behavior.
-- [ ] Verify two concurrent VMs do not share stores, mailboxes, or conflicting
+- [x] Isolate runtime files and identify running VM instances reliably.
+- [x] Add status reporting and define a guest-coordinated shutdown mechanism.
+- [x] Distinguish graceful shutdown from forced stop, including timeout behavior.
+- [x] Verify two concurrent VMs do not share stores, mailboxes, or conflicting
   listeners accidentally.
+
+The concurrent FreeBSD smoke check passed on 2026-09-23: two read-only ISO
+guests reached init simultaneously with separate instance IDs, EFI stores,
+serial logs, UART paths, and VNC ports. A third VM with a conflicting listener
+was rejected before launch. The user also confirmed the installed-guest
+shutdown check passed: it reaches SSH and requires the VMM's guest PSCI
+`SYSTEM_OFF` record without a forced host stop.
 
 ## 6. Offline disk-overlay management
 

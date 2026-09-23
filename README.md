@@ -126,6 +126,10 @@ UART file injection is opt-in: set `VMM_UART_IN` to a dedicated file path.
 mailbox for each run, and prints the retained console-log path. Prompt timeouts
 stop automation without dispatching installer commands.
 
+For named VM configurations, isolated EFI/console runtime files, status, guest
+shutdown over SSH, and explicit host stop, use `scripts/vmmctl.py`. See the
+[VM management runbook](docs/vm-management.md).
+
 Run `python3 -B scripts/verify.py` (or `make verify`) after code changes. This runs
 Rust tests in debug/release, Python tests, and diskless integration checks, with
 retained logs and JSON/JUnit reports. Use `--suite offline` for all media-based
