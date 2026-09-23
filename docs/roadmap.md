@@ -5,7 +5,8 @@ fixes in `06fb2b3`. Updated 2026-09-21: item 1 is complete with regression cover
 and user-confirmed guest SSH forwarding. Item 2 is complete with a user-confirmed
 full privileged install → boot → reboot regression run. Item 3 is complete for
 the offline UEFI/ZFS disk-boot path, including EFI persistence and cold start.
-Next is graphical desktop support in item 4.
+Item 4 is complete with a user-confirmed FreeBSD 14.4 desktop regression and
+recorded framebuffer timings. The next open work is item 5.
 Check off criteria only when supported by tests or a recorded manual run.
 
 ## 1. Reliable networking and configurable forwarding
@@ -88,19 +89,42 @@ MODINFO implementation plan.
 
 ## 4. Graphical desktop support
 
-The current VNC path provides a simple framebuffer and input devices. Console
-input has been tested; a complete desktop session needs separate validation.
+The current VNC path provides a simple framebuffer and input devices. A real
+FreeBSD 14.4 X11 desktop session passed the disposable regression on 2026-09-22.
 
-- [ ] Add configurable framebuffer resolution with memory/stride validation.
-- [ ] Verify a documented FreeBSD desktop setup, including pointer edges,
+- [x] Add configurable framebuffer resolution with memory/stride validation.
+- [x] Verify a documented FreeBSD desktop setup, including pointer edges,
   buttons, wheel, modifiers, and reconnect behavior.
-- [ ] Measure framebuffer update cost during desktop use before selecting
+- [x] Measure framebuffer update cost during desktop use before selecting
   further display optimizations.
-- [ ] Investigate FreeBSD guest-driver compatibility and firmware requirements
+- [x] Investigate FreeBSD guest-driver compatibility and firmware requirements
   for virtio-gpu; record a go/no-go decision before implementation.
 
-See [GUI architecture](gui_architecture.md). Virtio-gpu is an investigation,
-not a prerequisite for the initial desktop checks.
+`--display WIDTHxHEIGHT` now drives one validated geometry through the FDT, VNC
+handshake, and both tablet devices. Reservations grow from the 8 MiB minimum,
+are page aligned, and are limited to 256 MiB. The lifecycle check exercises a
+non-default resolution and invalid geometry.
+
+FreeBSD 14.4's ARM64 GENERIC kernel includes its base-system 2D virtio-gpu
+console driver, while ArmVirtQemu EDK2 includes VirtioGpuDxe. The decision is to
+defer the host device: the FreeBSD driver is a `vt(4)` framebuffer rather than
+an accelerated DRM desktop, so measurements from simple-framebuffer come first.
+The user-confirmed run passed unattended install, XI2 pointer edges, primary
+button, both wheel directions, modifiers, disconnect releases, VNC reconnect,
+installed-disk SSH, guest reboot, marker persistence, and clean poweroff.
+Its 32 full/incremental framebuffer updates averaged 38.4 updates/s and
+14.0 MiB/s of raw pixel payload. The VMM read 96.0 MiB of framebuffer data
+in 2.6 ms, compared 90.0 MiB of changed rows in 3.6 ms, and spent 291.0 ms
+sending 11.7 MiB across the initial and reconnected VNC sessions. Sending
+dominated these measured server costs. These measurements support keeping the
+simple-framebuffer path for this milestone; further display optimization can
+be based on workloads that show a limiting cost. The regression enables
+FreeBSD 14.4's `usbhid`/`hms` path at runtime and reprobes the tablet because
+direct UFS kernel boot bypasses `loader.conf`. The retained guest log confirms
+`uhid0` detached and `hms0` attached with five buttons and X/Y/wheel axes.
+
+See [GUI architecture](gui_architecture.md) and the
+[FreeBSD desktop runbook](freebsd-desktop.md).
 
 ## 5. Per-VM configuration and management
 

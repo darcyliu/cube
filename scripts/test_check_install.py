@@ -10,10 +10,30 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from check_install import ConsoleSession, Machine, line_present, main
+from check_install import ConsoleSession, Machine, find_usb_tablet, line_present, main
 
 
 class InstallGuards(unittest.TestCase):
+    def test_tablet_detection_uses_descriptors_not_database_names_or_addresses(self):
+        listing = """ugen2.1: <XHCI root HUB Generic> at usbus2
+ugen2.8: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
+ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
+"""
+        descriptors = {
+            "ugen2.1": "  iProduct = 0x0002 <XHCI root HUB>\n",
+            "ugen2.8": "  iProduct = 0x0003 <VMM USB Keyboard>\n"
+                       "  iSerialNumber = 0x0004 <kbd0>\n",
+            "ugen2.4": "  iProduct = 0x0002 <VMM USB Tablet>\n"
+                       "  iSerialNumber = 0x0005 <tablet0>\n",
+        }
+        def execute(command, deadline):
+            self.assertEqual(deadline, 123)
+            return subprocess.CompletedProcess(command, 0, descriptors[command.split()[2]], "")
+        self.assertEqual(find_usb_tablet(execute, listing, 123), "ugen2.4")
+        descriptors["ugen2.4"] = descriptors["ugen2.8"]
+        with self.assertRaisesRegex(RuntimeError, "Expected one VMM USB tablet"):
+            find_usb_tablet(execute, listing, 123)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -128,6 +148,23 @@ class InstallGuards(unittest.TestCase):
             self.invoke_main(lambda args, directory: self.fail("must not run"), "--filesystem", "zfs")
         self.assertEqual(error.exception.code, 2)
         self.assertEqual(list(self.directory.glob("vmm-install-*")), [])
+
+    def test_desktop_rejects_offline_console_before_allocating_disk(self):
+        with self.assertRaises(SystemExit) as error:
+            self.invoke_main(lambda args, directory: self.fail("must not run"),
+                             "--desktop", "--console-only")
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(list(self.directory.glob("vmm-install-*")), [])
+
+    def test_desktop_options_reach_the_disposable_runner(self):
+        captured = {}
+        def record(args, directory):
+            captured.update(desktop=args.desktop, display=args.display,
+                            vnc_port=args.vnc_port, timeout=args.desktop_timeout)
+        self.invoke_main(record, "--desktop", "--display", "1280x720",
+                         "--vnc-port", "5905")
+        self.assertEqual(captured, {"desktop": True, "display": "1280x720",
+                                    "vnc_port": 5905, "timeout": 1200})
 
     def test_seed_selects_ufs_or_efi_zfs(self):
         # Capture the real seed contents before hdiutil and cleanup, without

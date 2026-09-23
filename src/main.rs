@@ -128,6 +128,8 @@ fn main() {
     let mut serial_log: Option<String> = None;
     let mut module_paths: Vec<String> = Vec::new();
     let mut vnc_bind: Option<String> = None;
+    let mut display_size = (devices::display::FB_WIDTH, devices::display::FB_HEIGHT);
+    let mut display_requested = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -336,6 +338,18 @@ fn main() {
                     vnc_bind = Some("127.0.0.1:5900".to_string());
                 }
             }
+            "--display" => {
+                display_requested = true;
+                i += 1;
+                let value = args.get(i).unwrap_or_else(|| {
+                    eprintln!("--display requires WIDTHxHEIGHT");
+                    process::exit(1);
+                });
+                display_size = parse_display_size(value).unwrap_or_else(|e| {
+                    eprintln!("\x1b[1;31m[VMM Error] Invalid --display '{value}': {e}\x1b[0m");
+                    process::exit(1);
+                });
+            }
             "--help" | "-h" => {
                 println!("Usage: vmm [OPTIONS] [PAYLOAD/KERNEL]");
                 println!();
@@ -392,6 +406,9 @@ fn main() {
                     "      --vnc [ADDR]          Enable simple-framebuffer + VNC + USB HID (default 127.0.0.1:5900)"
                 );
                 println!(
+                    "      --display WIDTHxHEIGHT Framebuffer size for --vnc (default 1280x720; max 256 MiB)"
+                );
+                println!(
                     "      --efi-vars <PATH>     Persistent per-VM EFI variable store (default <disk>.vars.fd)"
                 );
                 println!("  -h, --help               Display this help message");
@@ -416,6 +433,11 @@ fn main() {
         for d in &mut disk_configs {
             d.cow = true;
         }
+    }
+
+    if display_requested && vnc_bind.is_none() {
+        eprintln!("\x1b[1;31m[VMM Error] --display requires --vnc\x1b[0m");
+        process::exit(1);
     }
 
     if is_uefi && firmware_path.is_none() {
@@ -518,6 +540,7 @@ fn main() {
             None,
             Some(&fw),
             vnc_bind.as_deref(),
+            display_size,
             efi_vars_path.as_deref(),
             &forward_rules,
             ssh_port,
@@ -578,6 +601,7 @@ fn main() {
                 root_dev.as_deref(),
                 None,
                 vnc_bind.as_deref(),
+                display_size,
                 efi_vars_path.as_deref(),
                 &forward_rules,
                 ssh_port,
@@ -616,6 +640,23 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
+fn parse_display_size(value: &str) -> Result<(u32, u32), String> {
+    let (width, height) = value
+        .split_once(['x', 'X'])
+        .ok_or_else(|| "expected WIDTHxHEIGHT".to_string())?;
+    if width.is_empty() || height.is_empty() || height.contains(['x', 'X']) {
+        return Err("expected WIDTHxHEIGHT".into());
+    }
+    let width = width
+        .parse::<u32>()
+        .map_err(|_| "width must be an integer".to_string())?;
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| "height must be an integer".to_string())?;
+    devices::display::FramebufferConfig::new(width, height)?;
+    Ok((width, height))
+}
+
 /// Boots an OS kernel ELF (such as FreeBSD ARM64) with GICv3, multi-vCPU SMP, and Device Tree.
 fn boot_os_kernel(
     kernel_path: &str,
@@ -633,6 +674,7 @@ fn boot_os_kernel(
     root_dev: Option<&str>,
     uefi_firmware: Option<&[u8]>,
     vnc_bind: Option<&str>,
+    display_size: (u32, u32),
     efi_vars_path: Option<&str>,
     forward_rules: &[forward::ForwardRule],
     ssh_port: Option<u16>,
@@ -864,12 +906,22 @@ fn boot_os_kernel(
     // GUI input when VNC is enabled:
     // - Platform xHCI + HID kbd/tablet (FreeBSD path; preferred by VNC)
     // - VirtIO-input kept registered for Linux guests (parked for FreeBSD)
+    let fb_cfg = if vnc_bind.is_some() {
+        Some(devices::display::FramebufferConfig::new(
+            display_size.0,
+            display_size.1,
+        )?)
+    } else {
+        None
+    };
+
     let (vnc_keyboard, vnc_tablet, vnc_usb) = if vnc_bind.is_some() {
+        let fb = fb_cfg.expect("framebuffer configured when VNC is enabled");
         let xhci = Arc::new(Mutex::new(XhciController::new(
             XHCI_IRQ,
             vm.memory(),
-            devices::display::FB_WIDTH as u16,
-            devices::display::FB_HEIGHT as u16,
+            fb.width as u16,
+            fb.height as u16,
         )));
         vm.mmio_mut()
             .register_shared(MMIO_XHCI_BASE, MMIO_XHCI_SIZE, xhci.clone());
@@ -885,8 +937,8 @@ fn boot_os_kernel(
         let tablet = Arc::new(Mutex::new(VirtioInput::new_tablet(
             VIRTIO_INPUT_TBL_IRQ,
             vm.memory(),
-            devices::display::FB_WIDTH as u16,
-            devices::display::FB_HEIGHT as u16,
+            fb.width as u16,
+            fb.height as u16,
         )));
         vm.mmio_mut().register_shared(
             MMIO_VIRTIO_INPUT_KBD_BASE,
@@ -921,8 +973,7 @@ fn boot_os_kernel(
         (None, None, None)
     };
 
-    let fb_cfg = if vnc_bind.is_some() {
-        let fb = devices::display::FramebufferConfig::default();
+    if let Some(fb) = fb_cfg {
         let need = fb.gpa + fb.reg_size;
         let ram_end = DEFAULT_RAM_BASE + ram_size as u64;
         if ram_end < need {
@@ -943,10 +994,7 @@ fn boot_os_kernel(
             "[VMM] Simple-framebuffer {}x{} at GPA 0x{:08x} (stride {})",
             fb.width, fb.height, fb.gpa, fb.stride
         );
-        Some(fb)
-    } else {
-        None
-    };
+    }
 
     let xhci_fdt = vnc_usb.as_ref().map(|_| fdt::XhciMmioDevice {
         base: MMIO_XHCI_BASE,

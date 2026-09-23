@@ -63,6 +63,10 @@ networking. If authentication expires or is unavailable, the run fails. A CI
 host needs noninteractive sudo configured for its trusted test workload, or a
 VMM signed with authorized networking entitlements. For the latter, omit
 `--sudo` and pass the signed VMM through `--binary` so it is not re-signed.
+Run the Python verifier as your regular user after `sudo -v`; placing `sudo`
+before `python3` makes the entire artifact directory root-owned.
+The network SSH check retains `network-guest-ssh.console.log` beside its step
+log so a failed guest setup can be distinguished from a forwarding failure.
 The VMM's existing vmnet initialization can modify host IP forwarding and its
 PF NAT anchor; run the full suite on an appropriate test host.
 
@@ -72,19 +76,28 @@ PF NAT anchor; run the full suite on an appropriate test host.
 | Python `test_*.py` discovery | yes | yes | yes |
 | Build and sign VMM (or verify `--binary`) | yes | yes | yes |
 | `check_vm_lifecycle.py`: diskless CPU/reset | yes | yes | yes |
-| Lifecycle: FreeBSD VNC and firmware | — | yes | yes |
+| Lifecycle: custom-resolution FreeBSD VNC, metrics, and firmware | — | yes | yes |
 | `check_network.py`: startup and bind errors | yes | yes | yes |
 | `check_unattended_console.py` | — | yes | yes |
 | `check_install.py`: UFS offline | — | yes | yes |
 | `check_install.py`: UEFI/ZFS offline, reboot/cold start | — | yes | yes |
 | Network: alternate static address and SSH forwarding | — | — | yes |
 | Installation: UFS and UEFI/ZFS with SSH | — | — | yes |
+| FreeBSD X11/scfb input and update measurements | — | — | yes (UFS) |
 
 The interactive installation, signing, seed-generation, and cleanup utilities
 are not independent tests and are not executed as top-level verification steps.
 Their relevant behavior is exercised by the existing checks. New Python unit
 test files matching `test_*.py` are discovered automatically; new integration
 scripts should be added explicitly to `make_plan()` in `scripts/verify.py`.
+The full suite's UFS SSH installation passes `--desktop` to
+`check_install.py`. It installs Xorg/scfb in that disposable guest, invokes
+`check_desktop.py`, and retains its X11 event and performance evidence in the
+suite artifact directory. See
+[FreeBSD desktop verification](freebsd-desktop.md).
+The standalone UFS `--desktop --keep` run passed on 2026-09-22, including all
+three X11/VNC checks and the subsequent reboot and clean poweroff. The 32
+framebuffer updates averaged 38.4 updates/s and 14.0 MiB/s raw payload.
 
 ## Options and results
 
@@ -114,8 +127,9 @@ prerequisites fail preflight and appear in both reports. Unselected suites are
 reported as excluded coverage, not as passing checks.
 
 Outer limits are 15 minutes for each Cargo step, 5 minutes for normal check
-scripts, and 30 minutes for each install workflow; installation phases also
-retain their own internal timeouts. On a timeout or Ctrl-C/SIGTERM, the runner
+scripts, 30 minutes for ordinary install workflows, and 50 minutes for the UFS
+desktop workflow; installation phases also retain their own internal timeouts.
+On a timeout or Ctrl-C/SIGTERM, the runner
 interrupts the current check and gives its cleanup handlers 30 seconds to stop
 VMs before forcing termination. Uncatchable termination such as SIGKILL or host
 loss cannot guarantee cleanup or a final report.

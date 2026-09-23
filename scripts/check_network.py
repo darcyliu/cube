@@ -12,6 +12,7 @@ import argparse
 import ipaddress
 import os
 from pathlib import Path
+import re
 import shlex
 import socket
 import subprocess
@@ -41,6 +42,8 @@ def main():
     parser.add_argument("--iso")
     parser.add_argument("--guest-cidr", type=ipaddress.IPv4Interface)
     parser.add_argument("--host-ip", type=ipaddress.IPv4Address)
+    parser.add_argument("--console-log", type=Path,
+                        help="retain the guest serial console at this path")
     args = parser.parse_args()
     guest_options = [args.kernel, args.iso, args.guest_cidr, args.host_ip]
     if any(guest_options) and not all(guest_options):
@@ -76,9 +79,11 @@ def main():
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         mailbox = directory / "uart"
+        console = args.console_log or directory / "guest.console.log"
         vm = VM(binary, directory, "guest", ["--freebsd", args.kernel,
             "--cdrom", args.iso, "--root", "cd9660:/dev/vtbd0", "--net", "vmnet",
-            "--cpus", 2, "--forward", f"127.0.0.1:{port}={args.guest_cidr.ip}:22222"],
+            "--cpus", 2, "--serial-log", console,
+            "--forward", f"127.0.0.1:{port}={args.guest_cidr.ip}:22222"],
             env=dict(os.environ, VMM_UART_IN=str(mailbox)))
         try:
             vm.wait_for("RETURN for /bin/sh", timeout=90)
@@ -86,6 +91,7 @@ def main():
             vm.wait_for("root@", timeout=30)
             command = " && ".join([
                 "mdmfs -s 64M md1 /tmp", "mdmfs -s 64M md2 /var",
+                "install -d -m 0755 /var/empty",
                 f"ifconfig vtnet0 inet {args.guest_cidr} up",
                 f"ping -c 2 {args.host_ip}",
                 "ssh-keygen -q -t ed25519 -N '' -f /tmp/hostkey",
@@ -94,7 +100,20 @@ def main():
                 "-o PidFile=/tmp/sshd.pid -o AuthorizedKeysFile=/tmp/authorized_keys "
                 "-o StrictModes=no -o PermitRootLogin=yes -o PasswordAuthentication=no -o UsePAM=no",
             ])
-            publish(mailbox, command)
+            # Escape the marker's first byte so terminal echo cannot look like
+            # successful completion. Report the first failing setup command.
+            publish(mailbox, command +
+                    "; rc=$?; printf '\\n\\126MM_NETWORK_READY:%s\\n' \"$rc\"")
+            deadline = time.monotonic() + 60
+            while True:
+                output = console.read_text(errors="replace") if console.exists() else ""
+                match = re.search(r"(?m)^VMM_NETWORK_READY:(\d+)\r*$", output)
+                if match:
+                    assert match.group(1) == "0", "Guest network/sshd setup failed"
+                    break
+                assert vm.proc.poll() is None, "VM exited during guest network/sshd setup"
+                assert time.monotonic() < deadline, "Guest network/sshd setup timed out"
+                time.sleep(0.2)
             ssh = ["ssh", "-F", "/dev/null", "-i", str(key), "-p", str(port),
                    "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=" + str(directory / "known_hosts"),
@@ -110,7 +129,9 @@ def main():
             vm.finish(stop=True)
             print("PASS guest connectivity and SSH through alternate guest address/port", flush=True)
         except BaseException:
-            print(vm.text()[-6000:])
+            if console.exists():
+                print("Guest console:\n" + console.read_text(errors="replace")[-8000:])
+            print("VMM log:\n" + vm.text()[-3000:])
             raise
         finally:
             vm.cleanup()

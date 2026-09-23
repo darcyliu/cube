@@ -521,6 +521,25 @@ impl VirtioNetInner {
         }
     }
 
+    fn reset(&mut self) {
+        self.status = 0;
+        self.device_features_sel = 0;
+        self.driver_features_sel = 0;
+        self.driver_features = 0;
+        self.queue_sel = 0;
+        for queue in [&mut self.rx_queue, &mut self.tx_queue] {
+            *queue = VirtQueue {
+                max_size: 1024,
+                size: 1024,
+                ..Default::default()
+            };
+        }
+        self.rx_backlog.clear();
+        self.interrupt_status = 0;
+        self.irq_asserted = false;
+        self.irq_pending_after_ack = false;
+    }
+
     fn notify_used(&mut self, avail_ring: u64) {
         self.interrupt_status |= 1;
         std::sync::atomic::fence(Ordering::SeqCst);
@@ -1063,6 +1082,40 @@ mod backend_tests {
     use super::*;
 
     #[test]
+    fn reset_discards_firmware_queues_before_os_reinitializes_them() {
+        let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let mut inner = VirtioNetInner::new([0; 6], 35, memory, Box::new(UserMockBackend::new()));
+        inner.status = VIRTIO_STATUS_DRIVER_OK;
+        inner.driver_features = VIRTIO_F_VERSION_1_BIT;
+        inner.rx_queue.ready = true;
+        inner.rx_queue.last_avail_idx = 4;
+        inner.rx_queue.used_idx = 4;
+        inner.tx_queue.ready = true;
+        inner.tx_queue.last_avail_idx = 2;
+        inner.tx_queue.used_idx = 2;
+        inner.interrupt_status = 1;
+        inner.irq_asserted = true;
+        inner.irq_pending_after_ack = true;
+        inner.rx_backlog.push_back(vec![1]);
+
+        inner.reset();
+
+        assert_eq!(inner.status, 0);
+        assert_eq!(inner.driver_features, 0);
+        for queue in [inner.rx_queue, inner.tx_queue] {
+            assert!(!queue.ready);
+            assert_eq!(queue.last_avail_idx, 0);
+            assert_eq!(queue.used_idx, 0);
+            assert_eq!(queue.avail_ring, 0);
+            assert_eq!(queue.used_ring, 0);
+        }
+        assert_eq!(inner.interrupt_status, 0);
+        assert!(!inner.irq_asserted);
+        assert!(!inner.irq_pending_after_ack);
+        assert!(inner.rx_backlog.is_empty());
+    }
+
+    #[test]
     fn discovers_only_complete_ack_for_this_guest() {
         let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
         let mut packet = vec![0; 14 + 20 + 8 + 244];
@@ -1323,7 +1376,15 @@ impl MmioDevice for VirtioNet {
             }
             VIRTIO_MMIO_STATUS => {
                 inner.status = data as u32;
-                if (inner.status & VIRTIO_STATUS_FAILED) != 0 {
+                if data == 0 {
+                    // UEFI may have used this NIC before handing it to the OS.
+                    // FreeBSD starts fresh rings at index zero after reset.
+                    inner.reset();
+                    *self.guest_address.lock().unwrap() = None;
+                    unsafe {
+                        crate::hypervisor::hv_gic_set_spi(inner.irq_num, false);
+                    }
+                } else if (inner.status & VIRTIO_STATUS_FAILED) != 0 {
                     eprintln!("[VirtIO-Net] Guest marked device as FAILED");
                 }
             }

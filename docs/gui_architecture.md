@@ -47,10 +47,10 @@ Running a graphical desktop (such as Debian GNOME/XFCE, Alpine desktop, or FreeB
 | Feature | Option A: `simple-framebuffer` (FDT) | Option B: `VirtIO-GPU` 2D (MMIO) |
 | :--- | :--- | :--- |
 | **Complexity** | Minimal (~100 lines of code) | Moderate (~800 lines of code) |
-| **Guest Drivers** | Built-in (`simpledrm`, `simplefb`, `vt_simplefb`) | Built-in (`virtio-gpu.ko`, `drm-kmod`) |
+| **Guest Drivers** | Built-in (`simpledrm`, `simplefb`, `vt_simplefb`) | FreeBSD 14 base `virtio_gpu` 2D VT driver; Linux DRM driver |
 | **Memory Model** | Reserved GPA physical RAM block | Guest-allocated scatter-gather buffers |
 | **Resolution** | Fixed at boot (e.g. 1920x1080 or 1280x720) | Dynamic runtime resizing & multi-head |
-| **Hardware 3D** | No (CPU blit only) | Future VirGL / Metal passthrough |
+| **Hardware 3D** | No (CPU blit only) | Not provided by the FreeBSD base driver |
 | **Best For** | Fast bring-up, OS installers, bootloaders | Production desktop VMs, multi-resolution |
 
 ---
@@ -60,7 +60,9 @@ Running a graphical desktop (such as Debian GNOME/XFCE, Alpine desktop, or FreeB
 Modern Linux kernels (`CONFIG_DRM_SIMPLEDRM`) and FreeBSD (`vt_simplefb`) natively bind to a standard Device Tree framebuffer node.
 
 #### 1. FDT Specification (`src/fdt.rs`)
-In the Device Tree Blob, allocate a fixed memory region at GPA (e.g., `0x50000000`, 8MB for 1920x1080 32bpp):
+In the Device Tree Blob, allocate a memory region at GPA `0x50000000`. The
+VMM keeps an 8 MiB minimum reservation and grows it to a page-aligned size for
+larger `--display WIDTHxHEIGHT` configurations:
 
 ```dts
 chosen {
@@ -69,10 +71,10 @@ chosen {
 
     framebuffer0: framebuffer@50000000 {
         compatible = "simple-framebuffer";
-        reg = <0x00 0x50000000 0x00 0x00800000>; /* 8 MB */
-        width = <1920>;
-        height = <1080>;
-        stride = <(1920 * 4)>;
+        reg = <0x00 0x50000000 0x00 0x00800000>; /* 8 MiB at 1280x720 */
+        width = <1280>;
+        height = <720>;
+        stride = <(1280 * 4)>;
         format = "a8r8g8b8";
         status = "okay";
     };
@@ -80,10 +82,12 @@ chosen {
 ```
 
 #### 2. How It Works
-1. VMM allocates `8 * 1024 * 1024` bytes of physical memory at GPA `0x5000_0000`.
+1. VMM validates width, height, 32-bit stride and total bytes, then reserves at
+   least 8 MiB of physical memory at GPA `0x5000_0000`.
 2. Guest kernel initializes `/dev/fb0` or direct DRM/KMS device mapped directly to `0x5000_0000`.
 3. Guest X11, Wayland, or Debian graphical installer writes BGRA/RGBA pixels directly into this memory region.
-4. Host presentation thread reads from the shared RAM slice at 60Hz and blits to the screen.
+4. The VNC server reads the framebuffer when a client requests an update,
+   compares incremental regions by row, and returns raw changed rows.
 
 ---
 
@@ -203,8 +207,8 @@ When `--vnc` is set, the VMM also exposes a platform MMIO **xHCI** controller:
 | MMIO base | `0x0a010000` (64 KiB) |
 | GIC IRQ | `41` (SPI 9) |
 | Root ports | 2 × USB2 High-Speed |
-| Port 1 | HID boot keyboard → FreeBSD `ukbd` / `usbhid` |
-| Port 2 | Absolute tablet (QEMU-compatible report desc, X/Y 0..0x7fff) → `ums` / `usbhid` |
+| Port 1 | HID boot keyboard → FreeBSD `ukbd`, or `usbhid` / `hkbd` |
+| Port 2 | Absolute tablet (QEMU-compatible report desc, X/Y 0..0x7fff) → `usbhid` / `hms` |
 
 VNC KeyEvent/PointerEvent prefer USB HID inject; virtio-input remains registered for Linux guests but is not required for FreeBSD.
 
@@ -224,10 +228,21 @@ enumeration stalls, check host `[XHCI]` logs and guest `dmesg` / `usbconfig`.
 ### Guest verification (FreeBSD)
 
 ```bash
-dmesg | grep -iE 'xhci|ukbd|ums|uhid|usbhid'
+sysctl hw.usb.usbhid.enable=1 kern.evdev.rcpt_mask=6
+kldload hms
+usbconfig dump_device_desc
+# Find iProduct <VMM USB Tablet> and iSerialNumber <tablet0>.
+# Reset that descriptor's ugenN.N device, for example:
+usbconfig -d ugen0.3 reset
+dmesg | grep -iE 'xhci|hkbd|hms|hidbus|usbhid'
 usbconfig
 # type on the VNC console — characters should appear on ttyv0 / login
 ```
+
+FreeBSD 14.4 leaves `usbhid` disabled by default. Direct kernel boot bypasses
+`/boot/loader.conf`, so enable it at runtime and reset the tablet. Otherwise,
+the absolute tablet attaches to generic `uhid`; legacy `ums` accepts relative
+mouse axes and cannot expose this device to an X11 desktop.
 
 Rebuild/run:
 
@@ -284,12 +299,15 @@ VNC framebuffer delivery in native 32-bit and RGB565 formats, and VNC typing
 context evaluation, USB address layout, port events, descriptors, duplicate
 pending transfers, pixel encoding, and the generated memory ranges.
 
-This provides a graphical **console**, not a desktop GPU or an installed desktop.
-The local kernel enumerates the tablet but does not attach a mouse driver in
-this diskless test. Guest mouse/desktop use requires the appropriate USB HID
-mouse driver (for example `ums`) and guest desktop configuration. Desktop
-pointer behavior and UEFI graphics have not been validated. UEFI loader console
-settings are independent of the direct-kernel boot defaults above.
+This provides the display and input hardware for a graphical desktop. The
+diskless check cannot load the userland X11 stack, so complete pointer behavior
+is verified separately by [the FreeBSD desktop runbook](freebsd-desktop.md).
+UEFI loader console settings remain independent of the direct-kernel defaults.
+
+Each VNC disconnect now logs requests, bytes scanned, pixels and wire bytes
+sent, and time spent reading guest RAM, comparing rows, and writing updates.
+Use those server figures together with the desktop verifier's client timing
+before changing the update algorithm.
 
 ### Host diagnostics
 

@@ -128,14 +128,17 @@ def make_plan(args, directory):
             ready += ("sudo-access",)
         steps.append(check("network-guest-ssh", "check_network.py",
             [binary, "--kernel", kernel, "--iso", args.iso,
-             "--guest-cidr", args.guest_cidr, "--host-ip", args.host_ip], ready,
+             "--guest-cidr", args.guest_cidr, "--host-ip", args.host_ip,
+             "--console-log", directory / "network-guest-ssh.console.log"], ready,
             privileged=True))
         for fs in ("ufs", "zfs"):
             extra = [binary, "--iso", args.iso, "--artifacts", directory, "--filesystem", fs]
+            if fs == "ufs":
+                extra += ["--desktop"]
             if fs == "zfs":
                 extra += ["--firmware", args.firmware]
             steps.append(check(f"install-{fs}-ssh", "check_install.py", extra, ready,
-                               timeout=1800, privileged=True))
+                               timeout=3000 if fs == "ufs" else 1800, privileged=True))
     return steps
 
 

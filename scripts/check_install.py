@@ -16,6 +16,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -32,6 +33,22 @@ def line_present(text, marker):
 
 def escaped(text):
     return "".join(f"\\{ord(c):03o}" for c in text)
+
+
+def find_usb_tablet(execute, listing, deadline):
+    # usbconfig's summary uses a VID/PID database. Both emulated devices
+    # share those IDs, so only their actual string descriptors distinguish them.
+    matches = []
+    for device in re.findall(r"(?m)^(ugen\d+\.\d+):", listing):
+        result = execute(f"usbconfig -d {device} dump_device_desc", deadline)
+        require(result is not None and result.returncode == 0,
+                f"Could not read USB descriptors for {device}; see ssh.log")
+        if (re.search(r"(?m)^\s*iProduct\s*=.*<VMM USB Tablet>\s*$", result.stdout)
+                and re.search(r"(?m)^\s*iSerialNumber\s*=.*<tablet0>\s*$", result.stdout)):
+            matches.append(device)
+    require(len(matches) == 1,
+            f"Expected one VMM USB tablet, found {matches}; see descriptor dumps in ssh.log")
+    return matches[0]
 
 
 class ConsoleSession:
@@ -164,13 +181,23 @@ def run(args, directory):
         vm.powered_off(deadline)
         print("PASS unattended installation and clean poweroff", flush=True)
 
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", args.ssh_port))
-            port = reservation.getsockname()[1]
+        reservations = []
+        for requested in (args.ssh_port, args.vnc_port if args.desktop else None):
+            if requested is None:
+                continue
+            reservation = socket.socket()
+            reservation.bind(("127.0.0.1", requested))
+            reservations.append(reservation)
+        port = reservations[0].getsockname()[1]
+        vnc_port = reservations[1].getsockname()[1] if args.desktop else None
+        for reservation in reservations:
+            reservation.close()
         boot = ["--uefi", args.firmware] if args.filesystem == "zfs" else [
             "--freebsd", directory / "boot/kernel/kernel", "--multiuser"]
         network = ["--net", "none"] if args.console_only else ["--net", "vmnet", "--ssh-port", port]
-        vm = Machine(args.binary, directory, "boot", [*common, *boot, *network])
+        display = (["--vnc", f"127.0.0.1:{vnc_port}", "--display", args.display]
+                   if args.desktop else [])
+        vm = Machine(args.binary, directory, "boot", [*common, *boot, *network, *display])
         machines.append(vm)
         console = ConsoleSession(vm, password)
         ssh = ["ssh", "-F", "/dev/null", "-i", str(key), "-p", str(port),
@@ -179,7 +206,7 @@ def run(args, directory):
                "-o", "UserKnownHostsFile=" + str(directory / "known_hosts"),
                "-o", "GlobalKnownHostsFile=/dev/null", "root@127.0.0.1"]
 
-        def execute(remote, deadline):
+        def execute(remote, deadline, timeout_cap=10):
             remaining = deadline - time.monotonic()
             require(remaining > 0, "Guest command phase timed out")
             if args.console_only:
@@ -189,7 +216,7 @@ def run(args, directory):
             else:
                 try:
                     result = subprocess.run([*ssh, remote], capture_output=True, text=True,
-                                            timeout=min(10, remaining))
+                                            timeout=min(timeout_cap, remaining))
                 except subprocess.TimeoutExpired:
                     return None
             with (directory / ("console-commands.log" if args.console_only else "ssh.log")).open("a") as log:
@@ -215,6 +242,93 @@ def run(args, directory):
                       "VMM_ZFS_OK", deadline)
         if args.filesystem == "zfs":
             verify_zfs(deadline)
+        if args.desktop:
+            deadline = time.monotonic() + args.desktop_timeout
+            # FreeBSD 14 keeps the modern USB HID bridge disabled by default.
+            # Direct kernel boot does not read /boot/loader.conf. Enable the
+            # bridge at runtime and reset the tablet so it is probed again.
+            hid = execute(
+                "sysctl hw.usb.usbhid.enable=1 kern.evdev.rcpt_mask=6 && "
+                "(kldload hms 2>/dev/null || true) && "
+                "usbconfig",
+                deadline)
+            require(hid is not None and hid.returncode == 0,
+                    "Could not enable the FreeBSD USB HID/evdev input path" +
+                    (f":\n{hid.stdout}{hid.stderr}" if hid is not None else ""))
+            tablet = find_usb_tablet(execute, hid.stdout, deadline)
+            reset = execute(f"usbconfig -d {tablet} reset", deadline)
+            require(reset is not None and reset.returncode == 0,
+                    "Could not reprobe the USB tablet" +
+                    (f":\n{reset.stdout}{reset.stderr}" if reset is not None else ""))
+            attachment = execute(
+                "sleep 2; dmesg | grep -E 'usbhid|hidbus|hms|uhid|ukbd|hkbd'; "
+                "usbconfig show_ifdrv", deadline)
+            if attachment is not None:
+                (directory / "guest-hid.log").write_text(attachment.stdout + attachment.stderr)
+            require(attachment is not None and re.search(r"\bhms\d+\b", attachment.stdout),
+                    "FreeBSD did not attach hms to the USB tablet; see guest-hid.log" +
+                    (f":\n{attachment.stdout[-4000:]}{attachment.stderr[-1000:]}"
+                     if attachment is not None else ""))
+            packages = execute(
+                "env ASSUME_ALWAYS_YES=yes pkg bootstrap -f && "
+                "pkg install -y xorg-minimal xf86-video-scfb "
+                "xf86-input-libinput twm xterm xinput xdpyinfo",
+                deadline, args.desktop_timeout)
+            require(packages is not None and packages.returncode == 0,
+                    "Could not install the FreeBSD X11 desktop packages")
+            configure = execute(
+                "install -d /usr/local/etc/X11/xorg.conf.d && "
+                "printf '%s\n' 'Section \"Device\"' '  Identifier \"Card0\"' "
+                "'  Driver \"scfb\"' 'EndSection' "
+                ">/usr/local/etc/X11/xorg.conf.d/20-scfb.conf && "
+                "rm -f /var/run/Xorg-vmm.pid /var/run/twm-vmm.pid /var/run/xterm-vmm.pid && "
+                "(pkill Xorg 2>/dev/null || true) && "
+                "daemon -f -p /var/run/Xorg-vmm.pid -o /var/log/Xorg-vmm.log "
+                "/usr/local/bin/Xorg :0 -ac -noreset vt9",
+                deadline)
+            require(configure is not None and configure.returncode == 0,
+                    "Could not configure and start Xorg with scfb")
+            await_command(
+                "env DISPLAY=:0 xdpyinfo >/dev/null 2>&1 && printf VMM_X11_OK",
+                "VMM_X11_OK", deadline)
+            desktop = execute(
+                "daemon -f -p /var/run/twm-vmm.pid -o /var/log/twm-vmm.log "
+                "/usr/bin/env DISPLAY=:0 /usr/local/bin/twm && "
+                "daemon -f -p /var/run/xterm-vmm.pid -o /var/log/xterm-vmm.log "
+                "/usr/bin/env DISPLAY=:0 /usr/local/bin/xterm -geometry 90x28+80+80",
+                deadline)
+            require(desktop is not None and desktop.returncode == 0,
+                    "Could not start the X11 desktop clients")
+            check_log = directory / "desktop-check.log"
+            check_command = [
+                sys.executable, "-B", Path(__file__).with_name("check_desktop.py"),
+                "--vnc", f"127.0.0.1:{vnc_port}",
+                "--ssh-port", port,
+                "--identity", key,
+                "--expect-resolution", args.display,
+                "--artifacts", directory / "desktop-results",
+            ]
+            with check_log.open("wb") as output:
+                result = subprocess.run(list(map(str, check_command)), cwd=directory,
+                                        stdout=output, stderr=subprocess.STDOUT,
+                                        timeout=max(1, deadline - time.monotonic()))
+            for remote, name in [
+                ("cat /var/log/Xorg-vmm.log", "Xorg-vmm.log"),
+                ("cat /var/log/Xorg.0.log", "Xorg.0.log"),
+                ("cat /var/log/twm-vmm.log", "twm-vmm.log"),
+                ("cat /var/log/xterm-vmm.log", "xterm-vmm.log"),
+                ("env DISPLAY=:0 xinput --list --long", "xinput-devices.log"),
+                ("dmesg | grep -E 'usbhid|hidbus|hms|hkbd|uhid|ukbd'", "guest-hid-after-xorg.log"),
+            ]:
+                diagnostic = execute(remote, deadline)
+                if diagnostic is not None and diagnostic.returncode == 0:
+                    (directory / name).write_text(diagnostic.stdout)
+            print(check_log.read_text(), end="", flush=True)
+            require(result.returncode == 0,
+                    "Desktop input/update verification failed; see desktop-check.log")
+            vm.wait_for(lambda: vm.text().count("Session metrics:") >= 2,
+                        deadline, "VNC session metrics")
+            deadline = time.monotonic() + args.boot_timeout
         token = secrets.token_hex(32)
         marker_path = "/root/vmm-regression-marker"
         await_command(f"printf '%s' {shlex.quote(token)} > {marker_path} && sync && cat {marker_path}",
@@ -298,24 +412,37 @@ def main():
     parser.add_argument("--filesystem", choices=("ufs", "zfs"), default="ufs")
     parser.add_argument("--firmware", type=Path, help="EDK2 firmware required for ZFS")
     parser.add_argument("--console-only", action="store_true", help="offline UART checks instead of SSH/vmnet")
+    parser.add_argument("--desktop", action="store_true",
+                        help="install Xorg/scfb and run the graphical desktop regression")
     parser.add_argument("--artifacts", type=Path, help="parent for a new private run directory")
     parser.add_argument("--keep", action="store_true", help="also retain artifacts on success")
     parser.add_argument("--disk-gib", type=positive, default=12)
     parser.add_argument("--ram", type=positive, default=2048)
     parser.add_argument("--cpus", type=positive, default=2)
     parser.add_argument("--ssh-port", type=int, default=0, help="loopback port; default: allocate a free port")
-    for phase, default in [("install", 900), ("boot", 180), ("reboot", 180), ("shutdown", 60)]:
+    parser.add_argument("--vnc-port", type=int, default=0,
+                        help="desktop VNC loopback port; default: allocate a free port")
+    parser.add_argument("--display", default="1024x768",
+                        help="desktop framebuffer WIDTHxHEIGHT (default: 1024x768)")
+    for phase, default in [("install", 900), ("boot", 180), ("desktop", 1200),
+                           ("reboot", 180), ("shutdown", 60)]:
         parser.add_argument(f"--{phase}-timeout", type=positive, default=default)
     args = parser.parse_args()
     if args.filesystem == "zfs" and not args.firmware:
         parser.error("--filesystem zfs requires --firmware")
+    if args.desktop and args.console_only:
+        parser.error("--desktop requires vmnet/SSH; omit --console-only")
+    if args.desktop and args.filesystem != "ufs":
+        parser.error("--desktop currently requires --filesystem ufs")
     for name in ("binary", "iso", *(["firmware"] if args.firmware else [])):
         path = getattr(args, name).resolve()
         if not path.is_file():
             parser.error(f"{name} is not a file: {path}")
         setattr(args, name, path)
-    if not 0 <= args.ssh_port <= 65535:
-        parser.error("--ssh-port must be 0..65535")
+    if not 0 <= args.ssh_port <= 65535 or not 0 <= args.vnc_port <= 65535:
+        parser.error("--ssh-port and --vnc-port must be 0..65535")
+    if args.desktop and args.ssh_port != 0 and args.ssh_port == args.vnc_port:
+        parser.error("--ssh-port and --vnc-port must differ")
     directory = Path(tempfile.mkdtemp(prefix="vmm-install-", dir=args.artifacts)).resolve()
     print(f"Artifacts: {directory}", flush=True)
     (directory / "run.json").write_text(json.dumps(vars(args), default=str, indent=2))

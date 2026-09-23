@@ -36,6 +36,13 @@ host IP forwarding and its PF NAT anchor. This test does not add separate host
 network configuration or attempt to remove shared host network state. These
 network settings do not apply to `--console-only`.
 
+`--desktop` extends the UFS SSH run with a 1024×768 VNC framebuffer, enables
+FreeBSD's `usbhid`/`hms` absolute-tablet path, installs Xorg/scfb plus a minimal
+twm/xterm desktop, verifies XI2 input and reconnect
+behavior, and records framebuffer update costs. It requires guest package
+network access and is incompatible with `--console-only` and ZFS mode. See the
+[desktop runbook](freebsd-desktop.md).
+
 Each run allocates a mode-0700 directory containing its new disk, seed ISO,
 extracted kernel, SSH key, known-hosts file, UART mailboxes, command manifests,
 console logs, VMM logs, guest versions, input hashes, and command results.
@@ -64,11 +71,12 @@ UART login and commands, without claiming SSH verification. ZFS cold start uses
 the boot and shutdown timeout limits again for the new VMM process.
 
 Default phase limits are 900 seconds for installation, 180 seconds for boot,
-180 seconds for reboot, and 60 seconds for final shutdown. Override them with
-`--install-timeout`, `--boot-timeout`, `--reboot-timeout`, and
-`--shutdown-timeout`. Preparation commands and individual SSH attempts also have
-timeouts. Port allocation has a small release-to-bind race; a collision fails
-the run and is recorded in the VMM log.
+1200 seconds for optional desktop setup, 180 seconds for reboot, and 60 seconds
+for final shutdown. Override them with `--install-timeout`, `--boot-timeout`,
+`--desktop-timeout`, `--reboot-timeout`, and `--shutdown-timeout`. Preparation
+commands and individual SSH attempts also have timeouts. Port allocation has a
+small release-to-bind race; a collision fails the run and is recorded in the
+VMM log.
 
 The runner's failure guards can be tested without a guest or sudo:
 

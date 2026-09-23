@@ -134,11 +134,15 @@ def connect(port):
     sock.sendall(b"\x01")
     init = read(sock, 24)
     read(sock, struct.unpack_from("!I", init, 20)[0])
-    return sock
+    return sock, struct.unpack_from("!HH", init)
 
 
 def key(sock, symbol, down):
     sock.sendall(struct.pack("!BBHI", 4, down, 0, symbol))
+
+
+def pointer(sock, mask, x, y):
+    sock.sendall(struct.pack("!BBHH", 5, mask, x, y))
 
 
 def main():
@@ -148,6 +152,14 @@ def main():
     parser.add_argument("--firmware")
     args = parser.parse_args()
     binary = str(Path(args.binary).resolve())
+    for command, expected in [
+        ([binary, "--display", "1024x768"], "--display requires --vnc"),
+        ([binary, "--vnc", "--display", "16384x16384"], "maximum is 256 MiB"),
+    ]:
+        result = subprocess.run(command, text=True, capture_output=True)
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert expected in result.stdout + result.stderr, result.stdout + result.stderr
+    print("PASS display geometry CLI validation", flush=True)
     machines = []
     with tempfile.TemporaryDirectory(prefix="vmm-lifecycle-") as temp:
         directory = Path(temp)
@@ -177,14 +189,17 @@ def main():
                     sock.bind(("127.0.0.1", 0))
                     port = sock.getsockname()[1]
                 vm = VM(binary, directory, "freebsd", ["--freebsd", args.kernel, "--cpus", 2,
-                                                         "--vnc", f"127.0.0.1:{port}"])
+                                                         "--vnc", f"127.0.0.1:{port}",
+                                                         "--display", "1024x768"])
                 machines.append(vm)
                 vm.wait_for("mountroot>", timeout=90)
-                sock = connect(port)
+                sock, size = connect(port)
+                assert size == (1024, 768), size
                 key(sock, 0xffe1, 1)  # Drop the connection while Shift is held.
                 sock.close()
                 time.sleep(0.2)
-                sock = connect(port)
+                sock, size = connect(port)
+                assert size == (1024, 768), size
                 # Request a small rectangle in RGB565; payload must match it.
                 fmt = struct.pack("!BBBBHHHBBBxxx", 16, 16, 0, 1, 31, 63, 31, 11, 5, 0)
                 sock.sendall(bytes(4) + fmt)
@@ -192,6 +207,10 @@ def main():
                 header = read(sock, 16)
                 assert struct.unpack("!HHHH", header[4:12]) == (10, 20, 30, 40), header
                 assert len(read(sock, 30 * 40 * 2)) == 2400
+                # Exercise absolute edges, buttons and both wheel directions.
+                for event in [(0, 0, 0), (1, 1023, 767), (0, 1023, 767),
+                              (8, 512, 384), (16, 512, 384), (0, 512, 384)]:
+                    pointer(sock, *event)
                 for symbol in [ord("."), 0xff0d]:
                     key(sock, symbol, 1)
                     key(sock, symbol, 0)
@@ -199,8 +218,9 @@ def main():
                 vm.wait_for("mountroot>", count=2)
                 assert "\n.\n" in vm.text(), vm.text()[-2000:]
                 sock.close()
+                vm.wait_for("Session metrics:", count=2)
                 vm.finish(stop=True)
-                print("PASS FreeBSD SMP, VNC region/RGB565, held-key cleanup, Ctrl-]", flush=True)
+                print("PASS FreeBSD SMP, custom VNC geometry, region/RGB565, pointer events, held-key cleanup, metrics, Ctrl-]", flush=True)
             if args.firmware:
                 vm = VM(binary, directory, "uefi", ["--uefi", args.firmware, "--cpus", 2,
                                                     "--efi-vars", directory / "vars.fd"])

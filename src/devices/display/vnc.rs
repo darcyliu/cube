@@ -15,7 +15,7 @@ use crate::devices::usb::xhci::XhciController;
 use crate::devices::virtio::VirtioInput;
 use crate::memory::GuestMemory;
 
-use super::{keysym, FramebufferConfig};
+use super::{FramebufferConfig, keysym};
 
 const RFB_VERSION: &[u8] = b"RFB 003.008\n";
 
@@ -336,6 +336,7 @@ fn handle_client(
     let mut previous = vec![0u8; fb.pixel_bytes()];
     let mut have_full_frame = false;
     let mut msg = [0u8; 1];
+    let mut metrics = SessionMetrics::new();
 
     while !stop.load(Ordering::Relaxed) {
         match stream.read(&mut msg) {
@@ -388,15 +389,30 @@ fn handle_client(
                 // FramebufferUpdateRequest
                 let mut rest = [0u8; 9];
                 read_exact_timeout(&mut stream, &mut rest, &stop)?;
+                metrics.requests += 1;
+                let read_started = Instant::now();
                 mem.read(fb.gpa, &mut fb_buf)
                     .map_err(|e| format!("FB read: {e}"))?;
+                metrics.read_time += read_started.elapsed();
+                metrics.read_bytes += fb.pixel_bytes() as u64;
                 let requested = Rect::from_request(&rest, fb);
-                let rect = if rest[0] != 0 && have_full_frame {
+                let compare = rest[0] != 0 && have_full_frame;
+                if compare {
+                    metrics.compared_bytes +=
+                        u64::from(requested.width) * u64::from(requested.height) * 4;
+                }
+                let diff_started = Instant::now();
+                let rect = if compare {
                     changed_rect(requested, fb.stride as usize, &fb_buf, &previous)
                 } else {
                     requested
                 };
-                send_raw_update(&mut stream, fb, &fb_buf, pixel_format, rect)?;
+                metrics.diff_time += diff_started.elapsed();
+                let send_started = Instant::now();
+                metrics.sent_bytes +=
+                    send_raw_update(&mut stream, fb, &fb_buf, pixel_format, rect)? as u64;
+                metrics.send_time += send_started.elapsed();
+                metrics.sent_pixels += u64::from(rect.width) * u64::from(rect.height);
                 for y in rect.y..rect.y + rect.height {
                     let start = y as usize * fb.stride as usize + rect.x as usize * 4;
                     let end = start + rect.width as usize * 4;
@@ -480,6 +496,52 @@ fn handle_client(
     Ok(())
 }
 
+struct SessionMetrics {
+    started: Instant,
+    requests: u64,
+    read_bytes: u64,
+    compared_bytes: u64,
+    sent_pixels: u64,
+    sent_bytes: u64,
+    read_time: Duration,
+    diff_time: Duration,
+    send_time: Duration,
+}
+
+impl SessionMetrics {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            requests: 0,
+            read_bytes: 0,
+            compared_bytes: 0,
+            sent_pixels: 0,
+            sent_bytes: 0,
+            read_time: Duration::ZERO,
+            diff_time: Duration::ZERO,
+            send_time: Duration::ZERO,
+        }
+    }
+}
+
+impl Drop for SessionMetrics {
+    fn drop(&mut self) {
+        let seconds = self.started.elapsed().as_secs_f64();
+        crate::host_log!(
+            "[VNC] Session metrics: requests={}, read={:.1} MiB/{:.1} ms, compared={:.1} MiB/{:.1} ms, sent_pixels={}, wire={:.1} MiB/{:.1} ms, elapsed={:.1} s",
+            self.requests,
+            self.read_bytes as f64 / (1024.0 * 1024.0),
+            self.read_time.as_secs_f64() * 1000.0,
+            self.compared_bytes as f64 / (1024.0 * 1024.0),
+            self.diff_time.as_secs_f64() * 1000.0,
+            self.sent_pixels,
+            self.sent_bytes as f64 / (1024.0 * 1024.0),
+            self.send_time.as_secs_f64() * 1000.0,
+            seconds
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Rect {
     x: u16,
@@ -535,9 +597,10 @@ fn send_raw_update(
     pixels: &[u8],
     format: PixelFormat,
     rect: Rect,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     if rect.width == 0 || rect.height == 0 {
-        return stream.write_all(&[0, 0, 0, 0]).map_err(|e| e.to_string());
+        stream.write_all(&[0, 0, 0, 0]).map_err(|e| e.to_string())?;
+        return Ok(4);
     }
     let mut hdr = Vec::with_capacity(16);
     hdr.push(0); // FramebufferUpdate
@@ -563,7 +626,7 @@ fn send_raw_update(
         stream.write_all(&encoded).map_err(|e| e.to_string())?;
     }
     stream.flush().map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(16 + rect.width as usize * rect.height as usize * format.bytes)
 }
 
 fn read_exact_timeout(

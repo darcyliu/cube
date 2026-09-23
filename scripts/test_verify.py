@@ -44,6 +44,11 @@ class VerifyTests(unittest.TestCase):
             if step.privileged:
                 self.assertIn("sudo-access", step.needs)
                 self.assertNotIn("--console-only", step.command)
+        ufs = next(s for s in steps if s.name == "install-ufs-ssh")
+        zfs = next(s for s in steps if s.name == "install-zfs-ssh")
+        self.assertIn("--desktop", ufs.command)
+        self.assertNotIn("--desktop", zfs.command)
+        self.assertEqual(ufs.timeout, 3000)
 
     def test_quick_needs_no_media_or_privilege(self):
         steps = verify.make_plan(self.options(), self.directory)
