@@ -155,8 +155,64 @@ pub struct VirtioInputEvent {
 | Backend | Implementation Details | Pros | Cons |
 | :--- | :--- | :--- | :--- |
 | **1. Embedded RFB/VNC Server** *(Recommended)* | Lightweight TCP server on `localhost:5900` implementing RFC 6143 (RFB 3.8). | **Zero external dependencies**.<br>Works headless/SSH.<br>Native macOS client via `open vnc://127.0.0.1:5900`. | 1–2ms network encoding overhead. |
-| **2. Native Cocoa / Metal Window** | `NSWindow` + `CAMetalLayer` / `MetalKit` via raw macOS FFI. | 60–120Hz ProMotion refresh rate.<br>Sub-millisecond input latency. | macOS mandates that UI run on the main OS thread (`dispatch_main`). |
+| **2. Native Cocoa / Metal Window** *(proposed)* | AppKit window with an `MTKView` presenting the existing guest framebuffer. | Local desktop in one window; no VNC viewer or RFB encoding. | Needs an AppKit event loop, framebuffer upload, input translation, and macOS packaging. |
 | **3. WebSocket / HTML5 Canvas** | Mini HTTP server + WebSocket streaming raw RGBA / PNG frames to a browser. | Works in any browser without client software. | Requires JavaScript frontend. |
+
+---
+
+### Native Cocoa / Metal window: proposed design
+
+This is a **host presentation option**, not a new guest display device. The
+current `--vnc` path creates the FDT simple-framebuffer, platform xHCI HID
+keyboard/tablet, and (for Linux) virtio-input devices in `src/main.rs`. A
+native `--gui native` path could reuse those same guest devices and replace the
+RFB frontend with a local AppKit window. It does **not** require virtio-gpu,
+change the guest driver, or provide guest 3D acceleration. The current VNC
+frontend remains useful for headless runs and automated checks.
+
+Proposed data flow:
+
+```text
+guest X11/desktop -> simple-framebuffer in guest RAM -> host snapshot/staging
+                  -> Metal texture -> MTKView in an NSWindow
+AppKit mouse/key/scroll events -> shared input translation -> xHCI HID
+                                                     (and virtio-input for Linux)
+```
+
+- **Window and VM lifetime:** AppKit owns the main-thread application/window
+  event loop; the VM execution and blocking I/O run on worker threads. Closing
+  the window needs an explicit policy (hide, request guest shutdown, or stop
+  the VM). VM reset must keep the window and input devices in sync.
+- **Pixels:** start with the existing fixed-size BGRA simple-framebuffer.
+  Snapshot changed pixels into staging memory, upload them to a Metal texture,
+  and draw that texture in an `MTKView`. Preserve the guest aspect ratio and
+  map between guest pixels and Retina/backing pixels. Cap refresh work when
+  the guest is idle or the window is occluded. Metal speeds host presentation;
+  guest rendering still uses the unaccelerated framebuffer.
+- **Input:** translate AppKit key events and modifier changes into the same
+  guest key/button state used by VNC. Convert view coordinates to absolute
+  tablet coordinates after accounting for scaling and letterboxing. Handle
+  wheel direction, key repeat, focus loss, and window close; release held
+  keys/buttons when focus is lost so the guest cannot retain a stuck input.
+- **Code boundary:** extract framebuffer access and guest input injection from
+  `src/devices/display/vnc.rs` into reusable interfaces. Keep RFB protocol
+  handling in the VNC frontend; put AppKit/Metal interop behind a macOS-only
+  frontend. A small Swift/Objective-C bridge or Rust bindings are both possible;
+  choose after a minimal window-and-texture prototype establishes the build
+  and signing path.
+- **Validation:** retain the VNC regression for device-level behavior, then
+  add native-window checks for rendering, pointer edges, clicks/wheel,
+  modifiers, focus-loss release, resize/scaling, reboot, and clean shutdown.
+  Measure capture/upload/present time and input-to-frame latency before
+  claiming a performance benefit.
+
+The first milestone is a window that displays the existing framebuffer and
+survives guest boot/reboot. The second is complete input and lifecycle handling;
+packaging and accessibility/keyboard-layout polish follow. Runtime guest
+resolution changes remain a separate virtio-gpu or display-device project.
+Apple documents [`MTKView`](https://developer.apple.com/documentation/metalkit/mtkview/)
+as a Metal-aware view and [`NSApplication`](https://developer.apple.com/documentation/appkit/nsapplication)
+as the owner of the application event loop.
 
 ---
 
@@ -175,9 +231,15 @@ pub struct VirtioInputEvent {
 2. Map incoming VNC `PointerEvent` and `KeyEvent` packets to `VirtioInputEvent` descriptors.
 3. Assert GIC IRQ 38/39 and kick vCPUs.
 
-### Phase 3: VirtIO-GPU & Native Cocoa/Metal Window
-1. Implement full VirtIO-GPU 2D command ring.
-2. Provide a `--gui native` CLI flag that initializes an `NSWindow` with a Metal texture pipeline for native, high-performance rendering.
+### Phase 3: Optional native Cocoa/Metal frontend
+1. Split guest framebuffer and input access from RFB protocol handling.
+2. Add the AppKit/Metal window and a `--gui native` option using simple-framebuffer.
+3. Verify display, input, lifecycle, and performance against the VNC baseline.
+
+### Separate future track: VirtIO-GPU 2D
+Implement the virtio-gpu control/cursor queues only when a guest capability or
+measured display limitation justifies a new virtual display device. It is not
+a prerequisite for the native window.
 
 
 ## FreeBSD input reality check (2026-09-20)

@@ -2,7 +2,8 @@
 """Disposable FreeBSD UFS or UEFI/ZFS install, boot, and reboot regression.
 
 Requires Apple Silicon macOS, a signed VMM, and an ARM64 disc1 ISO.
-Run with sudo for vmnet. Failure artifacts are always retained.
+Run with sudo for vmnet. --desktop-environment xfce installs an XFCE desktop
+and LightDM into the disposable UFS guest. Failure artifacts are always retained.
 """
 import argparse
 import hashlib
@@ -49,6 +50,64 @@ def find_usb_tablet(execute, listing, deadline):
     require(len(matches) == 1,
             f"Expected one VMM USB tablet, found {matches}; see descriptor dumps in ssh.log")
     return matches[0]
+
+
+def desktop_packages(environment):
+    common = "xorg-minimal xf86-video-scfb xf86-input-libinput xinput xdpyinfo"
+    return common + (" xfce dbus lightdm lightdm-gtk-greeter dejavu adwaita-icon-theme"
+                     if environment == "xfce"
+                     else " twm xterm")
+
+
+def desktop_session(environment):
+    if environment == "xfce":
+        return ("daemon -f -p /var/run/xfce-vmm.pid -o /var/log/xfce-vmm.log "
+                "/usr/bin/env DISPLAY=:0 /bin/sh -c "
+                "'. /usr/local/etc/xdg/xfce4/xinitrc'", "xfce4-session")
+    return ("daemon -f -p /var/run/twm-vmm.pid -o /var/log/twm-vmm.log "
+            "/usr/bin/env DISPLAY=:0 /usr/local/bin/twm && "
+            "daemon -f -p /var/run/xterm-vmm.pid -o /var/log/xterm-vmm.log "
+            "/usr/bin/env DISPLAY=:0 /usr/local/bin/xterm -geometry 90x28+80+80", "twm")
+
+
+def desktop_username(value):
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", value) or value in ("root", "toor"):
+        raise argparse.ArgumentTypeError(
+            "desktop username must use 1–32 lowercase letters, digits, '_' or '-', "
+            "start with a letter or '_', and not be root/toor")
+    return value
+
+
+def password_from_file(path, default, account):
+    if path is None:
+        return default
+    value = path.read_text(encoding="utf-8")
+    if value.endswith("\n"):
+        value = value[:-1]
+    if value.endswith("\r"):
+        value = value[:-1]
+    require(value and not any(char in value for char in "\r\n\0"),
+            f"{account} password file must contain one nonempty line")
+    return value
+
+
+def write_reuse_config(args, directory):
+    """Give a retained desktop install a stable launch recipe for vmmctl."""
+    config = {
+        "name": directory.name,
+        "binary": str(args.binary),
+        "boot": {"mode": "freebsd", "kernel": "boot/kernel/kernel", "multiuser": True},
+        "disks": [{"path": "installed.img"}],
+        "ram_mb": args.ram,
+        "cpus": args.cpus,
+        "network": {"mode": "vmnet", "ssh_port": 2222},
+        "vnc": {"bind": "127.0.0.1:5901", "display": args.display},
+        "shutdown": {"host": "127.0.0.1", "port": 2222, "user": "root",
+                     "identity_file": "id_ed25519"},
+    }
+    path = directory / "reuse-vm.json"
+    path.write_text(json.dumps(config, indent=2) + "\n")
+    return path
 
 
 class ConsoleSession:
@@ -145,7 +204,15 @@ def run(args, directory):
     try:
         key = directory / "id_ed25519"
         command(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key])
-        password = secrets.token_hex(24)
+        password = password_from_file(args.root_password_file, secrets.token_hex(24), "Root")
+        root_login = directory / "root-login.txt"
+        root_login.write_text(f"Username: root\nPassword: {password}\n")
+        root_login.chmod(0o600)
+        if args.desktop and args.desktop_environment == "xfce":
+            login_password = password_from_file(args.desktop_password_file, password, "Desktop")
+            login = directory / "desktop-login.txt"
+            login.write_text(f"Username: {args.desktop_user}\nPassword: {login_password}\n")
+            login.chmod(0o600)
         command(["bash", Path(__file__).with_name("create-seed.sh").resolve(),
                  "--output", directory / "seed.iso", "--ssh-key", key.with_suffix(".pub"),
                  "--hostname", "vmm-install-test", "--password", password,
@@ -206,17 +273,18 @@ def run(args, directory):
                "-o", "UserKnownHostsFile=" + str(directory / "known_hosts"),
                "-o", "GlobalKnownHostsFile=/dev/null", "root@127.0.0.1"]
 
-        def execute(remote, deadline, timeout_cap=10):
+        def execute(remote, deadline, timeout_cap=10, input_text=None):
             remaining = deadline - time.monotonic()
             require(remaining > 0, "Guest command phase timed out")
             if args.console_only:
+                require(input_text is None, "Console commands cannot receive stdin")
                 result = console.execute(remote, deadline)
                 if result is None:
                     return None
             else:
                 try:
                     result = subprocess.run([*ssh, remote], capture_output=True, text=True,
-                                            timeout=min(timeout_cap, remaining))
+                                            input=input_text, timeout=min(timeout_cap, remaining))
                 except subprocess.TimeoutExpired:
                     return None
             with (directory / ("console-commands.log" if args.console_only else "ssh.log")).open("a") as log:
@@ -271,17 +339,46 @@ def run(args, directory):
                      if attachment is not None else ""))
             packages = execute(
                 "env ASSUME_ALWAYS_YES=yes pkg bootstrap -f && "
-                "pkg install -y xorg-minimal xf86-video-scfb "
-                "xf86-input-libinput twm xterm xinput xdpyinfo",
+                f"pkg install -y {desktop_packages(args.desktop_environment)}",
                 deadline, args.desktop_timeout)
             require(packages is not None and packages.returncode == 0,
                     "Could not install the FreeBSD X11 desktop packages")
+            if args.desktop_environment == "xfce":
+                account = execute(
+                    f"pw useradd {shlex.quote(args.desktop_user)} -m -G video -s /bin/sh -h 0",
+                    deadline, input_text=login_password + "\n")
+                require(account is not None and account.returncode == 0,
+                        "Could not create the XFCE login user; see ssh.log")
+                services = execute(
+                    "sysrc dbus_enable=YES lightdm_enable=YES && "
+                    "service dbus onestart && "
+                    "command -v xfce4-session >/dev/null && "
+                    "command -v lightdm >/dev/null && "
+                    "test -r /usr/local/etc/xdg/xfce4/xinitrc && "
+                    "pkg info -e dejavu && "
+                    "test -r /usr/local/share/fonts/dejavu/DejaVuSans.ttf && "
+                    "install -d /usr/local/etc/lightdm && "
+                    "printf '%s\\n' '[greeter]' 'theme-name=Adwaita' "
+                    "'icon-theme-name=Adwaita' 'font-name=DejaVu Sans 11' "
+                    ">/usr/local/etc/lightdm/lightdm-gtk-greeter.conf",
+                    deadline)
+                require(services is not None and services.returncode == 0,
+                        "Could not configure XFCE/D-Bus/LightDM; see ssh.log")
+                hid_service = Path(__file__).with_name("freebsd-vmm-hid.rc").read_text()
+                persist_hid = execute(
+                    "cat > /usr/local/etc/rc.d/vmm_hid && "
+                    "chmod 555 /usr/local/etc/rc.d/vmm_hid && "
+                    "sysrc vmm_hid_enable=YES && service vmm_hid onestart",
+                    deadline, input_text=hid_service)
+                require(persist_hid is not None and persist_hid.returncode == 0,
+                        "Could not install the boot-time USB tablet reprobe; see ssh.log")
             configure = execute(
                 "install -d /usr/local/etc/X11/xorg.conf.d && "
                 "printf '%s\n' 'Section \"Device\"' '  Identifier \"Card0\"' "
                 "'  Driver \"scfb\"' 'EndSection' "
                 ">/usr/local/etc/X11/xorg.conf.d/20-scfb.conf && "
-                "rm -f /var/run/Xorg-vmm.pid /var/run/twm-vmm.pid /var/run/xterm-vmm.pid && "
+                "rm -f /var/run/Xorg-vmm.pid /var/run/twm-vmm.pid "
+                "/var/run/xterm-vmm.pid /var/run/xfce-vmm.pid && "
                 "(pkill Xorg 2>/dev/null || true) && "
                 "daemon -f -p /var/run/Xorg-vmm.pid -o /var/log/Xorg-vmm.log "
                 "/usr/local/bin/Xorg :0 -ac -noreset vt9",
@@ -291,14 +388,13 @@ def run(args, directory):
             await_command(
                 "env DISPLAY=:0 xdpyinfo >/dev/null 2>&1 && printf VMM_X11_OK",
                 "VMM_X11_OK", deadline)
-            desktop = execute(
-                "daemon -f -p /var/run/twm-vmm.pid -o /var/log/twm-vmm.log "
-                "/usr/bin/env DISPLAY=:0 /usr/local/bin/twm && "
-                "daemon -f -p /var/run/xterm-vmm.pid -o /var/log/xterm-vmm.log "
-                "/usr/bin/env DISPLAY=:0 /usr/local/bin/xterm -geometry 90x28+80+80",
-                deadline)
+            session_command, session_process = desktop_session(args.desktop_environment)
+            desktop = execute(session_command, deadline)
             require(desktop is not None and desktop.returncode == 0,
                     "Could not start the X11 desktop clients")
+            await_command(
+                f"pgrep -x {session_process} >/dev/null && printf VMM_SESSION_OK",
+                "VMM_SESSION_OK", deadline)
             check_log = directory / "desktop-check.log"
             check_command = [
                 sys.executable, "-B", Path(__file__).with_name("check_desktop.py"),
@@ -317,6 +413,7 @@ def run(args, directory):
                 ("cat /var/log/Xorg.0.log", "Xorg.0.log"),
                 ("cat /var/log/twm-vmm.log", "twm-vmm.log"),
                 ("cat /var/log/xterm-vmm.log", "xterm-vmm.log"),
+                ("cat /var/log/xfce-vmm.log", "xfce-vmm.log"),
                 ("env DISPLAY=:0 xinput --list --long", "xinput-devices.log"),
                 ("dmesg | grep -E 'usbhid|hidbus|hms|hkbd|uhid|ukbd'", "guest-hid-after-xorg.log"),
             ]:
@@ -365,6 +462,20 @@ def run(args, directory):
             console = ConsoleSession(vm, password)
         await_command(f"test \"$(sysctl -n kern.boottime)\" != {shlex.quote(before.stdout.strip())} "
                   f"&& cat {marker_path}", token, deadline)
+        if args.desktop and args.desktop_environment == "xfce":
+            await_command(
+                "pkg info -e xfce && "
+                "test \"$(sysctl -n hw.usb.usbhid.enable)\" = 1 && "
+                "test \"$(sysctl -n kern.evdev.rcpt_mask)\" = 6 && "
+                "dmesg | grep -Eq 'hms[0-9]+' && "
+                "service dbus onestatus >/dev/null && "
+                "service lightdm onestatus >/dev/null && pgrep -x Xorg >/dev/null && "
+                "printf VMM_XFCE_BOOT_OK",
+                "VMM_XFCE_BOOT_OK", deadline)
+            print("PASS installed XFCE, boot-time USB tablet, and LightDM/Xorg", flush=True)
+            print(f"Desktop login: {args.desktop_user} "
+                  f"(credentials: {directory / 'desktop-login.txt'})",
+                  flush=True)
         if args.filesystem == "zfs":
             verify_zfs(deadline)
             await_command(efi_read, token, deadline)
@@ -413,7 +524,15 @@ def main():
     parser.add_argument("--firmware", type=Path, help="EDK2 firmware required for ZFS")
     parser.add_argument("--console-only", action="store_true", help="offline UART checks instead of SSH/vmnet")
     parser.add_argument("--desktop", action="store_true",
-                        help="install Xorg/scfb and run the graphical desktop regression")
+                        help="install Xorg/scfb with twm and run the graphical desktop regression")
+    parser.add_argument("--desktop-environment", choices=("xfce",),
+                        help="install a full desktop environment (implies --desktop)")
+    parser.add_argument("--desktop-user", type=desktop_username,
+                        help="XFCE login username (default: vmm)")
+    parser.add_argument("--desktop-password-file", type=Path,
+                        help="UTF-8 file containing the XFCE login password (default: root password)")
+    parser.add_argument("--root-password-file", type=Path,
+                        help="UTF-8 file containing the root password (default: generated)")
     parser.add_argument("--artifacts", type=Path, help="parent for a new private run directory")
     parser.add_argument("--keep", action="store_true", help="also retain artifacts on success")
     parser.add_argument("--disk-gib", type=positive, default=12)
@@ -428,6 +547,26 @@ def main():
                            ("reboot", 180), ("shutdown", 60)]:
         parser.add_argument(f"--{phase}-timeout", type=positive, default=default)
     args = parser.parse_args()
+    if args.desktop_environment:
+        args.desktop = True
+        args.desktop_user = args.desktop_user or "vmm"
+    else:
+        if args.desktop_user or args.desktop_password_file:
+            parser.error("--desktop-user and --desktop-password-file require --desktop-environment xfce")
+        args.desktop_environment = "twm"
+    for field, account in (("desktop_password_file", "Desktop"),
+                           ("root_password_file", "Root")):
+        path = getattr(args, field)
+        if path is None:
+            continue
+        path = path.expanduser().resolve()
+        if not path.is_file():
+            parser.error(f"{account.lower()} password file does not exist: {path}")
+        try:
+            password_from_file(path, "", account)
+        except (OSError, UnicodeError, RuntimeError) as error:
+            parser.error(str(error))
+        setattr(args, field, path)
     if args.filesystem == "zfs" and not args.firmware:
         parser.error("--filesystem zfs requires --firmware")
     if args.desktop and args.console_only:
@@ -463,6 +602,11 @@ def main():
         print(f"FAIL: {error}\nArtifacts retained: {directory}", flush=True)
         raise
     else:
+        if args.keep and args.desktop_environment == "xfce":
+            config = write_reuse_config(args, directory)
+            print(f"Reusable VM config: {config}", flush=True)
+            print("Start later: python3 -B scripts/vmmctl.py start "
+                  f"{shlex.quote(str(config))} --sudo", flush=True)
         if not args.keep:
             shutil.rmtree(directory)
         print("PASS full install → boot → reboot regression", flush=True)

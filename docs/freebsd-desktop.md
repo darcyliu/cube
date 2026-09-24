@@ -1,8 +1,9 @@
 # FreeBSD desktop verification
 
 This runbook validates the VNC display and USB HID path with a real FreeBSD
-X11 session. It uses a disposable installed disk because package installation
-and Xorg configuration modify the guest.
+X11 session. The checker creates a new installed disk because package
+installation and Xorg configuration modify the guest. Keep its artifacts to
+reuse that disk as a VM later.
 
 ## Prerequisites
 
@@ -21,6 +22,151 @@ sudo python3 scripts/check_install.py /tmp/vmm-gui-fix/debug/vmm \
   --desktop --keep
 ```
 
+For an unattended **XFCE** installation on a new UFS disk, select
+the desktop environment instead of the default `twm` test session:
+
+```sh
+mkdir -p "$HOME/VMs"
+sudo python3 -B scripts/check_install.py target/debug/vmm \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --desktop-environment xfce --desktop-timeout 2400 \
+  --artifacts "$HOME/VMs" --keep
+```
+
+The XFCE login defaults to username `vmm` and a generated password. To choose
+your own credentials for a **new** install, add `--desktop-user NAME` and
+`--desktop-password-file PATH`. The file must contain one nonempty UTF-8 line;
+keep it private (for example, mode 0600). The password is read from the file
+and sent to FreeBSD's `pw` command over SSH standard input, rather than placed
+on the command line:
+
+```sh
+sudo python3 -B scripts/check_install.py target/debug/vmm \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --desktop-environment xfce --desktop-user darcy \
+  --desktop-password-file "$HOME/VMs/xfce-password.txt" \
+  --root-password-file "$HOME/VMs/xfce-password.txt" \
+  --desktop-timeout 2400 --artifacts "$HOME/VMs" --keep
+```
+
+The desktop password can differ from the root password. `desktop-login.txt` in
+the retained artifact directory records the selected username and password;
+`root-login.txt` records
+the separate root password. Read either with `sudo cat`. To choose root's
+password for a new install as well, pass `--root-password-file PATH` (the same
+file as the desktop password file if you want matching passwords). These files
+each contain one nonempty UTF-8 line and should have mode 0600.
+The desktop options affect new installations, not an existing `installed.img`.
+
+`unattended-install.sh` defaults to `root:root`, but this regression installer
+passes a generated root password to the same `create-seed.sh` script unless
+`--root-password-file` is supplied. For an already installed VM, boot it with
+`--ssh-port 2222` and set root to the password recorded in `desktop-login.txt`:
+
+```sh
+INSTALL="$HOME/VMs/vmm-install-uwtcnyim"  # replace with your artifact path
+bash scripts/set_freebsd_root_password.sh "$INSTALL"
+```
+
+The helper authenticates with the artifact's SSH key and passes the password
+to FreeBSD's `pw` over SSH standard input. It then updates `root-login.txt`.
+Pass a different password file as its second argument to choose another root
+password. The guest must be running and its SSH forward must be reachable; the
+third argument overrides port 2222. Use the desktop account for graphical login
+and root for terminal/SSH administration.
+
+This opt-in path installs XFCE, Xorg/scfb, D-Bus, LightDM and its GTK greeter,
+plus DejaVu fonts and Adwaita icons so the login screen has readable labels.
+It creates a `vmm` desktop user, starts an XFCE session for the same VNC/XI2
+input check, enables D-Bus and LightDM for subsequent boots, then requires
+the USB tablet, LightDM, and Xorg after the guest reboots. The retained
+`installed.img` contains those packages, account, and settings; the private
+artifact directory holds the login passwords (mode 0600).
+
+### Reuse the XFCE VM
+
+The checker shuts the guest down after verification; it does not leave an
+instance running. With `--keep`, it writes `reuse-vm.json` beside `installed.img`,
+`boot/kernel/kernel`, `id_ed25519`, `desktop-login.txt`, and `root-login.txt`.
+The output prints the artifact directory and config path. Keep the whole directory in a durable
+location: the config's paths to the disk, kernel, and SSH key are relative to
+that directory. To start the same installed VM later, substitute the printed
+artifact path below:
+
+```sh
+INSTALL=/path/to/vmm-install-XXXXXX
+sudo -v
+python3 -B scripts/vmmctl.py start "$INSTALL/reuse-vm.json" --sudo
+python3 -B scripts/vmmctl.py status "$INSTALL/reuse-vm.json" --sudo
+# Connect a VNC viewer to 127.0.0.1:5901; log in as vmm.
+sudo cat "$INSTALL/desktop-login.txt"
+python3 -B scripts/vmmctl.py shutdown "$INSTALL/reuse-vm.json" --sudo
+# Run start again whenever you want to use this same disk.
+```
+
+To run the same XFCE VM **in the foreground**, as with
+`unattended-install.sh`, stop any `vmmctl` instance using this disk first.
+Then run from the repository root:
+
+```sh
+INSTALL=/path/to/vmm-install-XXXXXX  # replace with the printed artifact path
+sudo ./target/debug/vmm \
+  --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
+  --disk "$INSTALL/installed.img" \
+  --ram 2048 --cpus 2 \
+  --net vmnet --ssh-port 2222 \
+  --vnc 127.0.0.1:5901 --display 1024x768 \
+  --serial-log "$INSTALL/foreground.console.log"
+```
+
+Connect a VNC viewer to `127.0.0.1:5901`, log in as `vmm`, and read the
+password with `sudo cat "$INSTALL/desktop-login.txt"`. For a clean poweroff,
+run this in another terminal (set `INSTALL` there too):
+
+```sh
+sudo ssh -F /dev/null -i "$INSTALL/id_ed25519" -p 2222 \
+  -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+  root@127.0.0.1 'shutdown -p now'
+```
+
+Older XFCE artifacts may have an unusable greeter with empty-square text and
+no mouse. They lack an explicit font set and the boot-time `vmm_hid` service.
+While the guest is running with `--ssh-port 2222`, repair that installed disk
+from the repository root:
+
+```sh
+bash scripts/repair_freebsd_desktop.sh "$INSTALL"
+```
+
+The repair installs fonts and icons, selects a readable LightDM GTK theme,
+enables FreeBSD's USB HID/evdev path, and reprobes the tablet by its USB
+descriptor rather than its changing `ugen` number. It restarts LightDM, which
+ends the current greeter/session; reconnect VNC and log in as `vmm`. New XFCE
+installs configure the same greeter assets and boot-time tablet service
+automatically. If the current X11 session does not pick up the tablet, shut
+down and boot the VM again.
+The in-place repair was confirmed on the 2026-09-23 FreeBSD XFCE guest: the
+greeter text and mouse worked after restarting LightDM. Persistence across a
+subsequent guest reboot still needs a live check.
+
+The config uses SSH forwarding on port 2222 for `vmmctl shutdown`, and the
+installed disk remains writable across later starts. Override occupied ports
+with `--ssh-port` and `--vnc` on `start` (and update the shutdown port in the
+JSON if SSH changes). The binary path in the config is absolute; edit it if
+the checkout moves. Unlike the regression's temporary process, `vmmctl` keeps
+the guest running until it is shut down or stopped. See [VM management](vm-management.md)
+for stop commands. The regression checks that the tablet attaches after reboot;
+a full XFCE login and pointer-input replay on a later start still need an
+end-to-end run.
+
+Package installation requires guest Internet access and may take substantially
+longer than the default `twm` check. The user completed a privileged XFCE
+installation and confirmed the repaired greeter text and mouse. Retain and
+inspect artifacts if a later run fails. The display manager presents a login
+screen after reboot; the script does not configure automatic login.
+[FreeBSD's desktop handbook](https://docs.freebsd.org/en/books/handbook/desktop/)
+documents the `xfce` package, D-Bus, and LightDM setup.
+
 Success includes the three desktop `PASS` lines documented below. The retained
 artifact directory contains `desktop-results/display-metrics.json`, the XI2 event
 and device logs, `desktop-check.log`, the VMM logs, and copies of the Xorg logs.
@@ -33,6 +179,12 @@ report 96.0 MiB of framebuffer reads in 2.6 ms, 90.0 MiB of changed-row
 comparisons in 3.6 ms, and 11.7 MiB sent in 291.0 ms. The send time was the
 largest measured server cost in this run. `guest-hid.log` confirms `hms0`
 attached with five buttons and X/Y/wheel axes.
+The default `twm` desktop checks run before reboot; its post-reboot phase
+verifies SSH and the persistent guest marker, not a restored X11 session or
+returning HID input. The XFCE variant checks tablet attachment, LightDM, and
+Xorg after reboot, but does not log in to XFCE or replay the HID test there.
+The update check validates protocol framing and event delivery, not the visual
+contents of a captured frame.
 
 The remaining commands describe the equivalent manual workflow for diagnosis.
 Use the printed artifact directory as `$INSTALL`. Start its installed system

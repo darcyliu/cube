@@ -1,0 +1,46 @@
+#!/bin/sh
+# PROVIDE: vmm_hid
+# REQUIRE: FILESYSTEMS
+# BEFORE: lightdm
+
+# Direct FreeBSD kernel boot bypasses loader.conf. Reprobe the VMM tablet
+# after enabling usbhid so Xorg/libinput can receive absolute pointer input.
+. /etc/rc.subr
+
+name=vmm_hid
+rcvar=vmm_hid_enable
+start_cmd=vmm_hid_start
+stop_cmd=:
+
+vmm_hid_start()
+{
+    sysctl hw.usb.usbhid.enable=1 kern.evdev.rcpt_mask=6 >/dev/null || return 1
+    kldload hms 2>/dev/null || true
+
+    attempt=0
+    while [ "$attempt" -lt 10 ]; do
+        tablet=
+        for device in $(usbconfig | awk '/^ugen[0-9]+\.[0-9]+:/ {sub(/:$/, "", $1); print $1}'); do
+            descriptor=$(usbconfig -d "$device" dump_device_desc 2>/dev/null) || continue
+            printf '%s\n' "$descriptor" | grep -q 'iProduct.*<VMM USB Tablet>' || continue
+            printf '%s\n' "$descriptor" | grep -q 'iSerialNumber.*<tablet0>' || continue
+            if [ -n "$tablet" ]; then
+                echo "vmm_hid: more than one VMM USB tablet" >&2
+                return 1
+            fi
+            tablet=$device
+        done
+        if [ -n "$tablet" ]; then
+            usbconfig -d "$tablet" reset
+            return $?
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    echo "vmm_hid: VMM USB tablet not found" >&2
+    return 1
+}
+
+load_rc_config "$name"
+: "${vmm_hid_enable:=NO}"
+run_rc_command "$1"

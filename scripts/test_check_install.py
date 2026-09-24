@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Failure guards for the installation runner; no hypervisor or root required."""
 from pathlib import Path
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-from check_install import ConsoleSession, Machine, find_usb_tablet, line_present, main
+from check_install import (ConsoleSession, Machine, desktop_packages, password_from_file,
+                           desktop_session, find_usb_tablet, line_present, main)
+import vmmctl
 
 
 class InstallGuards(unittest.TestCase):
@@ -165,6 +169,114 @@ ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
                          "--vnc-port", "5905")
         self.assertEqual(captured, {"desktop": True, "display": "1280x720",
                                     "vnc_port": 5905, "timeout": 1200})
+
+    def test_xfce_variant_implies_desktop_and_has_a_boot_login_manager(self):
+        captured = {}
+        def record(args, directory):
+            captured.update(desktop=args.desktop, environment=args.desktop_environment)
+        self.invoke_main(record, "--desktop-environment", "xfce")
+        self.assertEqual(captured, {"desktop": True, "environment": "xfce"})
+        self.assertIn("xfce dbus lightdm lightdm-gtk-greeter dejavu adwaita-icon-theme",
+                      desktop_packages("xfce"))
+        self.assertIn("xfce4/xinitrc", desktop_session("xfce")[0])
+        with self.assertRaises(SystemExit):
+            self.invoke_main(lambda args, directory: self.fail("must not run"),
+                             "--desktop-environment", "xfce", "--console-only")
+
+    def test_xfce_login_can_use_custom_user_and_password_file(self):
+        password_file = self.directory / "desktop-password"
+        password_file.write_text("custom pass with spaces!\n")
+        captured = {}
+        def record(args, directory):
+            captured.update(user=args.desktop_user,
+                            password=password_from_file(args.desktop_password_file,
+                                                        "fallback", "Desktop"))
+        self.invoke_main(record, "--desktop-environment", "xfce",
+                         "--desktop-user", "darcy", "--desktop-password-file", str(password_file),
+                         "--keep")
+        self.assertEqual(captured, {"user": "darcy", "password": "custom pass with spaces!"})
+        run = next(self.directory.glob("vmm-install-*"))
+        self.assertNotIn("custom pass with spaces!", (run / "run.json").read_text())
+        with self.assertRaises(SystemExit):
+            self.invoke_main(lambda args, directory: self.fail("must not run"),
+                             "--desktop-environment", "xfce", "--desktop-user", "root")
+        with self.assertRaises(SystemExit):
+            self.invoke_main(lambda args, directory: self.fail("must not run"),
+                             "--desktop-user", "darcy")
+        password_file.write_text("two\nlines\n")
+        with self.assertRaises(SystemExit):
+            self.invoke_main(lambda args, directory: self.fail("must not run"),
+                             "--desktop-environment", "xfce",
+                             "--desktop-password-file", str(password_file))
+
+    def test_root_password_file_is_independent_of_desktop_password(self):
+        root_file = self.directory / "root-password"
+        root_file.write_text("root secret\n")
+        desktop_file = self.directory / "desktop-password"
+        desktop_file.write_text("desktop secret\n")
+        captured = {}
+        def record(args, directory):
+            captured["root"] = password_from_file(args.root_password_file, "fallback", "Root")
+            captured["desktop"] = password_from_file(args.desktop_password_file,
+                                                      "fallback", "Desktop")
+        self.invoke_main(record, "--desktop-environment", "xfce",
+                         "--root-password-file", str(root_file),
+                         "--desktop-password-file", str(desktop_file), "--keep")
+        self.assertEqual(captured, {"root": "root secret", "desktop": "desktop secret"})
+        run = next(self.directory.glob("vmm-install-*"))
+        self.assertNotIn("root secret", (run / "run.json").read_text())
+        self.assertNotIn("desktop secret", (run / "run.json").read_text())
+        root_file.write_text("two\nlines\n")
+        with self.assertRaises(SystemExit):
+            self.invoke_main(lambda args, directory: self.fail("must not run"),
+                             "--root-password-file", str(root_file))
+
+    def test_root_password_helper_uses_key_and_private_credential_file(self):
+        install = self.directory / "retained"
+        install.mkdir()
+        (install / "id_ed25519").write_text("test key")
+        (install / "desktop-login.txt").write_text("Username: darcy\nPassword: test secret\n")
+        tools = self.directory / "tools"
+        tools.mkdir()
+        sudo = tools / "sudo"
+        sudo.write_text('#!/bin/sh\n[ "$1" = -v ] && exit 0\nexec "$@"\n')
+        sudo.chmod(0o755)
+        ssh = tools / "ssh"
+        ssh.write_text('#!/bin/sh\ncat > "$CAPTURE"\n')
+        ssh.chmod(0o755)
+        capture = self.directory / "ssh-input"
+        subprocess.run(["bash", str(Path(__file__).with_name("set_freebsd_root_password.sh")),
+                        str(install)], check=True, capture_output=True, text=True,
+                       env=dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                                CAPTURE=str(capture)), timeout=10)
+        self.assertEqual(capture.read_text(), "test secret\n")
+        login = install / "root-login.txt"
+        self.assertEqual(login.read_text(), "Username: root\nPassword: test secret\n")
+        self.assertEqual(login.stat().st_mode & 0o777, 0o600)
+
+    def test_retained_xfce_install_has_reusable_vm_config(self):
+        def installed(args, directory):
+            (directory / "installed.img").write_bytes(b"disk")
+            kernel = directory / "boot/kernel/kernel"
+            kernel.parent.mkdir(parents=True)
+            kernel.write_bytes(b"kernel")
+            (directory / "id_ed25519").write_text("key")
+        self.invoke_main(installed, "--desktop-environment", "xfce", "--keep")
+        run = next(self.directory.glob("vmm-install-*"))
+        config = json.loads((run / "reuse-vm.json").read_text())
+        self.assertEqual(config["boot"], {"mode": "freebsd", "kernel": "boot/kernel/kernel",
+                                          "multiuser": True})
+        self.assertEqual(config["disks"], [{"path": "installed.img"}])
+        self.assertEqual(config["vnc"]["bind"], "127.0.0.1:5901")
+        self.assertTrue((run / config["boot"]["kernel"]).is_file())
+        self.assertTrue((run / config["disks"][0]["path"]).is_file())
+        options = SimpleNamespace(binary=None, ram=None, cpus=None, disk=None, net=None,
+                                  mac=None, ssh_port=None, forward=None, vnc=None,
+                                  display=None, efi_vars=None, sudo=False)
+        spec = vmmctl.launch_spec(run / "reuse-vm.json", run / "state", options)
+        self.assertIn(str((run / "installed.img").resolve()), spec["command"])
+        self.assertIn(str((run / "boot/kernel/kernel").resolve()), spec["command"])
+        self.assertEqual(spec["shutdown"]["identity_file"], str((run / "id_ed25519").resolve()))
 
     def test_seed_selects_ufs_or_efi_zfs(self):
         # Capture the real seed contents before hdiutil and cleanup, without

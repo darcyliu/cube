@@ -128,6 +128,34 @@ direct UFS kernel boot bypasses `loader.conf`. The retained guest log confirms
 See [GUI architecture](gui_architecture.md) and the
 [FreeBSD desktop runbook](freebsd-desktop.md).
 
+### Remaining GUI gaps after this milestone
+
+- **Desktop across boots:** the FreeBSD USB HID setting is enabled at runtime
+  for the direct-kernel test. The desktop is exercised before reboot; after
+  reboot the regression checks SSH and a persistent marker, not Xorg, HID, or
+  VNC input again. An opt-in unattended XFCE variant now installs a boot-time
+  USB tablet reprobe service and LightDM, then checks tablet attachment and
+  Xorg after reboot. An in-place repair of an existing XFCE guest restored
+  greeter text and mouse input on 2026-09-23. The revised installer still
+  needs a privileged run and a second logged-in pointer/input check after
+  reboot.
+- **Visual correctness and workload coverage:** the X11 check verifies XI2
+  events, VNC geometry, and update framing, but does not compare rendered
+  pixels or measure interactive application latency. A later XFCE greeter
+  screenshot exposed missing fonts despite protocol checks passing; the XFCE
+  variant now installs DejaVu fonts and Adwaita icons. The recorded 1024×768
+  pointer-driven update sample is not a high-resolution workload benchmark.
+- **Display capability:** simple-framebuffer/scfb uses a fixed boot-time
+  resolution. There is no runtime resize, multi-head display, virtio-gpu host
+  device, or 3D acceleration. Virtio-gpu remains deferred by the decision above.
+- **Remote-desktop features:** VNC serves one loopback client with raw rectangle
+  encoding. It does not provide clipboard synchronization; incoming
+  `ClientCutText` is discarded. The keysym table covers common Latin-1 keys
+  and controls, leaving other layouts and input methods unverified.
+- **Guest coverage:** the end-to-end desktop check is limited to the FreeBSD
+  14.4 UFS/X11/scfb path. UEFI/ZFS graphics, other guest systems, Wayland, and
+  broader VNC viewer compatibility have not been verified.
+
 ## 5. Per-VM configuration and management
 
 `scripts/vmmctl.py` provides a named JSON configuration and a host-side manager.

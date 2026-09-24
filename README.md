@@ -156,6 +156,14 @@ use temporary kernels and variable stores without opening guest disks.
 
 For a disposable full installation, installed-disk SSH, and reboot/persistence
 check, see [the installation regression runbook](docs/install-regression.md).
+Pass `--desktop-environment xfce` to the UFS installation checker for an opt-in
+unattended XFCE/LightDM installation; see the [desktop runbook](docs/freebsd-desktop.md).
+With `--keep`, the run also writes `reuse-vm.json` beside the installed disk for
+later starts through `scripts/vmmctl.py`.
+Use `--desktop-user` and `--desktop-password-file` to choose the XFCE login
+credentials for a new install. The root account has a separate generated password;
+use `--root-password-file` to choose it, or read `root-login.txt` in retained
+artifacts.
 
 ---
 
