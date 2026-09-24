@@ -155,6 +155,8 @@ def main():
     for command, expected in [
         ([binary, "--display", "1024x768"], "--display requires --vnc"),
         ([binary, "--vnc", "--display", "16384x16384"], "maximum is 256 MiB"),
+        ([binary, "--retina"], "--retina requires --gui native"),
+        ([binary, "--retinaa"], "Unknown argument '--retinaa'"),
     ]:
         result = subprocess.run(command, text=True, capture_output=True)
         assert result.returncode != 0, result.stdout + result.stderr

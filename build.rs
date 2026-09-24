@@ -3,11 +3,32 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rustc-link-lib=framework=Hypervisor");
+    println!("cargo:rustc-link-lib=framework=AppKit");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=MetalKit");
+    println!("cargo:rerun-if-changed=src/native.m");
     println!("cargo:rerun-if-changed=guest/payload.S");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     let out_bin = std::path::Path::new(&out_dir).join("payload.bin");
     let out_obj = std::path::Path::new(&out_dir).join("payload.o");
+    let cocoa_obj = std::path::Path::new(&out_dir).join("native.o");
+    let cocoa_lib = std::path::Path::new(&out_dir).join("libvmm_native.a");
+    let status = Command::new("clang")
+        .args(["-fobjc-arc", "-c", "src/native.m", "-o"])
+        .arg(&cocoa_obj)
+        .status()
+        .expect("build.rs: clang is required for the native Cocoa frontend");
+    assert!(status.success(), "build.rs: failed to compile native Cocoa frontend");
+    let status = Command::new("ar")
+        .arg("rcs")
+        .arg(&cocoa_lib)
+        .arg(&cocoa_obj)
+        .status()
+        .expect("build.rs: ar is required for the native Cocoa frontend");
+    assert!(status.success(), "build.rs: failed to archive native Cocoa frontend");
+    println!("cargo:rustc-link-search=native={out_dir}");
+    println!("cargo:rustc-link-lib=static=vmm_native");
 
     // Assemble the tiny bare-metal test payload (include_bytes! in main.rs).
     // guest/*.bin is gitignored — this step must succeed on every clean build.

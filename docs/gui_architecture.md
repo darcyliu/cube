@@ -155,18 +155,18 @@ pub struct VirtioInputEvent {
 | Backend | Implementation Details | Pros | Cons |
 | :--- | :--- | :--- | :--- |
 | **1. Embedded RFB/VNC Server** *(Recommended)* | Lightweight TCP server on `localhost:5900` implementing RFC 6143 (RFB 3.8). | **Zero external dependencies**.<br>Works headless/SSH.<br>Native macOS client via `open vnc://127.0.0.1:5900`. | 1–2ms network encoding overhead. |
-| **2. Native Cocoa / Metal Window** *(proposed)* | AppKit window with an `MTKView` presenting the existing guest framebuffer. | Local desktop in one window; no VNC viewer or RFB encoding. | Needs an AppKit event loop, framebuffer upload, input translation, and macOS packaging. |
+| **2. Native Cocoa / Metal Window** *(first pass implemented)* | AppKit window with an `MTKView` presenting the existing guest framebuffer. | Local desktop in one window; no VNC viewer or RFB encoding. | Fixed guest resolution and US physical key mapping; full desktop input validation and packaging remain. |
 | **3. WebSocket / HTML5 Canvas** | Mini HTTP server + WebSocket streaming raw RGBA / PNG frames to a browser. | Works in any browser without client software. | Requires JavaScript frontend. |
 
 ---
 
-### Native Cocoa / Metal window: proposed design
+### Native Cocoa / Metal window: implemented first pass
 
 This is a **host presentation option**, not a new guest display device. The
 current `--vnc` path creates the FDT simple-framebuffer, platform xHCI HID
-keyboard/tablet, and (for Linux) virtio-input devices in `src/main.rs`. A
-native `--gui native` path could reuse those same guest devices and replace the
-RFB frontend with a local AppKit window. It does **not** require virtio-gpu,
+keyboard/tablet, and (for Linux) virtio-input devices in `src/main.rs`. The
+`--gui native` path reuses those guest devices and replaces the RFB frontend
+with a local AppKit window. It does **not** require virtio-gpu,
 change the guest driver, or provide guest 3D acceleration. The current VNC
 frontend remains useful for headless runs and automated checks.
 
@@ -206,10 +206,22 @@ AppKit mouse/key/scroll events -> shared input translation -> xHCI HID
   Measure capture/upload/present time and input-to-frame latency before
   claiming a performance benefit.
 
-The first milestone is a window that displays the existing framebuffer and
-survives guest boot/reboot. The second is complete input and lifecycle handling;
-packaging and accessibility/keyboard-layout polish follow. Runtime guest
-resolution changes remain a separate virtio-gpu or display-device project.
+The first pass is integrated into the CLI as `--gui native`. The AppKit/MetalKit
+frontend lives in `src/native.m`, with the framebuffer and HID bridge in
+`src/native.rs`. AppKit runs on the main thread while VM setup and vCPU execution
+run on a worker. It copies the BGRA framebuffer into a Metal texture at up to
+30 frames/s, scales it to an integer number of Retina drawable pixels with
+nearest-pixel sampling and letterboxing, and maps mouse, wheel, and US-layout
+physical keyboard events to the existing xHCI devices. Focus loss releases
+held guest input; closing the window requests VM shutdown. VNC remains a
+separate frontend and cannot be selected simultaneously. A guest reboot still
+uses the existing process re-exec path, so the native window closes and reopens.
+The optional `--retina` flag doubles the framebuffer dimensions relative to
+`--display` while keeping the initial Cocoa window size in points; guest-side
+DPI scaling is still needed for readable desktop controls at that resolution.
+Packaging, keyboard-layout/accessibility polish, and a full interactive XFCE
+regression remain to do. Runtime guest resolution changes remain a separate
+virtio-gpu or display-device project.
 Apple documents [`MTKView`](https://developer.apple.com/documentation/metalkit/mtkview/)
 as a Metal-aware view and [`NSApplication`](https://developer.apple.com/documentation/appkit/nsapplication)
 as the owner of the application event loop.
@@ -232,9 +244,9 @@ as the owner of the application event loop.
 3. Assert GIC IRQ 38/39 and kick vCPUs.
 
 ### Phase 3: Optional native Cocoa/Metal frontend
-1. Split guest framebuffer and input access from RFB protocol handling.
-2. Add the AppKit/Metal window and a `--gui native` option using simple-framebuffer.
-3. Verify display, input, lifecycle, and performance against the VNC baseline.
+1. [x] Expose guest framebuffer and xHCI HID input to a separate local frontend.
+2. [x] Add the AppKit/Metal window and a `--gui native` option using simple-framebuffer.
+3. [ ] Verify interactive XFCE input, lifecycle, and performance against the VNC baseline.
 
 ### Separate future track: VirtIO-GPU 2D
 Implement the virtio-gpu control/cursor queues only when a guest capability or

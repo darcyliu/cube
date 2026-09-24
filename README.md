@@ -164,6 +164,12 @@ Use `--desktop-user` and `--desktop-password-file` to choose the XFCE login
 credentials for a new install. The root account has a separate generated password;
 use `--root-password-file` to choose it, or read `root-login.txt` in retained
 artifacts.
+For a local Cocoa/Metal window instead of a VNC viewer, launch an installed
+FreeBSD VM with `--gui native` in place of `--vnc 127.0.0.1:5901`. The window
+uses the same simple framebuffer and USB keyboard/tablet; see the
+[desktop runbook](docs/freebsd-desktop.md) for a complete command. Add `--retina`
+to opt into a 2× guest framebuffer at the same window size; set guest desktop
+UI scaling separately for readable text.
 
 ---
 

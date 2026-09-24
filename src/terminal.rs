@@ -56,7 +56,6 @@ extern "C" fn shutdown_handler(_sig: i32) {
 }
 
 pub fn install_shutdown_handlers() {
-    SHUTDOWN_PENDING.store(false, Ordering::Relaxed);
     unsafe {
         signal(2, shutdown_handler);
         signal(15, shutdown_handler);
@@ -65,6 +64,10 @@ pub fn install_shutdown_handlers() {
 
 pub fn shutdown_requested() -> bool {
     SHUTDOWN_PENDING.load(Ordering::Relaxed)
+}
+
+pub fn request_shutdown() {
+    SHUTDOWN_PENDING.store(true, Ordering::Relaxed);
 }
 
 extern "C" fn sigwinch_handler(_sig: i32) {

@@ -129,6 +129,44 @@ sudo ssh -F /dev/null -i "$INSTALL/id_ed25519" -p 2222 \
   root@127.0.0.1 'shutdown -p now'
 ```
 
+To open the same installed VM in a **native Cocoa/Metal window**, stop the VNC
+instance first and replace `--vnc` in the foreground command with `--gui native`:
+
+```sh
+INSTALL=/path/to/vmm-install-XXXXXX
+CARGO_TARGET_DIR=/tmp/vmm-gui-fix cargo build --locked
+codesign --entitlements entitlements.plist --force -s - /tmp/vmm-gui-fix/debug/vmm
+sudo /tmp/vmm-gui-fix/debug/vmm \
+  --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
+  --disk "$INSTALL/installed.img" --ram 2048 --cpus 2 \
+  --net vmnet --ssh-port 2222 \
+  --gui native --display 1024x768 \
+  --serial-log "$INSTALL/native.console.log"
+```
+
+The window presents the existing fixed-resolution framebuffer with aspect-ratio
+letterboxing and sends mouse, wheel, and physical keyboard events through the
+guest USB HID devices. Closing it stops the VM process; shut down FreeBSD from
+inside the guest or over SSH first when you want a clean guest poweroff. The
+current key mapping uses a US physical keyboard layout, and a guest reboot
+restarts the process and reopens the window. Native mode cannot be combined with
+`--vnc`; use VNC for remote access and automated input checks.
+On Retina screens, the native view uses the Metal drawable's physical pixels,
+chooses the largest whole-pixel zoom that fits, and samples guest pixels without
+interpolation. Without `--retina`, `--display 1024x768` enlarges each guest
+pixel to roughly 2×2 physical pixels. Text is larger, but its glyphs can look
+coarse because FreeBSD still renders them at 1024×768.
+
+For an opt-in higher-resolution guest framebuffer, add `--retina` to the native
+command. With `--display 1024x768 --retina`, the window starts at 1024×768
+macOS points while FreeBSD sees a 2048×1536 framebuffer. On a 2× Retina screen
+at that window size, each guest pixel maps to one display pixel. `--retina`
+requires `--gui native`; it does not change VNC. XFCE and LightDM may initially
+show smaller controls and text because their DPI settings remain unchanged.
+Configure guest font/UI scaling to 200% if you want the same apparent size as
+the default mode. The default native mode keeps the guest at 1024×768 and
+scales each pixel sharply to 2×2 screen pixels.
+
 Older XFCE artifacts may have an unusable greeter with empty-square text and
 no mouse. They lack an explicit font set and the boot-time `vmm_hid` service.
 While the guest is running with `--ssh-port 2222`, repair that installed disk

@@ -5,6 +5,7 @@ mod forward;
 mod gpt;
 mod hypervisor;
 mod memory;
+mod native;
 mod preload;
 mod terminal;
 #[cfg(test)]
@@ -106,6 +107,30 @@ const DEFAULT_PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payload
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if !args.iter().any(|arg| arg == "--help" || arg == "-h")
+        && args.windows(2).any(|pair| pair == ["--gui", "native"])
+    {
+        let (width, height) = args.windows(2)
+            .find(|pair| pair[0] == "--display")
+            .and_then(|pair| parse_display_size(&pair[1]).ok())
+            .unwrap_or((devices::display::FB_WIDTH, devices::display::FB_HEIGHT));
+        let worker = thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| run_cli(args));
+            native::mark_finished();
+            result
+        });
+        let window_ok = native::run_window(width, height);
+        terminal::request_shutdown();
+        let worker_ok = matches!(worker.join(), Ok(Ok(())));
+        if !window_ok || !worker_ok {
+            process::exit(1);
+        }
+    } else {
+        run_cli(args);
+    }
+}
+
+fn run_cli(args: Vec<String>) {
 
     // Parse command line arguments
     let mut kernel_path: Option<String> = None;
@@ -128,6 +153,8 @@ fn main() {
     let mut serial_log: Option<String> = None;
     let mut module_paths: Vec<String> = Vec::new();
     let mut vnc_bind: Option<String> = None;
+    let mut native_gui = false;
+    let mut retina = false;
     let mut display_size = (devices::display::FB_WIDTH, devices::display::FB_HEIGHT);
     let mut display_requested = false;
 
@@ -338,6 +365,17 @@ fn main() {
                     vnc_bind = Some("127.0.0.1:5900".to_string());
                 }
             }
+            "--gui" => {
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some("native") => native_gui = true,
+                    _ => {
+                        eprintln!("--gui requires 'native'");
+                        process::exit(1);
+                    }
+                }
+            }
+            "--retina" => retina = true,
             "--display" => {
                 display_requested = true;
                 i += 1;
@@ -405,8 +443,12 @@ fn main() {
                 println!(
                     "      --vnc [ADDR]          Enable simple-framebuffer + VNC + USB HID (default 127.0.0.1:5900)"
                 );
+                println!("      --gui native          Open a local Cocoa/Metal window with USB HID input");
                 println!(
-                    "      --display WIDTHxHEIGHT Framebuffer size for --vnc (default 1280x720; max 256 MiB)"
+                    "      --retina              Double native guest framebuffer pixels; keep window point size"
+                );
+                println!(
+                    "      --display WIDTHxHEIGHT VNC framebuffer / native window size (default 1280x720; max 256 MiB)"
                 );
                 println!(
                     "      --efi-vars <PATH>     Persistent per-VM EFI variable store (default <disk>.vars.fd)"
@@ -421,9 +463,10 @@ fn main() {
             }
             _ => {
                 eprintln!(
-                    "\x1b[1;33m[VMM Warning] Unknown argument '{}'\x1b[0m",
+                    "\x1b[1;31m[VMM Error] Unknown argument '{}'\x1b[0m",
                     args[i]
                 );
+                process::exit(1);
             }
         }
         i += 1;
@@ -435,9 +478,31 @@ fn main() {
         }
     }
 
-    if display_requested && vnc_bind.is_none() {
-        eprintln!("\x1b[1;31m[VMM Error] --display requires --vnc\x1b[0m");
+    if native_gui && vnc_bind.is_some() {
+        eprintln!("[VMM Error] --gui native and --vnc cannot be combined");
         process::exit(1);
+    }
+    if native_gui && !is_freebsd && !is_uefi {
+        eprintln!("[VMM Error] --gui native requires --freebsd or --uefi");
+        process::exit(1);
+    }
+    if retina && !native_gui {
+        eprintln!("[VMM Error] --retina requires --gui native");
+        process::exit(1);
+    }
+    if display_requested && vnc_bind.is_none() && !native_gui {
+        eprintln!("\x1b[1;31m[VMM Error] --display requires --vnc or --gui native\x1b[0m");
+        process::exit(1);
+    }
+    if retina {
+        display_size = retina_framebuffer_size(display_size).unwrap_or_else(|e| {
+            eprintln!("[VMM Error] Invalid Retina framebuffer: {e}");
+            process::exit(1);
+        });
+        println!(
+            "[Native] Retina guest framebuffer: {}x{}",
+            display_size.0, display_size.1
+        );
     }
 
     if is_uefi && firmware_path.is_none() {
@@ -540,6 +605,7 @@ fn main() {
             None,
             Some(&fw),
             vnc_bind.as_deref(),
+            native_gui,
             display_size,
             efi_vars_path.as_deref(),
             &forward_rules,
@@ -571,7 +637,7 @@ fn main() {
                 Some(b) => b,
                 None => {
                     let s_flag = if is_multiuser { "" } else { " -s" };
-                    let console = if vnc_bind.is_some() {
+                    let console = if vnc_bind.is_some() || native_gui {
                         "-D boot_multicons=YES console=vt,comconsole"
                     } else {
                         "-h boot_serial=YES console=comconsole"
@@ -601,6 +667,7 @@ fn main() {
                 root_dev.as_deref(),
                 None,
                 vnc_bind.as_deref(),
+                native_gui,
                 display_size,
                 efi_vars_path.as_deref(),
                 &forward_rules,
@@ -657,6 +724,28 @@ fn parse_display_size(value: &str) -> Result<(u32, u32), String> {
     Ok((width, height))
 }
 
+fn retina_framebuffer_size(window_size: (u32, u32)) -> Result<(u32, u32), String> {
+    let width = window_size.0.checked_mul(2).ok_or("width overflow")?;
+    let height = window_size.1.checked_mul(2).ok_or("height overflow")?;
+    devices::display::FramebufferConfig::new(width, height)?;
+    Ok((width, height))
+}
+
+#[cfg(test)]
+mod retina_tests {
+    use super::retina_framebuffer_size;
+
+    #[test]
+    fn doubles_guest_resolution_and_rejects_oversized_buffers() {
+        assert_eq!(
+            retina_framebuffer_size((1024, 768)).unwrap(),
+            (2048, 1536)
+        );
+        assert!(retina_framebuffer_size((8192, 8192)).is_err());
+        assert!(retina_framebuffer_size((u32::MAX, 768)).is_err());
+    }
+}
+
 /// Boots an OS kernel ELF (such as FreeBSD ARM64) with GICv3, multi-vCPU SMP, and Device Tree.
 fn boot_os_kernel(
     kernel_path: &str,
@@ -674,6 +763,7 @@ fn boot_os_kernel(
     root_dev: Option<&str>,
     uefi_firmware: Option<&[u8]>,
     vnc_bind: Option<&str>,
+    native_gui: bool,
     display_size: (u32, u32),
     efi_vars_path: Option<&str>,
     forward_rules: &[forward::ForwardRule],
@@ -901,12 +991,12 @@ fn boot_os_kernel(
         })
         .expect("Failed to spawn sigwinch thread");
 
-    // Option A GUI: simple-framebuffer in FDT + optional embedded VNC
+    // Both frontends share the FDT simple-framebuffer and guest input devices.
 
-    // GUI input when VNC is enabled:
-    // - Platform xHCI + HID kbd/tablet (FreeBSD path; preferred by VNC)
+    // - Platform xHCI + HID kbd/tablet (FreeBSD path)
     // - VirtIO-input kept registered for Linux guests (parked for FreeBSD)
-    let fb_cfg = if vnc_bind.is_some() {
+    let graphics_enabled = vnc_bind.is_some() || native_gui;
+    let fb_cfg = if graphics_enabled {
         Some(devices::display::FramebufferConfig::new(
             display_size.0,
             display_size.1,
@@ -915,8 +1005,8 @@ fn boot_os_kernel(
         None
     };
 
-    let (vnc_keyboard, vnc_tablet, vnc_usb) = if vnc_bind.is_some() {
-        let fb = fb_cfg.expect("framebuffer configured when VNC is enabled");
+    let (vnc_keyboard, vnc_tablet, vnc_usb) = if graphics_enabled {
+        let fb = fb_cfg.expect("framebuffer configured when graphics is enabled");
         let xhci = Arc::new(Mutex::new(XhciController::new(
             XHCI_IRQ,
             vm.memory(),
@@ -1041,6 +1131,15 @@ fn boot_os_kernel(
             }
         }
     }
+    let _native_attachment = if native_gui {
+        Some(native::attach(
+            vm.memory(),
+            fb_cfg.expect("native GUI framebuffer"),
+            vnc_usb.as_ref().expect("native GUI USB HID").clone(),
+        ))
+    } else {
+        None
+    };
 
     // -------------------------------------------------------------------
     // Boot path dispatch: UEFI firmware vs direct ELF kernel
@@ -1205,7 +1304,7 @@ fn boot_os_kernel(
             for f in &mut files_kva {
                 f.gpa = to_kva(f.gpa);
             }
-            let mut kenv_vars = if vnc_bind.is_some() {
+            let mut kenv_vars = if graphics_enabled {
                 vec!["boot_multicons=YES", "console=vt,comconsole"]
             } else {
                 vec!["boot_serial=YES", "console=comconsole"]
@@ -1217,7 +1316,7 @@ fn boot_os_kernel(
             }
             let kenv = preload::encode_kenv(&kenv_vars);
             let mut howto = preload::RB_VERBOSE
-                | if vnc_bind.is_some() {
+                | if graphics_enabled {
                     preload::RB_MULTIPLE
                 } else {
                     preload::RB_SERIAL
