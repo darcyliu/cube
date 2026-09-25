@@ -115,6 +115,9 @@ def make_plan(args, directory):
     if args.suite != "quick":
         steps.append(check("installer-console", "check_unattended_console.py",
                            [binary, kernel, args.iso], ready))
+        steps.append(check("shared-folders", "check_shared_folders.py",
+                           [binary, "--kernel", kernel, "--iso", args.iso], ready,
+                           timeout=300))
         steps.append(check("vm-management", "check_vm_management.py",
                            [binary, "--kernel", kernel, "--iso", args.iso], ready,
                            timeout=240))

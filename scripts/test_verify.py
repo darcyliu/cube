@@ -34,7 +34,7 @@ class VerifyTests(unittest.TestCase):
         names = {s.name for s in steps}
         self.assertTrue({"rust-debug", "rust-release", "python-tests", "lifecycle",
                          "network-errors", "installer-console", "network-guest-ssh",
-                         "vm-management",
+                         "vm-management", "shared-folders",
                          "install-ufs-offline", "install-zfs-offline",
                          "install-ufs-ssh", "install-zfs-ssh"} <= names)
         seen = set()

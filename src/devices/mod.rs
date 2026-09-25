@@ -2,6 +2,7 @@
 
 pub mod display;
 pub mod fw_cfg;
+pub mod layout;
 pub mod pflash;
 pub mod rtc;
 pub mod uart;
@@ -43,6 +44,17 @@ pub struct MmioBus {
 }
 
 impl MmioBus {
+    fn check_range(&self, base: u64, size: u64) {
+        let end = base.checked_add(size).expect("MMIO range overflow");
+        assert!(
+            size != 0
+                && self
+                    .devices
+                    .iter()
+                    .all(|e| end <= e.base || base >= e.base + e.size),
+            "overlapping MMIO device range"
+        );
+    }
     pub fn shutdown(&self) -> Result<(), String> {
         let mut errors = Vec::new();
         for entry in &self.devices {
@@ -72,6 +84,7 @@ impl MmioBus {
     }
 
     pub fn register(&mut self, base: u64, size: u64, device: Box<dyn MmioDevice>) {
+        self.check_range(base, size);
         self.devices.push(MmioEntry {
             base,
             size,
@@ -81,6 +94,7 @@ impl MmioBus {
 
     #[allow(dead_code)]
     pub fn register_shared(&mut self, base: u64, size: u64, device: Arc<Mutex<dyn MmioDevice>>) {
+        self.check_range(base, size);
         self.devices.push(MmioEntry { base, size, device });
     }
 

@@ -7,6 +7,7 @@ mod hypervisor;
 mod memory;
 mod native;
 mod preload;
+mod shared_fs;
 mod terminal;
 #[cfg(test)]
 mod test_support;
@@ -107,10 +108,18 @@ const DEFAULT_PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payload
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).is_some_and(|s| s == "--internal-9p-worker") {
+        if let Err(e) = shared_fs::worker(&args) {
+            eprintln!("[9P helper] {e}");
+            process::exit(1);
+        }
+        return;
+    }
     if !args.iter().any(|arg| arg == "--help" || arg == "-h")
         && args.windows(2).any(|pair| pair == ["--gui", "native"])
     {
-        let (width, height) = args.windows(2)
+        let (width, height) = args
+            .windows(2)
             .find(|pair| pair[0] == "--display")
             .and_then(|pair| parse_display_size(&pair[1]).ok())
             .unwrap_or((devices::display::FB_WIDTH, devices::display::FB_HEIGHT));
@@ -131,10 +140,10 @@ fn main() {
 }
 
 fn run_cli(args: Vec<String>) {
-
     // Parse command line arguments
     let mut kernel_path: Option<String> = None;
     let mut disk_configs: Vec<DiskConfig> = Vec::new();
+    let mut shares = Vec::new();
     let mut global_cow = false;
     let mut root_dev: Option<String> = None;
     let mut custom_bootargs: Option<String> = None;
@@ -161,6 +170,27 @@ fn run_cli(args: Vec<String>) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--share" | "--share-rw" => {
+                let ro = args[i] == "--share";
+                if i + 2 >= args.len() {
+                    eprintln!("--share/--share-rw requires TAG PATH");
+                    process::exit(1);
+                }
+                let share = shared_fs::ShareConfig::new(&args[i + 1], &args[i + 2], ro)
+                    .unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        process::exit(1);
+                    });
+                if shares
+                    .iter()
+                    .any(|s: &shared_fs::ShareConfig| s.tag == share.tag)
+                {
+                    eprintln!("duplicate share tag: {}", share.tag);
+                    process::exit(1);
+                }
+                shares.push(share);
+                i += 2;
+            }
             "--efi-vars" => {
                 i += 1;
                 efi_vars_path = Some(args.get(i).cloned().unwrap_or_else(|| {
@@ -393,6 +423,12 @@ fn run_cli(args: Vec<String>) {
                 println!();
                 println!("Options:");
                 println!(
+                    "  --share TAG PATH         Export a host directory read-only (repeatable)"
+                );
+                println!(
+                    "  --share-rw TAG PATH      Export a host directory read-write (repeatable)"
+                );
+                println!(
                     "  -f, --freebsd [PATH]     Boot FreeBSD kernel ELF (defaults to boot/kernel/kernel)"
                 );
                 println!(
@@ -443,7 +479,9 @@ fn run_cli(args: Vec<String>) {
                 println!(
                     "      --vnc [ADDR]          Enable simple-framebuffer + VNC + USB HID (default 127.0.0.1:5900)"
                 );
-                println!("      --gui native          Open a local Cocoa/Metal window with USB HID input");
+                println!(
+                    "      --gui native          Open a local Cocoa/Metal window with USB HID input"
+                );
                 println!(
                     "      --retina              Double native guest framebuffer pixels; keep window point size"
                 );
@@ -476,6 +514,11 @@ fn run_cli(args: Vec<String>) {
         for d in &mut disk_configs {
             d.cow = true;
         }
+    }
+
+    if !shares.is_empty() && !is_freebsd && !is_uefi && kernel_path.is_none() {
+        eprintln!("shared folders require an OS kernel or UEFI boot");
+        process::exit(1);
     }
 
     if native_gui && vnc_bind.is_some() {
@@ -610,6 +653,7 @@ fn run_cli(args: Vec<String>) {
             efi_vars_path.as_deref(),
             &forward_rules,
             ssh_port,
+            &shares,
         ));
         return;
     }
@@ -672,9 +716,14 @@ fn run_cli(args: Vec<String>) {
                 efi_vars_path.as_deref(),
                 &forward_rules,
                 ssh_port,
+                &shares,
             ));
             return;
         } else {
+            if !shares.is_empty() {
+                eprintln!("shared folders require an ELF OS kernel or UEFI boot");
+                process::exit(1);
+            }
             let ram_size = ram_mb
                 .map(|mb| mb * 1024 * 1024)
                 .unwrap_or(DEFAULT_BAREMETAL_RAM_SIZE);
@@ -737,10 +786,7 @@ mod retina_tests {
 
     #[test]
     fn doubles_guest_resolution_and_rejects_oversized_buffers() {
-        assert_eq!(
-            retina_framebuffer_size((1024, 768)).unwrap(),
-            (2048, 1536)
-        );
+        assert_eq!(retina_framebuffer_size((1024, 768)).unwrap(), (2048, 1536));
         assert!(retina_framebuffer_size((8192, 8192)).is_err());
         assert!(retina_framebuffer_size((u32::MAX, 768)).is_err());
     }
@@ -768,7 +814,13 @@ fn boot_os_kernel(
     efi_vars_path: Option<&str>,
     forward_rules: &[forward::ForwardRule],
     ssh_port: Option<u16>,
+    shares: &[shared_fs::ShareConfig],
 ) -> Result<bool, String> {
+    let layout = devices::layout::dynamic_devices(disk_configs.len(), shares.len())?;
+    let share_backends = shares
+        .iter()
+        .map(shared_fs::Backend::start)
+        .collect::<Result<Vec<_>, _>>()?;
     if ssh_port.is_some()
         && (matches!(net_mode, Some("none" | "mock"))
             || net_mode.is_some_and(|s| s.starts_with("tap:")))
@@ -849,15 +901,29 @@ fn boot_os_kernel(
 
     let mut virtio_devices: Vec<fdt::VirtioMmioDevice> = Vec::new();
 
-    // Attach VirtIO-MMIO Block Devices
+    // Attach shared folders using the same layout tuples as the FDT.
+    for (idx, (share, backend)) in shares.iter().zip(share_backends).enumerate() {
+        let (base, irq) = layout[disk_configs.len().saturating_sub(1) + idx];
+        let dev = devices::virtio::p9::VirtioP9::new(&share.tag, irq, vm.memory(), backend)?;
+        vm.mmio_mut().register(base, 0x200, Box::new(dev));
+        virtio_devices.push(fdt::VirtioMmioDevice {
+            base,
+            size: 0x200,
+            irq,
+        });
+        println!(
+            "[VMM] 9P share '{}' {} ({}) at {base:#x}, IRQ {irq}",
+            share.tag,
+            share.path.display(),
+            if share.read_only { "ro" } else { "rw" }
+        );
+    }
+    // Attach VirtIO-MMIO block devices.
     for (idx, disk) in disk_configs.iter().enumerate() {
         let (base, irq) = if idx == 0 {
             (MMIO_VIRTIO_BLK_BASE, VIRTIO_BLK_IRQ)
         } else {
-            (
-                0x0a00_0800 + ((idx - 1) as u64) * 0x0200,
-                39 + ((idx - 1) as u32),
-            )
+            (layout[idx - 1].0, layout[idx - 1].1)
         };
         let serial_id = format!("vmm-disk-{}", idx);
         let blk_res = if disk.cow {

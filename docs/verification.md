@@ -66,6 +66,12 @@ VMM signed with authorized networking entitlements. For the latter, omit
 `--sudo` and pass the signed VMM through `--binary` so it is not re-signed.
 Run the Python verifier as your regular user after `sudo -v`; placing `sudo`
 before `python3` makes the entire artifact directory root-owned.
+If you do launch the entire verifier through sudo, the shared-folder check
+creates its disposable export separately under `/private/tmp` and assigns it
+to the original sudo user. This lets the unprivileged filesystem helper access
+the export without making the root-owned artifact tree accessible. The step's
+artifact directory contains `export-path.txt`; failed/kept runs retain both
+locations. Direct root launches without `SUDO_UID`/`SUDO_GID` cannot run this check.
 The network SSH check retains `network-guest-ssh.console.log` beside its step
 log so a failed guest setup can be distinguished from a forwarding failure.
 The VMM's existing vmnet initialization can modify host IP forwarding and its
@@ -81,6 +87,7 @@ PF NAT anchor; run the full suite on an appropriate test host.
 | Lifecycle: custom-resolution FreeBSD VNC, metrics, and firmware | — | yes | yes |
 | `check_network.py`: startup and bind errors | yes | yes | yes |
 | `check_unattended_console.py` | — | yes | yes |
+| Shared folders: host/guest changes, permissions and reboot | — | yes | yes |
 | Two concurrent managed FreeBSD VMs and listener collision | — | yes | yes |
 | `check_install.py`: UFS offline | — | yes | yes |
 | `check_install.py`: UEFI/ZFS offline, reboot/cold start | — | yes | yes |

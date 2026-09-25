@@ -133,6 +133,12 @@ For named VM configurations, isolated EFI/console runtime files, status, guest
 shutdown over SSH, and explicit host stop, use `scripts/vmmctl.py`. See the
 [VM management runbook](docs/vm-management.md).
 
+For shared host folders, add `--share TAG PATH` (read-only) or
+`--share-rw TAG PATH` to an OS launch. In FreeBSD 14.4, load `virtio_p9fs` and
+run `mount -t p9fs TAG /mnt/host`. Sharing works with `--net none`. See
+[shared folders](docs/shared-folders.md) for permissions, manager configuration,
+guest setup and current limitations.
+
 Run `python3 -B scripts/verify.py` (or `make verify`) after code changes. This runs
 Rust tests in debug/release, Python tests, and diskless integration checks, with
 retained logs and JSON/JUnit reports. Use `--suite offline` for all media-based

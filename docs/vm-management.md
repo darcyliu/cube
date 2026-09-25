@@ -110,3 +110,13 @@ python3 -B scripts/check_vm_shutdown.py target/debug/vmm \
 
 This check requires working vmnet and noninteractive sudo for the VMM. Failure
 artifacts are retained; `--keep` also retains a passing clone.
+
+## Shared folders
+
+The optional `shares` array contains `tag`, `path` and `read_only` (default
+`true`). Paths are relative to the JSON file. Repeatable `--share TAG PATH` and
+`--share-rw TAG PATH` options replace that array for a launch; CLI paths are
+relative to the working directory. The effective exports appear in launch and
+status records. Shared directories can be used by multiple managed VMs.
+See the [shared-folder runbook](shared-folders.md) for guest commands and the
+single-user ownership mapping.

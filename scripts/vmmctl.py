@@ -125,6 +125,28 @@ def launch_spec(config_path, state_dir, args):
             if cow:
                 resources.append("disk:" + disk + ".cow")
 
+    cli_shares = getattr(args, "share", None)
+    cli_rw = getattr(args, "share_rw", None)
+    share_items = ([{"tag": tag, "path": path, "read_only": ro}
+                    for items, ro in ((cli_shares or [], True), (cli_rw or [], False))
+                    for tag, path in items] if cli_shares is not None or cli_rw is not None
+                   else config.get("shares", []))
+    require(isinstance(share_items, list), "shares must be a list")
+    shares, tags = [], set()
+    for item in share_items:
+        require(isinstance(item, dict), "each share must be an object")
+        tag, ro = item.get("tag"), item.get("read_only", True)
+        require(isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", tag),
+                "share tag must be 1–120 ASCII letters, digits, '.', '_' or '-'")
+        require(tag not in tags, "duplicate share tag: " + tag)
+        require(type(ro) is bool, "share read_only must be a boolean")
+        path = path_from(item.get("path"), Path.cwd() if cli_shares is not None or cli_rw is not None else base)
+        require(Path(path).is_dir(), "share directory does not exist: " + path)
+        tags.add(tag)
+        shares.append({"tag": tag, "path": path, "read_only": ro})
+        command += ["--share" if ro else "--share-rw", tag, path]
+    require(max(0, len(disks) - 1) + len(shares) <= 64, "too many disks/shared folders")
+
     network = config.get("network", {})
     require(isinstance(network, dict), "network must be an object")
     net_mode = args.net or network.get("mode", "none")
@@ -189,7 +211,7 @@ def launch_spec(config_path, state_dir, args):
         shutdown = {"host": host, "port": port, "user": user,
                     "identity_file": identity}
     return {"name": config["name"], "config": str(config_path),
-            "command": command, "resources": resources, "shutdown": shutdown,
+            "command": command, "resources": resources, "shutdown": shutdown, "shares": shares,
             "sudo": args.sudo, "id": uuid.uuid4().hex}
 
 
@@ -293,7 +315,8 @@ def serve(state_dir):
         started = time.time()
         record = {"id": spec["id"], "name": spec["name"], "config": spec["config"],
                   "pid": proc.pid, "manager_pid": os.getpid(), "started": started,
-                  "resources": spec["resources"], "control_socket": str(control)}
+                  "resources": spec["resources"], "control_socket": str(control),
+                  "shares": spec.get("shares", [])}
         write_json(state_dir / "instance.json", record)
         try:
             while proc.poll() is None:
@@ -396,6 +419,10 @@ def main(argv=None):
     parser.add_argument("--display", help="replace vnc.display")
     parser.add_argument("--efi-vars", help="replace EFI store path")
     parser.add_argument("--disk", action="append", help="replace all disks with these paths")
+    parser.add_argument("--share", nargs=2, action="append", metavar=("TAG", "PATH"),
+                        help="replace configured shares; export read-only")
+    parser.add_argument("--share-rw", nargs=2, action="append", metavar=("TAG", "PATH"),
+                        help="replace configured shares; export read-write")
     parser.add_argument("--sudo", action="store_true", help="run the VMM via sudo -n")
     parser.add_argument("--timeout", type=int,
                         help="seconds to wait for guest shutdown (or host stop)")

@@ -58,6 +58,26 @@ class ManagerTests(unittest.TestCase):
             if vmmctl.live_status(directory):
                 vmmctl.query(directory, {"action": "stop", "timeout": 2}, timeout=5)
 
+    def test_shared_folder_paths_modes_overrides_and_duplicates(self):
+        path = self.config("first", 5901)
+        folder = self.base / "export with spaces,comma"
+        folder.mkdir()
+        config = json.loads(path.read_text())
+        config["shares"] = [{"tag": "work", "path": folder.name}]
+        path.write_text(json.dumps(config))
+        args = self.options()
+        spec = vmmctl.launch_spec(path, self.state / "first", args)
+        self.assertEqual(spec["shares"], [{"tag": "work", "path": str(folder.resolve()), "read_only": True}])
+        self.assertIn("--share", spec["command"])
+        self.assertNotIn("disk:" + str(folder), spec["resources"])
+        args.share_rw = [["write", str(folder)]]
+        spec = vmmctl.launch_spec(path, self.state / "first", args)
+        self.assertEqual([s["tag"] for s in spec["shares"]], ["write"])
+        self.assertIn("--share-rw", spec["command"])
+        args.share = [["write", str(folder)]]
+        with self.assertRaisesRegex(ValueError, "duplicate share"):
+            vmmctl.launch_spec(path, self.state / "first", args)
+
     def test_config_paths_and_command_line_overrides(self):
         config = self.config("first", 5901)
         options = self.options()

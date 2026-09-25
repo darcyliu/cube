@@ -6,6 +6,7 @@ pub mod block;
 pub mod console;
 pub mod input;
 pub mod net;
+pub mod p9;
 pub mod rng;
 
 pub use console::VirtioConsole;
