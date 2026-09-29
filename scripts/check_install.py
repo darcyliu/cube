@@ -2,8 +2,9 @@
 """Disposable FreeBSD UFS or UEFI/ZFS install, boot, and reboot regression.
 
 Requires Apple Silicon macOS, a signed VMM, and an ARM64 disc1 ISO.
-Run with sudo for vmnet. --desktop-environment xfce installs an XFCE desktop
-and LightDM into the disposable UFS guest. Failure artifacts are always retained.
+Run with sudo for vmnet. --desktop-environment xfce or plasma installs a full
+desktop and login manager into the disposable UFS guest. Failure artifacts are
+always retained.
 """
 import argparse
 import hashlib
@@ -53,17 +54,29 @@ def find_usb_tablet(execute, listing, deadline):
 
 
 def desktop_packages(environment):
-    common = "xorg-minimal xf86-video-scfb xf86-input-libinput xinput xdpyinfo"
-    return common + (" xfce dbus lightdm lightdm-gtk-greeter dejavu adwaita-icon-theme"
-                     if environment == "xfce"
-                     else " twm xterm")
+    common = "xorg-minimal xf86-video-scfb xf86-input-libinput xinput xdpyinfo xdotool"
+    if environment == "xfce":
+        return common + " xfce dbus lightdm lightdm-gtk-greeter dejavu adwaita-icon-theme"
+    if environment == "plasma":
+        return common + " plasma6-plasma konsole dbus sddm dejavu"
+    return common + " twm xterm"
 
 
-def desktop_session(environment):
+def desktop_session(environment, username="vmm"):
     if environment == "xfce":
         return ("daemon -f -p /var/run/xfce-vmm.pid -o /var/log/xfce-vmm.log "
                 "/usr/bin/env DISPLAY=:0 /bin/sh -c "
                 "'. /usr/local/etc/xdg/xfce4/xinitrc'", "xfce4-session")
+    if environment == "plasma":
+        user = shlex.quote(username)
+        home = shlex.quote(f"/home/{username}")
+        runtime = shlex.quote(f"/tmp/runtime-{username}")
+        return (f"install -d -o {user} -g {user} -m 700 {runtime} && "
+                "daemon -f -p /var/run/plasma-vmm.pid -o /var/log/plasma-vmm.log "
+                f"-u {user} /usr/bin/env DISPLAY=:0 HOME={home} USER={user} LOGNAME={user} "
+                f"XDG_RUNTIME_DIR={runtime} LIBGL_ALWAYS_SOFTWARE=1 "
+                "dbus-launch --exit-with-x11 ck-launch-session startplasma-x11",
+                "plasmashell")
     return ("daemon -f -p /var/run/twm-vmm.pid -o /var/log/twm-vmm.log "
             "/usr/bin/env DISPLAY=:0 /usr/local/bin/twm && "
             "daemon -f -p /var/run/xterm-vmm.pid -o /var/log/xterm-vmm.log "
@@ -208,7 +221,7 @@ def run(args, directory):
         root_login = directory / "root-login.txt"
         root_login.write_text(f"Username: root\nPassword: {password}\n")
         root_login.chmod(0o600)
-        if args.desktop and args.desktop_environment == "xfce":
+        if args.desktop_environment in ("xfce", "plasma"):
             login_password = password_from_file(args.desktop_password_file, password, "Desktop")
             login = directory / "desktop-login.txt"
             login.write_text(f"Username: {args.desktop_user}\nPassword: {login_password}\n")
@@ -285,7 +298,15 @@ def run(args, directory):
                 try:
                     result = subprocess.run([*ssh, remote], capture_output=True, text=True,
                                             input=input_text, timeout=min(timeout_cap, remaining))
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as error:
+                    # TimeoutExpired may carry bytes even with text=True.
+                    # Preserve package download diagnostics before cleanup stops
+                    # the guest, while keeping stdin (passwords) out of the log.
+                    def output_text(value):
+                        return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+                    with (directory / "ssh.log").open("a") as log:
+                        log.write(f"$ {remote}\nTIMEOUT after {error.timeout}s\n"
+                                  f"{output_text(error.stdout)}{output_text(error.stderr)}\n")
                     return None
             with (directory / ("console-commands.log" if args.console_only else "ssh.log")).open("a") as log:
                 log.write(f"$ {remote}\nexit={result.returncode}\n{result.stdout}{result.stderr}\n")
@@ -342,28 +363,46 @@ def run(args, directory):
                 f"pkg install -y {desktop_packages(args.desktop_environment)}",
                 deadline, args.desktop_timeout)
             require(packages is not None and packages.returncode == 0,
-                    "Could not install the FreeBSD X11 desktop packages")
-            if args.desktop_environment == "xfce":
+                    "Could not install the FreeBSD X11 desktop packages. " +
+                    ("SSH package command timed out; partial output is in "
+                     f"{directory / 'ssh.log'}"
+                     if packages is None else
+                     f"Command exited with status {packages.returncode}; "
+                     f"full output: {directory / 'ssh.log'}\n"
+                     f"{packages.stdout[-6000:]}{packages.stderr[-2000:]}"))
+            if args.desktop_environment in ("xfce", "plasma"):
                 account = execute(
                     f"pw useradd {shlex.quote(args.desktop_user)} -m -G video -s /bin/sh -h 0",
                     deadline, input_text=login_password + "\n")
                 require(account is not None and account.returncode == 0,
-                        "Could not create the XFCE login user; see ssh.log")
-                services = execute(
-                    "sysrc dbus_enable=YES lightdm_enable=YES && "
-                    "service dbus onestart && "
-                    "command -v xfce4-session >/dev/null && "
-                    "command -v lightdm >/dev/null && "
-                    "test -r /usr/local/etc/xdg/xfce4/xinitrc && "
-                    "pkg info -e dejavu && "
-                    "test -r /usr/local/share/fonts/dejavu/DejaVuSans.ttf && "
-                    "install -d /usr/local/etc/lightdm && "
-                    "printf '%s\\n' '[greeter]' 'theme-name=Adwaita' "
-                    "'icon-theme-name=Adwaita' 'font-name=DejaVu Sans 11' "
-                    ">/usr/local/etc/lightdm/lightdm-gtk-greeter.conf",
-                    deadline)
+                        "Could not create the desktop login user; see ssh.log")
+                if args.desktop_environment == "xfce":
+                    service_command = (
+                        "sysrc dbus_enable=YES lightdm_enable=YES && "
+                        "service dbus onestart && "
+                        "command -v xfce4-session >/dev/null && "
+                        "command -v lightdm >/dev/null && "
+                        "test -r /usr/local/etc/xdg/xfce4/xinitrc && "
+                        "pkg info -e dejavu && "
+                        "test -r /usr/local/share/fonts/dejavu/DejaVuSans.ttf && "
+                        "install -d /usr/local/etc/lightdm && "
+                        "printf '%s\\n' '[greeter]' 'theme-name=Adwaita' "
+                        "'icon-theme-name=Adwaita' 'font-name=DejaVu Sans 11' "
+                        ">/usr/local/etc/lightdm/lightdm-gtk-greeter.conf")
+                else:
+                    service_command = (
+                        "sysrc dbus_enable=YES sddm_enable=YES && "
+                        "service dbus onestart && "
+                        "command -v startplasma-x11 >/dev/null && "
+                        "command -v sddm >/dev/null && "
+                        "pkg info -e plasma6-plasma && "
+                        "install -d /usr/local/etc/sddm.conf.d && "
+                        "printf '%s\\n' '[General]' 'DisplayServer=x11' "
+                        ">/usr/local/etc/sddm.conf.d/10-vmm.conf")
+                services = execute(service_command, deadline)
                 require(services is not None and services.returncode == 0,
-                        "Could not configure XFCE/D-Bus/LightDM; see ssh.log")
+                        f"Could not configure {args.desktop_environment}/D-Bus/login manager; "
+                        "see ssh.log")
                 hid_service = Path(__file__).with_name("freebsd-vmm-hid.rc").read_text()
                 persist_hid = execute(
                     "cat > /usr/local/etc/rc.d/vmm_hid && "
@@ -378,7 +417,7 @@ def run(args, directory):
                 "'  Driver \"scfb\"' 'EndSection' "
                 ">/usr/local/etc/X11/xorg.conf.d/20-scfb.conf && "
                 "rm -f /var/run/Xorg-vmm.pid /var/run/twm-vmm.pid "
-                "/var/run/xterm-vmm.pid /var/run/xfce-vmm.pid && "
+                "/var/run/xterm-vmm.pid /var/run/xfce-vmm.pid /var/run/plasma-vmm.pid && "
                 "(pkill Xorg 2>/dev/null || true) && "
                 "daemon -f -p /var/run/Xorg-vmm.pid -o /var/log/Xorg-vmm.log "
                 "/usr/local/bin/Xorg :0 -ac -noreset vt9",
@@ -388,7 +427,8 @@ def run(args, directory):
             await_command(
                 "env DISPLAY=:0 xdpyinfo >/dev/null 2>&1 && printf VMM_X11_OK",
                 "VMM_X11_OK", deadline)
-            session_command, session_process = desktop_session(args.desktop_environment)
+            session_command, session_process = desktop_session(
+                args.desktop_environment, args.desktop_user or "vmm")
             desktop = execute(session_command, deadline)
             require(desktop is not None and desktop.returncode == 0,
                     "Could not start the X11 desktop clients")
@@ -414,6 +454,7 @@ def run(args, directory):
                 ("cat /var/log/twm-vmm.log", "twm-vmm.log"),
                 ("cat /var/log/xterm-vmm.log", "xterm-vmm.log"),
                 ("cat /var/log/xfce-vmm.log", "xfce-vmm.log"),
+                ("cat /var/log/plasma-vmm.log", "plasma-vmm.log"),
                 ("env DISPLAY=:0 xinput --list --long", "xinput-devices.log"),
                 ("dmesg | grep -E 'usbhid|hidbus|hms|hkbd|uhid|ukbd'", "guest-hid-after-xorg.log"),
             ]:
@@ -462,17 +503,22 @@ def run(args, directory):
             console = ConsoleSession(vm, password)
         await_command(f"test \"$(sysctl -n kern.boottime)\" != {shlex.quote(before.stdout.strip())} "
                   f"&& cat {marker_path}", token, deadline)
-        if args.desktop and args.desktop_environment == "xfce":
+        if args.desktop_environment in ("xfce", "plasma"):
+            if args.desktop_environment == "xfce":
+                package, manager, marker = "xfce", "lightdm", "VMM_XFCE_BOOT_OK"
+            else:
+                package, manager, marker = "plasma6-plasma", "sddm", "VMM_PLASMA_BOOT_OK"
             await_command(
-                "pkg info -e xfce && "
+                f"pkg info -e {package} && "
                 "test \"$(sysctl -n hw.usb.usbhid.enable)\" = 1 && "
                 "test \"$(sysctl -n kern.evdev.rcpt_mask)\" = 6 && "
                 "dmesg | grep -Eq 'hms[0-9]+' && "
                 "service dbus onestatus >/dev/null && "
-                "service lightdm onestatus >/dev/null && pgrep -x Xorg >/dev/null && "
-                "printf VMM_XFCE_BOOT_OK",
-                "VMM_XFCE_BOOT_OK", deadline)
-            print("PASS installed XFCE, boot-time USB tablet, and LightDM/Xorg", flush=True)
+                f"service {manager} onestatus >/dev/null && pgrep -x Xorg >/dev/null && "
+                f"printf {marker}",
+                marker, deadline)
+            print(f"PASS installed {args.desktop_environment}, boot-time USB tablet, "
+                  f"and {manager}/Xorg", flush=True)
             print(f"Desktop login: {args.desktop_user} "
                   f"(credentials: {directory / 'desktop-login.txt'})",
                   flush=True)
@@ -525,12 +571,12 @@ def main():
     parser.add_argument("--console-only", action="store_true", help="offline UART checks instead of SSH/vmnet")
     parser.add_argument("--desktop", action="store_true",
                         help="install Xorg/scfb with twm and run the graphical desktop regression")
-    parser.add_argument("--desktop-environment", choices=("xfce",),
+    parser.add_argument("--desktop-environment", choices=("xfce", "plasma"),
                         help="install a full desktop environment (implies --desktop)")
     parser.add_argument("--desktop-user", type=desktop_username,
-                        help="XFCE login username (default: vmm)")
+                        help="desktop login username (default: vmm)")
     parser.add_argument("--desktop-password-file", type=Path,
-                        help="UTF-8 file containing the XFCE login password (default: root password)")
+                        help="UTF-8 file containing the desktop login password (default: root password)")
     parser.add_argument("--root-password-file", type=Path,
                         help="UTF-8 file containing the root password (default: generated)")
     parser.add_argument("--artifacts", type=Path, help="parent for a new private run directory")
@@ -552,7 +598,7 @@ def main():
         args.desktop_user = args.desktop_user or "vmm"
     else:
         if args.desktop_user or args.desktop_password_file:
-            parser.error("--desktop-user and --desktop-password-file require --desktop-environment xfce")
+            parser.error("--desktop-user and --desktop-password-file require --desktop-environment")
         args.desktop_environment = "twm"
     for field, account in (("desktop_password_file", "Desktop"),
                            ("root_password_file", "Root")):
@@ -602,7 +648,7 @@ def main():
         print(f"FAIL: {error}\nArtifacts retained: {directory}", flush=True)
         raise
     else:
-        if args.keep and args.desktop_environment == "xfce":
+        if args.keep and args.desktop_environment in ("xfce", "plasma"):
             config = write_reuse_config(args, directory)
             print(f"Reusable VM config: {config}", flush=True)
             print("Start later: python3 -B scripts/vmmctl.py start "

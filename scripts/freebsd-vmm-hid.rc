@@ -1,7 +1,7 @@
 #!/bin/sh
 # PROVIDE: vmm_hid
 # REQUIRE: FILESYSTEMS
-# BEFORE: lightdm
+# BEFORE: lightdm sddm
 
 # Direct FreeBSD kernel boot bypasses loader.conf. Reprobe the VMM tablet
 # after enabling usbhid so Xorg/libinput can receive absolute pointer input.

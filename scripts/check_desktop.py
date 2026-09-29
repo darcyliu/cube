@@ -70,7 +70,34 @@ def xi2_events(text):
                       text, re.MULTILINE | re.DOTALL)
 
 
-def validate_events(text, width, height):
+def pointer_position(text):
+    """Parse xdotool getmouselocation --shell without evaluating shell text."""
+    values = dict(re.findall(r"^(X|Y)=(-?\d+)$", text, re.MULTILINE))
+    if set(values) != {"X", "Y"}:
+        raise AssertionError(f"Cannot read X11 pointer coordinates: {text!r}")
+    return int(values["X"]), int(values["Y"])
+
+
+def pointer_at_target(actual, target):
+    # Direct X11 queries on the Plasma guest report (1, 1) for a VNC move to
+    # (0, 0). Allow one pixel per axis, consistently during polling and final
+    # validation, while retaining the actual coordinates in the evidence log.
+    return all(abs(observed - expected) <= 1 for observed, expected in zip(actual, target))
+
+
+def wait_for_pointer(query, target, timeout=5):
+    deadline = time.monotonic() + timeout
+    while True:
+        actual = query()
+        if pointer_at_target(actual, target):
+            return actual
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"X11 pointer expected within 1px per axis of {target}, last observed {actual}")
+        time.sleep(0.1)
+
+
+def validate_events(text, width, height, pointer_positions=None):
     events = xi2_events(text)
     missing = []
 
@@ -86,9 +113,15 @@ def validate_events(text, width, height):
         if match:
             # XI2 positions include subpixel fractions within the final pixel.
             motion.append(tuple(math.floor(float(value)) for value in match.groups()))
+    # Normal Motion events selected on root may be delivered to a desktop or
+    # panel window instead. Live checks query X11 after each VNC move; retain
+    # event parsing for standalone historical-log validation.
+    if pointer_positions is not None:
+        motion = pointer_positions
     for point in ((0, 0), (width - 1, height - 1)):
-        if point not in motion:
-            missing.append(f"Motion root {point[0]}/{point[1]}")
+        if not any(0 <= x < width and 0 <= y < height and
+                   pointer_at_target((x, y), point) for x, y in motion):
+            missing.append(f"Pointer root {point[0]}/{point[1]} within 1px per axis")
     # Raw events reach the root observer even when xterm/twm owns the target
     # window or a button grab. Count only raw events to avoid master/slave copies.
     for name, detail in (("RawButtonPress", 1), ("RawButtonPress", 4),
@@ -103,12 +136,12 @@ def validate_events(text, width, height):
         raise AssertionError(f"Missing X11 events {missing}:\n{text[-6000:]}")
 
 
-def wait_for_events(path, width, height, process, timeout=15):
+def wait_for_events(path, width, height, process, timeout=15, pointer_positions=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         text = path.read_text(errors="replace") if path.exists() else ""
         try:
-            validate_events(text, width, height)
+            validate_events(text, width, height, pointer_positions)
             return text
         except AssertionError:
             pass
@@ -116,7 +149,7 @@ def wait_for_events(path, width, height, process, timeout=15):
             break
         time.sleep(0.1)
     text = path.read_text(errors="replace") if path.exists() else ""
-    validate_events(text, width, height)
+    validate_events(text, width, height, pointer_positions)
 
 
 def main(argv=None):
@@ -152,7 +185,7 @@ def main(argv=None):
            "-o", "GlobalKnownHostsFile=/dev/null", f"{args.user}@127.0.0.1"]
 
     probe = "test \"$(uname -s)\" = FreeBSD && pgrep Xorg >/dev/null && " \
-            "env DISPLAY=:0 xdpyinfo >/dev/null && command -v xinput"
+            "env DISPLAY=:0 xdpyinfo >/dev/null && command -v xinput && command -v xdotool"
     result = subprocess.run([*ssh, probe], text=True, capture_output=True, timeout=20)
     assert result.returncode == 0, "desktop preflight failed:\n" + result.stdout + result.stderr
 
@@ -167,6 +200,19 @@ def main(argv=None):
         "exec env DISPLAY=:0 stdbuf -oL xinput --test-xi2 --root"],
                               stdout=events_file, stderr=subprocess.STDOUT)
     measurements = []
+    positions = []
+    pointer_log = args.artifacts / "pointer-positions.jsonl"
+    pointer_log.write_text("")
+
+    def query_pointer(target):
+        result = subprocess.run([*ssh, "env DISPLAY=:0 xdotool getmouselocation --shell"],
+                                text=True, capture_output=True, timeout=5)
+        with pointer_log.open("a") as log:
+            log.write(json.dumps({"target": target, "returncode": result.returncode,
+                                  "stdout": result.stdout, "stderr": result.stderr}) + "\n")
+        assert result.returncode == 0, "X11 pointer query failed: " + result.stderr
+        return pointer_position(result.stdout)
+
     sock = None
     try:
         time.sleep(1)
@@ -178,12 +224,13 @@ def main(argv=None):
         measurements.append(update(sock, width, height, False))
         # Establish a nonzero position first: an initial (0, 0) HID report may
         # produce no motion. Pace transitions so Xorg does not coalesce edges.
-        for mask, x, y in [
-            (0, width // 2, height // 2), (0, 0, 0),
-            (0, width - 1, height - 1),
-            *[(mask, width // 2, height // 2) for mask in (1, 0, 8, 0, 16, 0)],
-        ]:
-            pointer(sock, mask, x, y)
+        pointer(sock, 0, width // 2, height // 2)
+        time.sleep(0.15)
+        for target in ((0, 0), (width - 1, height - 1)):
+            pointer(sock, 0, *target)
+            positions.append(wait_for_pointer(lambda: query_pointer(target), target))
+        for mask in (1, 0, 8, 0, 16, 0):
+            pointer(sock, mask, width // 2, height // 2)
             time.sleep(0.15)
         key(sock, 0xffe1, True)  # Shift
         key(sock, ord("a"), True)
@@ -219,7 +266,7 @@ def main(argv=None):
         # Preserve performance evidence even when an input assertion fails.
         (args.artifacts / "display-metrics.json").write_text(
             json.dumps(report, indent=2) + "\n")
-        wait_for_events(events_path, width, height, events)
+        wait_for_events(events_path, width, height, events, pointer_positions=positions)
     finally:
         if sock is not None:
             sock.close()

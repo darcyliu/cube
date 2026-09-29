@@ -183,6 +183,33 @@ ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
             self.invoke_main(lambda args, directory: self.fail("must not run"),
                              "--desktop-environment", "xfce", "--console-only")
 
+    def test_plasma_variant_uses_minimal_plasma_and_sddm_session(self):
+        captured = {}
+        def record(args, directory):
+            captured.update(desktop=args.desktop, environment=args.desktop_environment,
+                            user=args.desktop_user)
+        self.invoke_main(record, "--desktop-environment", "plasma")
+        self.assertEqual(captured, {"desktop": True, "environment": "plasma", "user": "vmm"})
+        packages = desktop_packages("plasma")
+        self.assertIn("plasma6-plasma", packages)
+        self.assertIn("sddm", packages)
+        command, process = desktop_session("plasma", "vmm")
+        self.assertIn("startplasma-x11", command)
+        self.assertIn("-u vmm", command)
+        self.assertIn("HOME=/home/vmm", command)
+        self.assertIn("LIBGL_ALWAYS_SOFTWARE=1", command)
+        self.assertEqual(process, "plasmashell")
+
+    def test_plasma_wrapper_has_safe_resource_defaults_and_retains_vm(self):
+        wrapper = Path(__file__).with_name("unattended-plasma-install.sh")
+        result = subprocess.run(["bash", str(wrapper), "--help"], capture_output=True,
+                                text=True, check=True, timeout=10)
+        self.assertIn("--iso FREEBSD-ARM64-DISC1.ISO", result.stdout)
+        source = wrapper.read_text()
+        self.assertIn("--desktop-environment plasma", source)
+        self.assertIn("--disk-gib 20 --ram 4096 --cpus 4", source)
+        self.assertIn("--keep", source)
+
     def test_xfce_login_can_use_custom_user_and_password_file(self):
         password_file = self.directory / "desktop-password"
         password_file.write_text("custom pass with spaces!\n")
@@ -254,14 +281,14 @@ ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
         self.assertEqual(login.read_text(), "Username: root\nPassword: test secret\n")
         self.assertEqual(login.stat().st_mode & 0o777, 0o600)
 
-    def test_retained_xfce_install_has_reusable_vm_config(self):
+    def test_retained_full_desktop_install_has_reusable_vm_config(self):
         def installed(args, directory):
             (directory / "installed.img").write_bytes(b"disk")
             kernel = directory / "boot/kernel/kernel"
             kernel.parent.mkdir(parents=True)
             kernel.write_bytes(b"kernel")
             (directory / "id_ed25519").write_text("key")
-        self.invoke_main(installed, "--desktop-environment", "xfce", "--keep")
+        self.invoke_main(installed, "--desktop-environment", "plasma", "--keep")
         run = next(self.directory.glob("vmm-install-*"))
         config = json.loads((run / "reuse-vm.json").read_text())
         self.assertEqual(config["boot"], {"mode": "freebsd", "kernel": "boot/kernel/kernel",

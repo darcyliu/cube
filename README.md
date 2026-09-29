@@ -164,9 +164,12 @@ For a disposable full installation, installed-disk SSH, and reboot/persistence
 check, see [the installation regression runbook](docs/install-regression.md).
 Pass `--desktop-environment xfce` to the UFS installation checker for an opt-in
 unattended XFCE/LightDM installation; see the [desktop runbook](docs/freebsd-desktop.md).
+For Plasma 6 with SDDM, run `scripts/unattended-plasma-install.sh --iso
+FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso`; the same runbook documents its
+resource defaults and retained VM artifacts.
 With `--keep`, the run also writes `reuse-vm.json` beside the installed disk for
 later starts through `scripts/vmmctl.py`.
-Use `--desktop-user` and `--desktop-password-file` to choose the XFCE login
+Use `--desktop-user` and `--desktop-password-file` to choose the desktop login
 credentials for a new install. The root account has a separate generated password;
 use `--root-password-file` to choose it, or read `root-login.txt` in retained
 artifacts.

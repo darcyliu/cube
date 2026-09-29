@@ -7,7 +7,8 @@ import threading
 import unittest
 
 sys.dont_write_bytecode = True
-from check_desktop import read, update, validate_events, xi2_events
+from check_desktop import (read, update, validate_events, xi2_events,
+                           pointer_position, wait_for_pointer)
 
 
 class DesktopVerifierTests(unittest.TestCase):
@@ -55,9 +56,42 @@ EVENT type 3 (KeyRelease)
         text = text.replace("1023.00/767.00", "1023.97/767.97")
         validate_events(text, 1024, 768)
 
+    def test_query_proves_edges_when_panel_consumes_motion(self):
+        text = self.XI2.replace("EVENT type 6 (Motion)\n    root: 1023.00/767.00\n", "")
+        validate_events(text, 1024, 768, [(0, 0), (1023, 767)])
+        with self.assertRaisesRegex(AssertionError, "Pointer root 1023/767"):
+            validate_events(text, 1024, 768, [(0, 0), (1021, 765)])
+        # Query results cannot replace missing button release evidence.
+        text = text.replace("EVENT type 16 (RawButtonRelease)\n    detail: 1\n", "", 1)
+        with self.assertRaisesRegex(AssertionError, "two RawButtonRelease"):
+            validate_events(text, 1024, 768, [(0, 0), (1023, 767)])
+
+    def test_pointer_query_parsing_and_timeout_reports_actual_position(self):
+        self.assertEqual(pointer_position("X=1279\nY=799\nSCREEN=0\nWINDOW=45\n"), (1279, 799))
+        with self.assertRaises(AssertionError):
+            pointer_position("X=1279\n")
+        with self.assertRaisesRegex(AssertionError, "last observed "):
+            wait_for_pointer(lambda: (800, 600), (1279, 799), timeout=0)
+        self.assertEqual(wait_for_pointer(lambda: (1279, 799), (1279, 799)), (1279, 799))
+
+    def test_measured_one_pixel_offset_passes_polling_and_final_validation(self):
+        positions = [wait_for_pointer(lambda: (1, 1), (0, 0), timeout=0),
+                     wait_for_pointer(lambda: (1278, 798), (1279, 799), timeout=0)]
+        self.assertEqual(positions, [(1, 1), (1278, 798)])
+        validate_events(self.XI2, 1280, 800, positions)
+
+    def test_two_pixel_errors_and_out_of_screen_positions_fail(self):
+        for actual in ((2, 1), (1, 2)):
+            with self.subTest(actual=actual), self.assertRaises(AssertionError):
+                wait_for_pointer(lambda: actual, (0, 0), timeout=0)
+            with self.assertRaises(AssertionError):
+                validate_events(self.XI2, 1280, 800, [actual, (1279, 799)])
+        with self.assertRaises(AssertionError):
+            validate_events(self.XI2, 1280, 800, [(-1, -1), (1279, 799)])
+
     def test_xi2_requires_both_pointer_edges(self):
         text = self.XI2.replace("    root: 1023.00/767.00", "    root: 800.00/600.00")
-        with self.assertRaisesRegex(AssertionError, "Motion root 1023/767"):
+        with self.assertRaisesRegex(AssertionError, "Pointer root 1023/767"):
             validate_events(text, 1024, 768)
 
     def test_raw_update_accounts_for_rectangles_and_payload(self):

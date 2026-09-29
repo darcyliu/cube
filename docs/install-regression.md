@@ -44,9 +44,11 @@ network access and is incompatible with `--console-only` and ZFS mode. See the
 [desktop runbook](freebsd-desktop.md).
 `--desktop-environment xfce` selects an unattended XFCE package installation
 instead of twm/xterm, enables D-Bus and LightDM, and checks the graphical login
-services after reboot. It implies `--desktop` and remains an opt-in guest check;
+services after reboot. `--desktop-environment plasma` installs minimal Plasma 6,
+Konsole, D-Bus, and SDDM and verifies the X11 login manager after reboot. Both
+options imply `--desktop` and remain opt-in guest checks;
 the full verifier continues to use the smaller, previously validated twm path.
-For new XFCE installs, `--desktop-user NAME` and `--desktop-password-file PATH`
+For new full desktop installs, `--desktop-user NAME` and `--desktop-password-file PATH`
 replace the default `vmm` login and generated desktop password. The root
 account has a separate password. By default it is generated and recorded in
 `root-login.txt` inside retained artifacts; pass `--root-password-file PATH` to
@@ -54,6 +56,15 @@ choose it for a new install. The desktop password defaults to the root password
 unless `--desktop-password-file` is also supplied. Each password file must hold
 one nonempty UTF-8 line. The options do not change an existing installed VM;
 see the [desktop runbook](freebsd-desktop.md) for that procedure.
+
+The convenience wrapper below selects Plasma, raises the resource and setup
+timeout defaults, keeps the successful image, and writes `reuse-vm.json`:
+
+```sh
+./scripts/unattended-plasma-install.sh \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --artifacts "$HOME/VMs"
+```
 
 Each run allocates a mode-0700 directory containing its new disk, seed ISO,
 extracted kernel, SSH key, known-hosts file, UART mailboxes, command manifests,

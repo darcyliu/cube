@@ -33,6 +33,27 @@ sudo python3 -B scripts/check_install.py target/debug/vmm \
   --artifacts "$HOME/VMs" --keep
 ```
 
+For an unattended **Plasma 6** installation, use the dedicated wrapper. It
+creates a fresh UFS disk, installs the minimal `plasma6-plasma` package with
+Konsole and SDDM, configures Xorg/scfb and the VMM USB tablet, verifies the
+desktop across a reboot, and retains a reusable VM configuration:
+
+```sh
+mkdir -p "$HOME/VMs"
+./scripts/unattended-plasma-install.sh \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --artifacts "$HOME/VMs"
+```
+
+The wrapper defaults to a 20 GiB sparse disk, 4096 MiB RAM, four CPUs, a
+1280x800 display, and a one-hour desktop setup timeout. Pass the regular
+`check_install.py` options after `--iso` to override those defaults. Use
+`--desktop-user`, `--desktop-password-file`, and `--root-password-file` to set
+credentials. Plasma runs as an X11 session because this VMM exposes an SCFB
+framebuffer without accelerated graphics. The resulting artifact directory
+contains `reuse-vm.json`, `desktop-login.txt`, and `root-login.txt` and is used
+the same way as the XFCE artifact described below.
+
 The XFCE login defaults to username `vmm` and a generated password. To choose
 your own credentials for a **new** install, add `--desktop-user NAME` and
 `--desktop-password-file PATH`. The file must contain one nonempty UTF-8 line;
@@ -75,7 +96,7 @@ password. The guest must be running and its SSH forward must be reachable; the
 third argument overrides port 2222. Use the desktop account for graphical login
 and root for terminal/SSH administration.
 
-This opt-in path installs XFCE, Xorg/scfb, D-Bus, LightDM and its GTK greeter,
+The XFCE path installs XFCE, Xorg/scfb, D-Bus, LightDM and its GTK greeter,
 plus DejaVu fonts and Adwaita icons so the login screen has readable labels.
 It creates a `vmm` desktop user, starts an XFCE session for the same VNC/XI2
 input check, enables D-Bus and LightDM for subsequent boots, then requires
@@ -266,7 +287,7 @@ desktop packages:
 ```sh
 $SSH 'env ASSUME_ALWAYS_YES=yes pkg bootstrap && \
   pkg install -y xorg-minimal xf86-video-scfb xf86-input-libinput \
-    twm xterm xinput xdpyinfo && \
+    twm xterm xinput xdpyinfo xdotool && \
   sysctl kern.evdev.rcpt_mask=6 && \
   mkdir -p /usr/local/etc/X11/xorg.conf.d && \
   printf "%s\n" "Section \"Device\"" "  Identifier \"Card0\"" \
@@ -296,8 +317,16 @@ python3 scripts/check_desktop.py \
   --artifacts "$INSTALL/desktop-results"
 ```
 
-The check uses `xinput --test-xi2 --root` and requires X11 to observe pointer
-coordinates at opposite framebuffer edges, primary-button press/release, wheel
+The check queries pointer coordinates with `xdotool getmouselocation --shell`
+after VNC moves to each framebuffer corner. This avoids depending on root-window
+Motion delivery when a desktop or panel window receives the event. It records
+the requested and observed positions in `pointer-positions.jsonl`, and requires
+each corner within one pixel per axis, inside the framebuffer. This accommodates
+the observed Plasma pointer position `(1, 1)` after a VNC move to `(0, 0)`;
+larger deviations still fail. Existing guests need `pkg install -y xdotool`
+before running the updated checker.
+
+The check also uses `xinput --test-xi2 --root` to observe primary-button press/release, wheel
 directions, keyboard press/release, and synthesized releases after disconnecting
 with Control and the primary button held. It reconnects, requests full and
 incremental frames, and writes client timing and payload measurements to
