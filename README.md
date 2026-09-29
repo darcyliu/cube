@@ -81,6 +81,16 @@ Press `Enter` to access the live FreeBSD root `#` prompt!
 # Run with root privileges to automatically enable macOS vmnet.framework NAT:
 sudo make sudo-freebsd-net
 
+# Or keep the VMM unprivileged: start the vmnet service once, then use --net vmnet-proxy.
+# `make vmnet-service` must be run as your user (it sudo's only the service).
+make all
+make vmnet-service
+./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet-proxy
+
+# LAN addresses instead of bridge100 NAT. Stop the NAT service first.
+make vmnet-service-bridge
+# or: make vmnet-service-bridge IFACE=en7
+
 # For offline unprivileged use, explicitly disable networking:
 ./target/debug/vmm --freebsd boot/kernel/kernel --net none
 ```

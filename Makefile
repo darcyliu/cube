@@ -71,6 +71,22 @@ define setup-vmnet-nat
 	fi
 endef
 
+# Long-running vmnet proxy. Build as your user first (`make all`), then `make vmnet-service`.
+# The recipe sudo's only the service. Guests use `--net vmnet-proxy` without sudo.
+# `sudo make vmnet-service` is refused: it would record SUDO_UID as root.
+# SUBNET=192.168.18.0/24 asks NAT mode for that RFC1918 range.
+vmnet-service:
+	@test "$$(id -u)" -ne 0 || { echo "[VMM] Run 'make vmnet-service' as your user, not 'sudo make'."; exit 1; }
+	@test -x $(VMM_BIN) || { echo "[VMM] Run 'make all' as your user first."; exit 1; }
+	sudo $(VMM_BIN) --vmnet-service $(if $(SUBNET),--subnet $(SUBNET),)
+
+# Same service, bridged onto the host's default NIC (or IFACE=en7). Guests use LAN DHCP.
+# Stop the NAT service first: one socket, one mode.
+vmnet-service-bridge:
+	@test "$$(id -u)" -ne 0 || { echo "[VMM] Run 'make vmnet-service-bridge' as your user, not 'sudo make'."; exit 1; }
+	@test -x $(VMM_BIN) || { echo "[VMM] Run 'make all' as your user first."; exit 1; }
+	sudo $(VMM_BIN) --vmnet-service --bridge $(IFACE)
+
 freebsd-net: all fetch-freebsd fetch-image
 	$(VMM_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus $(CPUS)
 

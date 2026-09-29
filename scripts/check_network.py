@@ -5,8 +5,14 @@ python3 scripts/check_network.py BINARY
 sudo python3 scripts/check_network.py BINARY --kernel KERNEL --iso ISO \
     --guest-cidr 192.168.18.77/24 --host-ip 192.168.18.1
 
+The no-argument check is unprivileged and does not need the vmnet service.
+The guest check starts the VMM with --net vmnet (in-process shared mode) and
+needs root to create the interface. Do not sudo this script for a
+--net vmnet-proxy guest: the service rejects uid 0. Start the service with
+`make vmnet-service`, then run the VMM as your user with --net vmnet-proxy.
+
 Choose an unused guest address on the vmnet shared subnet. The guest check opens
-no writable disk, but vmnet uses the VMM's existing host PF/NAT setup.
+no writable disk. In-process --net vmnet uses the VMM's host PF/NAT setup.
 """
 import argparse
 import ipaddress

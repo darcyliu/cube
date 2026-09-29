@@ -39,9 +39,24 @@ That target also installs a small PF NAT anchor (`com.apple/vmm`) so the guest
 subnet `192.168.18.0/24` can reach the internet via your default interface.
 See [networking.md](networking.md).
 
-If you start without sudo and vmnet fails, the VMM exits with an error. Re-run
-under sudo (or with an authorized networking signature). For offline operation,
-explicitly select `--net mock` to discard packets or `--net none` to omit the NIC.
+If you start without sudo and `--net vmnet` fails, the VMM exits with an error.
+Re-run under sudo (or with an authorized networking signature). For offline
+operation, explicitly select `--net mock` to discard packets or `--net none` to
+omit the NIC.
+
+Unprivileged guests use a long-running service instead of putting
+`com.apple.vm.networking` on this binary. `make sign` stays hypervisor-only.
+Build as your user, start the service once, then boot without sudo:
+
+```sh
+make all
+make vmnet-service
+./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy
+```
+
+`--net vmnet` is still the in-process shared interface and still needs root.
+`--net vmnet-proxy` only talks to the socket. Do not sudo a proxy guest: the
+service rejects uid 0. A second guest needs its own `--mac`.
 
 ## Optional: Developer ID + vm.networking
 
@@ -61,5 +76,5 @@ You should see both entitlements as `true`. Then `make freebsd-zfs-uefi …
 
 ## Related
 
-- `--net vmnet|mock|none` CLI — [networking.md](networking.md)
+- `--net vmnet|vmnet-proxy|mock|none` CLI — [networking.md](networking.md)
 - UEFI ZFS boot — [freebsd_zfs_runbook.md](freebsd_zfs_runbook.md)

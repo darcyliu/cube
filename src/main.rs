@@ -9,6 +9,9 @@ mod native;
 mod preload;
 mod shared_fs;
 mod terminal;
+mod vmnet_proto;
+mod vmnet_service;
+mod vmnet_sys;
 #[cfg(test)]
 mod test_support;
 mod vcpu;
@@ -16,6 +19,7 @@ mod vm;
 
 use std::env;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -115,6 +119,13 @@ fn main() {
         }
         return;
     }
+    if args.get(1).is_some_and(|s| s == "--vmnet-service") {
+        if let Err(e) = vmnet_service::run(&args) {
+            eprintln!("[vmnet] {e}");
+            process::exit(1);
+        }
+        return;
+    }
     if !args.iter().any(|arg| arg == "--help" || arg == "-h")
         && args.windows(2).any(|pair| pair == ["--gui", "native"])
     {
@@ -156,6 +167,7 @@ fn run_cli(args: Vec<String>) {
     let mut ssh_port: Option<u16> = None;
     let mut forward_rules = Vec::new();
     let mut net_mode: Option<String> = None;
+    let mut vmnet_socket: Option<PathBuf> = None;
     let mut mac_addr: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     let mut cpus: usize = 1;
     let mut cpu_model = CpuModel::detect_host();
@@ -355,8 +367,17 @@ fn run_cli(args: Vec<String>) {
                     net_mode = Some(args[i].clone());
                 } else {
                     eprintln!(
-                        "--net requires vmnet, bridge[:interface], tap:<path>, mock, or none"
+                        "--net requires vmnet, vmnet-proxy, bridge[:interface], tap:<path>, mock, or none"
                     );
+                    process::exit(1);
+                }
+            }
+            "--vmnet-socket" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    vmnet_socket = Some(PathBuf::from(&args[i]));
+                } else {
+                    eprintln!("--vmnet-socket requires a path");
                     process::exit(1);
                 }
             }
@@ -471,7 +492,16 @@ fn run_cli(args: Vec<String>) {
                     "  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)"
                 );
                 println!(
-                    "  -n, --net <MODE>         Network mode: vmnet (default NAT), bridge[:iface], tap:<dev>, mock, none"
+                    "  -n, --net <MODE>         Network mode: vmnet (default, in-process NAT, root),"
+                );
+                println!(
+                    "                           vmnet-proxy (unprivileged client of --vmnet-service),"
+                );
+                println!(
+                    "                           bridge[:iface], tap:<dev>, mock, none"
+                );
+                println!(
+                    "      --vmnet-socket <PATH> Unix socket for --net vmnet-proxy (default: ~/Library/Application Support/vmm/vmnet.sock)"
                 );
                 println!(
                     "      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)"
@@ -654,6 +684,7 @@ fn run_cli(args: Vec<String>) {
             &forward_rules,
             ssh_port,
             &shares,
+            vmnet_socket.as_deref(),
         ));
         return;
     }
@@ -717,6 +748,7 @@ fn run_cli(args: Vec<String>) {
                 &forward_rules,
                 ssh_port,
                 &shares,
+                vmnet_socket.as_deref(),
             ));
             return;
         } else {
@@ -815,6 +847,7 @@ fn boot_os_kernel(
     forward_rules: &[forward::ForwardRule],
     ssh_port: Option<u16>,
     shares: &[shared_fs::ShareConfig],
+    vmnet_socket: Option<&Path>,
 ) -> Result<bool, String> {
     let layout = devices::layout::dynamic_devices(disk_configs.len(), shares.len())?;
     let share_backends = shares
@@ -964,6 +997,7 @@ fn boot_os_kernel(
             VIRTIO_NET_IRQ,
             vm.memory(),
             net_mode.unwrap_or("vmnet"),
+            vmnet_socket,
         )?;
         if let Some(port) = ssh_port {
             _forwards.push(forward::start_ssh_forward(

@@ -423,7 +423,11 @@ def main(argv=None):
                         help="replace configured shares; export read-only")
     parser.add_argument("--share-rw", nargs=2, action="append", metavar=("TAG", "PATH"),
                         help="replace configured shares; export read-write")
-    parser.add_argument("--sudo", action="store_true", help="run the VMM via sudo -n")
+    parser.add_argument(
+        "--sudo",
+        action="store_true",
+        help="run the VMM via sudo -n (for --net vmnet and bridge; do not combine with --net vmnet-proxy)",
+    )
     parser.add_argument("--timeout", type=int,
                         help="seconds to wait for guest shutdown (or host stop)")
     parser.add_argument("--force-after-timeout", action="store_true",

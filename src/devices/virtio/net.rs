@@ -3,7 +3,10 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,6 +36,7 @@ struct NetDebugStats {
     irq_defer: AtomicU64,
     tx_notify: AtomicU64,
     vmnet_err: AtomicU64,
+    sock_drop: AtomicU64,
 }
 
 static NET_STATS: NetDebugStats = NetDebugStats {
@@ -47,6 +51,7 @@ static NET_STATS: NetDebugStats = NetDebugStats {
     irq_defer: AtomicU64::new(0),
     tx_notify: AtomicU64::new(0),
     vmnet_err: AtomicU64::new(0),
+    sock_drop: AtomicU64::new(0),
 };
 
 fn net_log(msg: &str) {
@@ -58,6 +63,52 @@ fn net_log(msg: &str) {
         let _ = writeln!(f, "{}", msg);
         let _ = f.flush();
     }
+}
+
+fn write_net_stats(inner: &VirtioNetInner) {
+    let rx_avail = inner
+        .mem
+        .read_u16(inner.rx_queue.avail_ring.saturating_add(2))
+        .unwrap_or(0);
+    let rx_used = inner
+        .mem
+        .read_u16(inner.rx_queue.used_ring.saturating_add(2))
+        .unwrap_or(0);
+    let tx_avail = inner
+        .mem
+        .read_u16(inner.tx_queue.avail_ring.saturating_add(2))
+        .unwrap_or(0);
+    let tx_used = inner
+        .mem
+        .read_u16(inner.tx_queue.used_ring.saturating_add(2))
+        .unwrap_or(0);
+    net_log(&format!(
+        "tx_pkts={} tx_bytes={} rx_pkts={} rx_bytes={} rx_drop={} rx_nomem={} irq_raise={} irq_ack={} irq_defer={} tx_notify={} vmnet_err={} sock_drop={} backlog={} irq_asserted={} isr={:#x} pending_ack={} rx_last={} rx_avail={} rx_used={} tx_last={} tx_avail={} tx_used={} rx_ready={} tx_ready={}",
+        NET_STATS.tx_pkts.load(Ordering::Relaxed),
+        NET_STATS.tx_bytes.load(Ordering::Relaxed),
+        NET_STATS.rx_pkts.load(Ordering::Relaxed),
+        NET_STATS.rx_bytes.load(Ordering::Relaxed),
+        NET_STATS.rx_drop.load(Ordering::Relaxed),
+        NET_STATS.rx_nomem.load(Ordering::Relaxed),
+        NET_STATS.irq_raise.load(Ordering::Relaxed),
+        NET_STATS.irq_ack.load(Ordering::Relaxed),
+        NET_STATS.irq_defer.load(Ordering::Relaxed),
+        NET_STATS.tx_notify.load(Ordering::Relaxed),
+        NET_STATS.vmnet_err.load(Ordering::Relaxed),
+        NET_STATS.sock_drop.load(Ordering::Relaxed),
+        inner.rx_backlog.len(),
+        inner.irq_asserted,
+        inner.interrupt_status,
+        inner.irq_pending_after_ack,
+        inner.rx_queue.last_avail_idx,
+        rx_avail,
+        rx_used,
+        inner.tx_queue.last_avail_idx,
+        tx_avail,
+        tx_used,
+        inner.rx_queue.ready,
+        inner.tx_queue.ready,
+    ));
 }
 
 /// Network backend trait for sending and receiving Ethernet frames.
@@ -432,6 +483,268 @@ impl NetBackend for TapBackend {
         self.file
             .write_all(packet)
             .map_err(|e| format!("TAP write error: {}", e))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Unprivileged client of the long-running vmnet service
+// -----------------------------------------------------------------------------
+
+enum ProxyFlush {
+    Done,
+    Blocked,
+    Dead,
+}
+
+pub struct SocketBackend {
+    stream: UnixStream,
+    pending: Vec<u8>,
+}
+
+impl SocketBackend {
+    /// Handshake, then `SO_NOSIGPIPE` and `O_NONBLOCK` before `try_clone`.
+    pub fn connect(path: &Path, mac: [u8; 6]) -> Result<(Self, UnixStream, usize), String> {
+        let mut stream = UnixStream::connect(path).map_err(|err| proxy_offline(path, &err))?;
+        let hello = crate::vmnet_proto::ClientHello {
+            version: crate::vmnet_proto::VERSION,
+            mac,
+            flags: 0,
+            max_frame: crate::vmnet_proto::MAX_FRAME,
+        };
+        if stream.write_all(&hello.encode()).is_err() {
+            return Err(proxy_handshake(path));
+        }
+        let mut reply_buf = [0u8; crate::vmnet_proto::SERVER_HELLO_LEN];
+        if crate::vmnet_proto::read_exact_deadline(
+            &mut stream,
+            &mut reply_buf,
+            Duration::from_secs(2),
+        )
+        .is_err()
+        {
+            return Err(proxy_handshake(path));
+        }
+        let reply = crate::vmnet_proto::decode_server_hello(&reply_buf)
+            .map_err(|_| proxy_handshake(path))?;
+        if reply.status != crate::vmnet_proto::STATUS_OK || reply.max_frame == 0 {
+            return Err(proxy_status(reply.status, mac));
+        }
+        set_nosigpipe(stream.as_raw_fd())?;
+        stream
+            .set_nonblocking(true)
+            .map_err(|err| format!("Cannot start vmnet: {err}"))?;
+        let rx = stream
+            .try_clone()
+            .map_err(|err| format!("Cannot start vmnet: {err}"))?;
+        Ok((
+            Self {
+                stream,
+                pending: Vec::new(),
+            },
+            rx,
+            reply.max_frame as usize,
+        ))
+    }
+
+    fn write_pending(&mut self) -> ProxyFlush {
+        while !self.pending.is_empty() {
+            match self.stream.write(&self.pending) {
+                Ok(0) => return ProxyFlush::Blocked,
+                Ok(n) => {
+                    self.pending.drain(..n);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    return ProxyFlush::Blocked;
+                }
+                Err(_) => {
+                    self.pending.clear();
+                    return ProxyFlush::Dead;
+                }
+            }
+        }
+        ProxyFlush::Done
+    }
+}
+
+fn set_nosigpipe(fd: i32) -> Result<(), String> {
+    let one: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        Err(format!(
+            "Cannot start vmnet: SO_NOSIGPIPE: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn proxy_offline(path: &Path, err: &std::io::Error) -> String {
+    let argv0 = std::env::args().next().unwrap_or_else(|| "vmm".into());
+    format!(
+        "Cannot start vmnet: vmnet service is not listening at {} ({err}). Start it once with sudo {argv0} --vmnet-service, then re-run this VMM without sudo. Use --net mock or --net none for offline operation.",
+        path.display()
+    )
+}
+
+fn proxy_handshake(path: &Path) -> String {
+    format!(
+        "Cannot start vmnet: vmnet service at {} did not complete the handshake.",
+        path.display()
+    )
+}
+
+fn proxy_status(status: u32, mac: [u8; 6]) -> String {
+    match status {
+        crate::vmnet_proto::STATUS_DUPLICATE_MAC => format!(
+            "Cannot start vmnet: MAC {} is already attached to the vmnet service. Pass a different --mac.",
+            format_mac(mac)
+        ),
+        crate::vmnet_proto::STATUS_UNAUTHORIZED => format!(
+            "Cannot start vmnet: vmnet service rejected this connection because peer uid {} is not the socket owner. Run the VMM without sudo, as the user who started the service.",
+            unsafe { libc::geteuid() }
+        ),
+        crate::vmnet_proto::STATUS_TOO_MANY_CLIENTS => {
+            "Cannot start vmnet: vmnet service rejected the handshake (status 6).".into()
+        }
+        other => format!("Cannot start vmnet: vmnet service rejected the handshake (status {other})."),
+    }
+}
+
+fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
+fn socket_rx_loop(
+    mut stream: UnixStream,
+    max_frame: usize,
+    mac: [u8; 6],
+    inner: Arc<Mutex<VirtioNetInner>>,
+    running: Arc<AtomicBool>,
+    discovered: crate::forward::GuestAddress,
+) {
+    let mut downlink = crate::vmnet_proto::Downlink::new(max_frame);
+    let mut buf = [0u8; 8192];
+    let mut last_stats = Instant::now();
+    let mut logged_disconnect = false;
+    let fd = stream.as_raw_fd();
+    let _ = File::create("/tmp/vmm-net.log");
+    net_log("[net] vmnet-proxy rx thread started");
+    while running.load(Ordering::Relaxed) {
+        let backlog_full = {
+            let mut inner = inner.lock().unwrap();
+            if !inner.rx_backlog.is_empty() {
+                inner.drain_rx_backlog();
+            }
+            inner.flush_deferred_interrupt();
+            inner.rx_backlog.len() >= 64
+        };
+        if last_stats.elapsed() >= Duration::from_secs(1) {
+            last_stats = Instant::now();
+            let inner = inner.lock().unwrap();
+            write_net_stats(&inner);
+        }
+        if backlog_full {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            log_proxy_disconnect(&mut logged_disconnect);
+            break;
+        }
+        if rc == 0 {
+            continue;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                log_proxy_disconnect(&mut logged_disconnect);
+                break;
+            }
+            Ok(n) => {
+                let mut stop = false;
+                for record in downlink.push(&buf[..n]) {
+                    match record {
+                        crate::vmnet_proto::ClientRecord::Forward(frame) => {
+                            if let Some(ip) = dhcp_guest_address(&frame, mac) {
+                                let mut address = discovered.lock().unwrap();
+                                if *address != Some(ip) {
+                                    *address = Some(ip);
+                                    crate::host_log!(
+                                        "[VirtIO-Net] Guest DHCP address: {ip} (--ssh-port destination)"
+                                    );
+                                }
+                            }
+                            let mut inner = inner.lock().unwrap();
+                            inner.receive_packet(&frame);
+                            inner.flush_deferred_interrupt();
+                        }
+                        crate::vmnet_proto::ClientRecord::Discard => {}
+                        crate::vmnet_proto::ClientRecord::Close
+                        | crate::vmnet_proto::ClientRecord::Spoof => {
+                            log_proxy_disconnect(&mut logged_disconnect);
+                            stop = true;
+                            break;
+                        }
+                    }
+                }
+                if stop {
+                    break;
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                log_proxy_disconnect(&mut logged_disconnect);
+                break;
+            }
+        }
+    }
+}
+
+fn log_proxy_disconnect(logged: &mut bool) {
+    if !*logged {
+        crate::host_log!("[VirtIO-Net] vmnet service disconnected");
+        *logged = true;
+    }
+}
+
+impl NetBackend for SocketBackend {
+    fn send_packet(&mut self, packet: &[u8]) -> Result<(), String> {
+        match self.write_pending() {
+            ProxyFlush::Blocked | ProxyFlush::Dead => {
+                NET_STATS.sock_drop.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            ProxyFlush::Done => {}
+        }
+        self.pending = crate::vmnet_proto::encode_record(packet);
+        if matches!(self.write_pending(), ProxyFlush::Dead) {
+            NET_STATS.sock_drop.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 
@@ -836,8 +1149,9 @@ impl VirtioNet {
         irq_num: u32,
         mem: Arc<GuestMemory>,
         backend_choice: &str,
+        vmnet_socket: Option<&Path>,
     ) -> Result<Self, String> {
-        let (backend, vmnet_iface) = match backend_choice {
+        let (backend, vmnet_iface, socket_rx) = match backend_choice {
             s if s == "bridge"
                 || s.starts_with("bridge:")
                 || s == "bridged"
@@ -858,7 +1172,7 @@ impl VirtioNet {
                 match VmnetBackend::new_bridged(&host_if) {
                     Ok(b) => {
                         let iface = b.interface;
-                        (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)))
+                        (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)), None)
                     }
                     Err(e) => {
                         return Err(format!(
@@ -867,10 +1181,36 @@ impl VirtioNet {
                     }
                 }
             }
+            "vmnet-proxy" => {
+                let path = match vmnet_socket {
+                    Some(path) => path.to_path_buf(),
+                    None => crate::vmnet_service::default_socket_path().map_err(|err| {
+                        if err.starts_with("Cannot start vmnet") {
+                            err
+                        } else {
+                            format!("Cannot start vmnet: {err}")
+                        }
+                    })?,
+                };
+                match SocketBackend::connect(&path, mac) {
+                    Ok((backend, rx, max_frame)) => {
+                        println!(
+                            "[VirtIO-Net] vmnet-proxy connected to {}",
+                            path.display()
+                        );
+                        (
+                            Box::new(backend) as Box<dyn NetBackend>,
+                            None,
+                            Some((rx, max_frame)),
+                        )
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
             "vmnet" => match VmnetBackend::new() {
                 Ok(b) => {
                     let iface = b.interface;
-                    (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)))
+                    (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)), None)
                 }
                 Err(e) => {
                     return Err(format!(
@@ -881,7 +1221,7 @@ impl VirtioNet {
             s if s.starts_with("tap:") => {
                 let path = &s[4..];
                 match TapBackend::open(path) {
-                    Ok(b) => (Box::new(b) as Box<dyn NetBackend>, None),
+                    Ok(b) => (Box::new(b) as Box<dyn NetBackend>, None, None),
                     Err(e) => {
                         return Err(format!("Cannot start tap backend '{path}': {e}"));
                     }
@@ -890,10 +1230,11 @@ impl VirtioNet {
             "mock" => (
                 Box::new(UserMockBackend::new()) as Box<dyn NetBackend>,
                 None,
+                None,
             ),
             _ => {
                 return Err(format!(
-                    "Unknown network mode '{backend_choice}'; expected vmnet, bridge[:interface], tap:<path>, mock, or none"
+                    "Unknown network mode '{backend_choice}'; expected vmnet, vmnet-proxy, bridge[:interface], tap:<path>, mock, or none"
                 ));
             }
         };
@@ -935,48 +1276,7 @@ impl VirtioNet {
                         if last_stats.elapsed() >= Duration::from_secs(1) {
                             last_stats = Instant::now();
                             let inner = inner_clone.lock().unwrap();
-                            let rx_avail = inner
-                                .mem
-                                .read_u16(inner.rx_queue.avail_ring.saturating_add(2))
-                                .unwrap_or(0);
-                            let rx_used = inner
-                                .mem
-                                .read_u16(inner.rx_queue.used_ring.saturating_add(2))
-                                .unwrap_or(0);
-                            let tx_avail = inner
-                                .mem
-                                .read_u16(inner.tx_queue.avail_ring.saturating_add(2))
-                                .unwrap_or(0);
-                            let tx_used = inner
-                                .mem
-                                .read_u16(inner.tx_queue.used_ring.saturating_add(2))
-                                .unwrap_or(0);
-                            net_log(&format!(
-                                "tx_pkts={} tx_bytes={} rx_pkts={} rx_bytes={} rx_drop={} rx_nomem={} irq_raise={} irq_ack={} irq_defer={} tx_notify={} vmnet_err={} backlog={} irq_asserted={} isr={:#x} pending_ack={} rx_last={} rx_avail={} rx_used={} tx_last={} tx_avail={} tx_used={} rx_ready={} tx_ready={}",
-                                NET_STATS.tx_pkts.load(Ordering::Relaxed),
-                                NET_STATS.tx_bytes.load(Ordering::Relaxed),
-                                NET_STATS.rx_pkts.load(Ordering::Relaxed),
-                                NET_STATS.rx_bytes.load(Ordering::Relaxed),
-                                NET_STATS.rx_drop.load(Ordering::Relaxed),
-                                NET_STATS.rx_nomem.load(Ordering::Relaxed),
-                                NET_STATS.irq_raise.load(Ordering::Relaxed),
-                                NET_STATS.irq_ack.load(Ordering::Relaxed),
-                                NET_STATS.irq_defer.load(Ordering::Relaxed),
-                                NET_STATS.tx_notify.load(Ordering::Relaxed),
-                                NET_STATS.vmnet_err.load(Ordering::Relaxed),
-                                inner.rx_backlog.len(),
-                                inner.irq_asserted,
-                                inner.interrupt_status,
-                                inner.irq_pending_after_ack,
-                                inner.rx_queue.last_avail_idx,
-                                rx_avail,
-                                rx_used,
-                                inner.tx_queue.last_avail_idx,
-                                tx_avail,
-                                tx_used,
-                                inner.rx_queue.ready,
-                                inner.tx_queue.ready,
-                            ));
+                            write_net_stats(&inner);
                         }
 
                         if defer_read {
@@ -1017,6 +1317,25 @@ impl VirtioNet {
                     }
                 })
                 .expect("Failed to spawn vmnet RX thread"));
+        } else if let Some((stream, max_frame)) = socket_rx {
+            let discovered_address = guest_address.clone();
+            let inner_clone = Arc::clone(&inner);
+            let running_clone = Arc::clone(&running);
+            worker = Some(
+                thread::Builder::new()
+                    .name("vmm-vmnet-rx".into())
+                    .spawn(move || {
+                        socket_rx_loop(
+                            stream,
+                            max_frame,
+                            mac,
+                            inner_clone,
+                            running_clone,
+                            discovered_address,
+                        )
+                    })
+                    .expect("Failed to spawn vmnet proxy RX thread"),
+            );
         }
 
         Ok(Self {
@@ -1146,102 +1465,64 @@ mod backend_tests {
         let dir = crate::test_support::TestDir::new();
         let missing = format!("tap:{}", dir.path("missing-tap").display());
         for mode in [missing.as_str(), "typo"] {
-            assert!(VirtioNet::new([0; 6], 35, memory.clone(), mode).is_err());
+            assert!(VirtioNet::new([0; 6], 35, memory.clone(), mode, None).is_err());
         }
-        assert!(VirtioNet::new([0; 6], 35, memory, "mock").is_ok());
+        assert!(VirtioNet::new([0; 6], 35, memory, "mock", None).is_ok());
+    }
+
+    #[test]
+    fn vmnet_connect_refused_does_not_select_mock() {
+        let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path("vmnet.sock");
+        let err = match VirtioNet::new(
+            [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+            35,
+            memory,
+            "vmnet-proxy",
+            Some(&path),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("vmnet-proxy attached without a service"),
+        };
+        assert!(err.contains("vmnet service is not listening"));
+        assert!(!err.contains("Initialized user-mode mock"));
+        assert!(err.starts_with("Cannot start vmnet:"));
+    }
+
+    #[test]
+    fn gateway_dns_rewrite_keeps_dhcp_ack() {
+        let mac = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+        let mut packet = vec![0u8; 292];
+        packet[12..14].copy_from_slice(&[8, 0]);
+        packet[14] = 0x45;
+        packet[16..18].copy_from_slice(&278u16.to_be_bytes());
+        packet[23] = 17;
+        packet[34..40].copy_from_slice(&[0, 67, 0, 68, 1, 2]);
+        packet[42..45].copy_from_slice(&[2, 1, 6]);
+        packet[58..62].copy_from_slice(&[192, 168, 18, 20]);
+        packet[70..76].copy_from_slice(&mac);
+        packet[278..292].copy_from_slice(&[
+            99, 130, 83, 99, 6, 4, 192, 168, 18, 1, 53, 1, 5, 255,
+        ]);
+        patch_dhcp_response(&mut packet);
+        assert_eq!(
+            dhcp_guest_address(&packet, mac),
+            Some(std::net::Ipv4Addr::new(192, 168, 18, 20))
+        );
+        assert_eq!(&packet[284..288], &[1, 1, 1, 1]);
+        assert_eq!(&packet[40..42], &[0, 0]);
     }
 }
 
-/// Inspects incoming packets from vmnet. If the packet is a DHCP Offer or Ack (UDP 67 -> 68),
-/// replaces macOS's non-functional internal DNS server IP (192.168.18.1 or any 192.168.x.1)
-/// with Cloudflare public DNS (1.1.1.1).
+/// In-process shared and bridge RX. Only `192.168.x.1` moves to `1.1.1.1`.
+/// The vmnet service uses `DhcpDnsScope::SharedBridge` on its own copy of the frame.
 fn patch_dhcp_response(buf: &mut [u8]) {
-    // Minimum Ethernet (14) + IPv4 (20) + UDP (8) + DHCP fixed headers (236) + cookie (4) = 282 bytes
-    if buf.len() < 282 {
-        return;
-    }
-    // Check EtherType == IPv4 (0x0800)
-    if buf[12] != 0x08 || buf[13] != 0x00 {
-        return;
-    }
-    // Check IPv4 protocol == UDP (17)
-    if buf[23] != 17 {
-        return;
-    }
-    // Check IPv4 header length
-    let ihl = (buf[14] & 0x0f) as usize * 4;
-    if ihl < 20 || 14 + ihl + 8 > buf.len() {
-        return;
-    }
-    let udp_offset = 14 + ihl;
-    let src_port = u16::from_be_bytes([buf[udp_offset], buf[udp_offset + 1]]);
-    let dst_port = u16::from_be_bytes([buf[udp_offset + 2], buf[udp_offset + 3]]);
-
-    // DHCP server to client: port 67 -> port 68
-    if src_port != 67 || dst_port != 68 {
-        return;
-    }
-
-    let dhcp_offset = udp_offset + 8;
-    if dhcp_offset + 240 > buf.len() {
-        return;
-    }
-
-    // Check op == 2 (BOOTREPLY)
-    if buf[dhcp_offset] != 2 {
-        return;
-    }
-
-    // Check DHCP magic cookie at offset 236: 0x63, 0x82, 0x53, 0x63
-    let cookie_offset = dhcp_offset + 236;
-    if &buf[cookie_offset..cookie_offset + 4] != [0x63, 0x82, 0x53, 0x63] {
-        return;
-    }
-
-    // Scan DHCP options starting at offset 240
-    let mut opt_idx = cookie_offset + 4;
-    let mut modified = false;
-
-    while opt_idx < buf.len() {
-        let opt_type = buf[opt_idx];
-        if opt_type == 0 {
-            // Pad
-            opt_idx += 1;
-            continue;
-        }
-        if opt_type == 255 {
-            // End
-            break;
-        }
-        if opt_idx + 1 >= buf.len() {
-            break;
-        }
-        let opt_len = buf[opt_idx + 1] as usize;
-        let opt_val = opt_idx + 2;
-        if opt_val + opt_len > buf.len() {
-            break;
-        }
-
-        // Option 6: Domain Name Server
-        if opt_type == 6 && opt_len >= 4 {
-            for chunk in (0..opt_len).step_by(4) {
-                if chunk + 4 <= opt_len {
-                    let dns_ip = &mut buf[opt_val + chunk..opt_val + chunk + 4];
-                    // If macOS offers 192.168.18.1 (or 192.168.x.1), rewrite to 1.1.1.1
-                    if dns_ip[0] == 192 && dns_ip[1] == 168 && dns_ip[3] == 1 {
-                        dns_ip.copy_from_slice(&[1, 1, 1, 1]);
-                        modified = true;
-                    }
-                }
-            }
-        }
-        opt_idx = opt_val + opt_len;
-    }
-
-    if modified {
-        // Clear UDP checksum (0x0000 = disabled/not computed in IPv4 UDP, per RFC 768)
-        buf[udp_offset + 6] = 0;
-        buf[udp_offset + 7] = 0;
+    if crate::vmnet_proto::rewrite_dhcp_dns(
+        buf,
+        crate::vmnet_proto::DhcpDnsScope::GatewayOnly,
+        &[std::net::Ipv4Addr::new(1, 1, 1, 1)],
+    ) {
         crate::device_trace!(
             "[VirtIO-Net] Rewrote DHCP DNS server option from macOS host IP to 1.1.1.1"
         );

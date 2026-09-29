@@ -8,13 +8,50 @@ VMM exits with an error. Failed vmnet, bridge, and TAP initialization never
 silently selects mock networking. Use `--net mock` explicitly to discard packets,
 or `--net none` to omit the NIC.
 
-**Working path today:**
+**Working path today (in-process, needs root):**
 
 ```sh
 make all
 # UEFI + ZFS disk with a real NIC:
 sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img
 ```
+
+**Unprivileged VMM, privileged vmnet service:**
+
+`--net vmnet` is unchanged: this process calls `vmnet_start_interface` and
+installs PF NAT, so it still needs root. `--net vmnet-proxy` does not. One
+service owns the shared interface; each guest connects to its socket. Guests
+still get addresses from macOS `bootpd` on `bridge100`, so each guest needs a
+distinct `--mac`. The service rewrites DHCP DNS (option 6) from the host's
+resolvers. The VMM does not.
+
+```sh
+make all
+make vmnet-service          # as your user; the recipe runs sudo on the service only
+make vmnet-service SUBNET=192.168.18.0/24   # ask vmnet for this NAT range
+./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
+# second guest:
+./target/debug/vmm --uefi --disk other.img --net vmnet-proxy --mac 52:54:00:12:34:57
+```
+
+Do not `sudo` a `--net vmnet-proxy` process. The socket owner is the user who
+started the service, and uid 0 is rejected. `sudo --net vmnet` is still the
+one-shot in-process command. If the service is down, `--net vmnet-proxy` exits.
+It does not fall through to mock or to in-process vmnet.
+
+**Same service, bridged onto the LAN** (no `bridge100`, no PF NAT). Stop the
+NAT service first. Guests still use `--net vmnet-proxy` and a distinct `--mac`.
+Each guest's DHCP request goes out the host NIC, and the LAN router assigns
+the address. DHCP DNS is left as the router sent it.
+
+```sh
+make vmnet-service-bridge            # default-route interface
+make vmnet-service-bridge IFACE=en7  # explicit Ethernet interface
+./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
+```
+
+Wi-Fi is a poor bridge target. vmnet often rejects a wireless interface.
+`--net bridge` remains the in-process root path and does not use this service.
 
 Inside FreeBSD (multi-user usually gets DHCP automatically):
 
@@ -85,9 +122,11 @@ sudo python3 scripts/check_network.py target/debug/vmm \
 
 The guest check uses a temporary SSH key and RAM-backed guest scratch files,
 without a writable disk. It checks host connectivity and forwards SSH to guest
-port 22222. It starts vmnet and uses the VMM's existing host PF/NAT setup, so
-sudo is required. The basic CLI checks and TCP unit tests require permission to
-open local sockets, but do not require sudo.
+port 22222. It starts `--net vmnet` (in-process) and uses the VMM's existing
+host PF/NAT setup, so sudo is required for that command. A `--net vmnet-proxy`
+guest must not be started under sudo; run `make vmnet-service` as your user
+and launch the VMM without sudo. The basic CLI checks and TCP unit tests
+require permission to open local sockets, but do not require sudo.
 
 ---
 
