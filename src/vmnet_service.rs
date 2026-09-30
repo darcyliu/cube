@@ -63,7 +63,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 Some(name) => name.clone(),
                 None => default_host_iface().unwrap_or_else(|| "en0".into()),
             };
-            warn_if_wifi(&name);
             VmnetPort::start_bridged(&name)?
         }
     };
@@ -668,26 +667,6 @@ fn command_with_stdin(
         stdout,
         stderr,
     })
-}
-
-fn warn_if_wifi(iface: &str) {
-    let Ok(output) = command_output(Command::new("ifconfig").arg(iface), Duration::from_secs(3))
-    else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let wifi = text.lines().any(|line| {
-        let line = line.trim();
-        line.starts_with("type: Wi-Fi") || line.contains("IEEE802.11")
-    });
-    if wifi {
-        eprintln!(
-            "[vmnet] {iface} is Wi-Fi; bridged vmnet often rejects a wireless interface. Ethernet is the reliable choice."
-        );
-    }
 }
 
 fn eprint_network_interface(name: &str) {

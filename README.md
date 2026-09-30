@@ -154,8 +154,10 @@ Rust tests in debug/release, Python tests, and diskless integration checks, with
 retained logs and JSON/JUnit reports. Use `--suite offline` for all media-based
 checks. `--suite full` also runs the three real-network guest checks:
 `vmnet-proxy` by default. In-process `vmnet` is
-`sudo python3 scripts/verify.py --suite full --sudo --keep-root`, and
-in-process bridge adds `--bridge en0 --keep-root` instead of `--sudo`. See
+`sudo python3 scripts/verify.py --suite full --sudo --keep-root`. In-process
+bridge is the command printed by `python3 -B scripts/verify-bridge.py`, which
+picks an active Ethernet interface, or the default route when that is the
+only address, and an unused address on that LAN. See
 [verification suites and CI usage](docs/verification.md) for prerequisites,
 complete commands, and a flowchart of the three suites.
 

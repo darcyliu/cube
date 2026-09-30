@@ -262,6 +262,7 @@ impl VmnetBackend {
         if host_if.is_empty() {
             return Err("bridge mode requires a host interface name (e.g. bridge:en0)".into());
         }
+        host_interface_ready(host_if)?;
         Self::start(VMNET_BRIDGED_MODE, Some(host_if))
     }
 
@@ -271,16 +272,22 @@ impl VmnetBackend {
             return Err("Failed to create XPC dictionary for vmnet".into());
         }
 
+        // vmnet copies the name, but the CString has to outlive set_string.
+        let iface_name = match bridge_if {
+            Some(iface) => Some(
+                std::ffi::CString::new(iface)
+                    .map_err(|_| "bridge interface name contains interior NUL".to_string())?,
+            ),
+            None => None,
+        };
         unsafe {
             xpc_dictionary_set_uint64(desc, b"vmnet_operation_mode\0".as_ptr() as *const i8, mode);
-            if let Some(iface) = bridge_if {
-                // vmnet_shared_interface_name_key — physical iface to bridge onto
-                let c_iface = std::ffi::CString::new(iface)
-                    .map_err(|_| "bridge interface name contains interior NUL".to_string())?;
+            if let Some(name) = iface_name.as_ref() {
+                // Framework key vmnet_shared_interface_name_key.
                 xpc_dictionary_set_string(
                     desc,
-                    b"shared_interface_name\0".as_ptr() as *const i8,
-                    c_iface.as_ptr(),
+                    b"vmnet_shared_interface_name\0".as_ptr() as *const i8,
+                    name.as_ptr(),
                 );
             }
         }
@@ -313,12 +320,12 @@ impl VmnetBackend {
 
         if interface.is_null() {
             unsafe { dispatch_release(queue) };
-            return Err("vmnet_start_interface returned null".into());
+            return Err("vmnet_start_interface returned null. Run with sudo or an authorized networking signature; use --net mock or --net none for offline operation.".into());
         }
 
         let start = std::time::Instant::now();
         let mut status = None;
-        while start.elapsed() < Duration::from_millis(1000) {
+        while start.elapsed() < Duration::from_secs(15) {
             {
                 let st = VMNET_INIT_STATUS.lock().unwrap();
                 if let Some(s) = *st {
@@ -326,7 +333,9 @@ impl VmnetBackend {
                     break;
                 }
             }
-            thread::sleep(Duration::from_millis(10));
+            // Bridged start completes on this thread's run loop. Sleeping
+            // through the wait drops that callback.
+            crate::vmnet_sys::pump_main_runloop(0.05);
         }
 
         match status {
@@ -351,20 +360,19 @@ impl VmnetBackend {
                     dispatch_queue: queue,
                 })
             }
-            Some(VMNET_FAILURE) => {
-                unsafe { dispatch_release(queue) };
+            Some(code) => {
+                drop_vmnet(interface, queue);
                 Err(format!(
-                    "vmnet_start_interface failed with status {} (Permission Denied). On macOS, vmnet.framework requires root (sudo) or the 'com.apple.vm.networking' entitlement.",
-                    VMNET_FAILURE
+                    "vmnet_start_interface failed with {}",
+                    crate::vmnet_sys::start_failure(code)
                 ))
             }
-            Some(s) => {
-                unsafe { dispatch_release(queue) };
-                Err(format!("vmnet_start_interface failed with status {s}"))
-            }
             None => {
-                unsafe { dispatch_release(queue) };
-                Err("Timed out waiting for vmnet_start_interface completion handler".into())
+                drop_vmnet(interface, queue);
+                let target = bridge_if.unwrap_or("shared mode");
+                Err(format!(
+                    "vmnet did not finish starting {target} within 15s. Stop other vmnet clients (the vmm service, Docker) and confirm the interface is up"
+                ))
             }
         }
     }
@@ -1111,6 +1119,51 @@ impl VirtioNetInner {
     }
 }
 
+fn host_interface_ready(name: &str) -> Result<(), String> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Err("cannot list host interfaces".into());
+    }
+    let mut flags = None;
+    let mut cursor = list;
+    while !cursor.is_null() {
+        let iface = unsafe { &*cursor };
+        if !iface.ifa_name.is_null() {
+            let ifname = unsafe { std::ffi::CStr::from_ptr(iface.ifa_name) };
+            if ifname.to_bytes() == name.as_bytes() {
+                flags = Some(iface.ifa_flags);
+                break;
+            }
+        }
+        cursor = iface.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(list) };
+    let Some(flags) = flags else {
+        return Err(format!("interface {name} does not exist"));
+    };
+    let flags = flags as libc::c_int;
+    if flags & libc::IFF_UP == 0 || flags & libc::IFF_RUNNING == 0 {
+        return Err(format!("interface {name} has no link"));
+    }
+    Ok(())
+}
+
+fn drop_vmnet(interface: *mut c_void, queue: *mut c_void) {
+    unsafe {
+        if !interface.is_null() && !queue.is_null() {
+            let _ = vmnet_stop_interface(interface, queue, std::ptr::null());
+            crate::vmnet_sys::pump_main_runloop(0.1);
+        }
+        if !queue.is_null() {
+            dispatch_release(queue);
+        }
+    }
+}
+
+fn bridge_start_failure(host_if: &str, error: &str) -> String {
+    format!("Cannot start bridge:{host_if}: {error}")
+}
+
 fn default_host_iface() -> String {
     std::process::Command::new("route")
         .args(["get", "default"])
@@ -1174,11 +1227,7 @@ impl VirtioNet {
                         let iface = b.interface;
                         (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)), None)
                     }
-                    Err(e) => {
-                        return Err(format!(
-                            "Cannot start bridge:{host_if}: {e}. Check the interface and run with sudo or an authorized networking signature; use --net mock or --net none for offline operation."
-                        ));
-                    }
+                    Err(e) => return Err(bridge_start_failure(&host_if, &e)),
                 }
             }
             "vmnet-proxy" => {

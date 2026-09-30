@@ -50,7 +50,10 @@ make vmnet-service-bridge IFACE=en7  # explicit Ethernet interface
 ./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
 ```
 
-Wi-Fi is a poor bridge target. vmnet often rejects a wireless interface.
+Wi-Fi can be that interface. On this Mac, `vmm --vmnet-service --bridge`
+completed on en0 and printed `bridged interface up`. Guests still take
+addresses from the LAN DHCP server.
+
 `--net bridge` remains the in-process root path and does not use this service.
 `scripts/verify.py --suite full --bridge en0` runs the real-network guest
 checks on that path. See [verification.md](verification.md).

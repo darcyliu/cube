@@ -7,14 +7,16 @@ use std::ffi::{c_void, CStr, CString};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
-use std::thread;
+
 use std::time::Duration;
 
 pub const VMNET_SHARED_MODE: u64 = 1001;
 pub const VMNET_BRIDGED_MODE: u64 = 1002;
 pub const VMNET_SUCCESS: u32 = 1000;
 pub const VMNET_FAILURE: u32 = 1001;
+pub const VMNET_INVALID_ARGUMENT: u32 = 1003;
 pub const VMNET_INVALID_ACCESS: u32 = 1005;
+pub const VMNET_SHARING_SERVICE_BUSY: u32 = 1009;
 pub const VMNET_PACKET_TOO_BIG: u32 = 1006;
 pub const VMNET_BUFFER_EXHAUSTED: u32 = 1007;
 pub const VMNET_NOT_AUTHORIZED: u32 = 1010;
@@ -81,6 +83,38 @@ unsafe extern "C" {
         queue: *mut c_void,
         callback: *const c_void,
     ) -> u32;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFRunLoopDefaultMode: *const c_void;
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: u8) -> i32;
+}
+
+/// vmnet delivers the start completion through this thread's run loop.
+/// Sleeping here leaves a bridged start unfinished.
+pub fn pump_main_runloop(seconds: f64) {
+    unsafe {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 0);
+    }
+}
+
+pub fn start_failure(status: u32) -> String {
+    let detail = match status {
+        VMNET_FAILURE => "general failure",
+        VMNET_INVALID_ARGUMENT => "invalid argument; vmnet cannot bridge this interface",
+        VMNET_INVALID_ACCESS => {
+            "permission denied; run with sudo or an authorized networking signature"
+        }
+        VMNET_SHARING_SERVICE_BUSY => {
+            "sharing service is busy; stop the vmm vmnet service and Docker's vmnet helper"
+        }
+        VMNET_NOT_AUTHORIZED => {
+            "not authorized; run with sudo or an authorized networking signature"
+        }
+        _ => "unexpected status",
+    };
+    format!("status {status} ({detail})")
 }
 
 unsafe extern "C" {
@@ -229,8 +263,8 @@ impl VmnetPort {
     }
 
     /// One bridged interface on `host_if`. Guest frames keep their own MAC.
-    /// The XPC key is `vmnet_shared_interface_name`. The in-process bridge path
-    /// still passes the literal `shared_interface_name` and is left unchanged.
+    /// The XPC key is `vmnet_shared_interface_name`, the same key the in-process
+    /// bridge path passes to vmnet.
     pub fn start_bridged(host_if: &str) -> Result<Self, String> {
         if host_if.is_empty() {
             return Err("bridge mode requires a host interface name (for example en0)".into());
@@ -333,17 +367,20 @@ impl VmnetPort {
             if let Some(info) = START_INFO.lock().unwrap().take() {
                 break info;
             }
-            if started.elapsed() > Duration::from_secs(2) {
+            if started.elapsed() > Duration::from_secs(15) {
                 abandon(interface, queue);
-                return Err("Timed out waiting for vmnet_start_interface".into());
+                return Err(
+                    "vmnet did not finish starting within 15s. Stop other vmnet clients and try again"
+                        .into(),
+                );
             }
-            thread::sleep(Duration::from_millis(10));
+            pump_main_runloop(0.05);
         };
         if info.status != VMNET_SUCCESS {
             abandon(interface, queue);
             return Err(format!(
-                "vmnet_start_interface failed with status {} (Permission Denied). On macOS, vmnet.framework requires root (sudo) or the 'com.apple.vm.networking' entitlement.",
-                info.status
+                "vmnet_start_interface failed with {}",
+                start_failure(info.status)
             ));
         }
         let read_budget = match info.max_packet {
@@ -590,6 +627,13 @@ pub fn classify_vmnet_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_failure_names_the_vmnet_status() {
+        assert!(start_failure(VMNET_SHARING_SERVICE_BUSY).contains("sharing service is busy"));
+        assert!(start_failure(VMNET_INVALID_ARGUMENT).contains("cannot bridge"));
+        assert!(!start_failure(VMNET_FAILURE).contains("Permission Denied"));
+    }
 
     #[test]
     fn shared_network_is_gateway_mask_and_dhcp_pool() {

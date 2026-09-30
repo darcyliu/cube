@@ -108,18 +108,21 @@ sudo python3 -B scripts/verify.py --suite full --sudo --keep-root \
 ```
 
 In-process bridge. Stop the vmnet service first so the guest is attached only
-to the bridge. `--bridge en0 --keep-root` elevates the same three checks and
-passes `--net bridge:en0`. Bare `--bridge` uses the host's default interface.
-Use an Ethernet interface; vmnet often rejects Wi-Fi. `--guest-cidr` is an
-unused LAN address and `--host-ip` is this Mac's address on that LAN. Bridge
-does not install the host NAT rule.
+to the bridge. The interface and LAN subnet change between networks. Print
+the command for the adapter that is up now:
 
 ```sh
-sudo python3 -B scripts/verify.py --suite full --bridge en0 --keep-root \
-  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
-  --firmware firmware/QEMU_EFI.fd \
-  --guest-cidr 192.168.50.77/24 --host-ip 192.168.50.37
+python3 -B scripts/verify-bridge.py
 ```
+
+That writes a `sudo python3 -B scripts/verify.py --suite full --bridge IFACE
+--keep-root` command. `IFACE` is an active Ethernet port when one has an
+address. Otherwise it is the default route, including Wi-Fi. vmnet accepts a
+bridged start on Wi-Fi, and guests take addresses from the DHCP server on
+that interface. `--host-ip` is this Mac's address on that interface, and
+`--guest-cidr` is an address in that subnet that did not answer. `--iface` and `--guest-ip` override those choices. Bare `--bridge`
+on `verify.py` still follows the default route. Bridge does not install the
+host NAT rule.
 
 `--sudo` and `--bridge` cannot be combined. Neither flag opens a password
 prompt or silently substitutes mock networking. `--keep-root` is what keeps
