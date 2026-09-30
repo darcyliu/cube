@@ -11,13 +11,16 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DISK="freebsd-unattended.img"
 DISK_SIZE="20g"
-SEED_ISO="seed.iso"
 HOSTNAME="freebsd-vmm"
 PASSWORD="root"
 SSH_KEY=""
 CPUS="2"
 RAM_MB="1024"
 ISO_PATH=""
+BASE="distsets"
+SEED_ISO="seed.iso"
+VMM_BIN="./target/debug/vmm"
+USE_SUDO=false
 
 # ANSI color codes
 BOLD="\033[1m"
@@ -70,6 +73,22 @@ while [[ $# -gt 0 ]]; do
             CPU_MODEL="$2"
             shift 2
             ;;
+        --base)
+            BASE="$2"
+            shift 2
+            ;;
+        --seed)
+            SEED_ISO="$2"
+            shift 2
+            ;;
+        --vmm)
+            VMM_BIN="$2"
+            shift 2
+            ;;
+        --sudo)
+            USE_SUDO=true
+            shift
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -83,6 +102,10 @@ while [[ $# -gt 0 ]]; do
             echo "  -c, --cpus <N>         Number of virtual CPUs (default: 2)"
             echo "  -m, --ram <MB>         Physical RAM in MB (default: 1024)"
             echo "      --cpu-model <MOD>  CPU model/MIDR spoofing (e.g. host, m2, neoverse-n2, 0x<hex>)"
+            echo "      --base <MODE>      distsets (default) or pkgbase (FreeBSD 15.1+ disc1)"
+            echo "      --seed <PATH>      Seed ISO path (default: seed.iso)"
+            echo "      --vmm <PATH>       VMM binary (default: ./target/debug/vmm)"
+            echo "      --sudo             In-process vmnet as root (default: vmnet-proxy)"
             exit 0
             ;;
         *)
@@ -93,7 +116,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Step 1: Create Seed ISO
-SEED_ARGS=(--output "$SEED_ISO" --hostname "$HOSTNAME" --password "$PASSWORD")
+SEED_ARGS=(--output "$SEED_ISO" --hostname "$HOSTNAME" --password "$PASSWORD" --base "$BASE")
 if [[ -n "$SSH_KEY" ]]; then
     SEED_ARGS+=(--ssh-key "$SSH_KEY")
 fi
@@ -135,10 +158,15 @@ else
 fi
 
 # Step 5: Ensure VMM binary is compiled and signed
-if [[ ! -f "target/debug/vmm" ]]; then
-    echo -e "${GREEN}[VMM] Building VMM binary...${RESET}"
-    cargo build
-    codesign -s - --entitlements entitlements.plist --force target/debug/vmm
+if [[ ! -f "$VMM_BIN" ]]; then
+    if [[ "$VMM_BIN" == "./target/debug/vmm" ]]; then
+        echo -e "${GREEN}[VMM] Building VMM binary...${RESET}"
+        cargo build
+        codesign -s - --entitlements entitlements.plist --force target/debug/vmm
+    else
+        echo -e "${RED}[Error] VMM binary does not exist: ${VMM_BIN}${RESET}"
+        exit 1
+    fi
 fi
 
 # Step 6: Launch VMM and automate installation via single-user script mode
@@ -248,11 +276,17 @@ shell_ready() {
 ) &
 FEEDER_PID=$!
 
-# Configure macOS PF NAT forwarding for guest internet access
-IF=$(netstat -rn -f inet 2>/dev/null | awk '/default/{print $4; exit}')
-if [[ -n "$IF" ]]; then
-    sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
-    printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$IF" "$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+# In-process vmnet installs its own PF NAT. The proxy path uses the service.
+NET_MODE="vmnet-proxy"
+VMM_CMD=(/usr/bin/env "VMM_UART_IN=$UART_IN" "$VMM_BIN")
+if [[ $USE_SUDO == true ]]; then
+    NET_MODE="vmnet"
+    VMM_CMD=(sudo /usr/bin/env "VMM_UART_IN=$UART_IN" "$VMM_BIN")
+    IF=$(netstat -rn -f inet 2>/dev/null | awk '/default/{print $4; exit}')
+    if [[ -n "$IF" ]]; then
+        sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
+        printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$IF" "$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+    fi
 fi
 
 CPU_MODEL_ARGS=()
@@ -261,13 +295,13 @@ if [[ -n "$CPU_MODEL" ]]; then
 fi
 
 # Launch VMM in single-user mode (omitting --multiuser) with direct serial logging
-sudo /usr/bin/env VMM_UART_IN="$UART_IN" ./target/debug/vmm \
+"${VMM_CMD[@]}" \
     --freebsd "$EXTRACTED_KERNEL" \
     --disk "$TARGET_DISK" \
     --disk "$SEED_ISO,ro" \
     --cdrom "$ISO_PATH" \
     --root "cd9660:/dev/vtbd2" \
-    --net vmnet \
+    --net "$NET_MODE" \
     --cpus "$CPUS" \
     --ram "$RAM_MB" \
     --serial-log "$CONSOLE_LOG" \
@@ -289,4 +323,8 @@ echo -e "${BOLD}${GREEN}  Unattended Installation Finished!                   ${
 echo -e "${BOLD}${GREEN}======================================================${RESET}"
 echo -e "Your automated FreeBSD VM is ready on ${BOLD}${TARGET_DISK}${RESET}."
 echo -e "Boot your new VM with:"
-echo -e "${CYAN}sudo ./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}\n"
+if [[ $USE_SUDO == true ]]; then
+    echo -e "${CYAN}sudo ./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}\n"
+else
+    echo -e "${CYAN}./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet-proxy --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}\n"
+fi

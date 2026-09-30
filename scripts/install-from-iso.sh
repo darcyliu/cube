@@ -17,6 +17,8 @@ CPUS="2"
 RAM_MB="1024"
 ISO_PATH=""
 CPU_MODEL=""
+VMM_BIN="./target/debug/vmm"
+USE_SUDO=false
 
 # ANSI color codes
 BOLD="\033[1m"
@@ -57,6 +59,14 @@ while [[ $# -gt 0 ]]; do
             CPU_MODEL="$2"
             shift 2
             ;;
+        --vmm)
+            VMM_BIN="$2"
+            shift 2
+            ;;
+        --sudo)
+            USE_SUDO=true
+            shift
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -67,6 +77,8 @@ while [[ $# -gt 0 ]]; do
             echo "  -c, --cpus <N>          Number of virtual CPUs (default: 2)"
             echo "  -m, --ram <MB>          Physical RAM in MB (default: 1024)"
             echo "      --cpu-model <MODEL> CPU model/MIDR spoofing (e.g. host, m2, neoverse-n2, 0x<hex>)"
+            echo "      --vmm <PATH>        VMM binary (default: ./target/debug/vmm)"
+            echo "      --sudo              In-process vmnet as root (default: vmnet-proxy)"
             echo "  -h, --help              Show this help message"
             exit 0
             ;;
@@ -148,10 +160,15 @@ else
 fi
 
 # Step 4: Ensure VMM binary is compiled and signed
-if [[ ! -f "target/debug/vmm" ]]; then
-    echo -e "${GREEN}[VMM] Building VMM binary...${RESET}"
-    cargo build
-    codesign -s - --entitlements entitlements.plist --force target/debug/vmm
+if [[ ! -f "$VMM_BIN" ]]; then
+    if [[ "$VMM_BIN" == "./target/debug/vmm" ]]; then
+        echo -e "${GREEN}[VMM] Building VMM binary...${RESET}"
+        cargo build
+        codesign -s - --entitlements entitlements.plist --force target/debug/vmm
+    else
+        echo -e "${RED}[Error] VMM binary does not exist: ${VMM_BIN}${RESET}"
+        exit 1
+    fi
 fi
 
 # Step 5: Boot Installer
@@ -181,31 +198,42 @@ echo -e "     ${CYAN}exit${RESET}"
 echo -e "  5. When complete, choose 'Reboot' or press ${BOLD}Ctrl-]${RESET} to exit."
 echo -e "------------------------------------------------------\n"
 
-# Configure macOS PF NAT forwarding for guest internet access
-IF=$(netstat -rn -f inet 2>/dev/null | awk '/default/{print $4; exit}')
-if [[ -n "$IF" ]]; then
-    sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
-    printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$IF" "$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
-fi
 CPU_MODEL_ARGS=()
 if [[ -n "$CPU_MODEL" ]]; then
     CPU_MODEL_ARGS=(--cpu-model "$CPU_MODEL")
 fi
 
-sudo ./target/debug/vmm \
+# In-process vmnet installs its own PF NAT. The proxy path uses the service.
+NET_MODE="vmnet-proxy"
+VMM_CMD=("$VMM_BIN")
+if [[ $USE_SUDO == true ]]; then
+    NET_MODE="vmnet"
+    VMM_CMD=(sudo "$VMM_BIN")
+    IF=$(netstat -rn -f inet 2>/dev/null | awk '/default/{print $4; exit}')
+    if [[ -n "$IF" ]]; then
+        sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
+        printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$IF" "$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+    fi
+fi
+
+"${VMM_CMD[@]}" \
     --freebsd "$EXTRACTED_KERNEL" \
     --disk "$TARGET_DISK" \
     --cdrom "$ISO_PATH" \
     --root "cd9660:/dev/vtbd1" \
     --multiuser \
-    --net vmnet \
+    --net "$NET_MODE" \
     --cpus "$CPUS" \
     --ram "$RAM_MB" \
     "${CPU_MODEL_ARGS[@]}"
 
 echo -e "\n${BOLD}${GREEN}Installation session ended.${RESET}"
 echo -e "To boot your installed FreeBSD VM from ${BOLD}${TARGET_DISK}${RESET} in the future:"
-echo -e "${CYAN}sudo ./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}"
+if [[ $USE_SUDO == true ]]; then
+    echo -e "${CYAN}sudo ./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}"
+else
+    echo -e "${CYAN}./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet-proxy --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}"
+fi
 echo -e "GPT auto-detects UFS vs ZFS. ${BOLD}--module zfs.ko${RESET} is only needed for Auto (ZFS);"
 echo -e "if you chose ZFS, keep ${CYAN}boot/kernel/zfs.ko${RESET} (cached from the ISO above).\n"
 echo -e "${YELLOW}[Network Troubleshooting Tip]${RESET}"

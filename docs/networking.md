@@ -52,6 +52,8 @@ make vmnet-service-bridge IFACE=en7  # explicit Ethernet interface
 
 Wi-Fi is a poor bridge target. vmnet often rejects a wireless interface.
 `--net bridge` remains the in-process root path and does not use this service.
+`scripts/verify.py --suite full --bridge en0` runs the real-network guest
+checks on that path. See [verification.md](verification.md).
 
 Inside FreeBSD (multi-user usually gets DHCP automatically):
 
@@ -72,7 +74,13 @@ so that subnet can reach the internet.
 sudo ./target/debug/vmm ... --net bridge        # default outbound iface (route get default)
 sudo ./target/debug/vmm ... --net bridge:en0    # explicit iface
 ```
-Guest gets an address from your LAN router. Still needs `sudo` (or `com.apple.vm.networking`) to *create* the vmnet interface — bridge only removes the PF NAT step.
+Guest gets an address from your LAN router. Creating the interface still needs
+root, or `com.apple.vm.networking` on the binary. Bridge only removes the PF
+NAT step. The ad-hoc signature does not carry that entitlement, so the
+regression run stays root with
+`sudo python3 -B scripts/verify.py --suite full --bridge en0 --keep-root`
+and a free LAN address. Stop `make vmnet-service` first. See
+[verification.md](verification.md).
 
 **Force mock** (no sudo, no external routing): `--net mock`  
 **Disable NIC:** `--net none`
@@ -114,7 +122,7 @@ Regression checks:
 cargo test
 python3 scripts/check_network.py target/debug/vmm
 # Choose an unused address on your actual vmnet subnet for the guest check:
-sudo python3 scripts/check_network.py target/debug/vmm \
+python3 scripts/check_network.py target/debug/vmm \
   --kernel .iso-boot/boot/kernel/kernel \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --guest-cidr 192.168.18.77/24 --host-ip 192.168.18.1
@@ -122,11 +130,14 @@ sudo python3 scripts/check_network.py target/debug/vmm \
 
 The guest check uses a temporary SSH key and RAM-backed guest scratch files,
 without a writable disk. It checks host connectivity and forwards SSH to guest
-port 22222. It starts `--net vmnet` (in-process) and uses the VMM's existing
-host PF/NAT setup, so sudo is required for that command. A `--net vmnet-proxy`
-guest must not be started under sudo; run `make vmnet-service` as your user
-and launch the VMM without sudo. The basic CLI checks and TCP unit tests
-require permission to open local sockets, but do not require sudo.
+port 22222. It starts `--net vmnet-proxy`. Run `make vmnet-service` as your
+user first, and do not sudo this script: the service rejects uid 0. Pass
+`--sudo` to re-run the guest check as root with in-process `--net vmnet` and
+the VMM's host PF/NAT setup. Pass `--net bridge:en0` to re-run it as root on
+the in-process bridge; pick the guest address from the LAN. The basic CLI
+checks and TCP unit tests require permission to open local sockets, but do not
+require sudo. The full suite wraps these three modes; see
+[verification.md](verification.md).
 
 ---
 

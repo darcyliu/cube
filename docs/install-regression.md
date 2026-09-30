@@ -7,6 +7,74 @@ directory. UFS with direct-kernel boot is the default; `--filesystem zfs
 --firmware firmware/QEMU_EFI.fd` selects UEFI/ZFS and adds a cold-start check.
 It never accepts an existing destination disk.
 
+`scripts/install-vm.py` is the operator front door. A desktop choice runs this
+script. A base install uses the shell installer instead.
+
+```mermaid
+flowchart TD
+  iv["install-vm.py"] --> kind{"Install kind"}
+  kind -->|interactive| hand["install-from-iso.sh: the FreeBSD installer is driven by hand"]
+  kind -->|"unattended base"| sh["unattended-install.sh"]
+  kind -->|"unattended desktop"| py["check_install.py --desktop-environment --keep"]
+  sh --> seed["Seed ISO. Public key from ~/.ssh/id_ed25519.pub, or id_rsa.pub"]
+  seed --> shellBoot["bsdinstall with --net none"]
+  hand --> saved["installed.img under ~/VMs/name"]
+  shellBoot --> saved
+  saved --> lines["Copy the kernel, write the vmmctl config, print both start lines"]
+  py --> below["The check_install flow below"]
+```
+
+`verify.py` also calls `check_install.py`, without `--keep`. A passing suite
+deletes that guest. The desktop install keeps it.
+
+```mermaid
+flowchart TD
+  start["check_install.py"] --> prep["Private directory, new ed25519 key, passwords, seed ISO"]
+  prep --> media["Extract the ISO kernel and create an empty installed.img"]
+  media --> inst["Boot the installer: --net none, seed disk, disc1"]
+  inst --> bsd["bsdinstall from the seed, then a guest poweroff"]
+  bsd --> early{"--skip-verify and no desktop"}
+  early -->|yes| stopEarly["Return before the installed disk is booted"]
+  early -->|no| fs{"Filesystem"}
+  fs -->|UFS| ufsBoot["Direct-kernel multi-user boot of the ISO kernel"]
+  fs -->|ZFS| zfsBoot["UEFI boot from the installed disk"]
+  ufsBoot --> channel{"Command channel"}
+  zfsBoot --> channel
+  channel -->|"--console-only"| uart["UART login and --net none"]
+  channel -->|SSH| ssh["vmnet-proxy, in-process vmnet, or bridge"]
+  uart --> alive["printf VMM_COMMAND_OK and record freebsd-version"]
+  ssh --> alive
+  alive --> zcheck{"ZFS"}
+  zcheck -->|yes| pool["Root dataset, pool ONLINE, and /dev/efi"]
+  zcheck -->|no| desk{"--desktop"}
+  pool --> desk
+  desk -->|no| marker
+  desk -->|yes| pkgs["Install the desktop packages"]
+  pkgs --> kind{"Environment"}
+  kind -->|"xfce or plasma"| account["User in video and wheel, login manager, tablet rc script"]
+  kind -->|twm| xconf
+  account --> xconf["Write the scfb xorg.conf"]
+  xconf --> skip{"--skip-verify"}
+  skip -->|yes| stopDesk["Power off before Xorg, the reboot, and cold start"]
+  skip -->|no| x11["Probe the USB tablet, start Xorg, run check_desktop.py"]
+  x11 --> marker["Write a marker, reboot, and require the same marker"]
+  marker --> down["Guest poweroff and VMM exit 0"]
+  down --> cold{"ZFS"}
+  cold -->|yes| coldStart["New VMM: recheck the pool and EFI variables, then power off"]
+  cold -->|no| after
+  coldStart --> after
+  stopEarly --> after
+  stopDesk --> after
+  after{"--keep"}
+  after -->|no| rm["Delete the directory"]
+  after -->|yes| kept{"xfce or plasma"}
+  kept -->|yes| reuse["reuse-vm.json, plus the vmmctl line and the direct vmm command"]
+  kept -->|no| plain["Keep the directory, with no reuse-vm.json"]
+```
+
+Any failed step keeps the directory and writes `failure.txt`. That path does
+not reach the cleanup decision above.
+
 Prerequisites:
 
 - Apple Silicon macOS, Python 3, Xcode command-line tools, and the system
@@ -14,10 +82,11 @@ Prerequisites:
 - A built VMM signed with the Hypervisor entitlement (`make all`), and `dtc`.
 - A local FreeBSD ARM64/aarch64 **disc1** ISO containing `base.txz` and
   `kernel.txz`. Boot-only media cannot perform this offline installation.
-- For default SSH checks: root access for vmnet, or an authorized networking
-  signature as described in [entitlements](entitlements.md). SSH uses the
-  DHCP-discovered guest address. `--console-only` instead runs offline UART
-  command checks with `--net none`, without sudo.
+- For default SSH checks: the vmnet service (`make vmnet-service`), started
+  as your user. SSH uses the DHCP-discovered guest address. Pass `--sudo` for
+  in-process vmnet, or `--net bridge:en0` for in-process bridge on that
+  Ethernet interface. `--console-only` runs offline UART command checks
+  with `--net none`.
 - Space for a sparse 12 GiB disk (several GiB actually written), and 2 GiB of
   available guest RAM. These defaults can be changed through CLI options.
 
@@ -25,16 +94,21 @@ From the repository root:
 
 ```sh
 make all
-sudo python3 scripts/check_install.py target/debug/vmm \
+python3 scripts/check_install.py target/debug/vmm \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso
 ```
 
-The installer runs without networking. The installed guest uses `--net vmnet`
+The installer runs without networking. The installed guest uses `--net vmnet-proxy`
 and `--ssh-port` on an automatically selected loopback port; use `--ssh-port
-2223` to select a fixed port. The VMM's existing vmnet initialization can modify
-host IP forwarding and its PF NAT anchor. This test does not add separate host
-network configuration or attempt to remove shared host network state. These
-network settings do not apply to `--console-only`.
+2223` to select a fixed port. Pass `--sudo` to re-run the script as root and
+boot the guest with in-process `--net vmnet`, which can modify host IP
+forwarding and its PF NAT anchor. Pass `--net bridge:en0` to boot that guest
+on the in-process bridge instead. The bridge uses LAN DHCP and does not
+install the NAT anchor. These network settings do not apply to
+`--console-only`. The same choices are `--suite full`, and, started with
+`sudo python3`, `--suite full --sudo --keep-root` and
+`--suite full --bridge en0 --keep-root`. See
+[verification.md](verification.md).
 
 `--desktop` extends the UFS SSH run with a 1024×768 VNC framebuffer, enables
 FreeBSD's `usbhid`/`hms` absolute-tablet path, installs Xorg/scfb plus a minimal

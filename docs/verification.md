@@ -6,6 +6,34 @@ all `scripts/test_*.py` tests, and invokes the existing integration scripts.
 Checks run sequentially, except the management check intentionally boots two
 isolated VMs together to exercise concurrent ownership.
 
+```mermaid
+flowchart TD
+  start["verify.py"] --> pre["Preflight: native Apple Silicon and the required tools"]
+  pre --> common["Rust tests, Python tests, then build and sign"]
+  common --> suite{"Suite"}
+  suite -->|quick| quick["Diskless lifecycle and network error checks"]
+  suite -->|"offline or full"| kernel["Extract boot/kernel/kernel into vmm-verify-*"]
+  kernel --> offline["Lifecycle with VNC and firmware, console installer, shared folders, two managed VMs"]
+  offline --> disks["UFS and UEFI/ZFS installs over UART, --net none"]
+  disks --> which{"Suite"}
+  which -->|offline| reports
+  which -->|full| mode{"One network mode"}
+  mode -->|default| proxy["vmnet-proxy, unprivileged"]
+  mode -->|"--sudo"| vmnet["In-process vmnet, sudo -n"]
+  mode -->|"--bridge"| bridge["In-process bridge, sudo -n"]
+  proxy --> guests
+  vmnet --> guests
+  bridge --> guests
+  guests["network-guest-ssh, UFS install with the twm desktop, UEFI/ZFS install over SSH"]
+  guests --> reports["summary.json and junit.xml, rewritten after every step"]
+  quick --> reports
+```
+
+A step whose dependency failed is skipped. Each install check creates
+`vmm-install-*` under the suite directory and deletes it when that check
+passes. The install flow inside those checks is the chart in
+[install-regression.md](install-regression.md).
+
 ## Quick checks after a code change
 
 From the repository root:
@@ -40,42 +68,87 @@ python3 -B scripts/verify.py --suite offline \
 
 This additionally needs `hdiutil`, `tar`, and `ssh`. It runs without root and uses
 serial-console commands for disposable UFS and UEFI/ZFS installations. Allow
-2 GiB guest RAM and several GiB of disk space per installation. Failed runs
-retain their disposable disks; repeated failures can consume substantial space.
+2 GiB guest RAM and several GiB of disk space per installation. A passing
+install deletes its disk. A failed install leaves `vmm-install-*` inside the
+suite directory; repeated failures can consume substantial space. See
+[Retained install directories](#retained-install-directories).
 
 ## Full suite, including real networking
 
-Choose an **unused** guest IPv4 address on the actual vmnet shared subnet and a
-reachable host address on that subnet. The runner validates subnet consistency,
-but cannot establish whether an address belongs to another machine. The example
-addresses below must be replaced if your subnet differs.
+The same three guest checks run in one network mode per invocation:
+`network-guest-ssh`, the UFS install with SSH and the desktop, and the UEFI/ZFS
+install with SSH. Choose an **unused** guest IPv4 address and a reachable host
+address on that subnet. The runner validates subnet consistency, but cannot
+establish whether an address belongs to another machine. Replace the examples
+when your subnet differs. Run these as separate invocations.
+
+`vmnet-proxy`, with the service already started by `make vmnet-service`. The
+guest checks do not elevate. Do not put `sudo` in front of `python3`.
 
 ```sh
-sudo -v
-python3 -B scripts/verify.py --suite full --sudo \
+python3 -B scripts/verify.py --suite full \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --firmware firmware/QEMU_EFI.fd \
   --guest-cidr 192.168.2.77/24 --host-ip 192.168.2.1
 ```
 
-`--sudo` elevates only the three real-network guest checks with `sudo -n`.
-It never opens a password prompt, builds as root, or silently substitutes mock
-networking. If authentication expires or is unavailable, the run fails. A CI
-host needs noninteractive sudo configured for its trusted test workload, or a
-VMM signed with authorized networking entitlements. For the latter, omit
-`--sudo` and pass the signed VMM through `--binary` so it is not re-signed.
-Run the Python verifier as your regular user after `sudo -v`; placing `sudo`
-before `python3` makes the entire artifact directory root-owned.
-If you do launch the entire verifier through sudo, the shared-folder check
-creates its disposable export separately under `/private/tmp` and assigns it
-to the original sudo user. This lets the unprivileged filesystem helper access
-the export without making the root-owned artifact tree accessible. The step's
-artifact directory contains `export-path.txt`; failed/kept runs retain both
-locations. Direct root launches without `SUDO_UID`/`SUDO_GID` cannot run this check.
+In-process `vmnet`. Start the process with `sudo` and pass `--sudo --keep-root`.
+The suite stays root, so the later `sudo -n` step does not need a terminal
+ticket. `--sudo` passes `--net vmnet` to the three guest checks. This path
+can modify host IP forwarding and the PF NAT anchor. The Cargo `target`
+directory is owned by root. The result directory is handed back to the
+`sudo` user, and the Python unit tests run as that user so they can create
+temporary directories in it.
+
+```sh
+sudo python3 -B scripts/verify.py --suite full --sudo --keep-root \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --firmware firmware/QEMU_EFI.fd \
+  --guest-cidr 192.168.2.77/24 --host-ip 192.168.2.1
+```
+
+In-process bridge. Stop the vmnet service first so the guest is attached only
+to the bridge. `--bridge en0 --keep-root` elevates the same three checks and
+passes `--net bridge:en0`. Bare `--bridge` uses the host's default interface.
+Use an Ethernet interface; vmnet often rejects Wi-Fi. `--guest-cidr` is an
+unused LAN address and `--host-ip` is this Mac's address on that LAN. Bridge
+does not install the host NAT rule.
+
+```sh
+sudo python3 -B scripts/verify.py --suite full --bridge en0 --keep-root \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --firmware firmware/QEMU_EFI.fd \
+  --guest-cidr 192.168.50.77/24 --host-ip 192.168.50.37
+```
+
+`--sudo` and `--bridge` cannot be combined. Neither flag opens a password
+prompt or silently substitutes mock networking. `--keep-root` is what keeps
+the build and the guest checks in the root process. Without it, `sudo python3`
+drops back to `SUDO_UID` before any step runs, and `sudo -v` followed by an
+unprivileged `python3` does the same. `sudo-access` then runs `sudo -n true`
+in a new session with no terminal. macOS will not apply the per-terminal
+ticket there, so that step fails and the three guest checks are skipped.
+A CI host with noninteractive sudo for the test user can omit `--keep-root`.
+`--keep-root` without `sudo` in front of `python3` is rejected. The
+shared-folder check still needs `SUDO_UID` so it can hand its export back to
+your user. `sudo python3` sets that. A root login that does not is rejected
+by that check.
+A binary signed with `com.apple.vm.networking` can create an in-process
+interface without root when launched by hand; these two flags still elevate
+the guest checks. Pass an already signed binary with `--binary` so the suite
+does not re-sign it.
+The shell installers (`unattended-install.sh`, `install-from-iso.sh`) already
+prefix `sudo` only on the `vmm` binary. `check_install.py`, `check_network.py`,
+and `vmmctl.py` still re-enter root for the whole driver when in-process
+networking is selected: that driver has to stop the VM, and the EFI store and
+serial log are created by the same user that executes `vmm`.
+If `check_shared_folders.py` itself is started as root, it creates its
+disposable export separately under `/private/tmp` and assigns it to the
+original sudo user. The step's artifact directory contains `export-path.txt`.
+A root launch without `SUDO_UID`/`SUDO_GID` cannot run that check.
 The network SSH check retains `network-guest-ssh.console.log` beside its step
 log so a failed guest setup can be distinguished from a forwarding failure.
-The VMM's existing vmnet initialization can modify host IP forwarding and its
-PF NAT anchor; run the full suite on an appropriate test host.
+Run the full suite on an appropriate test host.
 
 | Check | quick | offline | full |
 |---|:---:|:---:|:---:|
@@ -145,10 +218,83 @@ VMs before forcing termination. Uncatchable termination such as SIGKILL or host
 loss cannot guarantee cleanup or a final report.
 
 Logs and reports are always retained. Successful install workflows delete their
-disposable images; failed installations retain a private subdirectory with
-credentials and disk images. Privileged failures may leave root-owned artifacts.
+disposable images. Privileged failures may leave root-owned artifacts.
 Older lifecycle/network check scripts still clean their own temporary files;
 the outer logs preserve their output and printed diagnostics.
+
+## Retained install directories
+
+`extract-kernel` writes one file, `boot/kernel/kernel`, under `vmm-verify-*`.
+Lifecycle, the console installer, shared folders, VM management, and the
+network guest check boot that copy. It is the kernel from the ISO. That
+directory has no installed disk.
+
+Each `check_install.py` step creates `vmm-verify-*/vmm-install-*/` when the
+step starts and extracts the same ISO member again to
+`vmm-install-*/boot/kernel/kernel`. The offline suite runs
+`install-ufs-offline` and `install-zfs-offline`. The full suite adds
+`install-ufs-ssh` and `install-zfs-ssh`. The quick suite does not run these
+steps. The two kernel files are separate copies of the same bytes. The install
+check boots its own copy, for the installer and for the later boot of
+`installed.img`. Neither folder receives the rest of the ISO `/boot` tree;
+a ZFS install loads `zfs.ko` inside the guest from the disc.
+
+A passing install deletes its `vmm-install-*` directory before the step
+returns. The directory is still present while the step runs. It remains after
+the step when the install fails, times out, or is interrupted before that
+delete. `failure.txt` records the error. `run.json` records the filesystem and
+whether the run was console-only or a desktop. A `--sudo` or `--bridge` failure
+can leave the directory owned by root.
+
+`installed.img` is created as an empty 12 GiB sparse file before `bsdinstall`
+runs, so the file alone does not mean the guest is installed. The disk is
+bootable when the step log contains `PASS unattended installation and clean
+poweroff`. The root password is in `root-login.txt`. `id_ed25519` is the SSH
+key the seed authorized. The guest hostname is `vmm-install-test`.
+
+The suite does not pass `--keep` and does not write a `vmmctl` config. To keep
+a guest after a run that passes, use `scripts/install-vm.py` or
+`scripts/check_install.py --keep`.
+
+### Start a retained disk
+
+Start the vmnet service once with `make vmnet-service`. From the repository
+root, a UFS disk (`"filesystem": "ufs"` in `run.json`) boots with the kernel
+in that same `vmm-install-*` directory:
+
+```sh
+INSTALL=test-results/vmm-verify-XXXX/vmm-install-YYYY
+./target/debug/vmm \
+  --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
+  --disk "$INSTALL/installed.img" \
+  --ram 2048 --cpus 2 \
+  --efi-vars "$INSTALL/efi-vars.fd" \
+  --net vmnet-proxy --ssh-port 2222
+```
+
+A ZFS disk uses the EDK2 firmware passed to `verify.py` and that directory's
+`efi-vars.fd`:
+
+```sh
+./target/debug/vmm \
+  --uefi firmware/QEMU_EFI.fd \
+  --disk "$INSTALL/installed.img" \
+  --ram 2048 --cpus 2 \
+  --efi-vars "$INSTALL/efi-vars.fd" \
+  --net vmnet-proxy --ssh-port 2222
+```
+
+```sh
+ssh -F /dev/null -i "$INSTALL/id_ed25519" -p 2222 \
+  -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+  root@127.0.0.1
+```
+
+The password is also in `root-login.txt`. The full suite's UFS SSH check
+passes `--desktop` and installs the twm packages used for the X11 measurement.
+That session is not enabled at boot, so the command above starts multi-user
+FreeBSD with SSH. A graphical login comes from `scripts/install-vm.py
+--desktop` or `check_install.py --desktop-environment`.
 
 ## CI usage
 
@@ -170,7 +316,8 @@ or seed images as public CI artifacts. Set the job timeout above the expected
 suite duration so normal cancellation can run cleanup.
 
 For the full suite, use the same command with `--suite full`, the explicit
-network addresses, and suitable privilege setup. No particular hosted CI runner
+network addresses, and `--sudo` or `--bridge IFACE` when that mode is the one
+under test. No particular hosted CI runner
 image or nested-virtualization capability is assumed.
 
 ## Validation, 2026-09-22

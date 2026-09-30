@@ -22,7 +22,7 @@ Place a file such as `vms/freebsd-zfs.json` in the repository:
   "ram_mb": 2048,
   "cpus": 2,
   "network": {
-    "mode": "vmnet",
+    "mode": "vmnet-proxy",
     "ssh_port": 2222,
     "forwards": ["127.0.0.1:8080=192.168.2.77:80"]
   },
@@ -47,12 +47,11 @@ uses `ssh_port` forwarding to a DHCP guest; use a static `network.forwards`
 rule and matching shutdown port for a static guest address.
 
 ```sh
-sudo -v   # only needed for vmnet/bridge when the binary lacks a networking entitlement
-python3 -B scripts/vmmctl.py start vms/freebsd-zfs.json --sudo
-python3 -B scripts/vmmctl.py status vms/freebsd-zfs.json --sudo
-python3 -B scripts/vmmctl.py shutdown vms/freebsd-zfs.json --timeout 120 --sudo
+python3 -B scripts/vmmctl.py start vms/freebsd-zfs.json
+python3 -B scripts/vmmctl.py status vms/freebsd-zfs.json
+python3 -B scripts/vmmctl.py shutdown vms/freebsd-zfs.json --timeout 120
 # If the guest cannot be reached, explicitly stop the host process:
-python3 -B scripts/vmmctl.py stop vms/freebsd-zfs.json --timeout 10 --sudo
+python3 -B scripts/vmmctl.py stop vms/freebsd-zfs.json --timeout 10
 ```
 
 `start` returns the instance ID, VMM PID, and resource claims. `status` asks the
@@ -63,8 +62,9 @@ replaces the run logs. The manager reserves the VM name, each writable disk or
 COW overlay, and each TCP listener port against other managed VMs. Shared
 read-only disks are allowed. The VMM's own disk locks and socket binds still
 enforce these constraints against processes launched outside the manager.
-`--sudo` elevates the foreground command before it detaches the manager; use it
-on later commands for the same privileged instance. The detached manager cannot
+`--sudo` elevates the foreground command before it detaches the manager. Use it
+for network mode `vmnet` or `bridge`, and on later commands for that same
+privileged instance. `vmnet-proxy` rejects it. The detached manager cannot
 authenticate through a terminal-scoped sudo ticket.
 
 `shutdown` sends `/sbin/shutdown -p now` over batch-mode SSH. It reports
@@ -100,7 +100,6 @@ the VMM's PSCI `SYSTEM_OFF` record. The source disk is never opened for writing.
 Use `--efi-vars` to clone a matching EFI store when booting it depends on one.
 
 ```sh
-sudo -v
 python3 -B scripts/check_vm_shutdown.py target/debug/vmm \
   --disk /path/to/install-artifacts/installed.img \
   --ssh-key /path/to/install-artifacts/id_ed25519 \
@@ -108,8 +107,9 @@ python3 -B scripts/check_vm_shutdown.py target/debug/vmm \
   --efi-vars /path/to/install-artifacts/efi-vars.fd
 ```
 
-This check requires working vmnet and noninteractive sudo for the VMM. Failure
-artifacts are retained; `--keep` also retains a passing clone.
+This check uses `vmnet-proxy` and needs the vmnet service. Pass `--sudo` after
+`sudo -v` for in-process vmnet via noninteractive `sudo -n`. Failure artifacts
+are retained; `--keep` also retains a passing clone.
 
 ## Shared folders
 

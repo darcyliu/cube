@@ -2,22 +2,25 @@
 """Check network startup errors; optionally verify SSH from read-only FreeBSD media.
 
 python3 scripts/check_network.py BINARY
-sudo python3 scripts/check_network.py BINARY --kernel KERNEL --iso ISO \
+python3 scripts/check_network.py BINARY --kernel KERNEL --iso ISO \
     --guest-cidr 192.168.18.77/24 --host-ip 192.168.18.1
 
 The no-argument check is unprivileged and does not need the vmnet service.
-The guest check starts the VMM with --net vmnet (in-process shared mode) and
-needs root to create the interface. Do not sudo this script for a
---net vmnet-proxy guest: the service rejects uid 0. Start the service with
-`make vmnet-service`, then run the VMM as your user with --net vmnet-proxy.
+The guest check starts the VMM with --net vmnet-proxy. Start the service with
+`make vmnet-service` and run this script as that user. Pass --sudo to re-run
+as root with in-process --net vmnet. Pass --net bridge or --net bridge:en0 to
+re-run as root with in-process bridge; use an unused LAN address. Do not sudo
+the script yourself for a proxy guest: the service rejects uid 0.
 
-Choose an unused guest address on the vmnet shared subnet. The guest check opens
-no writable disk. In-process --net vmnet uses the VMM's host PF/NAT setup.
+Choose an unused guest address on the vmnet shared subnet, or on the LAN for
+bridge. The guest check opens no writable disk. In-process --net vmnet uses
+the VMM's host PF/NAT setup. In-process bridge does not.
 """
 import argparse
 import ipaddress
 import os
 from pathlib import Path
+import re
 import re
 import shlex
 import socket
@@ -41,6 +44,19 @@ def publish(path, command):
     pending.replace(path)
 
 
+def guest_net(sudo, requested):
+    mode = "vmnet" if sudo and requested is None else (requested or "vmnet-proxy")
+    iface = mode.removeprefix("bridge:")
+    valid = mode in ("vmnet-proxy", "vmnet", "bridge") or (
+        mode.startswith("bridge:") and iface != mode
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", iface) is not None)
+    return mode, valid
+
+
+def in_process_net(mode):
+    return mode == "vmnet" or mode == "bridge" or mode.startswith("bridge:")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
@@ -50,17 +66,35 @@ def main():
     parser.add_argument("--host-ip", type=ipaddress.IPv4Address)
     parser.add_argument("--console-log", type=Path,
                         help="retain the guest serial console at this path")
+    parser.add_argument("--sudo", action="store_true",
+                        help="re-run the guest check as root with in-process vmnet")
+    parser.add_argument("--net",
+                        help="vmnet-proxy (default), vmnet, bridge, or bridge:IFACE")
     args = parser.parse_args()
     guest_options = [args.kernel, args.iso, args.guest_cidr, args.host_ip]
     if any(guest_options) and not all(guest_options):
         parser.error("guest check requires --kernel, --iso, --guest-cidr, and --host-ip")
+    if (args.sudo or args.net) and not args.kernel:
+        parser.error("--sudo and --net apply to the guest check")
+    mode, valid = guest_net(args.sudo, args.net)
+    if not valid:
+        parser.error("--net must be vmnet-proxy, vmnet, bridge, or bridge:IFACE")
+    if args.sudo and mode != "vmnet":
+        parser.error("--sudo selects in-process vmnet")
+    if args.kernel and in_process_net(mode) and os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable, "-B", __file__, *sys.argv[1:]])
+    if args.kernel and not in_process_net(mode) and os.geteuid() == 0:
+        parser.error("vmnet-proxy rejects root; re-run as your user, or pass --sudo "
+                     "for in-process vmnet, or --net bridge[:IFACE] for in-process bridge")
     binary = str(Path(args.binary).resolve())
     with tempfile.TemporaryDirectory(prefix="vmm-network-") as temp:
         directory = Path(temp)
         image = kernel(directory, "idle", "b .\n")
-        for mode, message in [("invalid-mode", "Unknown network mode"),
-                              ("tap:" + str(directory / "missing-tap"), "Cannot start tap backend")]:
-            result = subprocess.run([binary, "--kernel", str(image), "--net", mode],
+        # Keep the guest's mode. Reusing that name here made the live VM
+        # start with the missing-tap backend from the last probe.
+        for probe, message in [("invalid-mode", "Unknown network mode"),
+                               ("tap:" + str(directory / "missing-tap"), "Cannot start tap backend")]:
+            result = subprocess.run([binary, "--kernel", str(image), "--net", probe],
                                     capture_output=True, text=True, timeout=15)
             assert result.returncode != 0 and message in result.stderr, result.stdout + result.stderr
             assert "Initialized user-mode mock" not in result.stdout
@@ -87,7 +121,7 @@ def main():
         mailbox = directory / "uart"
         console = args.console_log or directory / "guest.console.log"
         vm = VM(binary, directory, "guest", ["--freebsd", args.kernel,
-            "--cdrom", args.iso, "--root", "cd9660:/dev/vtbd0", "--net", "vmnet",
+            "--cdrom", args.iso, "--root", "cd9660:/dev/vtbd0", "--net", mode,
             "--cpus", 2, "--serial-log", console,
             "--forward", f"127.0.0.1:{port}={args.guest_cidr.ip}:22222"],
             env=dict(os.environ, VMM_UART_IN=str(mailbox)))

@@ -152,9 +152,12 @@ guest setup and current limitations.
 Run `python3 -B scripts/verify.py` (or `make verify`) after code changes. This runs
 Rust tests in debug/release, Python tests, and diskless integration checks, with
 retained logs and JSON/JUnit reports. Use `--suite offline` for all media-based
-checks or `--suite full` to also verify real guest networking. See
-[verification suites and CI usage](docs/verification.md) for prerequisites and
-complete commands.
+checks. `--suite full` also runs the three real-network guest checks:
+`vmnet-proxy` by default. In-process `vmnet` is
+`sudo python3 scripts/verify.py --suite full --sudo --keep-root`, and
+in-process bridge adds `--bridge en0 --keep-root` instead of `--sudo`. See
+[verification suites and CI usage](docs/verification.md) for prerequisites,
+complete commands, and a flowchart of the three suites.
 
 Individual checks remain available. Run `cargo test` and `cargo test --release`
 for device regression tests. On Apple
@@ -170,17 +173,36 @@ The kernel and firmware arguments are optional. The checks cover parked CPUs,
 CPU off/on, reboot, and (when supplied) FreeBSD VNC input and UEFI shutdown. They
 use temporary kernels and variable stores without opening guest disks.
 
+To install a FreeBSD VM, choose the release, whether the installer is interactive,
+and whether to add a desktop:
+
+```sh
+python3 -B scripts/install-vm.py --version 14.4
+python3 -B scripts/install-vm.py --version 15.1 --unattended --name freebsd15
+python3 -B scripts/install-vm.py --version 15 --unattended --desktop plasma --name work
+```
+
+`--version 15` is 15.1. 14.4 is the default. 14.5 uses the same distribution-set
+install as 14.4. 15.1 installs the packaged base system from disc1. 15.0 is
+interactive only: its scripted installer cannot use the packages on that disc.
+The VM is created under `~/VMs/<name>/`. The command prints a `vmmctl` start
+line and a direct `vmm` command for that disk. A desktop install needs guest
+internet for packages. Add `--skip-verify` to a desktop install to stop after
+the packages, login account, and Xorg configuration are written, and skip the
+X11 input check, reboot, and cold-start check. Installers use
+`vmnet-proxy` and the vmnet service (`make vmnet-service`); they do not use
+sudo. Pass `--sudo` to run the installer as root with in-process vmnet instead.
+The saved config, the `vmmctl` line, and the direct `vmm` command follow that choice.
+
 For a disposable full installation, installed-disk SSH, and reboot/persistence
 check, see [the installation regression runbook](docs/install-regression.md).
-Pass `--desktop-environment xfce` to the UFS installation checker for an opt-in
-unattended XFCE/LightDM installation; see the [desktop runbook](docs/freebsd-desktop.md).
-For Plasma 6 with SDDM, run `scripts/unattended-plasma-install.sh --iso
-FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso`; the same runbook documents its
-resource defaults and retained VM artifacts.
+That runbook has flowcharts of `install-vm.py` and of `check_install.py`.
+`scripts/check_install.py` and `scripts/unattended-plasma-install.sh` remain that
+regression path; see the [desktop runbook](docs/freebsd-desktop.md).
 With `--keep`, the run also writes `reuse-vm.json` beside the installed disk for
 later starts through `scripts/vmmctl.py`.
 Use `--desktop-user` and `--desktop-password-file` to choose the desktop login
-credentials for a new install. The root account has a separate generated password;
+credentials for a new install. The root account has a separate 8-character generated password;
 use `--root-password-file` to choose it, or read `root-login.txt` in retained
 artifacts.
 For a local Cocoa/Metal window instead of a VNC viewer, launch an installed

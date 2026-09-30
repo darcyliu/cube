@@ -2,9 +2,14 @@
 """Disposable FreeBSD UFS or UEFI/ZFS install, boot, and reboot regression.
 
 Requires Apple Silicon macOS, a signed VMM, and an ARM64 disc1 ISO.
-Run with sudo for vmnet. --desktop-environment xfce or plasma installs a full
-desktop and login manager into the disposable UFS guest. Failure artifacts are
-always retained.
+SSH checks use --net vmnet-proxy and the running vmnet service. Pass --sudo
+for in-process --net vmnet, or --net bridge[:IFACE] for in-process bridge.
+Either re-runs this script as root.
+--desktop-environment xfce or plasma installs a full desktop and login manager
+into the disposable UFS guest. Failure artifacts are always retained.
+--skip-verify stops after the installer (and, for a desktop, after packages,
+the login account, and the Xorg configuration). It skips the boot, input,
+reboot, and cold-start checks.
 """
 import argparse
 import hashlib
@@ -91,6 +96,19 @@ def desktop_username(value):
     return value
 
 
+def guest_net(sudo, requested):
+    mode = "vmnet" if sudo and requested is None else (requested or "vmnet-proxy")
+    iface = mode.removeprefix("bridge:")
+    valid = mode in ("vmnet-proxy", "vmnet", "bridge") or (
+        mode.startswith("bridge:") and iface != mode
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", iface) is not None)
+    return mode, valid
+
+
+def in_process_net(mode):
+    return mode == "vmnet" or mode == "bridge" or mode.startswith("bridge:")
+
+
 def password_from_file(path, default, account):
     if path is None:
         return default
@@ -104,6 +122,21 @@ def password_from_file(path, default, account):
     return value
 
 
+def direct_command(args, directory):
+    """Foreground vmm command for a retained desktop, using the reuse ports."""
+    parts = ["sudo"] if in_process_net(args.net_mode) else []
+    parts += [shlex.quote(str(args.binary)),
+              "--freebsd", shlex.quote(str(directory / "boot" / "kernel" / "kernel")),
+              "--multiuser",
+              "--disk", shlex.quote(str(directory / "installed.img")),
+              "--ram", str(args.ram), "--cpus", str(args.cpus),
+              "--net", args.net_mode,
+              "--ssh-port", "2222",
+              "--vnc", "127.0.0.1:5901",
+              "--display", shlex.quote(args.display)]
+    return " ".join(parts)
+
+
 def write_reuse_config(args, directory):
     """Give a retained desktop install a stable launch recipe for vmmctl."""
     config = {
@@ -113,7 +146,7 @@ def write_reuse_config(args, directory):
         "disks": [{"path": "installed.img"}],
         "ram_mb": args.ram,
         "cpus": args.cpus,
-        "network": {"mode": "vmnet", "ssh_port": 2222},
+        "network": {"mode": args.net_mode, "ssh_port": 2222},
         "vnc": {"bind": "127.0.0.1:5901", "display": args.display},
         "shutdown": {"host": "127.0.0.1", "port": 2222, "user": "root",
                      "identity_file": "id_ed25519"},
@@ -177,11 +210,19 @@ class Machine:
         path = self.console if console else self.path
         return path.read_text(errors="replace") if path.exists() else ""
 
+    def vmm_error(self):
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", self.text())
+        errors = [line.strip() for line in plain.splitlines() if "[VMM Error]" in line]
+        return errors[-1] if errors else None
+
     def wait_for(self, predicate, deadline, description):
         while True:
             if predicate():
                 return
-            require(self.proc.poll() is None, f"VM exited while waiting for {description}")
+            if self.proc.poll() is not None:
+                # The process log already names a startup failure, such as a
+                # missing vmnet service. Report that line instead of the wait.
+                require(False, self.vmm_error() or f"VM exited while waiting for {description}")
             require(time.monotonic() < deadline, f"Timed out waiting for {description}")
             time.sleep(0.2)
 
@@ -217,7 +258,8 @@ def run(args, directory):
     try:
         key = directory / "id_ed25519"
         command(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key])
-        password = password_from_file(args.root_password_file, secrets.token_hex(24), "Root")
+        # token_hex(4) is 8 characters, short enough to type at the login screen.
+        password = password_from_file(args.root_password_file, secrets.token_hex(4), "Root")
         root_login = directory / "root-login.txt"
         root_login.write_text(f"Username: root\nPassword: {password}\n")
         root_login.chmod(0o600)
@@ -229,7 +271,7 @@ def run(args, directory):
         command(["bash", Path(__file__).with_name("create-seed.sh").resolve(),
                  "--output", directory / "seed.iso", "--ssh-key", key.with_suffix(".pub"),
                  "--hostname", "vmm-install-test", "--password", password,
-                 "--filesystem", args.filesystem])
+                 "--filesystem", args.filesystem, "--base", args.base])
         command(["tar", "-xf", args.iso, "-C", directory, "boot/kernel/kernel"])
         disk = directory / "installed.img"
         # Exclusive creation, always inside our newly allocated private directory.
@@ -260,6 +302,9 @@ def run(args, directory):
         vm.wait_for(lambda: line_present(vm.text(True), marker), deadline, "installer success result")
         vm.powered_off(deadline)
         print("PASS unattended installation and clean poweroff", flush=True)
+        if args.skip_verify and not args.desktop:
+            print("Skipped boot, reboot, and cold-start verification", flush=True)
+            return
 
         reservations = []
         for requested in (args.ssh_port, args.vnc_port if args.desktop else None):
@@ -274,7 +319,8 @@ def run(args, directory):
             reservation.close()
         boot = ["--uefi", args.firmware] if args.filesystem == "zfs" else [
             "--freebsd", directory / "boot/kernel/kernel", "--multiuser"]
-        network = ["--net", "none"] if args.console_only else ["--net", "vmnet", "--ssh-port", port]
+        network = (["--net", "none"] if args.console_only
+                   else ["--net", args.net_mode, "--ssh-port", port])
         display = (["--vnc", f"127.0.0.1:{vnc_port}", "--display", args.display]
                    if args.desktop else [])
         vm = Machine(args.binary, directory, "boot", [*common, *boot, *network, *display])
@@ -333,31 +379,32 @@ def run(args, directory):
             verify_zfs(deadline)
         if args.desktop:
             deadline = time.monotonic() + args.desktop_timeout
-            # FreeBSD 14 keeps the modern USB HID bridge disabled by default.
-            # Direct kernel boot does not read /boot/loader.conf. Enable the
-            # bridge at runtime and reset the tablet so it is probed again.
-            hid = execute(
-                "sysctl hw.usb.usbhid.enable=1 kern.evdev.rcpt_mask=6 && "
-                "(kldload hms 2>/dev/null || true) && "
-                "usbconfig",
-                deadline)
-            require(hid is not None and hid.returncode == 0,
-                    "Could not enable the FreeBSD USB HID/evdev input path" +
-                    (f":\n{hid.stdout}{hid.stderr}" if hid is not None else ""))
-            tablet = find_usb_tablet(execute, hid.stdout, deadline)
-            reset = execute(f"usbconfig -d {tablet} reset", deadline)
-            require(reset is not None and reset.returncode == 0,
-                    "Could not reprobe the USB tablet" +
-                    (f":\n{reset.stdout}{reset.stderr}" if reset is not None else ""))
-            attachment = execute(
-                "sleep 2; dmesg | grep -E 'usbhid|hidbus|hms|uhid|ukbd|hkbd'; "
-                "usbconfig show_ifdrv", deadline)
-            if attachment is not None:
-                (directory / "guest-hid.log").write_text(attachment.stdout + attachment.stderr)
-            require(attachment is not None and re.search(r"\bhms\d+\b", attachment.stdout),
-                    "FreeBSD did not attach hms to the USB tablet; see guest-hid.log" +
-                    (f":\n{attachment.stdout[-4000:]}{attachment.stderr[-1000:]}"
-                     if attachment is not None else ""))
+            if not args.skip_verify:
+                # FreeBSD 14 keeps the modern USB HID bridge disabled by default.
+                # Direct kernel boot does not read /boot/loader.conf. Enable the
+                # bridge at runtime and reset the tablet so it is probed again.
+                hid = execute(
+                    "sysctl hw.usb.usbhid.enable=1 kern.evdev.rcpt_mask=6 && "
+                    "(kldload hms 2>/dev/null || true) && "
+                    "usbconfig",
+                    deadline)
+                require(hid is not None and hid.returncode == 0,
+                        "Could not enable the FreeBSD USB HID/evdev input path" +
+                        (f":\n{hid.stdout}{hid.stderr}" if hid is not None else ""))
+                tablet = find_usb_tablet(execute, hid.stdout, deadline)
+                reset = execute(f"usbconfig -d {tablet} reset", deadline)
+                require(reset is not None and reset.returncode == 0,
+                        "Could not reprobe the USB tablet" +
+                        (f":\n{reset.stdout}{reset.stderr}" if reset is not None else ""))
+                attachment = execute(
+                    "sleep 2; dmesg | grep -E 'usbhid|hidbus|hms|uhid|ukbd|hkbd'; "
+                    "usbconfig show_ifdrv", deadline)
+                if attachment is not None:
+                    (directory / "guest-hid.log").write_text(attachment.stdout + attachment.stderr)
+                require(attachment is not None and re.search(r"\bhms\d+\b", attachment.stdout),
+                        "FreeBSD did not attach hms to the USB tablet; see guest-hid.log" +
+                        (f":\n{attachment.stdout[-4000:]}{attachment.stderr[-1000:]}"
+                         if attachment is not None else ""))
             packages = execute(
                 "env ASSUME_ALWAYS_YES=yes pkg bootstrap -f && "
                 f"pkg install -y {desktop_packages(args.desktop_environment)}",
@@ -372,7 +419,8 @@ def run(args, directory):
                      f"{packages.stdout[-6000:]}{packages.stderr[-2000:]}"))
             if args.desktop_environment in ("xfce", "plasma"):
                 account = execute(
-                    f"pw useradd {shlex.quote(args.desktop_user)} -m -G video -s /bin/sh -h 0",
+                    # wheel is gid 0. FreeBSD has no group named root.
+                    f"pw useradd {shlex.quote(args.desktop_user)} -m -G video,wheel -s /bin/sh -h 0",
                     deadline, input_text=login_password + "\n")
                 require(account is not None and account.returncode == 0,
                         "Could not create the desktop login user; see ssh.log")
@@ -411,11 +459,26 @@ def run(args, directory):
                     deadline, input_text=hid_service)
                 require(persist_hid is not None and persist_hid.returncode == 0,
                         "Could not install the boot-time USB tablet reprobe; see ssh.log")
-            configure = execute(
+            xorg_conf = execute(
                 "install -d /usr/local/etc/X11/xorg.conf.d && "
                 "printf '%s\n' 'Section \"Device\"' '  Identifier \"Card0\"' "
                 "'  Driver \"scfb\"' 'EndSection' "
-                ">/usr/local/etc/X11/xorg.conf.d/20-scfb.conf && "
+                ">/usr/local/etc/X11/xorg.conf.d/20-scfb.conf",
+                deadline)
+            require(xorg_conf is not None and xorg_conf.returncode == 0,
+                    "Could not write the scfb Xorg configuration")
+            if args.skip_verify:
+                deadline = time.monotonic() + args.shutdown_timeout
+                execute("/sbin/shutdown -p now", deadline)
+                vm.powered_off(deadline)
+                if args.desktop_environment in ("xfce", "plasma"):
+                    print(f"Desktop login: {args.desktop_user} "
+                          f"(credentials: {directory / 'desktop-login.txt'})",
+                          flush=True)
+                print("Skipped desktop input verification, reboot, and cold-start checks",
+                      flush=True)
+                return
+            configure = execute(
                 "rm -f /var/run/Xorg-vmm.pid /var/run/twm-vmm.pid "
                 "/var/run/xterm-vmm.pid /var/run/xfce-vmm.pid /var/run/plasma-vmm.pid && "
                 "(pkill Xorg 2>/dev/null || true) && "
@@ -423,7 +486,7 @@ def run(args, directory):
                 "/usr/local/bin/Xorg :0 -ac -noreset vt9",
                 deadline)
             require(configure is not None and configure.returncode == 0,
-                    "Could not configure and start Xorg with scfb")
+                    "Could not start Xorg with scfb")
             await_command(
                 "env DISPLAY=:0 xdpyinfo >/dev/null 2>&1 && printf VMM_X11_OK",
                 "VMM_X11_OK", deadline)
@@ -562,6 +625,21 @@ def positive(value):
     return result
 
 
+def allocate_directory(args, parser):
+    if args.run_name is None:
+        return Path(tempfile.mkdtemp(prefix="vmm-install-", dir=args.artifacts)).resolve()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", args.run_name):
+        parser.error("--run-name must be 1–48 letters, digits, underscores, or hyphens")
+    parent = (args.artifacts or Path.cwd()).expanduser().resolve()
+    directory = parent / args.run_name
+    if directory.exists():
+        parser.error(f"install directory already exists: {directory}")
+    parent.mkdir(parents=True, exist_ok=True)
+    directory.mkdir()
+    directory.chmod(0o700)
+    return directory.resolve()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -569,6 +647,10 @@ def main():
     parser.add_argument("--filesystem", choices=("ufs", "zfs"), default="ufs")
     parser.add_argument("--firmware", type=Path, help="EDK2 firmware required for ZFS")
     parser.add_argument("--console-only", action="store_true", help="offline UART checks instead of SSH/vmnet")
+    parser.add_argument("--sudo", action="store_true",
+                        help="re-run as root and use in-process vmnet instead of vmnet-proxy")
+    parser.add_argument("--net",
+                        help="vmnet-proxy (default), vmnet, bridge, or bridge:IFACE")
     parser.add_argument("--desktop", action="store_true",
                         help="install Xorg/scfb with twm and run the graphical desktop regression")
     parser.add_argument("--desktop-environment", choices=("xfce", "plasma"),
@@ -578,9 +660,17 @@ def main():
     parser.add_argument("--desktop-password-file", type=Path,
                         help="UTF-8 file containing the desktop login password (default: root password)")
     parser.add_argument("--root-password-file", type=Path,
-                        help="UTF-8 file containing the root password (default: generated)")
+                        help="UTF-8 file containing the root password (default: 8 generated characters)")
     parser.add_argument("--artifacts", type=Path, help="parent for a new private run directory")
+    parser.add_argument("--run-name",
+                        help="install into ARTIFACTS/NAME instead of a generated directory")
+    parser.add_argument("--base", choices=("distsets", "pkgbase"), default="distsets",
+                        help="pkgbase for FreeBSD 15.1+ disc1; distsets for 14.x")
     parser.add_argument("--keep", action="store_true", help="also retain artifacts on success")
+    parser.add_argument("--skip-verify", action="store_true",
+                        help="install the guest and, for a desktop, its packages and "
+                             "Xorg configuration; skip boot, input, reboot, and "
+                             "cold-start checks")
     parser.add_argument("--disk-gib", type=positive, default=12)
     parser.add_argument("--ram", type=positive, default=2048)
     parser.add_argument("--cpus", type=positive, default=2)
@@ -617,6 +707,14 @@ def main():
         parser.error("--filesystem zfs requires --firmware")
     if args.desktop and args.console_only:
         parser.error("--desktop requires vmnet/SSH; omit --console-only")
+    if args.console_only and (args.sudo or args.net):
+        parser.error("omit --sudo and --net with --console-only")
+    mode, valid = guest_net(args.sudo, args.net)
+    if not valid:
+        parser.error("--net must be vmnet-proxy, vmnet, bridge, or bridge:IFACE")
+    if args.sudo and mode != "vmnet":
+        parser.error("--sudo selects in-process vmnet")
+    args.net_mode = mode
     if args.desktop and args.filesystem != "ufs":
         parser.error("--desktop currently requires --filesystem ufs")
     for name in ("binary", "iso", *(["firmware"] if args.firmware else [])):
@@ -628,7 +726,12 @@ def main():
         parser.error("--ssh-port and --vnc-port must be 0..65535")
     if args.desktop and args.ssh_port != 0 and args.ssh_port == args.vnc_port:
         parser.error("--ssh-port and --vnc-port must differ")
-    directory = Path(tempfile.mkdtemp(prefix="vmm-install-", dir=args.artifacts)).resolve()
+    if not args.console_only and in_process_net(args.net_mode) and os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable, "-B", __file__, *sys.argv[1:]])
+    if not args.console_only and not in_process_net(args.net_mode) and os.geteuid() == 0:
+        parser.error("vmnet-proxy rejects root; re-run as your user, or pass --sudo "
+                     "for in-process vmnet, or --net bridge[:IFACE] for in-process bridge")
+    directory = allocate_directory(args, parser)
     print(f"Artifacts: {directory}", flush=True)
     (directory / "run.json").write_text(json.dumps(vars(args), default=str, indent=2))
     try:
@@ -651,11 +754,17 @@ def main():
         if args.keep and args.desktop_environment in ("xfce", "plasma"):
             config = write_reuse_config(args, directory)
             print(f"Reusable VM config: {config}", flush=True)
-            print("Start later: python3 -B scripts/vmmctl.py start "
-                  f"{shlex.quote(str(config))} --sudo", flush=True)
+            start = "python3 -B scripts/vmmctl.py start " + shlex.quote(str(config))
+            if in_process_net(args.net_mode):
+                start += " --sudo"
+            print("Start later: " + start, flush=True)
+            print("Direct start: " + direct_command(args, directory), flush=True)
         if not args.keep:
             shutil.rmtree(directory)
-        print("PASS full install → boot → reboot regression", flush=True)
+        if args.skip_verify:
+            print("PASS install; verification checks skipped", flush=True)
+        else:
+            print("PASS full install → boot → reboot regression", flush=True)
 
 
 if __name__ == "__main__":

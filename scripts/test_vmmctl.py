@@ -97,6 +97,19 @@ class ManagerTests(unittest.TestCase):
                          str(self.state / "first" / "efi-vars.fd"))
         self.assertLess(len(str(vmmctl.control_socket_path(self.state / "first"))), 100)
 
+    def test_vmnet_proxy_is_a_network_mode_and_rejects_sudo(self):
+        path = self.config("first", 5901)
+        data = json.loads(path.read_text())
+        data["network"] = {"mode": "vmnet-proxy", "ssh_port": 2222}
+        path.write_text(json.dumps(data))
+        command = vmmctl.launch_spec(path, self.state / "first", self.options())["command"]
+        self.assertEqual(command[command.index("--net") + 1], "vmnet-proxy")
+        self.assertEqual(command[command.index("--ssh-port") + 1], "2222")
+        with patch.object(vmmctl.os, "execvp") as execvp:
+            with self.assertRaisesRegex(ValueError, "vmnet-proxy"):
+                vmmctl.main(["start", str(path), "--sudo", "--state-root", str(self.state)])
+        execvp.assert_not_called()
+
     def test_sudo_elevates_before_detaching_manager(self):
         command = ["start", "guest.json", "--sudo", "--state-root", str(self.state)]
         with patch.object(vmmctl.os, "geteuid", return_value=501), \

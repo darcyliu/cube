@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Create, provision, verify, and retain a FreeBSD Plasma VM.
+# Regression wrapper for a FreeBSD Plasma VM. New installs should use
+# scripts/install-vm.py --unattended --desktop plasma.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -23,8 +24,11 @@ Useful options:
   --cpus N                       Virtual CPUs (default here: 4)
   --display WIDTHxHEIGHT         Framebuffer size (default: 1280x800)
   --desktop-timeout SECONDS      Package/setup timeout (default here: 3600)
+  --sudo                         In-process vmnet as root (default: vmnet-proxy)
+  --skip-verify                  Write packages and Xorg configuration, then skip input and reboot checks
 
 Set VMM_BINARY to use a different signed vmm executable.
+The default needs the vmnet service (`make vmnet-service`).
 EOF
     exit 0
 fi
@@ -48,8 +52,7 @@ if [[ ! -x $VMM_BINARY ]]; then
     exit 2
 fi
 
-sudo -v
-exec sudo python3 -B "$SCRIPT_DIR/check_install.py" "$VMM_BINARY" \
+exec python3 -B "$SCRIPT_DIR/check_install.py" "$VMM_BINARY" \
     --desktop-environment plasma \
     --disk-gib 20 --ram 4096 --cpus 4 \
     --display 1280x800 --desktop-timeout 3600 \

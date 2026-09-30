@@ -55,8 +55,14 @@ make vmnet-service
 ```
 
 `--net vmnet` is still the in-process shared interface and still needs root.
+`--net bridge` and `--net bridge:en0` create the bridged interface in this
+process, so they need root for the same reason, and they do not install PF NAT.
 `--net vmnet-proxy` only talks to the socket. Do not sudo a proxy guest: the
 service rejects uid 0. A second guest needs its own `--mac`.
+`scripts/verify.py --suite full` covers the proxy. In-process vmnet is
+`sudo python3 scripts/verify.py --suite full --sudo --keep-root`, and
+in-process bridge is `--bridge en0 --keep-root` on that same command. See
+[verification.md](verification.md).
 
 ## Optional: Developer ID + vm.networking
 
@@ -76,5 +82,6 @@ You should see both entitlements as `true`. Then `make freebsd-zfs-uefi …
 
 ## Related
 
-- `--net vmnet|vmnet-proxy|mock|none` CLI — [networking.md](networking.md)
+- `--net vmnet|vmnet-proxy|bridge[:iface]|mock|none` CLI — [networking.md](networking.md)
+- Full-suite network modes — [verification.md](verification.md)
 - UEFI ZFS boot — [freebsd_zfs_runbook.md](freebsd_zfs_runbook.md)

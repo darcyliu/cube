@@ -150,7 +150,7 @@ def launch_spec(config_path, state_dir, args):
     network = config.get("network", {})
     require(isinstance(network, dict), "network must be an object")
     net_mode = args.net or network.get("mode", "none")
-    require(isinstance(net_mode, str) and (net_mode in ("none", "mock", "vmnet", "bridge")
+    require(isinstance(net_mode, str) and (net_mode in ("none", "mock", "vmnet", "vmnet-proxy", "bridge")
             or net_mode.startswith(("bridge:", "tap:"))), "invalid network mode")
     command += ["--net", net_mode]
     mac = args.mac or network.get("mac")
@@ -166,7 +166,7 @@ def launch_spec(config_path, state_dir, args):
     if ssh_port is not None:
         require(type(ssh_port) is int and 0 < ssh_port < 65536, "invalid ssh_port")
         require(net_mode not in ("none", "mock") and not net_mode.startswith("tap:"),
-                "ssh_port needs vmnet or bridge")
+                "ssh_port needs vmnet, vmnet-proxy, or bridge")
         command += ["--ssh-port", str(ssh_port)]
         resources.append("listen-port:" + str(ssh_port))
     forwards = args.forward if args.forward is not None else network.get("forwards", [])
@@ -402,6 +402,15 @@ def start(config_path, state_root, state_dir, args):
         raise RuntimeError("VM did not start; see " + str(state_dir / "manager.log"))
 
 
+def configured_network_mode(config_path):
+    config = json.loads(config_path.expanduser().read_text())
+    network = config.get("network", {})
+    if not isinstance(network, dict):
+        return "none"
+    mode = network.get("mode", "none")
+    return mode if isinstance(mode, str) else "none"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("start", "status", "shutdown", "stop", "_serve"))
@@ -426,13 +435,17 @@ def main(argv=None):
     parser.add_argument(
         "--sudo",
         action="store_true",
-        help="run the VMM via sudo -n (for --net vmnet and bridge; do not combine with --net vmnet-proxy)",
+        help="run the VMM via sudo -n for network mode vmnet or bridge; rejected with vmnet-proxy",
     )
     parser.add_argument("--timeout", type=int,
                         help="seconds to wait for guest shutdown (or host stop)")
     parser.add_argument("--force-after-timeout", action="store_true",
                         help="force a host stop if guest shutdown times out")
     args = parser.parse_args(argv)
+    if args.action == "start" and args.sudo and args.config.expanduser().is_file():
+        mode = args.net or configured_network_mode(args.config)
+        require(mode != "vmnet-proxy",
+                "--sudo cannot launch vmnet-proxy; omit --sudo and use the vmnet service")
     if args.sudo and os.geteuid() != 0:
         # Authenticate while still attached to the caller's terminal. A
         # detached manager cannot use a tty-scoped sudo credential cache.

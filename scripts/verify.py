@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import platform
+import pwd
+import re
 import shlex
 import shutil
 import signal
@@ -28,6 +30,17 @@ PYTHON_CHECK = (
     "runpy.run_path(sys.argv[0],run_name='__main__')"
 )
 
+# sudo -u would reset the environment. Dropping in this process keeps it, then
+# execs the real command as SUDO_UID. A root unittest process that calls
+# verify.main would otherwise setuid itself and lose its temporary directory.
+RUN_AS_INVOKING_USER = (
+    "import os,sys;"
+    "sys.path.insert(0,sys.argv[1]);"
+    "import verify;"
+    "verify.drop_privileges();"
+    "os.execvpe(sys.argv[2], sys.argv[2:], os.environ)"
+)
+
 
 @dataclass
 class Step:
@@ -36,6 +49,7 @@ class Step:
     needs: tuple = ()
     timeout: int = 300
     privileged: bool = False
+    as_user: bool = False
     status: str = "pending"
     seconds: float = 0
     message: str = ""
@@ -52,9 +66,19 @@ def parse_args(argv=None):
                         default=Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")))
     parser.add_argument("--artifacts", type=Path, default=REPO / "test-results",
                         help="parent for a new private run directory (default: test-results)")
-    parser.add_argument("--sudo", action="store_true", help="sudo -n only for full-suite guest checks")
+    parser.add_argument("--sudo", action="store_true",
+                        help="run full-suite guest checks as root with in-process vmnet "
+                             "(default is vmnet-proxy)")
+    parser.add_argument("--keep-root", action="store_true",
+                        help="stay root when started with sudo, instead of dropping to "
+                             "SUDO_UID. sudo -n then needs no terminal ticket. Cargo's "
+                             "target directory stays owned by root. The result directory "
+                             "and the Python unit tests are handed back to SUDO_UID")
+    parser.add_argument("--bridge", nargs="?", const="", default=None, metavar="IFACE",
+                        help="run full-suite guest checks as root with in-process bridge. "
+                             "Optional Ethernet name, such as en0; bare --bridge uses the host default")
     parser.add_argument("--guest-cidr", type=ipaddress.IPv4Interface,
-                        help="unused static guest address on vmnet subnet; required for full")
+                        help="unused static guest address on the vmnet or LAN subnet; required for full")
     parser.add_argument("--host-ip", type=ipaddress.IPv4Address,
                         help="reachable host address on that subnet; required for full")
     parser.add_argument("--list", action="store_true", help="print selected commands without running")
@@ -63,8 +87,12 @@ def parse_args(argv=None):
         parser.error("offline/full requires --iso and --firmware")
     if args.suite == "full" and not (args.guest_cidr and args.host_ip):
         parser.error("full requires --guest-cidr and --host-ip for the alternate-address SSH check")
-    if args.suite != "full" and (args.sudo or args.guest_cidr or args.host_ip):
-        parser.error("--sudo, --guest-cidr, and --host-ip apply only to --suite full")
+    if args.suite != "full" and (args.sudo or args.bridge is not None or args.guest_cidr or args.host_ip):
+        parser.error("--sudo, --bridge, --guest-cidr, and --host-ip apply only to --suite full")
+    if args.sudo and args.bridge is not None:
+        parser.error("pass --sudo for in-process vmnet, or --bridge for in-process bridge")
+    if args.bridge and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", args.bridge):
+        parser.error("--bridge expects an interface name such as en0")
     if args.suite == "quick" and (args.iso or args.firmware):
         parser.error("select --suite offline or full to use guest media")
     if args.guest_cidr and args.host_ip not in args.guest_cidr.network:
@@ -90,7 +118,7 @@ def make_plan(args, directory):
         Step("rust-debug", ["cargo", "test", "--locked"], timeout=900),
         Step("rust-release", ["cargo", "test", "--locked", "--release"], timeout=900),
         Step("python-tests", [sys.executable, "-u", "-B", "-m", "unittest", "discover",
-                              "-s", "scripts", "-p", "test_*.py", "-v"]),
+                              "-s", "scripts", "-p", "test_*.py", "-v"], as_user=True),
     ]
     if args.binary:
         steps.append(Step("signed-binary", ["codesign", "--verify", "--strict", str(binary)]))
@@ -129,23 +157,54 @@ def make_plan(args, directory):
             steps.append(check(f"install-{fs}-offline", "check_install.py", extra,
                                ("signed-binary",), timeout=1800))
     if args.suite == "full":
-        if args.sudo:
+        privileged = args.sudo or args.bridge is not None
+        if privileged:
             steps.append(Step("sudo-access", ["sudo", "-n", "true"], timeout=10))
             ready += ("sudo-access",)
-        steps.append(check("network-guest-ssh", "check_network.py",
-            [binary, "--kernel", kernel, "--iso", args.iso,
-             "--guest-cidr", args.guest_cidr, "--host-ip", args.host_ip,
-             "--console-log", directory / "network-guest-ssh.console.log"], ready,
-            privileged=True))
+        guest_net = (["--net", "bridge" if args.bridge == "" else "bridge:" + args.bridge]
+                     if args.bridge is not None else ["--sudo"] if args.sudo else [])
+        guest = [binary, "--kernel", kernel, "--iso", args.iso,
+                 "--guest-cidr", args.guest_cidr, "--host-ip", args.host_ip,
+                 "--console-log", directory / "network-guest-ssh.console.log", *guest_net]
+        steps.append(check("network-guest-ssh", "check_network.py", guest, ready,
+                           privileged=privileged))
         for fs in ("ufs", "zfs"):
             extra = [binary, "--iso", args.iso, "--artifacts", directory, "--filesystem", fs]
             if fs == "ufs":
                 extra += ["--desktop"]
             if fs == "zfs":
                 extra += ["--firmware", args.firmware]
+            extra += guest_net
             steps.append(check(f"install-{fs}-ssh", "check_install.py", extra, ready,
-                               timeout=3000 if fs == "ufs" else 1800, privileged=True))
+                               timeout=3000 if fs == "ufs" else 1800, privileged=privileged))
     return steps
+
+
+def drop_privileges():
+    """Return a sudo launch to the invoking user before any files are created.
+
+    In-process vmnet and bridge still re-enter root later, and only for the
+    guest check that executes vmm. vmnet-proxy must run as this user.
+    """
+    if os.geteuid() != 0:
+        return
+    try:
+        uid = int(os.environ["SUDO_UID"])
+        gid = int(os.environ["SUDO_GID"])
+        if not 0 < uid < 2**32 - 1 or not 0 <= gid < 2**32 - 1:
+            raise ValueError("invalid sudo identity")
+        account = pwd.getpwuid(uid)
+    except (KeyError, ValueError) as error:
+        raise RuntimeError(
+            "This process is root without a usable SUDO_UID. Run verify.py as "
+            "your user. --sudo and --bridge elevate only the in-process guest checks."
+        ) from error
+    os.initgroups(account.pw_name, gid)
+    os.setgid(gid)
+    os.setuid(uid)
+    os.environ["HOME"] = account.pw_dir
+    os.environ["USER"] = account.pw_name
+    os.environ["LOGNAME"] = account.pw_name
 
 
 def preflight(args):
@@ -199,6 +258,9 @@ def run_step(step, args, directory):
     if privileged:
         command = ["sudo", "-n", "/usr/bin/env", "TMPDIR=" + str(directory),
                    "PATH=" + os.environ["PATH"], *command]
+    elif step.as_user and os.geteuid() == 0:
+        command = [sys.executable, "-B", "-c", RUN_AS_INVOKING_USER,
+                   str(REPO / "scripts"), *command]
     print(f"RUN  {step.name} (limit {step.timeout}s) — {step.log}", flush=True)
     start = time.monotonic()
     proc = None
@@ -247,6 +309,17 @@ def write_reports(directory, suite, steps):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.keep_root:
+        if os.geteuid() != 0:
+            print("verify.py: error: --keep-root applies when the process is started with sudo",
+                  file=sys.stderr)
+            return 2
+    else:
+        try:
+            drop_privileges()
+        except RuntimeError as error:
+            print(f"verify.py: error: {error}", file=sys.stderr)
+            return 2
     if args.list:
         for step in make_plan(args, args.artifacts / "RUN"):
             prefix = "sudo -n " if step.privileged and args.sudo else ""
@@ -254,6 +327,17 @@ def main(argv=None):
         return 0
     args.artifacts.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="vmm-verify-", dir=args.artifacts))
+    # python-tests runs as SUDO_UID and creates its directories in TMPDIR.
+    # mkdtemp leaves this directory owned by root, mode 0700.
+    if os.geteuid() == 0:
+        try:
+            owner = int(os.environ["SUDO_UID"])
+            group = int(os.environ["SUDO_GID"])
+        except (KeyError, ValueError):
+            owner = group = None
+        if owner and 0 < owner < 2**32 - 1 and group is not None and 0 <= group < 2**32 - 1:
+            os.chown(directory, owner, group)
+            os.chmod(directory, 0o700)
     print(f"Suite: {args.suite}\nArtifacts: {directory}", flush=True)
     steps = [Step("preflight", [])] + make_plan(args, directory)
     interrupted = False

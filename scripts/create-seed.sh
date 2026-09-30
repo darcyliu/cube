@@ -14,6 +14,7 @@ PASSWORD="root"
 SSH_PUB_KEY=""
 SEED_DIR=".seed-staging"
 FILESYSTEM="ufs"
+BASE="distsets"
 
 # ANSI colors
 BOLD="\033[1m"
@@ -26,6 +27,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --filesystem)
             FILESYSTEM="$2"
+            shift 2
+            ;;
+        --base)
+            BASE="$2"
             shift 2
             ;;
         --output|-o)
@@ -56,6 +61,7 @@ while [[ $# -gt 0 ]]; do
             echo "  -p, --password <PASS>   Root password (default: root)"
             echo "  -k, --ssh-key <KEY|FILE> SSH public key or key file to authorize"
             echo "      --filesystem <FS>   ufs (default) or zfs with an EFI system partition"
+            echo "      --base <MODE>       distsets (default) or pkgbase (FreeBSD 15.1+ disc1)"
             exit 0
             ;;
     esac
@@ -64,6 +70,11 @@ done
 case "$FILESYSTEM" in
     ufs|zfs) ;;
     *) echo "Invalid filesystem: $FILESYSTEM" >&2; exit 1 ;;
+esac
+
+case "$BASE" in
+    distsets|pkgbase) ;;
+    *) echo "Invalid base: $BASE" >&2; exit 1 ;;
 esac
 
 # If no SSH key was specified, check default ~/.ssh/id_ed25519.pub or id_rsa.pub
@@ -102,10 +113,18 @@ ssh_authorized_keys:
 EOF
 fi
 
-# 3. Generate installerconfig (FreeBSD bsdinstall automated script)
+# 3. Generate installerconfig (FreeBSD bsdinstall automated script).
+# 14.x disc1 contains distribution sets. 15.1+ `bsdinstall script` installs
+# pkgbase when DISTRIBUTIONS is unset; that repo is on disc1 and base.txz is not.
+if [[ "$BASE" == "pkgbase" ]]; then
+    BASE_SPEC='export BSDINSTALL_PKG_REPOS_DIR="/usr/freebsd-packages/repos"
+export COMPONENTS="base"'
+else
+    BASE_SPEC='DISTRIBUTIONS="kernel.txz base.txz"'
+fi
 cat << EOF > "$SEED_DIR/installerconfig"
 PARTITIONS="vtbd0"
-DISTRIBUTIONS="kernel.txz base.txz"
+${BASE_SPEC}
 export nonInteractive="YES"
 
 #!/bin/sh

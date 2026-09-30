@@ -1,9 +1,53 @@
 # FreeBSD desktop verification
 
-This runbook validates the VNC display and USB HID path with a real FreeBSD
-X11 session. The checker creates a new installed disk because package
-installation and Xorg configuration modify the guest. Keep its artifacts to
-reuse that disk as a VM later.
+Install a desktop VM with `scripts/install-vm.py`:
+
+```sh
+python3 -B scripts/install-vm.py --version 14.4 --unattended --desktop xfce --name work
+python3 -B scripts/install-vm.py --version 15.1 --unattended --desktop plasma --name plasma
+```
+
+Start the vmnet service once with `make vmnet-service`. The installer then
+uses `vmnet-proxy` as your user. Add `--sudo` to run `check_install.py` as
+root with in-process vmnet. Direct `check_install.py --net bridge:en0` is the
+in-process bridge on that Ethernet interface; it also runs as root, and the
+guest takes a LAN address. The saved config and the printed `vmmctl` start
+line follow that choice. The same run prints a direct `vmm` command with the
+binary, kernel, disk, memory, CPUs, network mode, SSH port, and VNC display
+filled in. Add `--skip-verify` to write the packages, login account, and Xorg
+configuration, then skip the X11 input check, reboot, and cold-start check.
+The full suite selects the same modes with `--suite full` as your user, or,
+started with `sudo python3`, `--sudo --keep-root` and `--bridge en0 --keep-root`.
+See [verification.md](verification.md).
+
+`--version 15` selects 15.1. FreeBSD 15.0 can be installed interactively; its
+scripted installer cannot use the packages on disc1. This runbook is the
+regression and repair path. It validates the VNC display and USB HID path with
+a real FreeBSD X11 session. The checker creates a new installed disk because
+package installation and Xorg configuration modify the guest. Keep its artifacts
+to reuse that disk as a VM later.
+
+```mermaid
+flowchart TD
+  svc["make vmnet-service, once, as your user"] --> iv["install-vm.py --unattended --desktop xfce or plasma"]
+  iv --> iso["Reuse or download disc1 in ~/Library/Caches/vmm"]
+  iso --> dest["Create ~/VMs/name and a new ed25519 key"]
+  dest --> inst["bsdinstall from the seed, --net none, then power off"]
+  inst --> boot["Boot the installed disk with vmnet-proxy and SSH"]
+  boot --> pkg["Install packages, create the user in video and wheel, enable the login manager, write xorg.conf"]
+  pkg --> skip{"--skip-verify"}
+  skip -->|yes| early["Power off. Skip the X11 check, reboot, and cold start"]
+  skip -->|no| x11["Probe the tablet, start Xorg, run check_desktop.py"]
+  x11 --> reboot["Reboot and require the marker to persist, then power off"]
+  early --> out["Keep the directory: reuse-vm.json, vmmctl line, direct vmm command"]
+  reboot --> out
+```
+
+`--sudo` replaces vmnet-proxy with in-process vmnet for the boot that installs
+packages. The shared install, reboot, and ZFS checks are drawn in
+[install-regression.md](install-regression.md). The suite that calls this
+script with the smaller twm desktop is drawn in
+[verification.md](verification.md).
 
 ## Prerequisites
 
@@ -17,7 +61,7 @@ desktop packages, starts Xorg with SCFB, runs the input/update verifier, reboots
 and powers off cleanly:
 
 ```sh
-sudo python3 scripts/check_install.py /tmp/vmm-gui-fix/debug/vmm \
+python3 scripts/check_install.py /tmp/vmm-gui-fix/debug/vmm \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --desktop --keep
 ```
@@ -27,7 +71,7 @@ the desktop environment instead of the default `twm` test session:
 
 ```sh
 mkdir -p "$HOME/VMs"
-sudo python3 -B scripts/check_install.py target/debug/vmm \
+python3 -B scripts/check_install.py target/debug/vmm \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --desktop-environment xfce --desktop-timeout 2400 \
   --artifacts "$HOME/VMs" --keep
@@ -54,7 +98,7 @@ framebuffer without accelerated graphics. The resulting artifact directory
 contains `reuse-vm.json`, `desktop-login.txt`, and `root-login.txt` and is used
 the same way as the XFCE artifact described below.
 
-The XFCE login defaults to username `vmm` and a generated password. To choose
+The XFCE login defaults to username `vmm` and an 8-character generated password. To choose
 your own credentials for a **new** install, add `--desktop-user NAME` and
 `--desktop-password-file PATH`. The file must contain one nonempty UTF-8 line;
 keep it private (for example, mode 0600). The password is read from the file
@@ -62,7 +106,7 @@ and sent to FreeBSD's `pw` command over SSH standard input, rather than placed
 on the command line:
 
 ```sh
-sudo python3 -B scripts/check_install.py target/debug/vmm \
+python3 -B scripts/check_install.py target/debug/vmm \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --desktop-environment xfce --desktop-user darcy \
   --desktop-password-file "$HOME/VMs/xfce-password.txt" \
@@ -73,7 +117,7 @@ sudo python3 -B scripts/check_install.py target/debug/vmm \
 The desktop password can differ from the root password. `desktop-login.txt` in
 the retained artifact directory records the selected username and password;
 `root-login.txt` records
-the separate root password. Read either with `sudo cat`. To choose root's
+the separate root password. Read either with `cat`. To choose root's
 password for a new install as well, pass `--root-password-file PATH` (the same
 file as the desktop password file if you want matching passwords). These files
 each contain one nonempty UTF-8 line and should have mode 0600.
@@ -116,12 +160,11 @@ artifact path below:
 
 ```sh
 INSTALL=/path/to/vmm-install-XXXXXX
-sudo -v
-python3 -B scripts/vmmctl.py start "$INSTALL/reuse-vm.json" --sudo
-python3 -B scripts/vmmctl.py status "$INSTALL/reuse-vm.json" --sudo
+python3 -B scripts/vmmctl.py start "$INSTALL/reuse-vm.json"
+python3 -B scripts/vmmctl.py status "$INSTALL/reuse-vm.json"
 # Connect a VNC viewer to 127.0.0.1:5901; log in as vmm.
-sudo cat "$INSTALL/desktop-login.txt"
-python3 -B scripts/vmmctl.py shutdown "$INSTALL/reuse-vm.json" --sudo
+cat "$INSTALL/desktop-login.txt"
+python3 -B scripts/vmmctl.py shutdown "$INSTALL/reuse-vm.json"
 # Run start again whenever you want to use this same disk.
 ```
 
@@ -131,21 +174,21 @@ Then run from the repository root:
 
 ```sh
 INSTALL=/path/to/vmm-install-XXXXXX  # replace with the printed artifact path
-sudo ./target/debug/vmm \
+./target/debug/vmm \
   --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
   --disk "$INSTALL/installed.img" \
   --ram 2048 --cpus 2 \
-  --net vmnet --ssh-port 2222 \
+  --net vmnet-proxy --ssh-port 2222 \
   --vnc 127.0.0.1:5901 --display 1024x768 \
   --serial-log "$INSTALL/foreground.console.log"
 ```
 
 Connect a VNC viewer to `127.0.0.1:5901`, log in as `vmm`, and read the
-password with `sudo cat "$INSTALL/desktop-login.txt"`. For a clean poweroff,
+password with `cat "$INSTALL/desktop-login.txt"`. For a clean poweroff,
 run this in another terminal (set `INSTALL` there too):
 
 ```sh
-sudo ssh -F /dev/null -i "$INSTALL/id_ed25519" -p 2222 \
+ssh -F /dev/null -i "$INSTALL/id_ed25519" -p 2222 \
   -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
   root@127.0.0.1 'shutdown -p now'
 ```
@@ -157,10 +200,10 @@ instance first and replace `--vnc` in the foreground command with `--gui native`
 INSTALL=/path/to/vmm-install-XXXXXX
 CARGO_TARGET_DIR=/tmp/vmm-gui-fix cargo build --locked
 codesign --entitlements entitlements.plist --force -s - /tmp/vmm-gui-fix/debug/vmm
-sudo /tmp/vmm-gui-fix/debug/vmm \
+/tmp/vmm-gui-fix/debug/vmm \
   --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
   --disk "$INSTALL/installed.img" --ram 2048 --cpus 2 \
-  --net vmnet --ssh-port 2222 \
+  --net vmnet-proxy --ssh-port 2222 \
   --gui native --display 1024x768 \
   --serial-log "$INSTALL/native.console.log"
 ```
@@ -250,10 +293,10 @@ Use the printed artifact directory as `$INSTALL`. Start its installed system
 with a configurable 1024×768 framebuffer:
 
 ```sh
-sudo /tmp/vmm-gui-fix/debug/vmm \
+/tmp/vmm-gui-fix/debug/vmm \
   --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
   --disk "$INSTALL/installed.img" --ram 2048 --cpus 2 \
-  --net vmnet --ssh-port 2222 \
+  --net vmnet-proxy --ssh-port 2222 \
   --vnc 127.0.0.1:5901 --display 1024x768 \
   --serial-log "$INSTALL/desktop-vmm.log"
 ```
