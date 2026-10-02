@@ -8,7 +8,7 @@ REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 VMM_BINARY=${VMM_BINARY:-$REPO_DIR/target/debug/vmm}
 
 if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
-    cat <<EOF
+    cat <<'EOF'
 Usage: $0 --iso FREEBSD-ARM64-DISC1.ISO [CHECK_INSTALL_OPTIONS]
 
 Creates a fresh FreeBSD UFS disk, installs Plasma 6 with SDDM and the VMM

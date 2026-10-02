@@ -8,10 +8,13 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=MetalKit");
     println!("cargo:rerun-if-changed=src/native.m");
     println!("cargo:rerun-if-changed=guest/payload.S");
+    println!("cargo:rerun-if-changed=guest/linux_payload.S");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     let out_bin = std::path::Path::new(&out_dir).join("payload.bin");
     let out_obj = std::path::Path::new(&out_dir).join("payload.o");
+    let linux_out_bin = std::path::Path::new(&out_dir).join("linux_payload.bin");
+    let linux_out_obj = std::path::Path::new(&out_dir).join("linux_payload.o");
     let cocoa_obj = std::path::Path::new(&out_dir).join("native.o");
     let cocoa_lib = std::path::Path::new(&out_dir).join("libvmm_native.a");
     let status = Command::new("clang")
@@ -64,6 +67,29 @@ fn main() {
     fs::write(&out_bin, text_section).unwrap_or_else(|e| {
         panic!("build.rs: could not write guest/payload.bin: {e}")
     });
+
+    if std::path::Path::new("guest/linux_payload.S").exists() {
+        let status = Command::new("clang")
+            .args([
+                "-target",
+                "aarch64-unknown-none",
+                "-c",
+                "guest/linux_payload.S",
+                "-o",
+                linux_out_obj.to_str().unwrap(),
+            ])
+            .status();
+        if let Ok(st) = status {
+            if st.success() {
+                if let Ok(elf_bytes) = fs::read(linux_out_obj.to_str().unwrap()) {
+                    if let Some(text_section) = extract_elf_text_section(&elf_bytes) {
+                        let _ = fs::write(&linux_out_bin, text_section);
+                        let _ = fs::write("guest/linux_payload.bin", text_section);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn extract_elf_text_section(data: &[u8]) -> Option<&[u8]> {

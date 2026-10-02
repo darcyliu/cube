@@ -913,9 +913,9 @@ impl Vcpu {
                 self.set_reg(HV_REG_X3, w2).map_err(|e| e.to_string())?;
                 Ok(None)
             }
-            // PSCI_VERSION (0x84000000): Return PSCI v0.2
+            // PSCI_VERSION (0x84000000): Return PSCI v1.0 (0x00010000)
             PSCI_VERSION => {
-                self.set_reg(HV_REG_X0, 0x0002).map_err(|e| e.to_string())?;
+                self.set_reg(HV_REG_X0, 0x0001_0000).map_err(|e| e.to_string())?;
                 Ok(None)
             }
             // PSCI_FEATURES (0x8400000a)

@@ -1,4 +1,4 @@
-.PHONY: all build sign sign-networking run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify
+.PHONY: all build sign sign-networking run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify alpine debian debian-cloud
 
 all: build sign
 
@@ -100,6 +100,15 @@ install-iso: all
 install-seed: all
 	./scripts/unattended-install.sh
 
+alpine: all
+	./scripts/alpine.sh
+
+debian: all
+	./scripts/debian.sh
+
+debian-cloud: all
+	./scripts/debian-cloud.sh
+
 release:
 	cargo build --release
 	codesign --entitlements entitlements.plist --force -s - target/release/vmm
@@ -160,6 +169,7 @@ sudo-freebsd-zfs: all fetch-freebsd
 
 clean:
 	cargo clean
+	rm -f guest/payload.o guest/payload.bin guest/linux_payload.o guest/linux_payload.bin
 
 clean-vm:
 	./scripts/clean-vms.sh

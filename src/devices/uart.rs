@@ -50,6 +50,16 @@ const INT_RX: u32 = 1 << 4;
 const INT_TX: u32 = 1 << 5;
 const INT_RT: u32 = 1 << 6;
 
+// ARM PrimeCell identification registers (AMBA bus detection)
+const UART_PERIPH_ID0: u64 = 0xFE0;
+const UART_PERIPH_ID1: u64 = 0xFE4;
+const UART_PERIPH_ID2: u64 = 0xFE8;
+const UART_PERIPH_ID3: u64 = 0xFEC;
+const UART_PCELL_ID0: u64 = 0xFF0;
+const UART_PCELL_ID1: u64 = 0xFF4;
+const UART_PCELL_ID2: u64 = 0xFF8;
+const UART_PCELL_ID3: u64 = 0xFFC;
+
 pub struct Pl011Uart {
     cr: u32,
     imsc: u32,
@@ -70,9 +80,8 @@ impl Pl011Uart {
                 crate::vcpu::request_host_shutdown();
                 return;
             }
-            let byte = if b == b'\r' { b'\n' } else { b };
             if guard.len() < 4096 {
-                guard.push_back(byte);
+                guard.push_back(b);
             }
         }
         drop(guard);
@@ -219,6 +228,15 @@ impl MmioDevice for Pl011Uart {
                 let rx = if q.is_empty() { 0 } else { INT_RX | INT_RT };
                 ((rx | self.tx_int) & self.imsc) as u64
             }
+            // PrimeCell identification (pl011_id_arm: 0x11, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1)
+            UART_PERIPH_ID0 => 0x11,
+            UART_PERIPH_ID1 => 0x10,
+            UART_PERIPH_ID2 => 0x14,
+            UART_PERIPH_ID3 => 0x00,
+            UART_PCELL_ID0 => 0x0D,
+            UART_PCELL_ID1 => 0xF0,
+            UART_PCELL_ID2 => 0x05,
+            UART_PCELL_ID3 => 0xB1,
             _ => 0,
         }
     }

@@ -27,6 +27,7 @@ pub fn generate_dtb(
     virtio_devices: &[VirtioMmioDevice],
     framebuffer: Option<crate::devices::display::FramebufferConfig>,
     xhci: Option<XhciMmioDevice>,
+    initrd: Option<(u64, u64)>,
 ) -> Result<Vec<u8>, String> {
     let cpus_count = num_cpus.max(1);
     let mut cpus_dts = String::new();
@@ -127,6 +128,19 @@ pub fn generate_dtb(
         ranges.join(" ")
     } else { cells(ram_base, ram_size) };
 
+    let initrd_dts = match initrd {
+        Some((start, end)) => format!(
+            "        linux,initrd-start = <0x{:x} 0x{:x}>;\n        linux,initrd-end = <0x{:x} 0x{:x}>;\n",
+            (start >> 32) as u32,
+            (start & 0xffff_ffff) as u32,
+            (end >> 32) as u32,
+            (end & 0xffff_ffff) as u32,
+        ),
+        None => String::new(),
+    };
+
+    let escaped_bootargs = bootargs.replace('\\', "\\\\").replace('"', "\\\"");
+
     let dts = format!(
         r#"/dts-v1/;
 
@@ -139,21 +153,19 @@ pub fn generate_dtb(
     dma-coherent;
 
     chosen {{
-        bootargs = "{bootargs}";
+        bootargs = "{escaped_bootargs}";
         stdout-path = "serial0";
-{framebuffer_dts}    }};
+{initrd_dts}{framebuffer_dts}    }};
 
     aliases {{
         serial0 = "/pl011@09000000";
     }};
 
-    clocks {{
-        apb_pclk: apb-pclk {{
-            compatible = "fixed-clock";
-            #clock-cells = <0>;
-            clock-frequency = <24000000>;
-            clock-output-names = "clk24mhz";
-        }};
+    apb_pclk: apb-pclk {{
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <24000000>;
+        clock-output-names = "clk24mhz";
     }};
 
     flash@0 {{
@@ -200,6 +212,7 @@ pub fn generate_dtb(
     pl011@09000000 {{
         compatible = "arm,pl011", "arm,primecell";
         reg = <0x0 0x09000000 0x0 0x1000>;
+        interrupt-parent = <&intc>;
         interrupts = <0 1 4>; /* SPI 1 (interrupt ID 33) */
         clocks = <&apb_pclk>, <&apb_pclk>;
         clock-names = "uartclk", "apb_pclk";
@@ -210,6 +223,8 @@ pub fn generate_dtb(
         reg = <0x0 0x09010000 0x0 0x1000>;
         interrupt-parent = <&intc>;
         interrupts = <0 4 4>; /* SPI 4 (interrupt ID 36) */
+        clocks = <&apb_pclk>;
+        clock-names = "apb_pclk";
     }};
 
     fw-cfg@09020000 {{
@@ -220,7 +235,6 @@ pub fn generate_dtb(
 
 {virtio_dts}{xhci_dts}}};
 "#,
-        bootargs = bootargs,
         ram_base = ram_base,
         virtio_dts = virtio_dts,
         xhci_dts = xhci_dts,
@@ -260,7 +274,7 @@ mod tests {
     #[test]
     fn framebuffer_is_excluded_from_guest_ram() {
         let fb = crate::devices::display::FramebufferConfig::default();
-        let dtb = generate_dtb(0x40000000, 0x40000000, "", 1, &[], Some(fb), None).unwrap();
+        let dtb = generate_dtb(0x40000000, 0x40000000, "", 1, &[], Some(fb), None, None).unwrap();
         let mut child = Command::new("dtc").args(["-I", "dtb", "-O", "dts", "-"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         child.stdin.take().unwrap().write_all(&dtb).unwrap();
@@ -269,8 +283,37 @@ mod tests {
         let dts = String::from_utf8(output.stdout).unwrap();
         assert!(dts.contains("reg = <0x00 0x40000000 0x00 0x10000000 0x00 0x50800000 0x00 0x2f800000>"), "{dts}");
         assert!(dts.contains("framebuffer@50000000"));
-        assert!(generate_dtb(0x40000000, 0x10000000, "", 1, &[], Some(fb), None).is_err());
-        let headless = generate_dtb(0x40000000, 0x40000000, "", 1, &[], None, None).unwrap();
+        assert!(generate_dtb(0x40000000, 0x10000000, "", 1, &[], Some(fb), None, None).is_err());
+        let headless = generate_dtb(0x40000000, 0x40000000, "", 1, &[], None, None, None).unwrap();
         assert!(!headless.windows(b"simple-framebuffer".len()).any(|w| w == b"simple-framebuffer"));
+    }
+
+    #[test]
+    fn test_generate_dtb_with_initrd() {
+        let dtb = generate_dtb(
+            0x40000000,
+            0x40000000,
+            "console=ttyAMA0 earlycon",
+            1,
+            &[],
+            None,
+            None,
+            Some((0x49000000, 0x49800000)),
+        )
+        .unwrap();
+        let mut child = Command::new("dtc")
+            .args(["-I", "dtb", "-O", "dts", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&dtb).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let dts = String::from_utf8(output.stdout).unwrap();
+        assert!(dts.contains("linux,initrd-start = <0x00 0x49000000>"), "{dts}");
+        assert!(dts.contains("linux,initrd-end = <0x00 0x49800000>"), "{dts}");
+        assert!(dts.contains("bootargs = \"console=ttyAMA0 earlycon\""), "{dts}");
     }
 }

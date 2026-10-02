@@ -11,6 +11,7 @@ guest/*.bin
 *.iso
 /.iso-boot
 /target_root
+initrd*.gz
 
 # EDK2 flash images (make fetch-uefi)
 firmware/*.fd

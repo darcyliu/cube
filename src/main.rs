@@ -4,6 +4,7 @@ mod fdt;
 mod forward;
 mod gpt;
 mod hypervisor;
+mod linux;
 mod memory;
 mod native;
 mod preload;
@@ -160,7 +161,9 @@ fn run_cli(args: Vec<String>) {
     let mut custom_bootargs: Option<String> = None;
     let mut ram_mb: Option<usize> = None;
     let mut is_freebsd = false;
+    let mut is_linux = false;
     let mut is_uefi = false;
+    let mut initrd_path: Option<String> = None;
     let mut firmware_path: Option<String> = None;
     let mut efi_vars_path: Option<String> = None;
     let mut is_multiuser = false;
@@ -178,6 +181,7 @@ fn run_cli(args: Vec<String>) {
     let mut retina = false;
     let mut display_size = (devices::display::FB_WIDTH, devices::display::FB_HEIGHT);
     let mut display_requested = false;
+    let mut no_reboot = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -224,6 +228,22 @@ fn run_cli(args: Vec<String>) {
                     kernel_path = Some(args[i].clone());
                 } else if std::path::Path::new("boot/kernel/kernel").exists() {
                     kernel_path = Some("boot/kernel/kernel".to_string());
+                }
+            }
+            "--linux" | "-l" => {
+                is_linux = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    kernel_path = Some(args[i].clone());
+                }
+            }
+            "--initrd" => {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    initrd_path = Some(args[i].clone());
+                } else {
+                    eprintln!("--initrd requires a path to an initrd/initramfs image");
+                    process::exit(1);
                 }
             }
             "--multiuser" | "--multi-user" | "-u" => {
@@ -439,10 +459,16 @@ fn run_cli(args: Vec<String>) {
                     process::exit(1);
                 });
             }
+            "--no-reboot" => {
+                no_reboot = true;
+            }
             "--help" | "-h" => {
                 println!("Usage: vmm [OPTIONS] [PAYLOAD/KERNEL]");
                 println!();
                 println!("Options:");
+                println!(
+                    "      --no-reboot          Exit instead of rebooting when guest requests reset"
+                );
                 println!(
                     "  --share TAG PATH         Export a host directory read-only (repeatable)"
                 );
@@ -451,6 +477,12 @@ fn run_cli(args: Vec<String>) {
                 );
                 println!(
                     "  -f, --freebsd [PATH]     Boot FreeBSD kernel ELF (defaults to boot/kernel/kernel)"
+                );
+                println!(
+                    "  -l, --linux <PATH>       Boot Linux ARM64 kernel Image/vmlinuz"
+                );
+                println!(
+                    "      --initrd <PATH>      Load initrd/initramfs for Linux boot"
                 );
                 println!(
                     "      --uefi [PATH]        Boot EDK2/UEFI firmware (defaults to firmware/QEMU_EFI.fd); loader.efi handles ZFS"
@@ -555,8 +587,8 @@ fn run_cli(args: Vec<String>) {
         eprintln!("[VMM Error] --gui native and --vnc cannot be combined");
         process::exit(1);
     }
-    if native_gui && !is_freebsd && !is_uefi {
-        eprintln!("[VMM Error] --gui native requires --freebsd or --uefi");
+    if native_gui && !is_freebsd && !is_uefi && !is_linux {
+        eprintln!("[VMM Error] --gui native requires --freebsd, --linux, or --uefi");
         process::exit(1);
     }
     if retina && !native_gui {
@@ -588,7 +620,7 @@ fn run_cli(args: Vec<String>) {
 
     // Default root: GPT UFS or zfs:zroot/ROOT/default. Never guess ufs p2 on a ZFS disk
     // (bsdinstall Auto (ZFS) puts swap on p2 — that superblock error is swap, not UFS).
-    if !disk_configs.is_empty() && root_dev.is_none() {
+    if !disk_configs.is_empty() && root_dev.is_none() && !is_linux {
         let disk0 = &disk_configs[0].path;
         if let Some(layout) = gpt::describe_freebsd_gpt(disk0) {
             println!("[VMM] GPT on '{}': {}", disk0, layout);
@@ -662,30 +694,35 @@ fn run_cli(args: Vec<String>) {
             .map(|mb| mb * 1024 * 1024)
             .unwrap_or(DEFAULT_OS_RAM_SIZE);
         let bootargs = custom_bootargs.unwrap_or_else(|| "console=ttyAMA0".to_string());
-        finish_boot(boot_os_kernel(
-            &path,
-            &[],
-            &disk_configs,
-            ram_size,
-            &bootargs,
-            net_mode.as_deref(),
-            mac_addr,
-            cpus,
-            cpu_model,
-            serial_log.as_deref(),
-            &[],
-            is_multiuser,
-            None,
-            Some(&fw),
-            vnc_bind.as_deref(),
-            native_gui,
-            display_size,
-            efi_vars_path.as_deref(),
-            &forward_rules,
-            ssh_port,
-            &shares,
-            vmnet_socket.as_deref(),
-        ));
+        finish_boot(
+            boot_os_kernel(
+                &path,
+                &[],
+                false,
+                None,
+                &disk_configs,
+                ram_size,
+                &bootargs,
+                net_mode.as_deref(),
+                mac_addr,
+                cpus,
+                cpu_model,
+                serial_log.as_deref(),
+                &[],
+                is_multiuser,
+                None,
+                Some(&fw),
+                vnc_bind.as_deref(),
+                native_gui,
+                display_size,
+                efi_vars_path.as_deref(),
+                &forward_rules,
+                ssh_port,
+                &shares,
+                vmnet_socket.as_deref(),
+            ),
+            no_reboot,
+        );
         return;
     }
 
@@ -702,8 +739,59 @@ fn run_cli(args: Vec<String>) {
         };
 
         let is_elf = file_data.len() >= 4 && &file_data[0..4] == b"\x7fELF";
+        let is_linux_kernel = is_linux || linux::LinuxArm64Header::is_linux_image(&file_data);
 
-        if is_elf || is_freebsd {
+        if is_linux_kernel {
+            let ram_size = ram_mb
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or(DEFAULT_OS_RAM_SIZE);
+
+            let bootargs = match custom_bootargs {
+                Some(b) => b,
+                None => {
+                    let console = if vnc_bind.is_some() || native_gui {
+                        "console=tty0 console=ttyAMA0 earlycon"
+                    } else {
+                        "console=ttyAMA0 earlycon"
+                    };
+                    match root_dev {
+                        Some(ref root) => format!("{console} root={root} rw"),
+                        None => console.to_string(),
+                    }
+                }
+            };
+
+            finish_boot(
+                boot_os_kernel(
+                    path,
+                    &file_data,
+                    true,
+                    initrd_path.as_deref(),
+                    &disk_configs,
+                    ram_size,
+                    &bootargs,
+                    net_mode.as_deref(),
+                    mac_addr,
+                    cpus,
+                    cpu_model,
+                    serial_log.as_deref(),
+                    &module_paths,
+                    is_multiuser,
+                    root_dev.as_deref(),
+                    None,
+                    vnc_bind.as_deref(),
+                    native_gui,
+                    display_size,
+                    efi_vars_path.as_deref(),
+                    &forward_rules,
+                    ssh_port,
+                    &shares,
+                    vmnet_socket.as_deref(),
+                ),
+                no_reboot,
+            );
+            return;
+        } else if is_elf || is_freebsd {
             let ram_size = ram_mb
                 .map(|mb| mb * 1024 * 1024)
                 .unwrap_or(DEFAULT_OS_RAM_SIZE);
@@ -726,30 +814,35 @@ fn run_cli(args: Vec<String>) {
                 }
             };
 
-            finish_boot(boot_os_kernel(
-                path,
-                &file_data,
-                &disk_configs,
-                ram_size,
-                &bootargs,
-                net_mode.as_deref(),
-                mac_addr,
-                cpus,
-                cpu_model,
-                serial_log.as_deref(),
-                &module_paths,
-                is_multiuser,
-                root_dev.as_deref(),
-                None,
-                vnc_bind.as_deref(),
-                native_gui,
-                display_size,
-                efi_vars_path.as_deref(),
-                &forward_rules,
-                ssh_port,
-                &shares,
-                vmnet_socket.as_deref(),
-            ));
+            finish_boot(
+                boot_os_kernel(
+                    path,
+                    &file_data,
+                    false,
+                    None,
+                    &disk_configs,
+                    ram_size,
+                    &bootargs,
+                    net_mode.as_deref(),
+                    mac_addr,
+                    cpus,
+                    cpu_model,
+                    serial_log.as_deref(),
+                    &module_paths,
+                    is_multiuser,
+                    root_dev.as_deref(),
+                    None,
+                    vnc_bind.as_deref(),
+                    native_gui,
+                    display_size,
+                    efi_vars_path.as_deref(),
+                    &forward_rules,
+                    ssh_port,
+                    &shares,
+                    vmnet_socket.as_deref(),
+                ),
+                no_reboot,
+            );
             return;
         } else {
             if !shares.is_empty() {
@@ -824,10 +917,12 @@ mod retina_tests {
     }
 }
 
-/// Boots an OS kernel ELF (such as FreeBSD ARM64) with GICv3, multi-vCPU SMP, and Device Tree.
+/// Boots an OS kernel (FreeBSD ARM64 ELF or Linux ARM64 Image) with GICv3, multi-vCPU SMP, and Device Tree.
 fn boot_os_kernel(
     kernel_path: &str,
-    elf_data: &[u8],
+    kernel_data: &[u8],
+    is_linux: bool,
+    initrd_path: Option<&str>,
     disk_configs: &[DiskConfig],
     ram_size: usize,
     bootargs: &str,
@@ -869,9 +964,14 @@ fn boot_os_kernel(
     println!("\x1b[1;36m==================================================\x1b[0m");
     if uefi_firmware.is_some() {
         println!("[VMM] Preparing UEFI/EDK2 boot from '{}'...", kernel_path);
+    } else if is_linux {
+        println!(
+            "[VMM] Preparing to boot Linux ARM64 kernel from '{}'...",
+            kernel_path
+        );
     } else {
         println!(
-            "[VMM] Preparing to boot OS kernel from '{}'...",
+            "[VMM] Preparing to boot FreeBSD ARM64 kernel from '{}'...",
             kernel_path
         );
     }
@@ -1186,6 +1286,41 @@ fn boot_os_kernel(
         );
     }
 
+    // Load optional initrd / initramfs into guest memory
+    let initrd_info = if let Some(path) = initrd_path {
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("\x1b[1;31m[VMM Error] Failed to read initrd file '{}': {}\x1b[0m", path, e);
+                process::exit(1);
+            }
+        };
+        // Place initrd at 144MB offset from RAM base (above kernel & DTB)
+        let initrd_start = DEFAULT_RAM_BASE + 0x0900_0000;
+        let initrd_end = initrd_start + data.len() as u64;
+        if initrd_end > DEFAULT_RAM_BASE + (ram_size as u64) {
+            eprintln!(
+                "\x1b[1;31m[VMM Error] Initrd size ({:.2} MB) exceeds available guest RAM\x1b[0m",
+                data.len() as f64 / (1024.0 * 1024.0)
+            );
+            process::exit(1);
+        }
+        if let Err(e) = vm.memory().write(initrd_start, &data) {
+            eprintln!("\x1b[1;31m[VMM Error] Failed to write initrd to RAM: {}\x1b[0m", e);
+            process::exit(1);
+        }
+        println!(
+            "[VMM] Loaded initrd '{}' ({:.2} MB) at GPA 0x{:08x}..0x{:08x}",
+            path,
+            data.len() as f64 / (1024.0 * 1024.0),
+            initrd_start,
+            initrd_end
+        );
+        Some((initrd_start, initrd_end))
+    } else {
+        None
+    };
+
     let xhci_fdt = vnc_usb.as_ref().map(|_| fdt::XhciMmioDevice {
         base: MMIO_XHCI_BASE,
         size: MMIO_XHCI_SIZE,
@@ -1199,6 +1334,7 @@ fn boot_os_kernel(
         &virtio_devices,
         fb_cfg,
         xhci_fdt,
+        initrd_info,
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -1206,6 +1342,10 @@ fn boot_os_kernel(
             process::exit(1);
         }
     };
+
+    let fw_cfg = FwCfg::new(vm.memory(), dtb_bytes.clone());
+    vm.mmio_mut()
+        .register(MMIO_FW_CFG_BASE, MMIO_FW_CFG_SIZE, Box::new(fw_cfg));
 
     let mut vnc_server = None;
     if let Some(bind_str) = vnc_bind {
@@ -1255,9 +1395,6 @@ fn boot_os_kernel(
             eprintln!("[1;31m[VMM Error] Failed to write DTB to RAM: {e}[0m");
             process::exit(1);
         }
-        let fw_cfg = FwCfg::new(vm.memory(), dtb_bytes);
-        vm.mmio_mut()
-            .register(MMIO_FW_CFG_BASE, MMIO_FW_CFG_SIZE, Box::new(fw_cfg));
         println!("[VMM] Registered QEMU fw_cfg at GPA 0x{MMIO_FW_CFG_BASE:08x}");
         if let Err(e) = vm.map_firmware(0, fw) {
             eprintln!("\x1b[1;31m[VMM Error] {e}\x1b[0m");
@@ -1301,11 +1438,36 @@ fn boot_os_kernel(
         // QEMU starts EDK2 with X0=0; DTB is discovered via fw_cfg `etc/fdt`
         // (and we still plant a copy in RAM). Passing X0=DTB can confuse SEC/PrePi.
         (0u64, 0u64)
+    } else if is_linux {
+        // ---- Direct Linux ARM64 boot ----
+        let loaded = match linux::load_linux_image(kernel_data, &vm.memory(), DEFAULT_RAM_BASE) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "\x1b[1;31m[VMM Error] Failed to load Linux kernel image: {}\x1b[0m",
+                    e
+                );
+                process::exit(1);
+            }
+        };
+        let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000;
+        if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
+            eprintln!(
+                "\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m",
+                e
+            );
+            process::exit(1);
+        }
+        println!(
+            "[VMM] DTB at GPA 0x{dtb_addr:08x} ({} bytes); X0=DTB",
+            dtb_bytes.len()
+        );
+        (loaded.entry_point, dtb_addr)
     } else {
-        // ---- Direct ELF kernel boot (FreeBSD / Linux) ----
+        // ---- Direct ELF kernel boot (FreeBSD) ----
         // Load kernel ELF: FreeBSD locore requires 2MB alignment from RAM base
         let kernel_phys_load = DEFAULT_RAM_BASE + 0x0020_0000; // 0x40200000
-        let loaded = match elf::load_elf64(elf_data, &vm.memory(), kernel_phys_load) {
+        let loaded = match elf::load_elf64(kernel_data, &vm.memory(), kernel_phys_load) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!(
@@ -1562,10 +1724,14 @@ fn boot_os_kernel(
     Ok(vcpu_mgr.reset_requested())
 }
 
-fn finish_boot(result: Result<bool, String>) {
+fn finish_boot(result: Result<bool, String>, no_reboot: bool) {
     match result {
         Ok(false) => {}
         Ok(true) => {
+            if no_reboot {
+                println!("\x1b[1;32m[VMM] VM exited on guest reset (--no-reboot).\x1b[0m");
+                return;
+            }
             // All vCPUs, devices and mappings have been dropped before exec.
             // Re-exec preserves the launch configuration and starts fresh HVF state.
             use std::os::unix::process::CommandExt;

@@ -116,6 +116,22 @@ fetch --no-verify-peer -o - https://www.freebsd.org | head -n 15
 
 For complete architectural details, troubleshooting steps, and NAT forwarding explanations, see [docs/networking.md](docs/networking.md).
 
+### 4. Boot Linux (Alpine / Debian)
+The VMM natively supports direct Linux ARM64 kernel booting (`--linux`, `--initrd`, `--bootargs`):
+```bash
+# Alpine live environment (static IPv4 + DNS; internet works out of the box):
+make alpine
+# Or with direct in-process vmnet using sudo:
+sudo make alpine
+
+# Debian 13 netboot installer (preseeded, IPv4-only; login root:root after install):
+sudo make debian
+
+# Debian 13 nocloud cloud image (serial autologin as root, password root):
+sudo make debian-cloud
+```
+Linux guests can use either unprivileged `vmnet-proxy` or privileged `vmnet` NAT. Alpine and Debian pass static network boot arguments (`ip=192.168.18.2::192.168.18.1:255.255.255.0::eth0:none:1.1.1.1:8.8.8.8`) so they configure immediately. Debian also sets `ipv6.disable=1` because the installer wget prefers IPv6 AAAA records and otherwise stalls with **Bad archive mirror**.
+
 Press `Ctrl-]` to stop the VM and return to the host terminal. This joins VM workers
 and flushes disk backends, but does not shut down the guest OS; shut down inside
 the guest first when possible. Host SIGTERM also requests this cleanup. Guest

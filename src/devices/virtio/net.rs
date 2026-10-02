@@ -403,10 +403,35 @@ impl VmnetBackend {
             })
             .unwrap_or_else(|| "en0".to_string());
 
+        let bridge_cidr = std::process::Command::new("ifconfig")
+            .arg("bridge100")
+            .output()
+            .ok()
+            .and_then(|out| {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for line in stdout.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 && parts[0] == "inet" {
+                        let ip = parts[1];
+                        if let Some((prefix, _)) = ip.rsplit_once('.') {
+                            return Some(format!("{}.0/24", prefix));
+                        }
+                    }
+                }
+                None
+            });
+
+        let nat_from = match bridge_cidr {
+            Some(ref cidr) if cidr != "192.168.18.0/24" => {
+                format!("{{ 192.168.18.0/24, {} }}", cidr)
+            }
+            _ => "192.168.18.0/24".to_string(),
+        };
+
         // Configure macOS Packet Filter NAT anchor com.apple/vmm
         let rules = format!(
-            "nat on {} from 192.168.18.0/24 to any -> ({})\npass in quick on bridge100 all\npass out quick on {} all\n",
-            iface, iface, iface
+            "nat on {} from {} to any -> ({})\npass in quick on bridge100 all\npass out quick on {} all\n",
+            iface, nat_from, iface, iface
         );
 
         if let Ok(mut child) = std::process::Command::new("pfctl")
