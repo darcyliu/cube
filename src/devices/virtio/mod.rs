@@ -3,14 +3,7 @@
 #![allow(dead_code)]
 
 pub mod block;
-pub mod console;
-pub mod input;
 pub mod net;
-pub mod p9;
-pub mod rng;
-
-pub use console::VirtioConsole;
-pub use input::VirtioInput;
 
 // VirtIO MMIO Register Offsets (Modern, Version 2)
 pub const VIRTIO_MMIO_MAGIC_VALUE: u64 = 0x000;
@@ -233,7 +226,7 @@ mod tests {
                 used_ring: 0x300,
                 ..Default::default()
             },
-            GuestMemory::new_test(0, 0x4000),
+            GuestMemory::from_buffer(0, &vec![0; 0x4000]).unwrap(),
         )
     }
     #[test]

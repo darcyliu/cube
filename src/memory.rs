@@ -1,77 +1,47 @@
-//! Guest physical memory management aligned to Apple Silicon page boundaries.
+//! Host buffer of guest RAM. `hv_vm_map` stays in the binary.
 
 #![allow(dead_code)]
 
-use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ptr::NonNull;
 
-use crate::hypervisor::{
-    check_hv, hv_vm_map, hv_vm_unmap, HvResult, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
-};
-
-/// Host page size on Apple Silicon is 16KB (0x4000).
-pub const GUEST_PAGE_SIZE: usize = 0x4000;
+/// Intel Mac hosts use 4 KiB pages. `hv_vm_map` requires that alignment.
+pub const GUEST_PAGE_SIZE: usize = 0x1000;
 
 pub struct GuestMemory {
     ptr: NonNull<u8>,
     layout: Layout,
     guest_base: u64,
     size: usize,
-    mapped: bool,
 }
 
 unsafe impl Send for GuestMemory {}
 unsafe impl Sync for GuestMemory {}
 
 impl GuestMemory {
-    /// Allocates and maps a block of guest physical memory at `guest_base`.
-    /// `size` will be rounded up to the nearest 16KB page multiple.
-    pub fn new(guest_base: u64, requested_size: usize) -> HvResult<Self> {
-        let size = requested_size
+    /// Copy `bytes` into a page-aligned host buffer. The length rounds up to
+    /// [`GUEST_PAGE_SIZE`]. This does not map the buffer into a VM.
+    pub fn from_buffer(guest_base: u64, bytes: &[u8]) -> Result<Self, String> {
+        let size = bytes
+            .len()
             .checked_add(GUEST_PAGE_SIZE - 1)
             .map(|n| n & !(GUEST_PAGE_SIZE - 1))
             .filter(|&n| n > 0 && guest_base.checked_add(n as u64).is_some())
-            .ok_or(crate::hypervisor::HvError(
-                crate::hypervisor::HV_BAD_ARGUMENT,
-            ))?;
+            .ok_or_else(|| "guest memory size is zero or overflows".to_string())?;
         let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE)
-            .map_err(|_| crate::hypervisor::HvError(crate::hypervisor::HV_BAD_ARGUMENT))?;
-
-        // Allocate zeroed memory
+            .map_err(|_| "guest memory alignment failed".to_string())?;
         let raw_ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(raw_ptr).ok_or(crate::hypervisor::HvError(
-            crate::hypervisor::HV_NO_RESOURCES,
-        ))?;
-
-        // Map into VM address space with Read, Write, and Execute permissions
-        let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+        let ptr =
+            NonNull::new(raw_ptr).ok_or_else(|| "guest memory allocation failed".to_string())?;
         unsafe {
-            if let Err(e) = check_hv(hv_vm_map(ptr.as_ptr() as *mut _, guest_base, size, flags)) {
-                dealloc(ptr.as_ptr(), layout);
-                return Err(e);
-            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len());
         }
-
         Ok(Self {
             ptr,
             layout,
             guest_base,
             size,
-            mapped: true,
         })
-    }
-
-    #[cfg(test)]
-    pub fn new_test(guest_base: u64, size: usize) -> Self {
-        let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE).unwrap();
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
-        Self {
-            ptr,
-            layout,
-            guest_base,
-            size,
-            mapped: false,
-        }
     }
 
     pub fn guest_base(&self) -> u64 {
@@ -161,9 +131,6 @@ impl GuestMemory {
 impl Drop for GuestMemory {
     fn drop(&mut self) {
         unsafe {
-            if self.mapped {
-                let _ = hv_vm_unmap(self.guest_base, self.size);
-            }
             dealloc(self.ptr.as_ptr(), self.layout);
         }
     }
@@ -172,17 +139,27 @@ impl Drop for GuestMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounds_host_buffer_up_to_4k() {
+        let m = GuestMemory::from_buffer(0, &[1, 2, 3]).unwrap();
+        assert_eq!(m.size(), GUEST_PAGE_SIZE);
+        let mut buf = [0u8; 3];
+        m.read(0, &mut buf).unwrap();
+        assert_eq!(buf, [1, 2, 3]);
+    }
+
     #[test]
     fn rejects_overflow_and_cross_boundary_accesses() {
-        let m = GuestMemory::new_test(0x4000, 0x4000);
-        for addr in [0, 0x3fff, 0x7fff, u64::MAX] {
+        let m = GuestMemory::from_buffer(0x1000, &vec![0; 0x1000]).unwrap();
+        for addr in [0, 0xfff, 0x1fff, u64::MAX] {
             assert!(m.read_u16(addr).is_err());
             assert!(m.write_u16(addr, 1).is_err());
             assert!(m.write_u32(addr, 1).is_err());
             assert!(m.write_u64(addr, 1).is_err());
         }
-        m.write_u32(0x7ffc, 0x1234).unwrap();
-        assert_eq!(m.read_u32(0x7ffc).unwrap(), 0x1234);
-        assert!(m.checked_offset(0x4000, usize::MAX).is_err());
+        m.write_u32(0x1ffc, 0x1234).unwrap();
+        assert_eq!(m.read_u32(0x1ffc).unwrap(), 0x1234);
+        assert!(m.checked_offset(0x1000, usize::MAX).is_err());
     }
 }

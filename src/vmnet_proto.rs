@@ -244,12 +244,7 @@ pub fn read_exact_deadline(
             return Err(err);
         }
         match stream.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "handshake closed",
-                ))
-            }
+            Ok(0) => return Err(io::Error::new(ErrorKind::UnexpectedEof, "handshake closed")),
             Ok(n) => filled += n,
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
@@ -520,9 +515,7 @@ impl DhcpDnsScope {
         let gateway = ip.len() == 4 && ip[0] == 192 && ip[1] == 168 && ip[3] == 1;
         match self {
             DhcpDnsScope::GatewayOnly => gateway,
-            DhcpDnsScope::SharedBridge => {
-                gateway || (ip[0] == 192 && ip[1] == 168 && ip[2] == 18)
-            }
+            DhcpDnsScope::SharedBridge => gateway || (ip[0] == 192 && ip[1] == 168 && ip[2] == 18),
             DhcpDnsScope::Network { network, prefix } => {
                 if ip.len() != 4 || prefix == 0 || prefix > 32 {
                     return false;
@@ -657,7 +650,10 @@ pub fn select_dns_resolvers(text: &str) -> Vec<Ipv4Addr> {
             if !key.starts_with("nameserver") {
                 continue;
             }
-            let Some(addr) = value.split_whitespace().next().and_then(|tok| tok.parse().ok())
+            let Some(addr) = value
+                .split_whitespace()
+                .next()
+                .and_then(|tok| tok.parse().ok())
             else {
                 continue;
             };
@@ -1007,10 +1003,7 @@ mod tests {
             STATUS_BAD_MAX_FRAME
         );
         assert_eq!(reg.admit(1, &hello(mac(1), 0, 1514)).status, STATUS_OK);
-        assert_eq!(
-            reg.admit(1, &hello(mac(2), 0, 2048)).max_frame,
-            2048
-        );
+        assert_eq!(reg.admit(1, &hello(mac(2), 0, 2048)).max_frame, 2048);
         assert_eq!(reg.len(), 2);
     }
 
@@ -1301,10 +1294,7 @@ resolver #2
   domain : corp.example
   nameserver[0] : 1.2.3.4
 ";
-        assert_eq!(
-            select_dns_resolvers(text),
-            vec![Ipv4Addr::new(9, 9, 9, 9)]
-        );
+        assert_eq!(select_dns_resolvers(text), vec![Ipv4Addr::new(9, 9, 9, 9)]);
     }
 
     #[test]
@@ -1315,10 +1305,7 @@ DNS configuration
 resolver #1
   nameserver[0] : 10.1.2.3
 ";
-        assert_eq!(
-            select_dns_resolvers(text),
-            vec![Ipv4Addr::new(10, 1, 2, 3)]
-        );
+        assert_eq!(select_dns_resolvers(text), vec![Ipv4Addr::new(10, 1, 2, 3)]);
     }
 
     #[test]

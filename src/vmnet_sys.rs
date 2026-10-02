@@ -3,10 +3,10 @@
 //! The in-process `--net vmnet` and bridge paths keep their own calls in
 //! `devices::virtio::net`. This module is what `--vmnet-service` links against.
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use std::time::Duration;
 
@@ -88,7 +88,11 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFRunLoopDefaultMode: *const c_void;
-    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: u8) -> i32;
+    fn CFRunLoopRunInMode(
+        mode: *const c_void,
+        seconds: f64,
+        return_after_source_handled: u8,
+    ) -> i32;
 }
 
 /// vmnet delivers the start completion through this thread's run loop.
@@ -173,7 +177,9 @@ unsafe fn xpc_string(dict: *mut c_void, key: &[u8]) -> String {
     if ptr.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -294,11 +300,13 @@ impl VmnetPort {
         };
         let nat_names = if let Some((gateway, end, mask)) = nat {
             let make = |label: &str, value: &str| {
-                CString::new(value).map_err(|_| {
-                    format!("shared {label} {value} contains a NUL")
-                })
+                CString::new(value).map_err(|_| format!("shared {label} {value} contains a NUL"))
             };
-            match (make("gateway", gateway), make("end", end), make("mask", mask)) {
+            match (
+                make("gateway", gateway),
+                make("end", end),
+                make("mask", mask),
+            ) {
                 (Ok(gateway), Ok(end), Ok(mask)) => Some((gateway, end, mask)),
                 _ => {
                     unsafe { xpc_release(desc) };
@@ -309,11 +317,7 @@ impl VmnetPort {
             None
         };
         unsafe {
-            xpc_dictionary_set_uint64(
-                desc,
-                b"vmnet_operation_mode\0".as_ptr() as *const i8,
-                mode,
-            );
+            xpc_dictionary_set_uint64(desc, b"vmnet_operation_mode\0".as_ptr() as *const i8, mode);
             if let Some(name) = iface_name.as_ref() {
                 xpc_dictionary_set_string(
                     desc,
@@ -396,8 +400,8 @@ impl VmnetPort {
         } else {
             info.mac.clone()
         };
-        let (reported_network, shared_gateway, shared_cidr, host_iface) =
-            if let Some(iface) = bridge_if
+        let (reported_network, shared_gateway, shared_cidr, host_iface) = if let Some(iface) =
+            bridge_if
         {
             eprintln!(
                 "[vmnet] bridged interface up on {iface} mtu={} max_packet={} port_mac={port_mac} read_budget={read_budget}",
@@ -492,10 +496,23 @@ impl VmnetPort {
         };
         let mut pktcnt = 1i32;
         let code = unsafe { vmnet_write(self.interface, &mut desc, &mut pktcnt) };
-        self.finish(VmnetOp::Write, code, pktcnt, frame.len() as u64, frame.len())
+        self.finish(
+            VmnetOp::Write,
+            code,
+            pktcnt,
+            frame.len() as u64,
+            frame.len(),
+        )
     }
 
-    fn finish(&mut self, op: VmnetOp, code: u32, pktcnt: i32, size: u64, buf_len: usize) -> IoOutcome {
+    fn finish(
+        &mut self,
+        op: VmnetOp,
+        code: u32,
+        pktcnt: i32,
+        size: u64,
+        buf_len: usize,
+    ) -> IoOutcome {
         let decision = classify_vmnet_status(op, code, pktcnt, self.seen_write_success);
         if decision.set_latch {
             self.seen_write_success = true;

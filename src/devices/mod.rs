@@ -1,12 +1,7 @@
-//! MMIO subsystem and device bus.
+//! MMIO bus and devices that do not call the hypervisor.
 
-pub mod display;
 pub mod fw_cfg;
-pub mod layout;
 pub mod pflash;
-pub mod rtc;
-pub mod uart;
-pub mod usb;
 pub mod virtio;
 
 use std::sync::{Arc, Mutex};

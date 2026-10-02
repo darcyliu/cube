@@ -1,9 +1,7 @@
-//! Minimal Intel-command-set CFI parallel flash (QEMU pflash_cfi01 subset).
+//! Intel CFI flash (QEMU pflash_cfi01 subset) for an OVMF variable store.
 //!
-//! EDK2 ArmVirt NorFlashDxe talks CFI to the EFI variable bank at 0x0400_0000.
-//! Mapping that GPA as plain RAM makes status/query reads look wrong and hangs
-//! Variable services — this MMIO model returns a ready status and a valid CFI
-//! table, and programs/erases into a backing buffer.
+//! `QemuFlashDetected` accepts the device only when clear-status (`0x50`)
+//! leaves the following status read (`0x70`) as `0x00`, not the ready bit.
 
 use super::MmioDevice;
 use std::fs::{File, OpenOptions};
@@ -55,8 +53,8 @@ impl Drop for CfiPflash {
 }
 
 impl CfiPflash {
-    pub fn new(storage: Vec<u8>) -> Self {
-        let block_size: u32 = 256 * 1024;
+    pub fn new(storage: Vec<u8>, block_size: u32) -> Self {
+        assert!(block_size != 0, "cfi block size");
         let len = storage.len() as u32;
         let blocks_per_device = (len / block_size).max(1);
         let mut cfi = [0u8; 0x60];
@@ -74,7 +72,13 @@ impl CfiPflash {
         cfi[0x23] = 0x04;
         cfi[0x24] = 0x04;
         cfi[0x25] = 0x04;
-        let size_log2 = (len.next_power_of_two().trailing_zeros() as u8).max(1);
+        // JEDEC device size is log2. 540672 is not a power of two; floor(log2)
+        // is 19. next_power_of_two would claim 1 MiB and overlap the code flash.
+        let size_log2 = if len == 0 {
+            0
+        } else {
+            (31 - len.leading_zeros()) as u8
+        };
         cfi[0x27] = size_log2;
         cfi[0x28] = 0x02; // x8/x16
         cfi[0x2a] = 0x08; // max buffered write = 256 bytes
@@ -100,7 +104,11 @@ impl CfiPflash {
     }
 
     /// Keep the template immutable; each VM owns a separately locked store.
-    pub fn open(path: &std::path::Path, template: Vec<u8>) -> Result<Self, String> {
+    pub fn open(
+        path: &std::path::Path,
+        template: Vec<u8>,
+        block_size: u32,
+    ) -> Result<Self, String> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -124,7 +132,7 @@ impl CfiPflash {
             file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
             bytes
         };
-        let mut flash = Self::new(storage);
+        let mut flash = Self::new(storage, block_size);
         flash.backing = Some(file);
         Ok(flash)
     }
@@ -149,7 +157,7 @@ impl CfiPflash {
     fn write_storage(&mut self, offset: u64, data: u64, size: usize) {
         let off = offset as usize;
         if off >= self.storage.len() {
-            self.status |= 0x10;
+            self.status |= STATUS_READY | 0x10;
             return;
         }
         let bytes = data.to_le_bytes();
@@ -168,21 +176,42 @@ impl CfiPflash {
         } else {
             self.persist(off, end);
         }
-        self.status |= STATUS_READY;
+        if self.persistence_error.is_none() {
+            self.status = STATUS_READY;
+        } else {
+            self.status |= STATUS_READY;
+        }
     }
 
     fn erase_block(&mut self, offset: u64) {
-        let off = offset as usize;
+        let Some(off) = usize::try_from(offset).ok() else {
+            self.status = STATUS_READY | 0x20;
+            return;
+        };
         let bs = self.block_size as usize;
-        let base = (off / bs) * bs;
-        let end = (base + bs).min(self.storage.len());
-        if base < self.storage.len() {
-            for b in &mut self.storage[base..end] {
-                *b = 0xff;
-            }
-            self.persist(base, end);
+        if bs == 0 || off >= self.storage.len() {
+            self.status = STATUS_READY | 0x20;
+            return;
         }
-        self.status |= STATUS_READY;
+        let base = (off / bs) * bs;
+        let Some(end) = base.checked_add(bs) else {
+            self.status = STATUS_READY | 0x20;
+            return;
+        };
+        // One confirm erases one block. A span past the image is not a partial erase.
+        if end > self.storage.len() {
+            self.status = STATUS_READY | 0x20;
+            return;
+        }
+        for b in &mut self.storage[base..end] {
+            *b = 0xff;
+        }
+        self.persist(base, end);
+        if self.persistence_error.is_none() {
+            self.status = STATUS_READY;
+        } else {
+            self.status |= STATUS_READY;
+        }
     }
 
     fn cfi_byte(&self, offset: u64) -> u8 {
@@ -228,8 +257,9 @@ impl MmioDevice for CfiPflash {
         let size = size.clamp(1, 8);
         match self.cmd {
             CMD_READ_ARRAY | CMD_READ_ARRAY_ALT => self.read_data(offset, size),
-            CMD_STATUS | CMD_PROGRAM | CMD_PROGRAM_ALT | CMD_ERASE | CMD_CLEAR_STATUS
-            | CMD_WRITE_BUFFER => Self::replicate_byte(self.status, size),
+            CMD_STATUS | CMD_PROGRAM | CMD_PROGRAM_ALT | CMD_ERASE | CMD_WRITE_BUFFER => {
+                Self::replicate_byte(self.status, size)
+            }
             CMD_CFI_QUERY => Self::replicate_byte(self.cfi_byte(offset), size),
             CMD_DEVICE_ID => {
                 let boff = (offset as usize) & 0xff;
@@ -315,7 +345,8 @@ impl MmioDevice for CfiPflash {
                 self.cycle = Cycle::EraseConfirm { offset };
             }
             CMD_CLEAR_STATUS => {
-                self.status = STATUS_READY;
+                // OVMF reads the array byte back, then 0x70, and wants 0x00.
+                self.status = 0x00;
                 self.set_read_array();
             }
             CMD_STATUS => {
@@ -348,7 +379,7 @@ mod tests {
     fn buffered_program_persists_on_confirm_at_data_addresses() {
         let dir = crate::test_support::TestDir::new();
         let path = dir.path("buffered-vars");
-        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000], 4096).unwrap();
         // Two x16 chips: EDK2 duplicates the command/count in both lanes.
         flash.write(0, 0x00e8_00e8, 4);
         flash.write(0, 0x0001_0001, 4); // two words
@@ -365,7 +396,7 @@ mod tests {
         );
         flash.shutdown().unwrap();
         drop(flash);
-        let mut reopened = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        let mut reopened = CfiPflash::open(&path, vec![0xff; 0x40000], 4096).unwrap();
         assert_eq!(reopened.read(0x100, 8), 0xabcdef0112345678);
     }
 
@@ -373,18 +404,63 @@ mod tests {
     fn variables_survive_reopen_and_store_is_exclusive() {
         let dir = crate::test_support::TestDir::new();
         let path = dir.path("vars");
-        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
-        assert!(CfiPflash::open(&path, vec![0xff; 0x40000]).is_err());
+        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000], 4096).unwrap();
+        assert!(CfiPflash::open(&path, vec![0xff; 0x40000], 4096).is_err());
         flash.write(0, CMD_PROGRAM as u64, 4);
         flash.write(0x100, 0x12345678, 4);
         flash.shutdown().unwrap();
         drop(flash);
-        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000], 4096).unwrap();
         assert_eq!(flash.read(0x100, 4), 0x12345678);
         flash.write(0, CMD_ERASE as u64, 4);
         flash.write(0, CMD_CONFIRM as u64, 4);
         drop(flash);
-        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000]).unwrap();
+        let mut flash = CfiPflash::open(&path, vec![0xff; 0x40000], 4096).unwrap();
         assert_eq!(flash.read(0x100, 4), 0xffffffff);
+    }
+
+    #[test]
+    fn erase_clears_one_4k_block_of_ovmf_vars() {
+        const VARS_LEN: usize = 540672;
+        let mut flash = CfiPflash::new(vec![0xa5; VARS_LEN], 4096);
+        assert_eq!(flash.block_size, 4096);
+        flash.write(0, 0x98, 1);
+        assert_eq!(flash.read(0x27, 1), 19);
+        assert_eq!(flash.read(0x2c, 1), 1);
+        assert_eq!(flash.read(0x2d, 1), 0x83);
+        assert_eq!(flash.read(0x2e, 1), 0x00);
+        assert_eq!(flash.read(0x2f, 1), 0x10);
+        assert_eq!(flash.read(0x30, 1), 0x00);
+        let blocks = (flash.read(0x2d, 1) as u32 | ((flash.read(0x2e, 1) as u32) << 8)) + 1;
+        let region = (flash.read(0x2f, 1) as u32 | ((flash.read(0x30, 1) as u32) << 8)) * 256;
+        assert_eq!(blocks, 132);
+        assert_eq!(blocks * region, VARS_LEN as u32);
+        assert_eq!(blocks * flash.block_size, VARS_LEN as u32);
+
+        flash.write(0x1000, 0x20, 1);
+        flash.write(0x1000, 0xd0, 1);
+        assert!(flash.storage[0x1000..0x2000].iter().all(|&b| b == 0xff));
+        assert!(flash.storage[..0x1000].iter().all(|&b| b == 0xa5));
+        assert!(flash.storage[0x2000..].iter().all(|&b| b == 0xa5));
+        assert_eq!(flash.status & 0xa0, 0x80);
+    }
+
+    #[test]
+    fn qemu_flash_detected_accepts_clear_status_and_program() {
+        let mut flash = CfiPflash::new(vec![0xff; 540672], 4096);
+        assert_eq!(flash.read(0, 1), 0xff);
+        flash.write(0, 0x50, 1);
+        assert_eq!(flash.read(0, 1), 0xff);
+        assert_eq!(flash.storage[0], 0xff);
+        flash.write(0, 0x70, 1);
+        assert_eq!(flash.read(0, 1), 0x00);
+        flash.write(0, 0x10, 1);
+        flash.write(0, 0xff, 1);
+        flash.write(0, 0x70, 1);
+        let status = flash.read(0, 1);
+        assert_eq!(status & 0x10, 0);
+        assert_eq!(status & 0x80, 0x80);
+        flash.write(0, 0xff, 1);
+        assert_eq!(flash.read(0, 1), 0xff);
     }
 }

@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static BLK_IOS: AtomicU64 = AtomicU64::new(0);
 
 use super::*;
+use crate::cow::{self, CLUSTER_SIZE as COW_CLUSTER_SIZE, MAGIC as COW_MAGIC};
 use crate::devices::MmioDevice;
 use crate::memory::GuestMemory;
-use vmm::cow::{self, CLUSTER_SIZE as COW_CLUSTER_SIZE, MAGIC as COW_MAGIC};
 
 // VirtIO Block Request Types
 const VIRTIO_BLK_T_IN: u32 = 0; // Read from disk
@@ -365,6 +365,7 @@ pub struct VirtioBlock {
     queue_sel: u32,
     used_idx: u16,
     interrupt_status: u32,
+    #[allow(dead_code)]
     irq_num: u32,
     serial_id: String,
     mem: Arc<GuestMemory>,
@@ -503,12 +504,6 @@ impl VirtioBlock {
 
         if processed_any {
             self.interrupt_status |= 1;
-            // Always raise: vtblk_ident() busy-polls GET_ID but later bios
-            // wait on the IRQ. Skipping for NO_INTERRUPT wedged attach.
-            unsafe {
-                crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
-            }
-            crate::vcpu::kick_vcpu();
         }
     }
 
@@ -799,11 +794,6 @@ impl MmioDevice for VirtioBlock {
             }
             VIRTIO_MMIO_INTERRUPT_ACK => {
                 self.interrupt_status &= !(data as u32);
-                if self.interrupt_status == 0 {
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-                    }
-                }
             }
             VIRTIO_MMIO_STATUS => {
                 self.status = data as u32;
@@ -815,9 +805,6 @@ impl MmioDevice for VirtioBlock {
                     };
                     self.used_idx = 0;
                     self.interrupt_status = 0;
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-                    }
                 }
             }
             _ => {}
@@ -914,7 +901,7 @@ mod tests {
     fn huge_sector_and_wrong_descriptor_direction_are_rejected_before_io() {
         let dir = TestDir::new();
         let path = dir.file("disk", &[0x11; 1024]);
-        let mem = Arc::new(GuestMemory::new_test(0, 0x10000));
+        let mem = Arc::new(GuestMemory::from_buffer(0, &vec![0; 0x10000]).unwrap());
         let mut disk = VirtioBlock::from_raw(name(&path), false, 34, "test", mem.clone()).unwrap();
         disk.queue.ready = true;
         disk.queue.desc_table = 0x1000;

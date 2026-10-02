@@ -624,7 +624,9 @@ fn proxy_status(status: u32, mac: [u8; 6]) -> String {
         crate::vmnet_proto::STATUS_TOO_MANY_CLIENTS => {
             "Cannot start vmnet: vmnet service rejected the handshake (status 6).".into()
         }
-        other => format!("Cannot start vmnet: vmnet service rejected the handshake (status {other})."),
+        other => {
+            format!("Cannot start vmnet: vmnet service rejected the handshake (status {other}).")
+        }
     }
 }
 
@@ -793,11 +795,12 @@ pub struct VirtioNetInner {
     tx_queue: VirtQueue,
     queue_sel: u32,
     interrupt_status: u32,
+    #[allow(dead_code)]
     irq_num: u32,
     mem: Arc<GuestMemory>,
     backend: Arc<Mutex<Box<dyn NetBackend>>>,
     rx_backlog: VecDeque<Vec<u8>>,
-    /// GIC SPI line currently driven high.
+    /// IRQ line currently driven high.
     irq_asserted: bool,
     /// Used-buffer event arrived while the SPI was already high. Re-raise after ACK.
     irq_pending_after_ack: bool,
@@ -889,10 +892,6 @@ impl VirtioNetInner {
         self.irq_pending_after_ack = false;
         self.interrupt_status |= 1;
         NET_STATS.irq_raise.fetch_add(1, Ordering::Relaxed);
-        unsafe {
-            crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
-        }
-        crate::vcpu::kick_vcpu();
     }
 
     fn try_assert_irq(&mut self) {
@@ -908,9 +907,6 @@ impl VirtioNetInner {
         self.last_ack = std::time::Instant::now();
         if self.irq_asserted {
             self.irq_asserted = false;
-            unsafe {
-                crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-            }
         }
         if self.irq_pending_after_ack {
             self.interrupt_status |= 1;
@@ -1225,7 +1221,11 @@ impl VirtioNet {
                 match VmnetBackend::new_bridged(&host_if) {
                     Ok(b) => {
                         let iface = b.interface;
-                        (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)), None)
+                        (
+                            Box::new(b) as Box<dyn NetBackend>,
+                            Some(SendPtr(iface)),
+                            None,
+                        )
                     }
                     Err(e) => return Err(bridge_start_failure(&host_if, &e)),
                 }
@@ -1243,10 +1243,7 @@ impl VirtioNet {
                 };
                 match SocketBackend::connect(&path, mac) {
                     Ok((backend, rx, max_frame)) => {
-                        println!(
-                            "[VirtIO-Net] vmnet-proxy connected to {}",
-                            path.display()
-                        );
+                        println!("[VirtIO-Net] vmnet-proxy connected to {}", path.display());
                         (
                             Box::new(backend) as Box<dyn NetBackend>,
                             None,
@@ -1259,7 +1256,11 @@ impl VirtioNet {
             "vmnet" => match VmnetBackend::new() {
                 Ok(b) => {
                     let iface = b.interface;
-                    (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)), None)
+                    (
+                        Box::new(b) as Box<dyn NetBackend>,
+                        Some(SendPtr(iface)),
+                        None,
+                    )
                 }
                 Err(e) => {
                     return Err(format!(
@@ -1451,7 +1452,7 @@ mod backend_tests {
 
     #[test]
     fn reset_discards_firmware_queues_before_os_reinitializes_them() {
-        let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let memory = Arc::new(GuestMemory::from_buffer(0, &vec![0; 0x4000]).unwrap());
         let mut inner = VirtioNetInner::new([0; 6], 35, memory, Box::new(UserMockBackend::new()));
         inner.status = VIRTIO_STATUS_DRIVER_OK;
         inner.driver_features = VIRTIO_F_VERSION_1_BIT;
@@ -1510,7 +1511,7 @@ mod backend_tests {
 
     #[test]
     fn failed_or_unknown_backends_do_not_become_mock() {
-        let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let memory = Arc::new(GuestMemory::from_buffer(0, &vec![0; 0x4000]).unwrap());
         let dir = crate::test_support::TestDir::new();
         let missing = format!("tap:{}", dir.path("missing-tap").display());
         for mode in [missing.as_str(), "typo"] {
@@ -1521,7 +1522,7 @@ mod backend_tests {
 
     #[test]
     fn vmnet_connect_refused_does_not_select_mock() {
-        let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let memory = Arc::new(GuestMemory::from_buffer(0, &vec![0; 0x4000]).unwrap());
         let dir = crate::test_support::TestDir::new();
         let path = dir.path("vmnet.sock");
         let err = match VirtioNet::new(
@@ -1551,9 +1552,7 @@ mod backend_tests {
         packet[42..45].copy_from_slice(&[2, 1, 6]);
         packet[58..62].copy_from_slice(&[192, 168, 18, 20]);
         packet[70..76].copy_from_slice(&mac);
-        packet[278..292].copy_from_slice(&[
-            99, 130, 83, 99, 6, 4, 192, 168, 18, 1, 53, 1, 5, 255,
-        ]);
+        packet[278..292].copy_from_slice(&[99, 130, 83, 99, 6, 4, 192, 168, 18, 1, 53, 1, 5, 255]);
         patch_dhcp_response(&mut packet);
         assert_eq!(
             dhcp_guest_address(&packet, mac),
@@ -1711,9 +1710,6 @@ impl MmioDevice for VirtioNet {
                     // FreeBSD starts fresh rings at index zero after reset.
                     inner.reset();
                     *self.guest_address.lock().unwrap() = None;
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(inner.irq_num, false);
-                    }
                 } else if (inner.status & VIRTIO_STATUS_FAILED) != 0 {
                     eprintln!("[VirtIO-Net] Guest marked device as FAILED");
                 }

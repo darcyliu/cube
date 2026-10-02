@@ -52,9 +52,11 @@ fn inspect_and_export_commands_use_read_only_sources() {
     assert!(exported.status.success());
     let result = fs::read(&output).unwrap();
     assert_eq!(result.len(), (CLUSTER_SIZE + 5) as usize);
-    assert!(result[..CLUSTER_SIZE as usize]
-        .iter()
-        .all(|&byte| byte == 7));
+    assert!(
+        result[..CLUSTER_SIZE as usize]
+            .iter()
+            .all(|&byte| byte == 7)
+    );
     assert_eq!(&result[CLUSTER_SIZE as usize..], &[2u8; 5]);
     assert_eq!(fs::read(&base).unwrap()[0], 1);
     assert_eq!(fs::read(&overlay).unwrap(), bytes);

@@ -2,7 +2,7 @@
 use std::env;
 use std::path::Path;
 use std::process;
-use vmm::cow::{CowImage, CLUSTER_SIZE};
+use vmm::cow::{CLUSTER_SIZE, CowImage};
 
 fn run(args: &[String]) -> Result<(), String> {
     if args.len() < 4 || !matches!(args[1].as_str(), "inspect" | "export") {

@@ -1,111 +1,86 @@
-//! Low-level bindings and abstractions for Apple's Hypervisor.framework on macOS ARM64.
+//! VMX Hypervisor.framework bindings from the macOS 10.15 SDK.
+//! Nothing in this crate calls these functions yet.
 
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 
 use std::fmt;
 
 pub type hv_return_t = i32;
+pub type hv_vcpuid_t = libc::c_uint;
+pub type hv_vm_options_t = u64;
+pub type hv_vcpu_options_t = u64;
+pub type hv_memory_flags_t = u64;
+pub type hv_gpaddr_t = u64;
+/// C `hv_x86_reg_t` is an enum that fits in `int`.
+pub type hv_x86_reg_t = i32;
 
 pub const HV_SUCCESS: hv_return_t = 0;
-pub const HV_ERROR: hv_return_t = -85377023; // 0xfae94001 as signed i32
-pub const HV_BUSY: hv_return_t = -85377022;
-pub const HV_BAD_ARGUMENT: hv_return_t = -85377021;
-pub const HV_ILLEGAL_GUEST_STATE: hv_return_t = -85377020;
-pub const HV_NO_RESOURCES: hv_return_t = -85377019;
-pub const HV_NO_DEVICE: hv_return_t = -85377018;
-pub const HV_DENIED: hv_return_t = -85377017;
-pub const HV_EXISTS: hv_return_t = -85377016;
-pub const HV_UNSUPPORTED: hv_return_t = -85377009;
+pub const HV_ERROR: hv_return_t = 0xfae9_4001_u32 as i32;
+pub const HV_BUSY: hv_return_t = 0xfae9_4002_u32 as i32;
+pub const HV_BAD_ARGUMENT: hv_return_t = 0xfae9_4003_u32 as i32;
+pub const HV_NO_RESOURCES: hv_return_t = 0xfae9_4005_u32 as i32;
+pub const HV_NO_DEVICE: hv_return_t = 0xfae9_4006_u32 as i32;
+pub const HV_UNSUPPORTED: hv_return_t = 0xfae9_400f_u32 as i32;
 
-// Memory mapping permissions
-pub const HV_MEMORY_READ: u64 = 1 << 0;
-pub const HV_MEMORY_WRITE: u64 = 1 << 1;
-pub const HV_MEMORY_EXEC: u64 = 1 << 2;
+pub const HV_VM_DEFAULT: hv_vm_options_t = 0;
+pub const HV_VCPU_DEFAULT: hv_vcpu_options_t = 0;
 
-// Exit reasons
-pub const HV_EXIT_REASON_CANCELED: u32 = 0;
-pub const HV_EXIT_REASON_EXCEPTION: u32 = 1;
-pub const HV_EXIT_REASON_VTIMER_ACTIVATED: u32 = 2;
-pub const HV_EXIT_REASON_UNKNOWN: u32 = 3;
+pub const HV_MEMORY_READ: hv_memory_flags_t = 1 << 0;
+pub const HV_MEMORY_WRITE: hv_memory_flags_t = 1 << 1;
+pub const HV_MEMORY_EXEC: hv_memory_flags_t = 1 << 2;
 
-// Register indices (HV_REG_*)
-pub const HV_REG_X0: u32 = 0;
-pub const HV_REG_X1: u32 = 1;
-pub const HV_REG_X2: u32 = 2;
-pub const HV_REG_X3: u32 = 3;
-pub const HV_REG_X4: u32 = 4;
-pub const HV_REG_X5: u32 = 5;
-pub const HV_REG_X6: u32 = 6;
-pub const HV_REG_X7: u32 = 7;
-pub const HV_REG_X8: u32 = 8;
-pub const HV_REG_X9: u32 = 9;
-pub const HV_REG_X10: u32 = 10;
-pub const HV_REG_X11: u32 = 11;
-pub const HV_REG_X12: u32 = 12;
-pub const HV_REG_X13: u32 = 13;
-pub const HV_REG_X14: u32 = 14;
-pub const HV_REG_X15: u32 = 15;
-pub const HV_REG_X16: u32 = 16;
-pub const HV_REG_X17: u32 = 17;
-pub const HV_REG_X18: u32 = 18;
-pub const HV_REG_X19: u32 = 19;
-pub const HV_REG_X20: u32 = 20;
-pub const HV_REG_X21: u32 = 21;
-pub const HV_REG_X22: u32 = 22;
-pub const HV_REG_X23: u32 = 23;
-pub const HV_REG_X24: u32 = 24;
-pub const HV_REG_X25: u32 = 25;
-pub const HV_REG_X26: u32 = 26;
-pub const HV_REG_X27: u32 = 27;
-pub const HV_REG_X28: u32 = 28;
-pub const HV_REG_X29: u32 = 29;
-pub const HV_REG_FP: u32 = 29;
-pub const HV_REG_X30: u32 = 30;
-pub const HV_REG_LR: u32 = 30;
-pub const HV_REG_PC: u32 = 31;
-pub const HV_REG_FPCR: u32 = 32;
-pub const HV_REG_FPSR: u32 = 33;
-pub const HV_REG_CPSR: u32 = 34;
-
-// System registers (HV_SYS_REG_*)
-pub const HV_SYS_REG_MIDR_EL1: u16 = 0xc000;
-pub const HV_SYS_REG_MPIDR_EL1: u16 = 0xc005;
-pub const HV_SYS_REG_ID_AA64ISAR0_EL1: u16 = 0xc030;
-pub const HV_SYS_REG_SCTLR_EL1: u16 = 0xc080;
-pub const HV_SYS_REG_CPACR_EL1: u16 = 0xc082;
-pub const HV_SYS_REG_TTBR0_EL1: u16 = 0xc100;
-pub const HV_SYS_REG_TTBR1_EL1: u16 = 0xc101;
-pub const HV_SYS_REG_TCR_EL1: u16 = 0xc102;
-pub const HV_SYS_REG_SPSR_EL1: u16 = 0xc200;
-pub const HV_SYS_REG_ELR_EL1: u16 = 0xc201;
-pub const HV_SYS_REG_SP_EL0: u16 = 0xc208;
-pub const HV_SYS_REG_ESR_EL1: u16 = 0xc290;
-pub const HV_SYS_REG_FAR_EL1: u16 = 0xc300;
-pub const HV_SYS_REG_MAIR_EL1: u16 = 0xc510;
-pub const HV_SYS_REG_VBAR_EL1: u16 = 0xc600;
-pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
-pub const HV_SYS_REG_CNTV_CTL_EL0: u16 = 0xdf19;
-pub const HV_SYS_REG_CNTV_CVAL_EL0: u16 = 0xdf1a;
-
-pub const CNTV_CTL_ENABLE: u64 = 1 << 0;
-pub const CNTV_CTL_IMASK: u64 = 1 << 1;
-pub const CNTV_CTL_ISTATUS: u64 = 1 << 2;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct HvVcpuExitException {
-    pub syndrome: u64,
-    pub virtual_address: u64,
-    pub physical_address: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct HvVcpuExit {
-    pub reason: u32,
-    _pad: u32,
-    pub exception: HvVcpuExitException,
-}
+pub const HV_X86_RIP: hv_x86_reg_t = 0;
+pub const HV_X86_RFLAGS: hv_x86_reg_t = 1;
+pub const HV_X86_RAX: hv_x86_reg_t = 2;
+pub const HV_X86_RCX: hv_x86_reg_t = 3;
+pub const HV_X86_RDX: hv_x86_reg_t = 4;
+pub const HV_X86_RBX: hv_x86_reg_t = 5;
+pub const HV_X86_RSI: hv_x86_reg_t = 6;
+pub const HV_X86_RDI: hv_x86_reg_t = 7;
+pub const HV_X86_RSP: hv_x86_reg_t = 8;
+pub const HV_X86_RBP: hv_x86_reg_t = 9;
+pub const HV_X86_R8: hv_x86_reg_t = 10;
+pub const HV_X86_R9: hv_x86_reg_t = 11;
+pub const HV_X86_R10: hv_x86_reg_t = 12;
+pub const HV_X86_R11: hv_x86_reg_t = 13;
+pub const HV_X86_R12: hv_x86_reg_t = 14;
+pub const HV_X86_R13: hv_x86_reg_t = 15;
+pub const HV_X86_R14: hv_x86_reg_t = 16;
+pub const HV_X86_R15: hv_x86_reg_t = 17;
+pub const HV_X86_CS: hv_x86_reg_t = 18;
+pub const HV_X86_SS: hv_x86_reg_t = 19;
+pub const HV_X86_DS: hv_x86_reg_t = 20;
+pub const HV_X86_ES: hv_x86_reg_t = 21;
+pub const HV_X86_FS: hv_x86_reg_t = 22;
+pub const HV_X86_GS: hv_x86_reg_t = 23;
+pub const HV_X86_IDT_BASE: hv_x86_reg_t = 24;
+pub const HV_X86_IDT_LIMIT: hv_x86_reg_t = 25;
+pub const HV_X86_GDT_BASE: hv_x86_reg_t = 26;
+pub const HV_X86_GDT_LIMIT: hv_x86_reg_t = 27;
+pub const HV_X86_LDTR: hv_x86_reg_t = 28;
+pub const HV_X86_LDT_BASE: hv_x86_reg_t = 29;
+pub const HV_X86_LDT_LIMIT: hv_x86_reg_t = 30;
+pub const HV_X86_LDT_AR: hv_x86_reg_t = 31;
+pub const HV_X86_TR: hv_x86_reg_t = 32;
+pub const HV_X86_TSS_BASE: hv_x86_reg_t = 33;
+pub const HV_X86_TSS_LIMIT: hv_x86_reg_t = 34;
+pub const HV_X86_TSS_AR: hv_x86_reg_t = 35;
+pub const HV_X86_CR0: hv_x86_reg_t = 36;
+pub const HV_X86_CR1: hv_x86_reg_t = 37;
+pub const HV_X86_CR2: hv_x86_reg_t = 38;
+pub const HV_X86_CR3: hv_x86_reg_t = 39;
+pub const HV_X86_CR4: hv_x86_reg_t = 40;
+pub const HV_X86_DR0: hv_x86_reg_t = 41;
+pub const HV_X86_DR1: hv_x86_reg_t = 42;
+pub const HV_X86_DR2: hv_x86_reg_t = 43;
+pub const HV_X86_DR3: hv_x86_reg_t = 44;
+pub const HV_X86_DR4: hv_x86_reg_t = 45;
+pub const HV_X86_DR5: hv_x86_reg_t = 46;
+pub const HV_X86_DR6: hv_x86_reg_t = 47;
+pub const HV_X86_DR7: hv_x86_reg_t = 48;
+pub const HV_X86_TPR: hv_x86_reg_t = 49;
+pub const HV_X86_XCR0: hv_x86_reg_t = 50;
+pub const HV_X86_REGISTERS_MAX: hv_x86_reg_t = 51;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvError(pub hv_return_t);
@@ -117,13 +92,10 @@ impl fmt::Display for HvError {
             HV_ERROR => write!(f, "HV_ERROR: generic error"),
             HV_BUSY => write!(f, "HV_BUSY: resource busy"),
             HV_BAD_ARGUMENT => write!(f, "HV_BAD_ARGUMENT: invalid argument"),
-            HV_ILLEGAL_GUEST_STATE => write!(f, "HV_ILLEGAL_GUEST_STATE: guest in illegal state"),
             HV_NO_RESOURCES => write!(f, "HV_NO_RESOURCES: out of resources"),
             HV_NO_DEVICE => write!(f, "HV_NO_DEVICE: no device"),
-            HV_DENIED => write!(f, "HV_DENIED: access denied (check entitlements / code signing)"),
-            HV_EXISTS => write!(f, "HV_EXISTS: resource already exists"),
             HV_UNSUPPORTED => write!(f, "HV_UNSUPPORTED: operation unsupported"),
-            other => write!(f, "Hypervisor error: 0x{:08x}", other),
+            other => write!(f, "Hypervisor error: 0x{other:08x}"),
         }
     }
 }
@@ -142,77 +114,28 @@ pub fn check_hv(ret: hv_return_t) -> HvResult<()> {
 }
 
 unsafe extern "C" {
-    pub fn hv_vm_create(config: *const core::ffi::c_void) -> hv_return_t;
+    pub fn hv_vm_create(flags: hv_vm_options_t) -> hv_return_t;
     pub fn hv_vm_destroy() -> hv_return_t;
     pub fn hv_vm_map(
-        addr: *mut core::ffi::c_void,
-        ipa: u64,
+        uva: *const core::ffi::c_void,
+        gpa: hv_gpaddr_t,
         size: usize,
-        flags: u64,
+        flags: hv_memory_flags_t,
     ) -> hv_return_t;
-    pub fn hv_vm_unmap(ipa: u64, size: usize) -> hv_return_t;
 
-    pub fn hv_vcpu_create(
-        vcpu: *mut u64,
-        exit: *mut *mut HvVcpuExit,
-        config: *const core::ffi::c_void,
+    pub fn hv_vcpu_create(vcpu: *mut hv_vcpuid_t, flags: hv_vcpu_options_t) -> hv_return_t;
+    pub fn hv_vcpu_run(vcpu: hv_vcpuid_t) -> hv_return_t;
+    pub fn hv_vcpu_run_until(vcpu: hv_vcpuid_t, deadline: u64) -> hv_return_t;
+    pub fn hv_vcpu_interrupt(vcpus: *const hv_vcpuid_t, vcpu_count: libc::c_uint) -> hv_return_t;
+
+    pub fn hv_vcpu_read_register(
+        vcpu: hv_vcpuid_t,
+        reg: hv_x86_reg_t,
+        value: *mut u64,
     ) -> hv_return_t;
-    pub fn hv_vcpu_destroy(vcpu: u64) -> hv_return_t;
-    pub fn hv_vcpu_run(vcpu: u64) -> hv_return_t;
-    pub fn hv_vcpus_exit(vcpus: *const u64, vcpu_count: u32) -> hv_return_t;
+    pub fn hv_vcpu_write_register(vcpu: hv_vcpuid_t, reg: hv_x86_reg_t, value: u64) -> hv_return_t;
 
-    pub fn hv_vcpu_get_reg(vcpu: u64, reg: u32, value: *mut u64) -> hv_return_t;
-    pub fn hv_vcpu_set_reg(vcpu: u64, reg: u32, value: u64) -> hv_return_t;
-
-    pub fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> hv_return_t;
-    pub fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> hv_return_t;
-
-    pub fn hv_vcpu_get_vtimer_mask(vcpu: u64, vtimer_is_masked: *mut bool) -> hv_return_t;
-    pub fn hv_vcpu_set_vtimer_mask(vcpu: u64, vtimer_is_masked: bool) -> hv_return_t;
-
-    // GIC v3 In-Kernel Device APIs (macOS 15+)
-    pub fn hv_gic_config_create() -> *mut core::ffi::c_void;
-    pub fn hv_gic_config_set_distributor_base(
-        config: *mut core::ffi::c_void,
-        distributor_base_address: u64,
-    ) -> hv_return_t;
-    pub fn hv_gic_config_set_redistributor_base(
-        config: *mut core::ffi::c_void,
-        redistributor_base_address: u64,
-    ) -> hv_return_t;
-    pub fn hv_gic_create(config: *mut core::ffi::c_void) -> hv_return_t;
-    pub fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t;
-
-    pub fn os_release(object: *mut core::ffi::c_void);
+    pub fn hv_vmx_vcpu_read_vmcs(vcpu: hv_vcpuid_t, field: u32, value: *mut u64) -> hv_return_t;
+    pub fn hv_vmx_vcpu_write_vmcs(vcpu: hv_vcpuid_t, field: u32, value: u64) -> hv_return_t;
+    pub fn hv_vmx_vcpu_set_apic_address(vcpu: hv_vcpuid_t, gpa: hv_gpaddr_t) -> hv_return_t;
 }
-
-// -----------------------------------------------------------------------------
-// ARM Power State Coordination Interface (PSCI) Constants
-// -----------------------------------------------------------------------------
-pub const PSCI_VERSION: u64 = 0x8400_0000;
-pub const PSCI_CPU_OFF: u64 = 0x8400_0002;
-pub const PSCI_CPU_ON_AARCH32: u64 = 0x8400_0003;
-pub const PSCI_CPU_ON_AARCH64: u64 = 0xc400_0003;
-pub const PSCI_MIGRATE_INFO_TYPE: u64 = 0x8400_0006;
-pub const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
-pub const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
-pub const PSCI_FEATURES: u64 = 0x8400_000a;
-
-// ARM SMCCC (Firmware Calls) — probed by EDK2 RngDxe / ArmTrngLib before PSCI
-pub const SMCCC_VERSION: u64 = 0x8000_0000;
-pub const SMCCC_ARCH_FEATURES: u64 = 0x8000_0001;
-pub const SMCCC_ARCH_SOC_ID: u64 = 0x8000_0002;
-pub const SMCCC_ARCH_WORKAROUND_1: u64 = 0x8000_8000;
-pub const SMCCC_ARCH_WORKAROUND_2: u64 = 0x8000_7fff;
-
-// ARM TRNG (True RNG via SMC) — return NOT_SUPPORTED so EDK2 skips it
-pub const SMCCC_TRNG_VERSION: u64 = 0x8400_0050;
-pub const SMCCC_TRNG_FEATURES: u64 = 0x8400_0051;
-pub const SMCCC_TRNG_GET_UUID: u64 = 0x8400_0052;
-pub const SMCCC_TRNG_RND32: u64 = 0x8400_0053;
-pub const SMCCC_TRNG_RND64: u64 = 0xc400_0053;
-
-pub const PSCI_SUCCESS: i64 = 0;
-pub const PSCI_NOT_SUPPORTED: i64 = -1;
-pub const PSCI_INVALID_PARAMETERS: i64 = -2;
-pub const PSCI_ALREADY_ON: i64 = -4;

@@ -18,8 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::vmnet_proto::{
-    decode_client_hello, server_hello_for_raw, ClientHello, ClientIngress, ClientRecord, HelloResult,
-    OutQueue, Registry, CLIENT_HELLO_LEN, STATUS_OK,
+    CLIENT_HELLO_LEN, ClientHello, ClientIngress, ClientRecord, HelloResult, OutQueue, Registry,
+    STATUS_OK, decode_client_hello, server_hello_for_raw,
 };
 use crate::vmnet_sys::{IoOutcome, VmnetPort};
 
@@ -90,9 +90,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         enable_forwarding();
         install_pf_nat(&nat_cidr);
-        Some(
-            network_scope(&nat_cidr).unwrap_or(crate::vmnet_proto::DhcpDnsScope::SharedBridge),
-        )
+        Some(network_scope(&nat_cidr).unwrap_or(crate::vmnet_proto::DhcpDnsScope::SharedBridge))
     };
     let resolvers = if dns_scope.is_some() {
         load_resolvers()
@@ -137,7 +135,9 @@ pub fn socket_path_for(uid: u32) -> Result<PathBuf, String> {
 enum ServiceNet {
     Shared,
     /// `None` selects the default-route interface when the service starts.
-    Bridged { iface: Option<String> },
+    Bridged {
+        iface: Option<String>,
+    },
 }
 
 struct RequestedSubnet {
@@ -209,7 +209,11 @@ fn parse_service_args(args: &[String]) -> Result<ServiceArgs, String> {
     if subnet.is_some() && matches!(net, ServiceNet::Bridged { .. }) {
         return Err("--subnet applies to NAT mode; omit it with --bridge".into());
     }
-    Ok(ServiceArgs { socket, net, subnet })
+    Ok(ServiceArgs {
+        socket,
+        net,
+        subnet,
+    })
 }
 
 fn parse_subnet(text: &str) -> Result<RequestedSubnet, String> {
@@ -223,7 +227,9 @@ fn parse_subnet(text: &str) -> Result<RequestedSubnet, String> {
         .parse()
         .map_err(|_| format!("--subnet {text} is not an IPv4 CIDR"))?;
     if !(8..=30).contains(&prefix) {
-        return Err(format!("--subnet {text} must use a prefix from /8 through /30"));
+        return Err(format!(
+            "--subnet {text} must use a prefix from /8 through /30"
+        ));
     }
     let mask_bits = u32::MAX << (32 - prefix);
     let addr_bits = u32::from(addr);
@@ -374,8 +380,8 @@ fn parent_allows_bind(path: &Path, uid: u32) -> Result<(), String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let meta = fs::symlink_metadata(parent)
-        .map_err(|err| format!("lstat {}: {err}", parent.display()))?;
+    let meta =
+        fs::symlink_metadata(parent).map_err(|err| format!("lstat {}: {err}", parent.display()))?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(format!(
             "socket directory {} is not a real directory",
@@ -412,16 +418,10 @@ fn probe_socket(path: &Path) -> Result<Probe, String> {
         Ok(meta) => meta,
     };
     if meta.file_type().is_symlink() {
-        return Err(format!(
-            "refusing to unlink symlink {}",
-            path.display()
-        ));
+        return Err(format!("refusing to unlink symlink {}", path.display()));
     }
     if !meta.file_type().is_socket() {
-        return Err(format!(
-            "{} exists and is not a socket",
-            path.display()
-        ));
+        return Err(format!("{} exists and is not a socket", path.display()));
     }
     match UnixStream::connect(path) {
         Ok(_stream) => Ok(Probe::AlreadyListening),
@@ -495,8 +495,8 @@ fn configure_listener(
             io::Error::last_os_error()
         ));
     }
-    let meta = fs::symlink_metadata(path)
-        .map_err(|err| format!("lstat {}: {err}", path.display()))?;
+    let meta =
+        fs::symlink_metadata(path).map_err(|err| format!("lstat {}: {err}", path.display()))?;
     if meta.file_type().is_symlink() {
         return Err(format!(
             "{} is a symlink; refusing to listen",
@@ -587,10 +587,7 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), String> {
             || libc::setuid(uid) != 0
     };
     if rc {
-        return Err(format!(
-            "setuid({uid}): {}",
-            io::Error::last_os_error()
-        ));
+        return Err(format!("setuid({uid}): {}", io::Error::last_os_error()));
     }
     eprintln!("[vmnet] dropped privileges to uid {uid}");
     Ok(())
@@ -680,7 +677,9 @@ fn log_shared_interface(gateway: Option<Ipv4Addr>) {
     };
     let output = command_output(Command::new("ifconfig").arg("-a"), Duration::from_secs(3));
     let text = match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
         Ok(output) => {
             eprintln!(
                 "[vmnet] ifconfig -a failed: {}",
@@ -726,9 +725,14 @@ fn interface_with_inet(text: &str, gateway: Ipv4Addr) -> Option<String> {
 }
 
 fn log_bridge100_range() {
-    let output = command_output(Command::new("ifconfig").arg("bridge100"), Duration::from_secs(3));
+    let output = command_output(
+        Command::new("ifconfig").arg("bridge100"),
+        Duration::from_secs(3),
+    );
     let text = match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
         Ok(output) => {
             eprintln!(
                 "[vmnet] ifconfig bridge100 failed: {}",
@@ -1414,7 +1418,8 @@ fn poll_once(
 fn flush_outputs(table: &mut Table, dead: &mut Vec<usize>) {
     let Table { sw, lives, .. } = table;
     for idx in 0..lives.len() {
-        let pending = sw.clients[idx].out.queued() > 0 || !sw.clients[idx].out.outbound().is_empty();
+        let pending =
+            sw.clients[idx].out.queued() > 0 || !sw.clients[idx].out.outbound().is_empty();
         if !pending {
             continue;
         }
@@ -1506,7 +1511,12 @@ mod tests {
 
     #[test]
     fn bridge_flag_selects_lan_mode() {
-        let args = |parts: &[&str]| parts.iter().map(|part| part.to_string()).collect::<Vec<_>>();
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        };
         let shared = parse_service_args(&args(&["vmm", "--vmnet-service"])).unwrap();
         assert!(matches!(shared.net, ServiceNet::Shared));
         assert!(shared.socket.is_none());
@@ -1526,7 +1536,9 @@ mod tests {
         assert!(matches!(en.net, ServiceNet::Bridged { iface: Some(ref name) } if name == "en0"));
         assert_eq!(en.socket.unwrap(), PathBuf::from("/tmp/vmm.sock"));
 
-        assert!(parse_service_args(&args(&["vmm", "--vmnet-service", "--bridge", "--bridge"])).is_err());
+        assert!(
+            parse_service_args(&args(&["vmm", "--vmnet-service", "--bridge", "--bridge"])).is_err()
+        );
         assert!(parse_service_args(&args(&["vmm", "--vmnet-service", "--nat"])).is_err());
     }
 
@@ -1549,7 +1561,12 @@ mod tests {
         assert!(parse_subnet("192.168.18.0/31").is_err());
         assert!(parse_subnet("192.168.18.0").is_err());
 
-        let args = |parts: &[&str]| parts.iter().map(|part| part.to_string()).collect::<Vec<_>>();
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        };
         let parsed = parse_service_args(&args(&[
             "vmm",
             "--vmnet-service",
@@ -1558,14 +1575,16 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(parsed.subnet.unwrap().cidr, "192.168.18.0/24");
-        assert!(parse_service_args(&args(&[
-            "vmm",
-            "--vmnet-service",
-            "--bridge",
-            "--subnet",
-            "192.168.18.0/24",
-        ]))
-        .is_err());
+        assert!(
+            parse_service_args(&args(&[
+                "vmm",
+                "--vmnet-service",
+                "--bridge",
+                "--subnet",
+                "192.168.18.0/24",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

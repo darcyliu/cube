@@ -1,6 +1,4 @@
-//! Minimal QEMU fw_cfg MMIO device (selector + data + DMA).
-//!
-//! EDK2 ArmVirtQemu reads the DTB from `etc/fdt` here (0x09020000 on virt).
+//! fw_cfg item list, big-endian file directory, and DMA descriptor.
 
 use std::sync::Arc;
 
@@ -40,7 +38,7 @@ pub struct FwCfg {
 }
 
 impl FwCfg {
-    pub fn new(ram: Arc<GuestMemory>, dtb: Vec<u8>) -> Self {
+    pub fn from_files(ram: Arc<GuestMemory>, files: &[(&str, &[u8])]) -> Self {
         let mut items = Vec::new();
         items.push(FwCfgItem {
             selector: FW_CFG_SIGNATURE,
@@ -53,13 +51,17 @@ impl FwCfg {
             data: (FW_CFG_VERSION | FW_CFG_VERSION_DMA).to_le_bytes().to_vec(),
         });
 
-        let mut name = [0u8; 56];
-        name[..8].copy_from_slice(b"etc/fdt\0");
-        items.push(FwCfgItem {
-            selector: FW_CFG_FILE_FIRST,
-            name,
-            data: dtb,
-        });
+        for (index, (name, data)) in files.iter().enumerate() {
+            let mut item_name = [0u8; 56];
+            let raw = name.as_bytes();
+            let n = raw.len().min(55);
+            item_name[..n].copy_from_slice(&raw[..n]);
+            items.push(FwCfgItem {
+                selector: FW_CFG_FILE_FIRST + index as u16,
+                name: item_name,
+                data: data.to_vec(),
+            });
+        }
 
         let dir = build_file_dir(&items);
         items.insert(
