@@ -156,13 +156,16 @@ pub fn load_linux_image(
 ) -> Result<LoadedLinuxKernel, String> {
     let decompressed: Vec<u8>;
     let data = if kernel_data.len() >= 8 && &kernel_data[0..8] == ZIMG_MAGIC {
+        if kernel_data.len() < 16 {
+            return Err("Truncated zimg header (< 16 bytes)".into());
+        }
         println!("[Linux] Detected EFI zimg compressed kernel format (Alpine / EFI stub).");
         let start_offset = u32::from_le_bytes(kernel_data[0x08..0x0c].try_into().unwrap()) as usize;
         let payload_size = u32::from_le_bytes(kernel_data[0x0c..0x10].try_into().unwrap()) as usize;
-        if start_offset + payload_size > kernel_data.len() {
-            return Err("zimg payload offset/size exceeds file size".into());
-        }
-        let compressed_payload = &kernel_data[start_offset..start_offset + payload_size];
+        let payload_end = start_offset.checked_add(payload_size)
+            .filter(|&end| end <= kernel_data.len())
+            .ok_or("zimg payload offset/size exceeds file size")?;
+        let compressed_payload = &kernel_data[start_offset..payload_end];
         decompressed = decompress_gzip(compressed_payload)?;
         println!(
             "[Linux] Decompressed zimg kernel size: {:.2} MB ({} bytes)",
@@ -251,6 +254,23 @@ mod tests {
         buf[0x18..0x20].copy_from_slice(&flags.to_le_bytes());
         buf[0x38..0x3c].copy_from_slice(&magic.to_le_bytes());
         buf
+    }
+
+    #[test]
+    fn rejects_truncated_zimg_headers_and_invalid_payload_ranges() {
+        let mem = GuestMemory::new_test(0, 0x4000);
+        for len in 8..16 {
+            let mut data = vec![0; len];
+            data[..8].copy_from_slice(&ZIMG_MAGIC);
+            assert!(load_linux_image(&data, &mem, 0).unwrap_err().contains("Truncated"));
+        }
+        for (offset, size) in [(16u32, 1u32), (u32::MAX, u32::MAX)] {
+            let mut data = [0; 16];
+            data[..8].copy_from_slice(&ZIMG_MAGIC);
+            data[8..12].copy_from_slice(&offset.to_le_bytes());
+            data[12..16].copy_from_slice(&size.to_le_bytes());
+            assert!(load_linux_image(&data, &mem, 0).unwrap_err().contains("payload"));
+        }
     }
 
     #[test]

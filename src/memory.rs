@@ -4,6 +4,7 @@
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::hypervisor::{
     check_hv, hv_vm_map, hv_vm_unmap, HvResult, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
@@ -115,9 +116,17 @@ impl GuestMemory {
     }
 
     pub fn read_u16(&self, gpa: u64) -> Result<u16, String> {
-        let mut bytes = [0u8; 2];
-        self.read(gpa, &mut bytes)?;
-        Ok(u16::from_le_bytes(bytes))
+        let offset = self.checked_offset(gpa, 2)?;
+        let ptr = unsafe { self.ptr.as_ptr().add(offset) };
+        if (ptr as usize) % std::mem::align_of::<AtomicU16>() == 0 {
+            // Queue indices are aligned and shared with concurrently running vCPUs.
+            let value = unsafe { AtomicU16::from_ptr(ptr.cast()).load(Ordering::Acquire) };
+            Ok(u16::from_le(value))
+        } else {
+            let mut bytes = [0u8; 2];
+            self.read(gpa, &mut bytes)?;
+            Ok(u16::from_le_bytes(bytes))
+        }
     }
 
     pub fn read_u32(&self, gpa: u64) -> Result<u32, String> {
@@ -134,10 +143,17 @@ impl GuestMemory {
 
     pub fn write_u16(&self, gpa: u64, val: u16) -> Result<(), String> {
         let offset = self.checked_offset(gpa, 2)?;
-        let bytes = val.to_le_bytes();
-        unsafe {
-            self.ptr.as_ptr().add(offset).write_volatile(bytes[0]);
-            self.ptr.as_ptr().add(offset + 1).write_volatile(bytes[1]);
+        let ptr = unsafe { self.ptr.as_ptr().add(offset) };
+        if (ptr as usize) % std::mem::align_of::<AtomicU16>() == 0 {
+            // Publish the entire index at once, after preceding completion writes.
+            unsafe { AtomicU16::from_ptr(ptr.cast()).store(val.to_le(), Ordering::Release) };
+        } else {
+            // Unaligned data accesses remain supported, but are not atomic.
+            let bytes = val.to_le_bytes();
+            unsafe {
+                ptr.write_volatile(bytes[0]);
+                ptr.add(1).write_volatile(bytes[1]);
+            }
         }
         Ok(())
     }
@@ -172,6 +188,29 @@ impl Drop for GuestMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aligned_indices_do_not_tear_across_byte_boundaries() {
+        let mem = std::sync::Arc::new(GuestMemory::new_test(0, 0x4000));
+        mem.write_u16(2, 0x00ff).unwrap();
+        let writer_mem = mem.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..100_000 {
+                for value in [0x0100, 0xffff, 0, 0x00ff] {
+                    writer_mem.write_u16(2, value).unwrap();
+                }
+            }
+        });
+        for _ in 0..100_000 {
+            assert!(matches!(mem.read_u16(2).unwrap(), 0x00ff | 0x0100 | 0xffff | 0));
+        }
+        writer.join().unwrap();
+        mem.write_u16(5, 0xabcd).unwrap();
+        assert_eq!(mem.read_u16(5).unwrap(), 0xabcd);
+        let mut bytes = [0; 2];
+        mem.read(5, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xcd, 0xab]);
+    }
+
     #[test]
     fn rejects_overflow_and_cross_boundary_accesses() {
         let m = GuestMemory::new_test(0x4000, 0x4000);

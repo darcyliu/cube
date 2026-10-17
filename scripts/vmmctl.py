@@ -328,7 +328,12 @@ def serve(state_dir):
                     conn.settimeout(3)
                     try:
                         request = json.loads(conn.recv(4096).decode())
+                        require(isinstance(request, dict), "request must be a JSON object")
                         action = request.get("action")
+                        if action in ("stop", "shutdown"):
+                            timeout = request.get("timeout", 10 if action == "stop" else 120)
+                            require(type(timeout) is int and 0 < timeout <= 3600,
+                                    "timeout must be 1–3600 seconds")
                         if action == "status":
                             response = {"ok": True, "state": "running", **record}
                         elif action == "stop":
@@ -341,7 +346,12 @@ def serve(state_dir):
                             response = {"ok": False, "error": "unknown action"}
                     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
                         response = {"ok": False, "error": str(error)}
-                    conn.sendall((json.dumps(response) + "\n").encode())
+                    try:
+                        conn.sendall((json.dumps(response) + "\n").encode())
+                    except OSError:
+                        # A client may time out or disconnect while an action runs.
+                        # Keep accepting commands for the still-running VM.
+                        pass
         finally:
             code = proc.wait()
             write_json(state_dir / "last.json", {**record, "state": "stopped",

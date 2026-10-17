@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.dont_write_bytecode = True
 import vmmctl
@@ -57,6 +57,44 @@ class ManagerTests(unittest.TestCase):
         for directory in self.running:
             if vmmctl.live_status(directory):
                 vmmctl.query(directory, {"action": "stop", "timeout": 2}, timeout=5)
+
+    def test_disconnected_and_malformed_clients_do_not_end_accept_loop(self):
+        directory = self.base / "control-test"
+        directory.mkdir()
+        spec = {"id": "test", "name": "test", "config": "test.json",
+                "command": ["fake-vmm"], "resources": [], "sudo": False}
+        (directory / "launch.json").write_text(json.dumps(spec))
+        control = directory / "control.sock"
+        requests = [b'{"action":"status"}', b'[]',
+                    b'{"action":"stop","timeout":null}', b'{"action":"status"}']
+        clients = []
+        for request in requests:
+            client = MagicMock()
+            client.__enter__.return_value = client
+            client.recv.return_value = request
+            clients.append(client)
+        clients[0].sendall.side_effect = BrokenPipeError("client disconnected")
+        server = MagicMock()
+        server.bind.side_effect = lambda _: control.touch()
+        server.accept.side_effect = [(client, None) for client in clients]
+        proc = MagicMock()
+        proc.pid = 123
+        proc.poll.side_effect = [None] * len(clients) + [0]
+        proc.wait.return_value = 0
+        with patch.object(vmmctl, "control_socket_path", return_value=control), \
+             patch.object(vmmctl, "ensure_control_root"), \
+             patch.object(vmmctl.socket, "socket", return_value=server), \
+             patch.object(vmmctl.subprocess, "Popen", return_value=proc), \
+             patch.object(vmmctl, "force_stop") as stop:
+            self.assertEqual(vmmctl.serve(directory), 0)
+        self.assertEqual(server.accept.call_count, len(clients))
+        stop.assert_not_called()
+        for client in clients[1:3]:
+            response = json.loads(client.sendall.call_args.args[0])
+            self.assertFalse(response["ok"])
+        response = json.loads(clients[-1].sendall.call_args.args[0])
+        self.assertEqual(response["state"], "running")
+        self.assertTrue(response["ok"])
 
     def test_shared_folder_paths_modes_overrides_and_duplicates(self):
         path = self.config("first", 5901)
