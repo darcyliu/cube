@@ -1,15 +1,16 @@
 # Named VM configuration and management
 
-`scripts/vmmctl.py` manages one VMM process per named JSON configuration. It
-uses Python's standard library and the existing VMM binary. The manager keeps
-an instance identity, logs, EFI variables, and a UART mailbox under
-`~/.local/state/vmm/NAME/` by default. The control socket lives under a
-private `/tmp/vmmctl-UID/` directory with a short, instance-specific name so
-deep artifact paths work on macOS. Its exact path appears in `status`. Use
-`--state-root DIR` on every command to choose another
-root. VM names contain letters, digits, `_`, or `-` and are unique within that
-root. `status`, `shutdown`, and `stop` accept either the configuration path or
-the bare VM name, so they still work if the JSON file is moved after launch.
+`cubectl` (also available via `scripts/vmmctl.py`) manages one Cube VMM process per named JSON configuration.
+The native `cubectl` CLI is built in Rust, requires no Python runtime, and is bundled inside `Cube.app`.
+
+### Where VM files are stored
+
+By default, VMs are separated into two directories:
+1. **VM Files & Virtual Disks**: stored under `~/VMs/<NAME>/` (e.g. `~/VMs/my-freebsd/my-freebsd.json`, `rootfs.img`).
+   - **Customizing per VM**: Pass `--dest <PATH>` when creating (e.g. `cubectl create my-vm --dest /Volumes/Data/VMs/my-vm`).
+   - **Changing the global default**: Set `export CUBE_VMS_DIR=/Volumes/Data/VMs` in your shell profile.
+   - **Moving existing VMs**: Move the directory (`mv ~/VMs/my-vm /new/path/my-vm`) and update any absolute disk paths in the `.json` file.
+2. **Runtime State, Logs & Sockets**: stored under `~/.local/state/cube/<NAME>/` (or override with `--state-root <DIR>`). The manager control socket lives under `/tmp/cubectl-UID/`.
 
 Place a file such as `vms/freebsd-zfs.json` in the repository:
 
@@ -47,11 +48,69 @@ uses `ssh_port` forwarding to a DHCP guest; use a static `network.forwards`
 rule and matching shutdown port for a static guest address.
 
 ```sh
-python3 -B scripts/vmmctl.py start vms/freebsd-zfs.json
-python3 -B scripts/vmmctl.py status vms/freebsd-zfs.json
-python3 -B scripts/vmmctl.py shutdown vms/freebsd-zfs.json --timeout 120
-# If the guest cannot be reached, explicitly stop the host process:
-python3 -B scripts/vmmctl.py stop vms/freebsd-zfs.json --timeout 10
+# ----------------------------------------------------------------------
+# 1. Automated Unattended OS Installation (Approach A - Recommended)
+# ----------------------------------------------------------------------
+# Create, auto-generate CIDATA seed, install OS unattended, and configure VM in 1 step:
+cubectl create my-freebsd \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --unattended \
+  --ram 2048 --cpus 2 \
+  --ssh-port 2222 \
+  --password root
+
+# Start directly into your ready-to-use FreeBSD VM:
+cubectl start my-freebsd
+
+# Connect via SSH with key or password:
+ssh root@127.0.0.1 -p 2222
+
+# Or run unattended install on an existing VM:
+cubectl install my-freebsd --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso
+
+# ----------------------------------------------------------------------
+# 2. Interactive ISO Installation (Manual / VNC)
+# ----------------------------------------------------------------------
+# Create VM specification with a 20GB sparse disk & attach installer ISO
+cubectl create my-ubuntu \
+  --iso /path/to/ubuntu-24.04-live-server-arm64.iso \
+  --ram 2048 --cpus 2 \
+  --ssh-port 2222
+
+# Start VM in background (or run with -i --no-reboot for interactive installation)
+cubectl start my-ubuntu -i --no-reboot
+
+# Connect to the graphical installer (if VNC is enabled)
+open vnc://127.0.0.1:5901
+
+# Once installed, stop the VM and eject the installer ISO
+cubectl stop my-ubuntu
+cubectl eject my-ubuntu
+
+# Start into the installed OS
+cubectl start my-ubuntu
+
+# ----------------------------------------------------------------------
+# 3. VM Lifecycle Management
+# ----------------------------------------------------------------------
+# List all known VMs and status
+cubectl list
+
+# Inspect live VM status
+cubectl status my-freebsd
+
+# Request clean guest shutdown over SSH
+cubectl shutdown my-freebsd --timeout 120
+
+# Force stop the VM if guest does not respond
+cubectl stop my-freebsd --timeout 10
+
+# Delete a VM, its disks, and state directory
+cubectl delete my-freebsd
+
+# Or force-stop and delete in one step:
+cubectl delete my-freebsd --force
+# (alias: cubectl rm my-freebsd -f)
 ```
 
 `start` returns the instance ID, VMM PID, and resource claims. `status` asks the

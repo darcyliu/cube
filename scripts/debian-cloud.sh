@@ -77,6 +77,16 @@ done
 
 cd "$ROOT_DIR"
 
+# Ensure Cube binaries are compiled and signed
+VMM_BIN="${VMM_BIN:-target/debug/cube}"
+CUBECTL_BIN="$(dirname "$VMM_BIN")/cubectl"
+if [[ ! -x "$VMM_BIN" || ! -x "$CUBECTL_BIN" ]]; then
+    echo -e "${GREEN}[Cube] Building and signing Cube binaries...${RESET}"
+    cargo build
+    codesign -s - --entitlements entitlements.plist --force "$VMM_BIN"
+    codesign -s - --entitlements entitlements.plist --force "$CUBECTL_BIN"
+fi
+
 # 1. Download and extract official pre-built Debian nocloud raw image if missing
 mkdir -p boot/debian
 if [[ ! -f "$TARGET_DISK" ]]; then
@@ -92,7 +102,7 @@ fi
 # nocloud images lock root and run systemd-firstboot (easy to miss on serial).
 # Always (re)prepare the image: unlock root, write machine-id, enable autologin.
 echo -e "${GREEN}[Cube] Preparing nocloud image for serial login (root password: root)...${RESET}"
-if ! python3 "$SCRIPT_DIR/patch-cloud-shadow.py" "$TARGET_DISK" root; then
+if ! "$CUBECTL_BIN" patch-shadow "$TARGET_DISK" root; then
     echo -e "${RED}[Error] Failed to prepare ${TARGET_DISK} for login.${RESET}"
     echo -e "${YELLOW}Hint: the image is often root-owned after 'sudo make debian-cloud'. Re-run with sudo.${RESET}"
     exit 1
@@ -109,11 +119,7 @@ if [[ ! -f "$KERNEL_PATH" || ! -f "$INITRD_PATH" ]]; then
         cp debian-cloud-initrd.img "$INITRD_PATH" 2>/dev/null || INITRD_PATH="debian-cloud-initrd.img"
     else
         echo -e "${YELLOW}[Cube] Extracting kernel and initramfs from ${TARGET_DISK}...${RESET}"
-        python3 "$SCRIPT_DIR/extract-debian-cloud-kernel.py" "$TARGET_DISK" "$KERNEL_PATH" "$INITRD_PATH" || {
-            KERNEL_PATH="debian-cloud-vmlinuz"
-            INITRD_PATH="debian-cloud-initrd.img"
-            python3 "$SCRIPT_DIR/extract-debian-cloud-kernel.py" "$TARGET_DISK" "$KERNEL_PATH" "$INITRD_PATH"
-        }
+        "$CUBECTL_BIN" extract-kernel "$TARGET_DISK" "$KERNEL_PATH" "$INITRD_PATH"
     fi
 fi
 
@@ -173,16 +179,7 @@ if [[ ! -f "$CIDATA_ISO" ]]; then
     echo -e "${GREEN}[Cube] Seed image ready: ${CIDATA_ISO} (root password: 'root')${RESET}"
 fi
 
-
-# 4. Ensure Cube binary is compiled and signed
-VMM_BIN="${VMM_BIN:-target/debug/cube}"
-if [[ ! -f "$VMM_BIN" ]]; then
-    echo -e "${GREEN}[Cube] Building and signing Cube binary...${RESET}"
-    cargo build
-    codesign -s - --entitlements entitlements.plist --force "$VMM_BIN"
-fi
-
-# 5. Configure macOS PF NAT packet forwarding for guest internet access
+# 4. Configure macOS PF NAT packet forwarding for guest internet access
 if [[ $EUID -eq 0 ]]; then
     NET_MODE="vmnet"
     IF="$(netstat -rn -f inet 2>/dev/null | awk '$1=="default" && $2 !~ /link/ && $NF !~ /^bridge/ {print $NF; exit}')"

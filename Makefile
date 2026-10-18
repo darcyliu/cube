@@ -1,14 +1,19 @@
-.PHONY: all build sign sign-networking run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify alpine debian debian-cloud app cube run-cube debug-app sign-cube-networking debug-run-cube
+.PHONY: all build sign sign-networking run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify alpine debian debian-cloud app cube run-cube debug-app sign-cube-networking debug-run-cube install install-cli
 
-all: build sign install-cli
+all: build sign
+
+install: install-cli
 
 CUBE_BIN := target/debug/cube
+CUBECTL_BIN := target/debug/cubectl
 CUBE_APP ?= dist/Cube.app
 
 install-cli:
 	@mkdir -p $(HOME)/.local/bin
 	@ln -sf $(CURDIR)/$(CUBE_BIN) $(HOME)/.local/bin/cube
+	@ln -sf $(CURDIR)/$(CUBECTL_BIN) $(HOME)/.local/bin/cubectl
 	@echo "[Cube] Linked CLI: $(HOME)/.local/bin/cube → $(CURDIR)/$(CUBE_BIN)"
+	@echo "[Cube] Linked CLI: $(HOME)/.local/bin/cubectl → $(CURDIR)/$(CUBECTL_BIN)"
 
 # VERIFY_ARGS can select offline/full suites and supply media paths.
 verify:
@@ -19,6 +24,7 @@ build:
 
 sign:
 	codesign --entitlements entitlements.plist --force -s - $(CUBE_BIN)
+	codesign --entitlements entitlements.plist --force -s - $(CUBECTL_BIN)
 
 BUNDLE_ID ?= net.neuralengine.cube
 TEAM_ID   ?= ZV8TTD4Z45
@@ -33,7 +39,7 @@ sign-networking: build
 		CUBE_BIN="$(CUBE_BIN)" ./scripts/sign-networking.sh
 
 # Native macOS Menu Bar app to host vmnet-service / vmnet-service-bridge
-app: build
+app: build sign
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
 	swiftc -O -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
@@ -46,7 +52,7 @@ app: build
 	@BUILD_NUM=$$(git rev-list --count HEAD 2>/dev/null || echo 1); \
 	sed -i '' "s/<string>33<\/string>/<string>$$BUILD_NUM<\/string>/g" "$(CUBE_APP)"/Contents/Info.plist 2>/dev/null || true
 	cp app/Cube/Resources/AppIcon.icns "$(CUBE_APP)"/Contents/Resources/AppIcon.icns
-	python3 scripts/embed-cube-helper.py "$(CUBE_BIN)" "$(CUBE_APP)"
+	./scripts/embed-cube-helper.sh "$(CUBE_BIN)" "$(CUBE_APP)"
 	@if [ -n "$$PROFILE" ] || ls *.provisionprofile >/dev/null 2>&1; then \
 		echo "[Cube] Provisioning profile detected, signing with Developer identity & com.apple.vm.networking..."; \
 		IDENTITY="$(IDENTITY)" PROFILE="$(PROFILE)" BUNDLE_ID="$(BUNDLE_ID)" TEAM_ID="$(TEAM_ID)" \
@@ -71,7 +77,7 @@ debug-app: build
 		-o "$(CUBE_APP)"/Contents/MacOS/CubeBar
 	cp app/Cube/Resources/Info.plist "$(CUBE_APP)"/Contents/Info.plist
 	cp app/Cube/Resources/AppIcon.icns "$(CUBE_APP)"/Contents/Resources/AppIcon.icns
-	python3 scripts/embed-cube-helper.py "$(CUBE_BIN)" "$(CUBE_APP)"
+	./scripts/embed-cube-helper.sh "$(CUBE_BIN)" "$(CUBE_APP)"
 	codesign --force --deep --sign - --entitlements app/Cube/Resources/Cube.debug.entitlements "$(CUBE_APP)"
 	@echo "[Cube] Built Debug macOS Menu Bar App (debugger-attachable) → $(CUBE_APP)"
 
@@ -105,8 +111,11 @@ fetch-freebsd:
 		echo "[Cube] boot/kernel/kernel and boot/kernel/zfs.ko already present."; \
 	fi
 
+CPUS ?= 2
+NET  ?= vmnet-proxy
+
 freebsd: all fetch-freebsd
-	$(CUBE_BIN) --freebsd boot/kernel/kernel
+	$(CUBE_BIN) --freebsd boot/kernel/kernel --net $(NET)
 
 fetch-image:
 	@if [ ! -f mini-memstick.img ]; then \
@@ -118,9 +127,7 @@ fetch-image:
 	fi
 
 freebsd-root: all fetch-freebsd fetch-image
-	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img
-
-CPUS ?= 2
+	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net $(NET)
 
 
 # Shared-mode vmnet needs root. Also install a small PF NAT anchor so the
@@ -153,7 +160,7 @@ vmnet-service-bridge:
 	sudo $(CUBE_BIN) --vmnet-service --bridge $(IFACE)
 
 freebsd-net: all fetch-freebsd fetch-image
-	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus $(CPUS)
+	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net $(NET) --cpus $(CPUS)
 
 sudo-freebsd-net: all fetch-freebsd fetch-image
 	$(setup-vmnet-nat)
@@ -207,7 +214,7 @@ freebsd-zfs-uefi: all fetch-uefi
 		echo "[Cube] Missing $(DISK). Run: make install-iso   (choose Auto ZFS in bsdinstall)"; \
 		exit 1; \
 	fi
-	$(CUBE_BIN) --uefi --disk "$(DISK)" --cpus $(CPUS)
+	$(CUBE_BIN) --uefi --disk "$(DISK)" --net $(NET) --cpus $(CPUS)
 
 sudo-freebsd-zfs-uefi: all fetch-uefi
 	@if [ ! -f "$(DISK)" ]; then echo "[Cube] Missing $(DISK)"; exit 1; fi
@@ -224,7 +231,7 @@ CPUS ?= 2
 
 freebsd-zfs: all fetch-freebsd
 	@if [ ! -f "$(DISK)" ]; then 		echo "[Cube] Missing $(DISK). Run: make install-iso   (choose Auto ZFS in bsdinstall)"; 		exit 1; 	fi
-	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk "$(DISK)" --cpus $(CPUS)
+	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk "$(DISK)" --net $(NET) --cpus $(CPUS)
 
 sudo-freebsd-zfs: all fetch-freebsd
 	@if [ ! -f "$(DISK)" ]; then echo "[Cube] Missing $(DISK)"; exit 1; fi

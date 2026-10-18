@@ -207,7 +207,19 @@ codesign --force \
   --timestamp \
   "$HELPER_APP"
 
-# 8. Sign main CubeBar executable
+# 8. Sign cubectl if present (standard hypervisor entitlements, avoiding restricted vm.networking which triggers AMFI SIGKILL on unbundled binaries)
+if [[ -f "$APP_DIR/Contents/MacOS/cubectl" ]]; then
+  echo "[sign-cube] Signing $APP_DIR/Contents/MacOS/cubectl..."
+  codesign --force \
+    --sign "$IDENTITY" \
+    --identifier "$BUNDLE_ID.ctl" \
+    --entitlements app/Cube/Resources/Cube.entitlements \
+    --options runtime \
+    --timestamp \
+    "$APP_DIR/Contents/MacOS/cubectl"
+fi
+
+# 9. Sign main CubeBar executable
 echo "[sign-cube] Signing $APP_DIR/Contents/MacOS/CubeBar..."
 codesign --force \
   --sign "$IDENTITY" \
@@ -217,7 +229,7 @@ codesign --force \
   --timestamp \
   "$APP_DIR/Contents/MacOS/CubeBar"
 
-# 9. Sign outer app bundle (without --deep to avoid clobbering inner binaries)
+# 10. Sign outer app bundle (without --deep to avoid clobbering inner binaries)
 echo "[sign-cube] Signing app bundle $APP_DIR..."
 codesign --force \
   --sign "$IDENTITY" \

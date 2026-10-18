@@ -184,7 +184,7 @@ pub fn generate_dtb(
         method = "hvc";
     }};
 
-    memory@{ram_base:x} {{
+    memory {{
         device_type = "memory";
         reg = <{memory_reg}>;
     }};
@@ -235,7 +235,6 @@ pub fn generate_dtb(
 
 {virtio_dts}{xhci_dts}}};
 "#,
-        ram_base = ram_base,
         virtio_dts = virtio_dts,
         xhci_dts = xhci_dts,
         framebuffer_dts = framebuffer_dts,

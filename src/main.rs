@@ -524,13 +524,16 @@ fn run_cli(args: Vec<String>) {
                     "  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)"
                 );
                 println!(
-                    "  -n, --net <MODE>         Network mode: vmnet (default, in-process NAT, root),"
+                    "  -n, --net <MODE>         Network mode: none (default, offline),"
                 );
                 println!(
                     "                           vmnet-proxy (unprivileged client of --vmnet-service),"
                 );
                 println!(
-                    "                           bridge[:iface], tap:<dev>, mock, none"
+                    "                           vmnet (in-process NAT, root),"
+                );
+                println!(
+                    "                           bridge[:iface], tap:<dev>, mock"
                 );
                 println!(
                     "      --vmnet-socket <PATH> Unix socket for --net vmnet-proxy (default: ~/Library/Application Support/cube/vmnet.sock)"
@@ -957,9 +960,10 @@ fn boot_os_kernel(
         .iter()
         .map(shared_fs::Backend::start)
         .collect::<Result<Vec<_>, _>>()?;
+    let effective_net = net_mode.unwrap_or("none");
     if ssh_port.is_some()
-        && (matches!(net_mode, Some("none" | "mock"))
-            || net_mode.is_some_and(|s| s.starts_with("tap:")))
+        && (matches!(effective_net, "none" | "mock")
+            || effective_net.starts_with("tap:"))
     {
         return Err("--ssh-port requires a DHCP-capable vmnet/bridge NIC; use --forward for an explicit destination".into());
     }
@@ -1099,12 +1103,12 @@ fn boot_os_kernel(
     }
 
     // Attach VirtIO-MMIO Network Device
-    if net_mode != Some("none") {
+    if effective_net != "none" {
         let virtio_net = VirtioNet::new(
             mac_addr,
             VIRTIO_NET_IRQ,
             vm.memory(),
-            net_mode.unwrap_or("vmnet"),
+            effective_net,
             vmnet_socket,
         )?;
         if let Some(port) = ssh_port {
@@ -1340,7 +1344,7 @@ fn boot_os_kernel(
         bootargs,
         cpus,
         &virtio_devices,
-        fb_cfg,
+        if uefi_firmware.is_some() { None } else { fb_cfg },
         xhci_fdt,
         initrd_info,
     ) {

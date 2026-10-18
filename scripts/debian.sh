@@ -124,17 +124,29 @@ INITRD_PRESEED="initrd-trixie-preseed.gz"
 INITRD_NET_PRESEED="initrd-trixie-netpreseed.gz"
 PRESEED_CFG="$SCRIPT_DIR/debian-preseed.cfg"
 NET_PRESEED_CFG="$SCRIPT_DIR/debian-net-preseed.cfg"
+CUBECTL_BIN="$(dirname "$VMM_BIN")/cubectl"
+
+build_preseed_initrd() {
+    local in_initrd="$1"
+    local out_initrd="$2"
+    local cfg="$3"
+    if [[ ! -x "$CUBECTL_BIN" ]]; then
+        cargo build --bin cubectl || exit 1
+    fi
+    "$CUBECTL_BIN" preseed-initrd "$in_initrd" "$out_initrd" "$cfg"
+}
+
 if [[ "$INTERACTIVE" == "1" ]]; then
-    if [[ ! -f "$INITRD_NET_PRESEED" || "$NET_PRESEED_CFG" -nt "$INITRD_NET_PRESEED" || "$SCRIPT_DIR/make-preseed-initrd.py" -nt "$INITRD_NET_PRESEED" ]]; then
+    if [[ ! -f "$INITRD_NET_PRESEED" || "$NET_PRESEED_CFG" -nt "$INITRD_NET_PRESEED" ]]; then
         echo -e "${GREEN}[Cube] Building interactive network/mirror preseed initrd...${RESET}"
-        python3 "$SCRIPT_DIR/make-preseed-initrd.py" "$INITRD_BASE" "$INITRD_NET_PRESEED" "$NET_PRESEED_CFG"
+        build_preseed_initrd "$INITRD_BASE" "$INITRD_NET_PRESEED" "$NET_PRESEED_CFG"
     fi
     INITRD_INSTALL="$INITRD_NET_PRESEED"
     PRESEED_CFG="$NET_PRESEED_CFG"
 else
-    if [[ ! -f "$INITRD_PRESEED" || "$PRESEED_CFG" -nt "$INITRD_PRESEED" || "$SCRIPT_DIR/make-preseed-initrd.py" -nt "$INITRD_PRESEED" ]]; then
+    if [[ ! -f "$INITRD_PRESEED" || "$PRESEED_CFG" -nt "$INITRD_PRESEED" ]]; then
         echo -e "${GREEN}[Cube] Building unattended preseed initrd...${RESET}"
-        python3 "$SCRIPT_DIR/make-preseed-initrd.py" "$INITRD_BASE" "$INITRD_PRESEED" "$PRESEED_CFG"
+        build_preseed_initrd "$INITRD_BASE" "$INITRD_PRESEED" "$PRESEED_CFG"
     fi
     INITRD_INSTALL="$INITRD_PRESEED"
 fi
@@ -251,8 +263,8 @@ INSTALLED_INITRD="boot/debian/debian-installed-initrd.img"
 INSTALLED_ROOTPART="boot/debian/debian-installed-rootpart"
 if [[ ! -f "$INSTALLED_KERNEL" || ! -f "$INSTALLED_INITRD" || ! -f "$INSTALLED_ROOTPART" ]]; then
     echo -e "${GREEN}[Cube] Extracting kernel/initrd from installed disk...${RESET}"
-    python3 "$SCRIPT_DIR/extract-debian-cloud-kernel.py" \
-        "$TARGET_DISK" "$INSTALLED_KERNEL" "$INSTALLED_INITRD" "$INSTALLED_ROOTPART" || {
+    "$CUBECTL_BIN" extract-kernel \
+        "$TARGET_DISK" "$INSTALLED_KERNEL" "$INSTALLED_INITRD" --rootpart "$INSTALLED_ROOTPART" || {
         echo -e "${RED}[Error] Could not extract installed kernel.${RESET}"
         echo -e "${YELLOW}Hint: The installer may not have finished. Re-run make debian to install.${RESET}"
         exit 1

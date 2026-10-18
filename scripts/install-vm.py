@@ -346,7 +346,7 @@ def main(argv=None):
     print(f"VM config: {config_path}")
     if spec.unattended and identity is None:
         print("No ~/.ssh/id_ed25519 or id_rsa key pair found; the config has no SSH shutdown entry.")
-    start = "python3 -B scripts/vmmctl.py start " + shlex.quote(str(config_path))
+    start = "cubectl start " + shlex.quote(str(config_path))
     if args.sudo:
         start += " --sudo"
     print("Start later: " + start)

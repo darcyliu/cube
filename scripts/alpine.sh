@@ -149,7 +149,7 @@ if [[ $IS_NEW_DISK -eq 1 || $FORCE_INSTALL -eq 1 ]]; then
     exec "$VMM_BIN" \
         --linux boot/alpine/vmlinuz-virt \
         --initrd boot/alpine/initramfs-virt \
-        --bootargs "console=ttyAMA0 earlycon modules=loop,squashfs,sd-mod ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/latest-stable/main modloop=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/netboot/modloop-virt" \
+        --bootargs "console=ttyAMA0 earlycon modules=loop,squashfs,sd-mod,virtio_net,virtio_mmio,virtio_blk ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/latest-stable/main modloop=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/netboot/modloop-virt" \
         --disk "$TARGET_DISK" \
         --net "$NET_MODE" \
         --cpus "$CPUS" \
@@ -167,6 +167,7 @@ else
     exec "$VMM_BIN" \
         --linux boot/alpine/vmlinuz-virt \
         --initrd boot/alpine/initramfs-virt \
+        --bootargs "console=ttyAMA0 earlycon modules=loop,squashfs,sd-mod,virtio_net,virtio_mmio,virtio_blk" \
         --disk "$TARGET_DISK" \
         --net "$NET_MODE" \
         --cpus "$CPUS" \
