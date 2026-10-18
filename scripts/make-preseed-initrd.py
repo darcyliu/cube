@@ -73,12 +73,12 @@ def main():
             print(f"[Error] File not found: {p}", file=sys.stderr)
             sys.exit(1)
 
-    print(f"[VMM] Reading initrd: {input_path} ({os.path.getsize(input_path) // 1024} KB)")
+    print(f"[Cube] Reading initrd: {input_path} ({os.path.getsize(input_path) // 1024} KB)")
     with open(input_path, 'rb') as f:
         compressed_in = f.read()
 
     decompressed = gzip.decompress(compressed_in)
-    print(f"[VMM] Decompressed initrd: {len(decompressed) // 1024} KB")
+    print(f"[Cube] Decompressed initrd: {len(decompressed) // 1024} KB")
 
     with open(preseed_path, 'rb') as f:
         preseed_content = f.read()
@@ -98,13 +98,13 @@ def main():
     pad = (512 - len(new_cpio) % 512) % 512
     new_cpio += b'\x00' * pad
 
-    print(f"[VMM] Injected preseed.cfg ({len(preseed_content)} bytes)")
+    print(f"[Cube] Injected preseed.cfg ({len(preseed_content)} bytes)")
     recompressed = gzip.compress(new_cpio, compresslevel=1)
 
     with open(output_path, 'wb') as f:
         f.write(recompressed)
 
-    print(f"[VMM] Written preseeded initrd: {output_path} ({os.path.getsize(output_path) // 1024} KB)")
+    print(f"[Cube] Written preseeded initrd: {output_path} ({os.path.getsize(output_path) // 1024} KB)")
 
 if __name__ == '__main__':
     main()

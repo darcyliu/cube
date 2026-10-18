@@ -181,7 +181,7 @@ impl MmioDevice for FwCfg {
 
     fn write(&mut self, offset: u64, data: u64, size: usize) {
         if std::env::var_os("VMM_TRACE_BOOT").is_some() {
-            eprintln!("[VMM TRACE] fwcfg-wr off={offset:#x} size={size} data={data:#x}");
+            eprintln!("[Cube TRACE] fwcfg-wr off={offset:#x} size={size} data={data:#x}");
         }
         match offset {
             REG_SELECTOR => {

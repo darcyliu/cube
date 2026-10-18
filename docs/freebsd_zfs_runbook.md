@@ -13,7 +13,7 @@ fetch firmware if it is missing:
 ```sh
 make all
 make fetch-uefi
-python3 -B scripts/check_install.py target/debug/vmm \
+python3 -B scripts/check_install.py target/debug/cube \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --filesystem zfs --firmware firmware/QEMU_EFI.fd --console-only --keep
 ```
@@ -55,7 +55,7 @@ logs restart when the VMM resets; the process log preserves all boot generations
 
 On an Apple M1 Max, FreeBSD 14.4-RELEASE ARM64 passed the complete offline workflow
 with two vCPUs, 2048 MiB RAM, and a new 12 GiB disk. The exact invocation used
-`/tmp/vmm-gui-fix/debug/vmm` in place of `target/debug/vmm` above.
+`/tmp/vmm-gui-fix/debug/vmm` in place of `target/debug/cube` above.
 
 Firmware identified itself as `edk2-stable202408-prebuilt.qemu.org`, built
 September 12, 2024 at 16:28:50; the loader reported EFI 2.70 and EDK II revision
@@ -109,7 +109,7 @@ matching the operation boundary in EDK2's
 For normal use after a manual or retained test installation:
 
 ```sh
-./target/debug/vmm --uefi firmware/QEMU_EFI.fd \
+./target/debug/cube --uefi firmware/QEMU_EFI.fd \
   --disk /path/to/installed.img --efi-vars /path/to/installed.vars.fd \
   --cpus 2 --ram 2048 --net none
 ```

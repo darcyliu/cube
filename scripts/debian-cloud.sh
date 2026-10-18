@@ -80,18 +80,18 @@ cd "$ROOT_DIR"
 # 1. Download and extract official pre-built Debian nocloud raw image if missing
 mkdir -p boot/debian
 if [[ ! -f "$TARGET_DISK" ]]; then
-    echo -e "${YELLOW}[VMM] Downloading official Debian 13 'nocloud' ARM64 image...${RESET}"
+    echo -e "${YELLOW}[Cube] Downloading official Debian 13 'nocloud' ARM64 image...${RESET}"
     echo -e "${YELLOW}      Source: ${CLOUD_IMG_URL}${RESET}"
     curl -fSL --progress-bar "$CLOUD_IMG_URL" | tar -xJf -
     if [[ -f "disk.raw" ]]; then
         mv disk.raw "$TARGET_DISK"
     fi
-    echo -e "${GREEN}[VMM] Pre-configured Debian 13 disk image ready: ${TARGET_DISK}${RESET}"
+    echo -e "${GREEN}[Cube] Pre-configured Debian 13 disk image ready: ${TARGET_DISK}${RESET}"
 fi
 
 # nocloud images lock root and run systemd-firstboot (easy to miss on serial).
 # Always (re)prepare the image: unlock root, write machine-id, enable autologin.
-echo -e "${GREEN}[VMM] Preparing nocloud image for serial login (root password: root)...${RESET}"
+echo -e "${GREEN}[Cube] Preparing nocloud image for serial login (root password: root)...${RESET}"
 if ! python3 "$SCRIPT_DIR/patch-cloud-shadow.py" "$TARGET_DISK" root; then
     echo -e "${RED}[Error] Failed to prepare ${TARGET_DISK} for login.${RESET}"
     echo -e "${YELLOW}Hint: the image is often root-owned after 'sudo make debian-cloud'. Re-run with sudo.${RESET}"
@@ -108,7 +108,7 @@ if [[ ! -f "$KERNEL_PATH" || ! -f "$INITRD_PATH" ]]; then
         cp debian-cloud-vmlinuz "$KERNEL_PATH" 2>/dev/null || KERNEL_PATH="debian-cloud-vmlinuz"
         cp debian-cloud-initrd.img "$INITRD_PATH" 2>/dev/null || INITRD_PATH="debian-cloud-initrd.img"
     else
-        echo -e "${YELLOW}[VMM] Extracting kernel and initramfs from ${TARGET_DISK}...${RESET}"
+        echo -e "${YELLOW}[Cube] Extracting kernel and initramfs from ${TARGET_DISK}...${RESET}"
         python3 "$SCRIPT_DIR/extract-debian-cloud-kernel.py" "$TARGET_DISK" "$KERNEL_PATH" "$INITRD_PATH" || {
             KERNEL_PATH="debian-cloud-vmlinuz"
             INITRD_PATH="debian-cloud-initrd.img"
@@ -122,14 +122,13 @@ fi
 CIDATA_ISO="cidata.iso"
 
 if [[ ! -f "$CIDATA_ISO" ]]; then
-    echo -e "${GREEN}[VMM] Generating cloud-init NoCloud seed image (unattended)...${RESET}"
+    echo -e "${GREEN}[Cube] Generating cloud-init NoCloud seed image (unattended)...${RESET}"
 
     # Pre-hash the root password so cloud-init applies it without interactive prompts
     ROOT_HASH="$(openssl passwd -6 -salt vmmdebian root 2>/dev/null || \
         printf '%s' '$6$vmmdebian$cTEwBCyPjJIDXBkb6D0Y/V9H8hJhcCWneA6klgFte2bqsmPQJ2jolV/JDKPAKdgyR0WxLRni1t7Asnlj2GI7w/')"
 
-    CIDATA_DIR="$ROOT_DIR/scratch/cidata-$$"
-    mkdir -p "$CIDATA_DIR"
+    CIDATA_DIR="$(mktemp -d -t vmm-cidata-XXXXXX)"
 
     printf 'instance-id: debian-cloud-01\nlocal-hostname: debian\n' > "$CIDATA_DIR/meta-data"
 
@@ -171,14 +170,14 @@ if [[ ! -f "$CIDATA_ISO" ]]; then
     hdiutil makehybrid -o "$CIDATA_ISO" -iso -joliet \
         -default-volume-name cidata "$CIDATA_DIR" >/dev/null 2>&1
     rm -rf "$CIDATA_DIR"
-    echo -e "${GREEN}[VMM] Seed image ready: ${CIDATA_ISO} (root password: 'root')${RESET}"
+    echo -e "${GREEN}[Cube] Seed image ready: ${CIDATA_ISO} (root password: 'root')${RESET}"
 fi
 
 
-# 4. Ensure VMM binary is compiled and signed
-VMM_BIN="${VMM_BIN:-target/debug/vmm}"
+# 4. Ensure Cube binary is compiled and signed
+VMM_BIN="${VMM_BIN:-target/debug/cube}"
 if [[ ! -f "$VMM_BIN" ]]; then
-    echo -e "${GREEN}[VMM] Building and signing VMM binary...${RESET}"
+    echo -e "${GREEN}[Cube] Building and signing Cube binary...${RESET}"
     cargo build
     codesign -s - --entitlements entitlements.plist --force "$VMM_BIN"
 fi
@@ -201,9 +200,9 @@ if [[ $EUID -eq 0 ]]; then
     else
         NAT_FROM="192.168.18.0/24"
     fi
-    echo -e "${GREEN}[VMM] Setting up macOS PF NAT forwarding on ${IF} for ${NAT_FROM}...${RESET}"
+    echo -e "${GREEN}[Cube] Setting up macOS PF NAT forwarding on ${IF} for ${NAT_FROM}...${RESET}"
     sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
-    printf 'nat on %s from %s to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$NAT_FROM" "$IF" "$IF" | pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+    printf 'nat on %s from %s to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$NAT_FROM" "$IF" "$IF" | pfctl -a "com.apple/cube" -f - 2>/dev/null || true
 fi
 
 echo -e "\n${BOLD}${GREEN}======================================================${RESET}"

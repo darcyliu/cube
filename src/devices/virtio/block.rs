@@ -10,7 +10,7 @@ static BLK_IOS: AtomicU64 = AtomicU64::new(0);
 use super::*;
 use crate::devices::MmioDevice;
 use crate::memory::GuestMemory;
-use vmm::cow::{self, CLUSTER_SIZE as COW_CLUSTER_SIZE, MAGIC as COW_MAGIC};
+use cube::cow::{self, CLUSTER_SIZE as COW_CLUSTER_SIZE, MAGIC as COW_MAGIC};
 
 // VirtIO Block Request Types
 const VIRTIO_BLK_T_IN: u32 = 0; // Read from disk

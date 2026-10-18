@@ -180,7 +180,7 @@ shutdown check passed: it reaches SSH and requires the VMM's guest PSCI
 ## 6. Offline disk-overlay management
 
 COW overlays can now be inspected and exported with the standalone
-`vmm-overlay` tool. See [offline overlay management](overlay-management.md).
+`cube-overlay` tool. See [offline overlay management](overlay-management.md).
 
 - [x] Add read-only inspection of geometry, allocation, base association, and
   consistency errors.

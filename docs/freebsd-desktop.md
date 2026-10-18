@@ -71,7 +71,7 @@ the desktop environment instead of the default `twm` test session:
 
 ```sh
 mkdir -p "$HOME/VMs"
-python3 -B scripts/check_install.py target/debug/vmm \
+python3 -B scripts/check_install.py target/debug/cube \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --desktop-environment xfce --desktop-timeout 2400 \
   --artifacts "$HOME/VMs" --keep
@@ -106,9 +106,9 @@ and sent to FreeBSD's `pw` command over SSH standard input, rather than placed
 on the command line:
 
 ```sh
-python3 -B scripts/check_install.py target/debug/vmm \
+python3 -B scripts/check_install.py target/debug/cube \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
-  --desktop-environment xfce --desktop-user darcy \
+  --desktop-environment xfce --desktop-user cubeuser \
   --desktop-password-file "$HOME/VMs/xfce-password.txt" \
   --root-password-file "$HOME/VMs/xfce-password.txt" \
   --desktop-timeout 2400 --artifacts "$HOME/VMs" --keep
@@ -174,7 +174,7 @@ Then run from the repository root:
 
 ```sh
 INSTALL=/path/to/vmm-install-XXXXXX  # replace with the printed artifact path
-./target/debug/vmm \
+./target/debug/cube \
   --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
   --disk "$INSTALL/installed.img" \
   --ram 2048 --cpus 2 \

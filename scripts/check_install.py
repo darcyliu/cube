@@ -212,7 +212,7 @@ class Machine:
 
     def vmm_error(self):
         plain = re.sub(r"\x1b\[[0-9;]*m", "", self.text())
-        errors = [line.strip() for line in plain.splitlines() if "[VMM Error]" in line]
+        errors = [line.strip() for line in plain.splitlines() if "[Cube Error]" in line]
         return errors[-1] if errors else None
 
     def wait_for(self, predicate, deadline, description):

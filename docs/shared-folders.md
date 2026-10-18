@@ -10,12 +10,12 @@ Add one or more exports to an existing OS launch:
 
 ```sh
 # Read-only by default. Quote paths containing spaces or commas.
-./target/debug/vmm --freebsd boot/kernel/kernel --disk freebsd-installed.img \
-  --net none --share work /Users/darcy/Dev/project
+./target/debug/cube --freebsd boot/kernel/kernel --disk freebsd-installed.img \
+  --net none --share work ~/Dev/project
 
 # Explicitly allow guest changes to the host files:
-./target/debug/vmm --freebsd boot/kernel/kernel --disk freebsd-installed.img \
-  --net none --share-rw work /Users/darcy/Dev/project
+./target/debug/cube --freebsd boot/kernel/kernel --disk freebsd-installed.img \
+  --net none --share-rw work ~/Dev/project
 ```
 
 Inside FreeBSD, as root:

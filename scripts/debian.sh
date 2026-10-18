@@ -108,11 +108,11 @@ KERNEL_PATH="boot/debian/linux-trixie"
 INITRD_BASE="boot/debian/initrd-trixie.gz"
 
 if [[ ! -f "$KERNEL_PATH" ]]; then
-    echo -e "${YELLOW}[VMM] Downloading Debian 13 (Trixie) netboot kernel...${RESET}"
+    echo -e "${YELLOW}[Cube] Downloading Debian 13 (Trixie) netboot kernel...${RESET}"
     curl -fSL https://deb.debian.org/debian/dists/trixie/main/installer-arm64/current/images/netboot/debian-installer/arm64/linux -o "$KERNEL_PATH"
 fi
 if [[ ! -f "$INITRD_BASE" ]]; then
-    echo -e "${YELLOW}[VMM] Downloading Debian 13 (Trixie) netboot initrd...${RESET}"
+    echo -e "${YELLOW}[Cube] Downloading Debian 13 (Trixie) netboot initrd...${RESET}"
     curl -fSL https://deb.debian.org/debian/dists/trixie/main/installer-arm64/current/images/netboot/debian-installer/arm64/initrd.gz -o "$INITRD_BASE"
 fi
 
@@ -126,14 +126,14 @@ PRESEED_CFG="$SCRIPT_DIR/debian-preseed.cfg"
 NET_PRESEED_CFG="$SCRIPT_DIR/debian-net-preseed.cfg"
 if [[ "$INTERACTIVE" == "1" ]]; then
     if [[ ! -f "$INITRD_NET_PRESEED" || "$NET_PRESEED_CFG" -nt "$INITRD_NET_PRESEED" || "$SCRIPT_DIR/make-preseed-initrd.py" -nt "$INITRD_NET_PRESEED" ]]; then
-        echo -e "${GREEN}[VMM] Building interactive network/mirror preseed initrd...${RESET}"
+        echo -e "${GREEN}[Cube] Building interactive network/mirror preseed initrd...${RESET}"
         python3 "$SCRIPT_DIR/make-preseed-initrd.py" "$INITRD_BASE" "$INITRD_NET_PRESEED" "$NET_PRESEED_CFG"
     fi
     INITRD_INSTALL="$INITRD_NET_PRESEED"
     PRESEED_CFG="$NET_PRESEED_CFG"
 else
     if [[ ! -f "$INITRD_PRESEED" || "$PRESEED_CFG" -nt "$INITRD_PRESEED" || "$SCRIPT_DIR/make-preseed-initrd.py" -nt "$INITRD_PRESEED" ]]; then
-        echo -e "${GREEN}[VMM] Building unattended preseed initrd...${RESET}"
+        echo -e "${GREEN}[Cube] Building unattended preseed initrd...${RESET}"
         python3 "$SCRIPT_DIR/make-preseed-initrd.py" "$INITRD_BASE" "$INITRD_PRESEED" "$PRESEED_CFG"
     fi
     INITRD_INSTALL="$INITRD_PRESEED"
@@ -142,22 +142,22 @@ fi
 # 2. Determine mode: Install or Run
 IS_NEW_DISK=0
 if [[ ! -f "$TARGET_DISK" ]]; then
-    echo -e "${GREEN}[VMM] Creating sparse virtual disk '${TARGET_DISK}' (${DISK_SIZE})...${RESET}"
+    echo -e "${GREEN}[Cube] Creating sparse virtual disk '${TARGET_DISK}' (${DISK_SIZE})...${RESET}"
     truncate -s "$DISK_SIZE" "$TARGET_DISK"
     IS_NEW_DISK=1
 else
     # A previous installer run that died at "Bad archive mirror" leaves an empty
     # sparse image with no GPT. Treat that as a fresh disk so we re-install.
     if ! python3 -c "import sys; f=open(sys.argv[1],'rb'); f.seek(512); sys.exit(0 if f.read(8)==b'EFI PART' else 1)" "$TARGET_DISK"; then
-        echo -e "${YELLOW}[VMM] '${TARGET_DISK}' has no installed GPT — starting installer.${RESET}"
+        echo -e "${YELLOW}[Cube] '${TARGET_DISK}' has no installed GPT — starting installer.${RESET}"
         IS_NEW_DISK=1
     fi
 fi
 
-# 3. Ensure VMM binary is compiled and signed
-VMM_BIN="${VMM_BIN:-target/debug/vmm}"
+# 3. Ensure Cube binary is compiled and signed
+VMM_BIN="${VMM_BIN:-target/debug/cube}"
 if [[ ! -f "$VMM_BIN" ]]; then
-    echo -e "${GREEN}[VMM] Building and signing VMM binary...${RESET}"
+    echo -e "${GREEN}[Cube] Building and signing Cube binary...${RESET}"
     cargo build
     codesign -s - --entitlements entitlements.plist --force "$VMM_BIN"
 fi
@@ -180,9 +180,9 @@ if [[ $EUID -eq 0 ]]; then
     else
         NAT_FROM="192.168.18.0/24"
     fi
-    echo -e "${GREEN}[VMM] Setting up macOS PF NAT forwarding on ${IF} for ${NAT_FROM}...${RESET}"
+    echo -e "${GREEN}[Cube] Setting up macOS PF NAT forwarding on ${IF} for ${NAT_FROM}...${RESET}"
     sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
-    printf 'nat on %s from %s to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$NAT_FROM" "$IF" "$IF" | pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+    printf 'nat on %s from %s to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$NAT_FROM" "$IF" "$IF" | pfctl -a "com.apple/cube" -f - 2>/dev/null || true
 fi
 
 if [[ $IS_NEW_DISK -eq 1 || $FORCE_INSTALL -eq 1 ]]; then
@@ -238,8 +238,8 @@ if [[ $IS_NEW_DISK -eq 1 || $FORCE_INSTALL -eq 1 ]]; then
         exit $INSTALL_EXIT
     fi
 
-    echo -e "\n${BOLD}${GREEN}[VMM] Installation completed successfully.${RESET}"
-    echo -e "${GREEN}[VMM] Preparing to boot the newly installed system...${RESET}\n"
+    echo -e "\n${BOLD}${GREEN}[Cube] Installation completed successfully.${RESET}"
+    echo -e "${GREEN}[Cube] Preparing to boot the newly installed system...${RESET}\n"
     # Ensure freshly installed kernel/initrd are extracted rather than stale cached ones
     rm -f boot/debian/debian-installed-vmlinuz boot/debian/debian-installed-initrd.img boot/debian/debian-installed-rootpart
 fi
@@ -250,7 +250,7 @@ INSTALLED_KERNEL="boot/debian/debian-installed-vmlinuz"
 INSTALLED_INITRD="boot/debian/debian-installed-initrd.img"
 INSTALLED_ROOTPART="boot/debian/debian-installed-rootpart"
 if [[ ! -f "$INSTALLED_KERNEL" || ! -f "$INSTALLED_INITRD" || ! -f "$INSTALLED_ROOTPART" ]]; then
-    echo -e "${GREEN}[VMM] Extracting kernel/initrd from installed disk...${RESET}"
+    echo -e "${GREEN}[Cube] Extracting kernel/initrd from installed disk...${RESET}"
     python3 "$SCRIPT_DIR/extract-debian-cloud-kernel.py" \
         "$TARGET_DISK" "$INSTALLED_KERNEL" "$INSTALLED_INITRD" "$INSTALLED_ROOTPART" || {
         echo -e "${RED}[Error] Could not extract installed kernel.${RESET}"

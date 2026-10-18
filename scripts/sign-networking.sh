@@ -14,24 +14,25 @@
 #   BUNDLE_ID="com.example.vmm" \
 #   make sign-networking
 #
-# Produces: dist/vmm.app  (run: open dist/vmm.app  or  dist/vmm.app/Contents/MacOS/vmm …)
+# Produces: dist/cube.app  (run: open dist/cube.app  or  dist/cube.app/Contents/MacOS/cube …)
 # Also copies a convenience binary link note in dist/README-networking-sign.txt
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VMM_BIN="${VMM_BIN:-target/debug/vmm}"
-APP_DIR="${APP_DIR:-dist/vmm.app}"
-BUNDLE_ID="${BUNDLE_ID:-com.darcy.vmm}"
+CUBE_BIN="${CUBE_BIN:-${VMM_BIN:-target/debug/cube}}"
+APP_DIR="${APP_DIR:-dist/cube.app}"
+BUNDLE_ID="${BUNDLE_ID:-net.neuralengine.cube}"
+TEAM_ID="${TEAM_ID:-ZV8TTD4Z45}"
 IDENTITY="${IDENTITY:-}"
 PROFILE="${PROFILE:-}"
 ENTITLEMENTS="${ENTITLEMENTS:-entitlements.networking.plist}"
 
 die() { echo "[sign-networking] ERROR: $*" >&2; exit 1; }
 
-if [[ ! -f "$VMM_BIN" ]]; then
-  die "missing $VMM_BIN — run: make build"
+if [[ ! -f "$CUBE_BIN" ]]; then
+  die "missing $CUBE_BIN — run: make build"
 fi
 if [[ ! -f "$ENTITLEMENTS" ]]; then
   die "missing $ENTITLEMENTS"
@@ -78,13 +79,13 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>vmm</string>
+	<string>cube</string>
 	<key>CFBundleIdentifier</key>
 	<string>${BUNDLE_ID}</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>vmm</string>
+	<string>cube</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -97,8 +98,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-cp "$VMM_BIN" "$APP_DIR/Contents/MacOS/vmm"
-chmod +x "$APP_DIR/Contents/MacOS/vmm"
+cp "$CUBE_BIN" "$APP_DIR/Contents/MacOS/cube"
+chmod +x "$APP_DIR/Contents/MacOS/cube"
 cp "$PROFILE" "$APP_DIR/Contents/embedded.provisionprofile"
 
 echo "[sign-networking] Signing $APP_DIR with identity: $IDENTITY"
@@ -110,7 +111,7 @@ codesign --force --deep --sign "$IDENTITY" \
 echo "[sign-networking] Verifying…"
 codesign --verify --verbose=2 "$APP_DIR"
 echo "[sign-networking] Entitlements on binary:"
-codesign -d --entitlements - --xml "$APP_DIR/Contents/MacOS/vmm" 2>/dev/null | plutil -p - || true
+codesign -d --entitlements - --xml "$APP_DIR/Contents/MacOS/cube" 2>/dev/null | plutil -p - || true
 
 mkdir -p dist
 cat > dist/README-networking-sign.txt <<TXT
@@ -119,10 +120,10 @@ Bundle ID:  $BUNDLE_ID
 Identity:   $IDENTITY
 
 Run (no sudo needed for vmnet *if* the profile grants com.apple.vm.networking):
-  $APP_DIR/Contents/MacOS/vmm --uefi --disk freebsd-installed.img --net vmnet
+  $APP_DIR/Contents/MacOS/cube --uefi --disk freebsd-installed.img --net vmnet
 
 or:
-  $APP_DIR/Contents/MacOS/vmm … --net bridge:en0
+  $APP_DIR/Contents/MacOS/cube … --net bridge:en0
 
 Host PF NAT may still need sudo once for shared/NAT mode internet; bridge mode skips PF NAT.
 

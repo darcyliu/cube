@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
-VMM_BINARY=${VMM_BINARY:-$REPO_DIR/target/debug/vmm}
+VMM_BINARY=${VMM_BINARY:-$REPO_DIR/target/debug/cube}
 
 if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
     cat <<'EOF'
@@ -47,7 +47,7 @@ if [[ $has_iso != true ]]; then
     exit 2
 fi
 if [[ ! -x $VMM_BINARY ]]; then
-    echo "[Error] VMM binary is missing or not executable: $VMM_BINARY" >&2
+    echo "[Error] Cube binary is missing or not executable: $VMM_BINARY" >&2
     echo "Run 'make all' first, or set VMM_BINARY." >&2
     exit 2
 fi

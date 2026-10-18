@@ -2,16 +2,16 @@
 use std::env;
 use std::path::Path;
 use std::process;
-use vmm::cow::{CowImage, CLUSTER_SIZE};
+use cube::cow::{CowImage, CLUSTER_SIZE};
 
 fn run(args: &[String]) -> Result<(), String> {
     if args.len() < 4 || !matches!(args[1].as_str(), "inspect" | "export") {
-        return Err("Usage: vmm-overlay inspect BASE OVERLAY\n       vmm-overlay export BASE OVERLAY OUTPUT".into());
+        return Err("Usage: cube-overlay inspect BASE OVERLAY\n       cube-overlay export BASE OVERLAY OUTPUT".into());
     }
     let action = args[1].as_str();
     if (action == "inspect" && args.len() != 4) || (action == "export" && args.len() != 5) {
         return Err(
-            "Wrong number of arguments; run vmm-overlay without arguments for usage".into(),
+            "Wrong number of arguments; run cube-overlay without arguments for usage".into(),
         );
     }
     let mut image = CowImage::open(Path::new(&args[2]), Path::new(&args[3]))?;
@@ -42,7 +42,7 @@ fn run(args: &[String]) -> Result<(), String> {
 
 fn main() {
     if let Err(error) = run(&env::args().collect::<Vec<_>>()) {
-        eprintln!("vmm-overlay: {error}");
+        eprintln!("cube-overlay: {error}");
         process::exit(1);
     }
 }

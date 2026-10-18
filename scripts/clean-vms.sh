@@ -149,7 +149,7 @@ else
     fi
 
     # Perform deletion
-    echo -e "\n${GREEN}[VMM] Cleaning instance files...${RESET}"
+    echo -e "\n${GREEN}[Cube] Cleaning instance files...${RESET}"
     for item in "${ITEMS_TO_REMOVE[@]}"; do
         # Use sudo if permission denied (files might be owned by root from sudo truncate)
         rm -rf "$item" 2>/dev/null || sudo rm -rf "$item"
@@ -158,7 +158,7 @@ else
 fi
 
 # Clean up host /tmp pipes and logs
-echo -e "${GREEN}[VMM] Cleaning host temporary files...${RESET}"
+echo -e "${GREEN}[Cube] Cleaning host temporary files...${RESET}"
 rm -f /tmp/vmm-uart-in \
       /tmp/vmm-unattended-console.log \
       /tmp/vmm-console.log \

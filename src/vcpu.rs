@@ -543,14 +543,14 @@ impl Vcpu {
         match self.get_sys_reg(HV_SYS_REG_ID_AA64ISAR0_EL1) {
             Ok(isar0) => {
                 let masked = isar0 & !(0xfu64 << 60);
-                eprintln!("[VMM] ID_AA64ISAR0_EL1={isar0:#x} (RNDR field cleared -> {masked:#x})");
+                eprintln!("[Cube] ID_AA64ISAR0_EL1={isar0:#x} (RNDR field cleared -> {masked:#x})");
                 if let Err(e) = self.set_sys_reg(HV_SYS_REG_ID_AA64ISAR0_EL1, masked) {
-                    eprintln!("[VMM] Warning: failed to set ID_AA64ISAR0_EL1: {e}");
+                    eprintln!("[Cube] Warning: failed to set ID_AA64ISAR0_EL1: {e}");
                 } else if let Ok(v) = self.get_sys_reg(HV_SYS_REG_ID_AA64ISAR0_EL1) {
-                    eprintln!("[VMM] ID_AA64ISAR0_EL1 readback={v:#x}");
+                    eprintln!("[Cube] ID_AA64ISAR0_EL1 readback={v:#x}");
                 }
             }
-            Err(e) => eprintln!("[VMM] Warning: get ID_AA64ISAR0_EL1: {e}"),
+            Err(e) => eprintln!("[Cube] Warning: get ID_AA64ISAR0_EL1: {e}"),
         }
 
         Ok(())
@@ -586,7 +586,7 @@ impl Vcpu {
         if trace_boot {
             let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
             let x0 = self.get_reg(HV_REG_X0).unwrap_or(0);
-            eprintln!("[VMM TRACE] enter run PC=0x{pc:016x} X0=0x{x0:016x}");
+            eprintln!("[Cube TRACE] enter run PC=0x{pc:016x} X0=0x{x0:016x}");
             // Force periodic exits so we can sample PC if the guest spins with no traps.
             let vcpu_id = self.id;
             std::thread::spawn(move || {
@@ -596,7 +596,7 @@ impl Vcpu {
                         let ids = [vcpu_id];
                         let _ = crate::hypervisor::hv_vcpus_exit(ids.as_ptr(), 1);
                     }
-                    eprintln!("[VMM TRACE] kick #{i} sent");
+                    eprintln!("[Cube TRACE] kick #{i} sent");
                 }
             });
         }
@@ -625,7 +625,7 @@ impl Vcpu {
                 let ec = (syndrome >> 26) & 0x3f;
                 let ipa = exit.exception.physical_address;
                 eprintln!(
-                    "[VMM TRACE] exit#{exits} reason={} EC=0x{ec:02x} PC=0x{pc:016x} IPA=0x{ipa:016x} X0=0x{x0:016x}",
+                    "[Cube TRACE] exit#{exits} reason={} EC=0x{ec:02x} PC=0x{pc:016x} IPA=0x{ipa:016x} X0=0x{x0:016x}",
                     exit.reason as u32
                 );
                 last_trace = std::time::Instant::now();
@@ -701,7 +701,7 @@ impl Vcpu {
                         let sp = self.get_sys_reg(HV_SYS_REG_SP_EL1).unwrap_or(0);
                         let cpsr = self.get_reg(HV_REG_CPSR).unwrap_or(0);
                         eprintln!(
-                            "[VMM TRACE] kick-sample PC={pc:#x} X0={x0:#x} X1={x1:#x} X19={x19:#x} LR={lr:#x} SP={sp:#x} CPSR={cpsr:#x}"
+                            "[Cube TRACE] kick-sample PC={pc:#x} X0={x0:#x} X1={x1:#x} X19={x19:#x} LR={lr:#x} SP={sp:#x} CPSR={cpsr:#x}"
                         );
                     }
                     // vCPU was kicked by another thread (hv_vcpus_exit) to process interrupts
@@ -813,7 +813,7 @@ impl Vcpu {
         if std::env::var_os("VMM_TRACE_BOOT").is_some() {
             let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
             eprintln!(
-                "[VMM TRACE] sysreg-trap PC={pc:#x} op0={op0} op1={op1} CRn={crn} CRm={crm} op2={op2} Rt={rt} read={is_read}"
+                "[Cube TRACE] sysreg-trap PC={pc:#x} op0={op0} op1={op1} CRn={crn} CRm={crm} op2={op2} Rt={rt} read={is_read}"
             );
         }
         // op0 == 2 is ARM Debug register space (OSLAR_EL1, OSLSR_EL1, MDSCR_EL1, etc.)
@@ -828,7 +828,7 @@ impl Vcpu {
             if std::env::var_os("VMM_TRACE_BOOT").is_some() {
                 let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
                 eprintln!(
-                    "[VMM TRACE] sysreg-RAZWI PC={pc:#x} op0={op0} op1={op1} CRn={crn} CRm={crm} op2={op2} Rt={rt} read={is_read}"
+                    "[Cube TRACE] sysreg-RAZWI PC={pc:#x} op0={op0} op1={op1} CRn={crn} CRm={crm} op2={op2} Rt={rt} read={is_read}"
                 );
             }
             if is_read && rt != 31 {
@@ -848,7 +848,7 @@ impl Vcpu {
         let func_id = self.get_reg(HV_REG_X0).map_err(|e| e.to_string())?;
         if std::env::var_os("VMM_TRACE_BOOT").is_some() {
             let x1 = self.get_reg(HV_REG_X1).unwrap_or(0);
-            eprintln!("[VMM TRACE] SMCCC/PSCI call id={func_id:#x} x1={x1:#x}");
+            eprintln!("[Cube TRACE] SMCCC/PSCI call id={func_id:#x} x1={x1:#x}");
         }
 
         match func_id {
@@ -1005,7 +1005,7 @@ impl Vcpu {
             }
             _ => {
                 eprintln!(
-                    "[VMM Warning] Unhandled PSCI function ID: 0x{:08x}",
+                    "[Cube Warning] Unhandled PSCI function ID: 0x{:08x}",
                     func_id
                 );
                 self.set_reg(HV_REG_X0, PSCI_NOT_SUPPORTED as u64)

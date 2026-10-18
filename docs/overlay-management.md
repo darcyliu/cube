@@ -1,13 +1,13 @@
 # Offline COW overlay management
 
-Build the standalone tool with `cargo build --locked --bin vmm-overlay`. It does
+Build the standalone tool with `cargo build --locked --bin cube-overlay`. It does
 not launch a VM or require Hypervisor.framework. Stop every VM using the overlay
 before inspecting or exporting it; the tool checks the existing file locks and
 fails if a writer still holds either input.
 
 ```sh
-target/debug/vmm-overlay inspect freebsd.img freebsd.img.cow
-target/debug/vmm-overlay export freebsd.img freebsd.img.cow freebsd-merged.img
+target/debug/cube-overlay inspect freebsd.img freebsd.img.cow
+target/debug/cube-overlay export freebsd.img freebsd.img.cow freebsd-merged.img
 ```
 
 `inspect` opens both inputs read-only and reports the base size, 64 KiB cluster

@@ -106,7 +106,7 @@ def extract_kernel_and_initrd(disk_image_path, out_kernel_path, out_initrd_path,
 
             if names.intersection({"etc", "usr", "var", "bin", "sbin"}):
                 root_part_idx = part_num
-                print(f"[VMM] Partition {part_num} identified as root filesystem (/dev/vda{part_num})")
+                print(f"[Cube] Partition {part_num} identified as root filesystem (/dev/vda{part_num})")
 
             # Check if kernel/initrd are in root (dedicated /boot partition)
             k_candidates = [(n, i) for n, i, t in root_entries if n.startswith("vmlinuz-") and t in (0, 1)]
@@ -122,7 +122,7 @@ def extract_kernel_and_initrd(disk_image_path, out_kernel_path, out_initrd_path,
                     "kernel": sorted(k_candidates)[-1],
                     "initrd": sorted(i_candidates)[-1],
                 }
-                print(f"[VMM] Partition {part_num} identified as dedicated /boot partition")
+                print(f"[Cube] Partition {part_num} identified as dedicated /boot partition")
 
             # Check if kernel/initrd are in /boot subdirectory (unified root partition)
             if "boot" in names and not boot_info:
@@ -142,7 +142,7 @@ def extract_kernel_and_initrd(disk_image_path, out_kernel_path, out_initrd_path,
                             "kernel": sorted(k_c)[-1],
                             "initrd": sorted(i_c)[-1],
                         }
-                        print(f"[VMM] Partition {part_num} has /boot directory with kernel/initrd")
+                        print(f"[Cube] Partition {part_num} has /boot directory with kernel/initrd")
 
         if not boot_info:
             print("[Error] No kernel/initramfs found on any partition", file=sys.stderr)
@@ -204,21 +204,21 @@ def extract_kernel_and_initrd(disk_image_path, out_kernel_path, out_initrd_path,
         k_name, k_inum = boot_info["kernel"]
         i_name, i_inum = boot_info["initrd"]
 
-        print(f"[VMM] Extracting kernel '{k_name}' -> {out_kernel_path}...")
+        print(f"[Cube] Extracting kernel '{k_name}' -> {out_kernel_path}...")
         k_sz = read_file(k_inum, out_kernel_path)
-        print(f"[VMM] Extracted kernel ({k_sz / (1024*1024):.2f} MB)")
+        print(f"[Cube] Extracted kernel ({k_sz / (1024*1024):.2f} MB)")
 
-        print(f"[VMM] Extracting initramfs '{i_name}' -> {out_initrd_path}...")
+        print(f"[Cube] Extracting initramfs '{i_name}' -> {out_initrd_path}...")
         i_sz = read_file(i_inum, out_initrd_path)
-        print(f"[VMM] Extracted initramfs ({i_sz / (1024*1024):.2f} MB)")
+        print(f"[Cube] Extracted initramfs ({i_sz / (1024*1024):.2f} MB)")
 
         root_dev = f"/dev/vda{root_part_idx}" if root_part_idx else "/dev/vda1"
-        print(f"[VMM] Detected root partition device: {root_dev}")
+        print(f"[Cube] Detected root partition device: {root_dev}")
         if out_rootpart_path:
             os.makedirs(os.path.dirname(os.path.abspath(out_rootpart_path)), exist_ok=True)
             with open(out_rootpart_path, "w") as rf:
                 rf.write(root_dev + "\n")
-            print(f"[VMM] Saved root partition device to {out_rootpart_path}")
+            print(f"[Cube] Saved root partition device to {out_rootpart_path}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:

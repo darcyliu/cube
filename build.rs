@@ -16,7 +16,7 @@ fn main() {
     let linux_out_bin = std::path::Path::new(&out_dir).join("linux_payload.bin");
     let linux_out_obj = std::path::Path::new(&out_dir).join("linux_payload.o");
     let cocoa_obj = std::path::Path::new(&out_dir).join("native.o");
-    let cocoa_lib = std::path::Path::new(&out_dir).join("libvmm_native.a");
+    let cocoa_lib = std::path::Path::new(&out_dir).join("libcube_native.a");
     let status = Command::new("clang")
         .args(["-fobjc-arc", "-c", "src/native.m", "-o"])
         .arg(&cocoa_obj)
@@ -31,7 +31,24 @@ fn main() {
         .expect("build.rs: ar is required for the native Cocoa frontend");
     assert!(status.success(), "build.rs: failed to archive native Cocoa frontend");
     println!("cargo:rustc-link-search=native={out_dir}");
-    println!("cargo:rustc-link-lib=static=vmm_native");
+    println!("cargo:rustc-link-lib=static=cube_native");
+
+    let git_hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "release".to_string());
+    let build_number = Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "1".to_string());
+    println!("cargo:rustc-env=CUBE_BUILD_GIT_HASH={git_hash}");
+    println!("cargo:rustc-env=CUBE_BUILD_NUMBER={build_number}");
 
     // Assemble the tiny bare-metal test payload (include_bytes! in main.rs).
     // guest/*.bin is gitignored — this step must succeed on every clean build.

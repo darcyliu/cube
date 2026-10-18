@@ -256,7 +256,7 @@ fn run_cli(args: Vec<String>) {
                     process::exit(1);
                 });
                 forward_rules.push(forward::ForwardRule::parse(value).unwrap_or_else(|e| {
-                    eprintln!("[VMM Error] {e}");
+                    eprintln!("[Cube Error] {e}");
                     process::exit(1);
                 }));
             }
@@ -267,7 +267,7 @@ fn run_cli(args: Vec<String>) {
                         ssh_port = Some(port);
                     } else {
                         eprintln!(
-                            "\x1b[1;31m[VMM Error] Invalid SSH port: '{}'\x1b[0m",
+                            "\x1b[1;31m[Cube Error] Invalid SSH port: '{}'\x1b[0m",
                             args[i]
                         );
                         process::exit(1);
@@ -297,7 +297,7 @@ fn run_cli(args: Vec<String>) {
                             "ro" | "readonly" => read_only = true,
                             _ => {
                                 eprintln!(
-                                    "\x1b[1;33m[VMM Warning] Unknown disk option '{}'\x1b[0m",
+                                    "\x1b[1;33m[Cube Warning] Unknown disk option '{}'\x1b[0m",
                                     opt
                                 );
                             }
@@ -342,7 +342,7 @@ fn run_cli(args: Vec<String>) {
                         ram_mb = Some(mb);
                     } else {
                         eprintln!(
-                            "\x1b[1;31m[VMM Error] Invalid RAM size: '{}'\x1b[0m",
+                            "\x1b[1;31m[Cube Error] Invalid RAM size: '{}'\x1b[0m",
                             args[i]
                         );
                         process::exit(1);
@@ -355,14 +355,14 @@ fn run_cli(args: Vec<String>) {
                     if let Ok(c) = args[i].parse::<usize>() {
                         if c == 0 || c > 16 {
                             eprintln!(
-                                "\x1b[1;31m[VMM Error] CPU count must be between 1 and 16\x1b[0m"
+                                "\x1b[1;31m[Cube Error] CPU count must be between 1 and 16\x1b[0m"
                             );
                             process::exit(1);
                         }
                         cpus = c;
                     } else {
                         eprintln!(
-                            "\x1b[1;31m[VMM Error] Invalid CPU count: '{}'\x1b[0m",
+                            "\x1b[1;31m[Cube Error] Invalid CPU count: '{}'\x1b[0m",
                             args[i]
                         );
                         process::exit(1);
@@ -375,7 +375,7 @@ fn run_cli(args: Vec<String>) {
                     match CpuModel::parse(&args[i]) {
                         Ok(model) => cpu_model = model,
                         Err(e) => {
-                            eprintln!("\x1b[1;31m[VMM Error] {}\x1b[0m", e);
+                            eprintln!("\x1b[1;31m[Cube Error] {}\x1b[0m", e);
                             process::exit(1);
                         }
                     }
@@ -420,7 +420,7 @@ fn run_cli(args: Vec<String>) {
                         mac_addr = mac;
                     } else {
                         eprintln!(
-                            "\x1b[1;31m[VMM Error] Invalid MAC address: '{}'\x1b[0m",
+                            "\x1b[1;31m[Cube Error] Invalid MAC address: '{}'\x1b[0m",
                             args[i]
                         );
                         process::exit(1);
@@ -455,7 +455,7 @@ fn run_cli(args: Vec<String>) {
                     process::exit(1);
                 });
                 display_size = parse_display_size(value).unwrap_or_else(|e| {
-                    eprintln!("\x1b[1;31m[VMM Error] Invalid --display '{value}': {e}\x1b[0m");
+                    eprintln!("\x1b[1;31m[Cube Error] Invalid --display '{value}': {e}\x1b[0m");
                     process::exit(1);
                 });
             }
@@ -463,7 +463,7 @@ fn run_cli(args: Vec<String>) {
                 no_reboot = true;
             }
             "--help" | "-h" => {
-                println!("Usage: vmm [OPTIONS] [PAYLOAD/KERNEL]");
+                println!("Usage: cube [OPTIONS] [PAYLOAD/KERNEL]");
                 println!();
                 println!("Options:");
                 println!(
@@ -533,7 +533,7 @@ fn run_cli(args: Vec<String>) {
                     "                           bridge[:iface], tap:<dev>, mock, none"
                 );
                 println!(
-                    "      --vmnet-socket <PATH> Unix socket for --net vmnet-proxy (default: ~/Library/Application Support/vmm/vmnet.sock)"
+                    "      --vmnet-socket <PATH> Unix socket for --net vmnet-proxy (default: ~/Library/Application Support/cube/vmnet.sock)"
                 );
                 println!(
                     "      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)"
@@ -553,7 +553,15 @@ fn run_cli(args: Vec<String>) {
                 println!(
                     "      --efi-vars <PATH>     Persistent per-VM EFI variable store (default <disk>.vars.fd)"
                 );
+                println!("  -V, --version            Display version and build information");
                 println!("  -h, --help               Display this help message");
+                return;
+            }
+            "--version" | "-V" => {
+                let version = env!("CARGO_PKG_VERSION");
+                let git_hash = option_env!("CUBE_BUILD_GIT_HASH").unwrap_or("unknown");
+                let build_num = option_env!("CUBE_BUILD_NUMBER").unwrap_or("1");
+                println!("cube {version} (build {build_num}, commit {git_hash})");
                 return;
             }
             arg if !arg.starts_with('-') => {
@@ -563,7 +571,7 @@ fn run_cli(args: Vec<String>) {
             }
             _ => {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Unknown argument '{}'\x1b[0m",
+                    "\x1b[1;31m[Cube Error] Unknown argument '{}'\x1b[0m",
                     args[i]
                 );
                 process::exit(1);
@@ -584,24 +592,24 @@ fn run_cli(args: Vec<String>) {
     }
 
     if native_gui && vnc_bind.is_some() {
-        eprintln!("[VMM Error] --gui native and --vnc cannot be combined");
+        eprintln!("[Cube Error] --gui native and --vnc cannot be combined");
         process::exit(1);
     }
     if native_gui && !is_freebsd && !is_uefi && !is_linux {
-        eprintln!("[VMM Error] --gui native requires --freebsd, --linux, or --uefi");
+        eprintln!("[Cube Error] --gui native requires --freebsd, --linux, or --uefi");
         process::exit(1);
     }
     if retina && !native_gui {
-        eprintln!("[VMM Error] --retina requires --gui native");
+        eprintln!("[Cube Error] --retina requires --gui native");
         process::exit(1);
     }
     if display_requested && vnc_bind.is_none() && !native_gui {
-        eprintln!("\x1b[1;31m[VMM Error] --display requires --vnc or --gui native\x1b[0m");
+        eprintln!("\x1b[1;31m[Cube Error] --display requires --vnc or --gui native\x1b[0m");
         process::exit(1);
     }
     if retina {
         display_size = retina_framebuffer_size(display_size).unwrap_or_else(|e| {
-            eprintln!("[VMM Error] Invalid Retina framebuffer: {e}");
+            eprintln!("[Cube Error] Invalid Retina framebuffer: {e}");
             process::exit(1);
         });
         println!(
@@ -623,14 +631,14 @@ fn run_cli(args: Vec<String>) {
     if !disk_configs.is_empty() && root_dev.is_none() && !is_linux {
         let disk0 = &disk_configs[0].path;
         if let Some(layout) = gpt::describe_freebsd_gpt(disk0) {
-            println!("[VMM] GPT on '{}': {}", disk0, layout);
+            println!("[Cube] GPT on '{}': {}", disk0, layout);
         }
         if let Some(detected) = detect_root_partition(disk0) {
-            println!("[VMM] Auto-detected root partition: {}", detected);
+            println!("[Cube] Auto-detected root partition: {}", detected);
             root_dev = Some(detected);
         } else {
             eprintln!(
-                "\x1b[1;33m[VMM Warning] No FreeBSD UFS/ZFS GPT partition on '{}'; not assuming ufs:/dev/vtbd0p2 (that is often swap).\x1b[0m",
+                "\x1b[1;33m[Cube Warning] No FreeBSD UFS/ZFS GPT partition on '{}'; not assuming ufs:/dev/vtbd0p2 (that is often swap).\x1b[0m",
                 disk0
             );
         }
@@ -640,10 +648,10 @@ fn run_cli(args: Vec<String>) {
         if let Some(ref root) = root_dev {
             if root.starts_with("zfs:") {
                 eprintln!(
-                    "\x1b[1;33m[VMM] ZFS root selected. Direct ELF+zfs.ko (Strategy 1) often hangs after MODINFO."
+                    "\x1b[1;33m[Cube] ZFS root selected. Direct ELF+zfs.ko (Strategy 1) often hangs after MODINFO."
                 );
                 eprintln!(
-                    "[VMM] Recommended Strategy 2: make fetch-uefi && make freebsd-zfs-uefi DISK=<img>\x1b[0m"
+                    "[Cube] Recommended Strategy 2: make fetch-uefi && make freebsd-zfs-uefi DISK=<img>\x1b[0m"
                 );
             }
         }
@@ -664,13 +672,13 @@ fn run_cli(args: Vec<String>) {
             module_paths.push(default_zfs.to_string());
         } else {
             eprintln!(
-                "\x1b[1;31m[VMM Error] Root-on-ZFS requires preloaded zfs.ko, but '{default_zfs}' was not found.\x1b[0m"
+                "\x1b[1;31m[Cube Error] Root-on-ZFS requires preloaded zfs.ko, but '{default_zfs}' was not found.\x1b[0m"
             );
             eprintln!(
-                "\x1b[1;33m[VMM Hint] Run 'make fetch-freebsd' to extract boot/kernel/kernel and boot/kernel/zfs.ko from kernel.txz.\x1b[0m"
+                "\x1b[1;33m[Cube Hint] Run 'make fetch-freebsd' to extract boot/kernel/kernel and boot/kernel/zfs.ko from kernel.txz.\x1b[0m"
             );
             eprintln!(
-                "\x1b[1;33m[VMM Hint] Or pass --module /path/to/zfs.ko (and --root zfs:pool/ROOT/default if the dataset is not zroot/ROOT/default).\x1b[0m"
+                "\x1b[1;33m[Cube Hint] Or pass --module /path/to/zfs.ko (and --root zfs:pool/ROOT/default if the dataset is not zroot/ROOT/default).\x1b[0m"
             );
             process::exit(1);
         }
@@ -682,10 +690,10 @@ fn run_cli(args: Vec<String>) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Failed to read UEFI firmware '{path}': {e}\x1b[0m"
+                    "\x1b[1;31m[Cube Error] Failed to read UEFI firmware '{path}': {e}\x1b[0m"
                 );
                 eprintln!(
-                    "\x1b[1;33m[VMM Hint] Run 'make fetch-uefi' to download firmware/QEMU_EFI.fd.\x1b[0m"
+                    "\x1b[1;33m[Cube Hint] Run 'make fetch-uefi' to download firmware/QEMU_EFI.fd.\x1b[0m"
                 );
                 process::exit(1);
             }
@@ -731,7 +739,7 @@ fn run_cli(args: Vec<String>) {
             Ok(data) => data,
             Err(e) => {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Failed to read file '{}': {}\x1b[0m",
+                    "\x1b[1;31m[Cube Error] Failed to read file '{}': {}\x1b[0m",
                     path, e
                 );
                 process::exit(1);
@@ -859,7 +867,7 @@ fn run_cli(args: Vec<String>) {
 
     // Default: run built-in baremetal test payload
     println!("\x1b[1;36m==================================================\x1b[0m");
-    println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
+    println!("\x1b[1;36m  macOS Hypervisor.framework Cube (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
     boot_flat_binary(
         "embedded EL1 baremetal test suite",
@@ -960,53 +968,53 @@ fn boot_os_kernel(
         .map(forward::start_port_forward)
         .collect::<Result<Vec<_>, _>>()?;
     println!("\x1b[1;36m==================================================\x1b[0m");
-    println!("\x1b[1;36m  macOS Hypervisor.framework VMM (ARM64)\x1b[0m");
+    println!("\x1b[1;36m  macOS Hypervisor.framework Cube (ARM64)\x1b[0m");
     println!("\x1b[1;36m==================================================\x1b[0m");
     if uefi_firmware.is_some() {
-        println!("[VMM] Preparing UEFI/EDK2 boot from '{}'...", kernel_path);
+        println!("[Cube] Preparing UEFI/EDK2 boot from '{}'...", kernel_path);
     } else if is_linux {
         println!(
-            "[VMM] Preparing to boot Linux ARM64 kernel from '{}'...",
+            "[Cube] Preparing to boot Linux ARM64 kernel from '{}'...",
             kernel_path
         );
     } else {
         println!(
-            "[VMM] Preparing to boot FreeBSD ARM64 kernel from '{}'...",
+            "[Cube] Preparing to boot FreeBSD ARM64 kernel from '{}'...",
             kernel_path
         );
     }
     println!(
-        "[VMM] Allocating {}MB RAM at GPA 0x{:08x}...",
+        "[Cube] Allocating {}MB RAM at GPA 0x{:08x}...",
         ram_size / (1024 * 1024),
         DEFAULT_RAM_BASE
     );
-    println!("[VMM] Configuring {} virtual CPUs (SMP)...", cpus);
-    println!("[VMM] Bootargs: \"{}\"", bootargs);
+    println!("[Cube] Configuring {} virtual CPUs (SMP)...", cpus);
+    println!("[Cube] Bootargs: \"{}\"", bootargs);
 
     let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!(
-                "\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m",
+                "\x1b[1;31m[Cube Error] Failed to initialize VM: {}\x1b[0m",
                 e
             );
             eprintln!(
-                "[VMM Hint] Ensure binary is signed with 'com.apple.security.hypervisor' entitlement."
+                "[Cube Hint] Ensure binary is signed with 'com.apple.security.hypervisor' entitlement."
             );
             process::exit(1);
         }
     };
 
     // Initialize native in-kernel ARM GICv3
-    println!("[VMM] Initializing in-kernel ARM GICv3 device...");
+    println!("[Cube] Initializing in-kernel ARM GICv3 device...");
     if let Err(e) = vm.init_gic(MMIO_GICD_BASE, MMIO_GICR_BASE) {
         eprintln!(
-            "\x1b[1;31m[VMM Error] Failed to create GICv3 device: {}\x1b[0m",
+            "\x1b[1;31m[Cube Error] Failed to create GICv3 device: {}\x1b[0m",
             e
         );
         process::exit(1);
     }
-    println!("\x1b[1;32m[VMM] In-kernel GICv3 initialized successfully.\x1b[0m");
+    println!("\x1b[1;32m[Cube] In-kernel GICv3 initialized successfully.\x1b[0m");
     let vcpu_mgr = VcpuManager::new(cpus, cpu_model);
     terminal::install_shutdown_handlers();
 
@@ -1017,7 +1025,7 @@ fn boot_os_kernel(
         Box::new(Pl011Uart::with_log(UART_IRQ, true, serial_log)),
     );
     println!(
-        "[VMM] Registered interactive PL011 UART console at GPA 0x{:08x} (IRQ {})",
+        "[Cube] Registered interactive PL011 UART console at GPA 0x{:08x} (IRQ {})",
         MMIO_UART_BASE, UART_IRQ
     );
 
@@ -1028,7 +1036,7 @@ fn boot_os_kernel(
         Box::new(Pl031Rtc::new(RTC_IRQ)),
     );
     println!(
-        "[VMM] Registered ARM PL031 RTC at GPA 0x{:08x} (IRQ {})",
+        "[Cube] Registered ARM PL031 RTC at GPA 0x{:08x} (IRQ {})",
         MMIO_RTC_BASE, RTC_IRQ
     );
 
@@ -1045,7 +1053,7 @@ fn boot_os_kernel(
             irq,
         });
         println!(
-            "[VMM] 9P share '{}' {} ({}) at {base:#x}, IRQ {irq}",
+            "[Cube] 9P share '{}' {} ({}) at {base:#x}, IRQ {irq}",
             share.tag,
             share.path.display(),
             if share.read_only { "ro" } else { "rw" }
@@ -1076,13 +1084,13 @@ fn boot_os_kernel(
                     irq,
                 });
                 println!(
-                    "[VMM] Registered VirtIO-MMIO block device '{}' (disk {}) at GPA 0x{:08x} (IRQ {})",
+                    "[Cube] Registered VirtIO-MMIO block device '{}' (disk {}) at GPA 0x{:08x} (IRQ {})",
                     disk.path, idx, base, irq
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Failed to initialize VirtIO block device '{}': {}\x1b[0m",
+                    "\x1b[1;31m[Cube Error] Failed to initialize VirtIO block device '{}': {}\x1b[0m",
                     disk.path, e
                 );
                 process::exit(1);
@@ -1116,7 +1124,7 @@ fn boot_os_kernel(
             irq: VIRTIO_NET_IRQ,
         });
         println!(
-            "[VMM] Registered VirtIO-MMIO network device at GPA 0x{:08x} (IRQ {})",
+            "[Cube] Registered VirtIO-MMIO network device at GPA 0x{:08x} (IRQ {})",
             MMIO_VIRTIO_NET_BASE, VIRTIO_NET_IRQ
         );
     }
@@ -1134,7 +1142,7 @@ fn boot_os_kernel(
         irq: VIRTIO_RNG_IRQ,
     });
     println!(
-        "[VMM] Registered VirtIO-MMIO RNG device at GPA 0x{:08x} (IRQ {})",
+        "[Cube] Registered VirtIO-MMIO RNG device at GPA 0x{:08x} (IRQ {})",
         MMIO_VIRTIO_RNG_BASE, VIRTIO_RNG_IRQ
     );
 
@@ -1157,7 +1165,7 @@ fn boot_os_kernel(
         irq: VIRTIO_CONSOLE_IRQ,
     });
     println!(
-        "[VMM] Registered VirtIO-MMIO console device at GPA 0x{:08x} (IRQ {}, {}x{})",
+        "[Cube] Registered VirtIO-MMIO console device at GPA 0x{:08x} (IRQ {}, {}x{})",
         MMIO_VIRTIO_CONSOLE_BASE, VIRTIO_CONSOLE_IRQ, term_size.ws_col, term_size.ws_row
     );
 
@@ -1182,7 +1190,7 @@ fn boot_os_kernel(
                     if old_cols != new_ws.ws_col || old_rows != new_ws.ws_row {
                         con.update_size(new_ws.ws_col, new_ws.ws_row);
                         eprintln!(
-                            "\r\n[VMM] Terminal window resized: {}x{} -> {}x{} (forwarded SIGWINCH to guest)\r\n",
+                            "\r\n[Cube] Terminal window resized: {}x{} -> {}x{} (forwarded SIGWINCH to guest)\r\n",
                             old_cols, old_rows, new_ws.ws_col, new_ws.ws_row
                         );
                     }
@@ -1216,7 +1224,7 @@ fn boot_os_kernel(
         vm.mmio_mut()
             .register_shared(MMIO_XHCI_BASE, MMIO_XHCI_SIZE, xhci.clone());
         println!(
-            "[VMM] Registered platform xHCI (generic-xhci) at GPA 0x{:08x} size 0x{:x} (IRQ {})",
+            "[Cube] Registered platform xHCI (generic-xhci) at GPA 0x{:08x} size 0x{:x} (IRQ {})",
             MMIO_XHCI_BASE, MMIO_XHCI_SIZE, XHCI_IRQ
         );
 
@@ -1241,7 +1249,7 @@ fn boot_os_kernel(
             irq: VIRTIO_INPUT_KBD_IRQ,
         });
         println!(
-            "[VMM] Registered VirtIO-MMIO keyboard at GPA 0x{:08x} (IRQ {}) [parked for FreeBSD]",
+            "[Cube] Registered VirtIO-MMIO keyboard at GPA 0x{:08x} (IRQ {}) [parked for FreeBSD]",
             MMIO_VIRTIO_INPUT_KBD_BASE, VIRTIO_INPUT_KBD_IRQ
         );
         vm.mmio_mut().register_shared(
@@ -1255,7 +1263,7 @@ fn boot_os_kernel(
             irq: VIRTIO_INPUT_TBL_IRQ,
         });
         println!(
-            "[VMM] Registered VirtIO-MMIO tablet at GPA 0x{:08x} (IRQ {}) [parked for FreeBSD]",
+            "[Cube] Registered VirtIO-MMIO tablet at GPA 0x{:08x} (IRQ {}) [parked for FreeBSD]",
             MMIO_VIRTIO_INPUT_TBL_BASE, VIRTIO_INPUT_TBL_IRQ
         );
         (Some(kbd), Some(tablet), Some(xhci))
@@ -1268,7 +1276,7 @@ fn boot_os_kernel(
         let ram_end = DEFAULT_RAM_BASE + ram_size as u64;
         if ram_end < need {
             eprintln!(
-                "\x1b[1;31m[VMM Error] RAM too small for framebuffer at 0x{:08x} (need >= {}MB)\x1b[0m",
+                "\x1b[1;31m[Cube Error] RAM too small for framebuffer at 0x{:08x} (need >= {}MB)\x1b[0m",
                 fb.gpa,
                 (need - DEFAULT_RAM_BASE).div_ceil(1024 * 1024)
             );
@@ -1277,11 +1285,11 @@ fn boot_os_kernel(
         // Clear framebuffer to black (avoid rainbow snow under vt)
         let black = vec![0u8; fb.pixel_bytes()];
         if let Err(e) = vm.memory().write(fb.gpa, &black) {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to init framebuffer: {e}\x1b[0m");
+            eprintln!("\x1b[1;31m[Cube Error] Failed to init framebuffer: {e}\x1b[0m");
             process::exit(1);
         }
         println!(
-            "[VMM] Simple-framebuffer {}x{} at GPA 0x{:08x} (stride {})",
+            "[Cube] Simple-framebuffer {}x{} at GPA 0x{:08x} (stride {})",
             fb.width, fb.height, fb.gpa, fb.stride
         );
     }
@@ -1291,7 +1299,7 @@ fn boot_os_kernel(
         let data = match fs::read(path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("\x1b[1;31m[VMM Error] Failed to read initrd file '{}': {}\x1b[0m", path, e);
+                eprintln!("\x1b[1;31m[Cube Error] Failed to read initrd file '{}': {}\x1b[0m", path, e);
                 process::exit(1);
             }
         };
@@ -1300,17 +1308,17 @@ fn boot_os_kernel(
         let initrd_end = initrd_start + data.len() as u64;
         if initrd_end > DEFAULT_RAM_BASE + (ram_size as u64) {
             eprintln!(
-                "\x1b[1;31m[VMM Error] Initrd size ({:.2} MB) exceeds available guest RAM\x1b[0m",
+                "\x1b[1;31m[Cube Error] Initrd size ({:.2} MB) exceeds available guest RAM\x1b[0m",
                 data.len() as f64 / (1024.0 * 1024.0)
             );
             process::exit(1);
         }
         if let Err(e) = vm.memory().write(initrd_start, &data) {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to write initrd to RAM: {}\x1b[0m", e);
+            eprintln!("\x1b[1;31m[Cube Error] Failed to write initrd to RAM: {}\x1b[0m", e);
             process::exit(1);
         }
         println!(
-            "[VMM] Loaded initrd '{}' ({:.2} MB) at GPA 0x{:08x}..0x{:08x}",
+            "[Cube] Loaded initrd '{}' ({:.2} MB) at GPA 0x{:08x}..0x{:08x}",
             path,
             data.len() as f64 / (1024.0 * 1024.0),
             initrd_start,
@@ -1338,7 +1346,7 @@ fn boot_os_kernel(
     ) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to generate DTB: {}\x1b[0m", e);
+            eprintln!("\x1b[1;31m[Cube Error] Failed to generate DTB: {}\x1b[0m", e);
             process::exit(1);
         }
     };
@@ -1350,7 +1358,7 @@ fn boot_os_kernel(
     let mut vnc_server = None;
     if let Some(bind_str) = vnc_bind {
         let addr: std::net::SocketAddr = bind_str.parse().unwrap_or_else(|_| {
-            eprintln!("\x1b[1;31m[VMM Error] Invalid --vnc address '{bind_str}'\x1b[0m");
+            eprintln!("\x1b[1;31m[Cube Error] Invalid --vnc address '{bind_str}'\x1b[0m");
             process::exit(1);
         });
         let fb = fb_cfg.expect("fb_cfg set when vnc_bind is Some");
@@ -1366,7 +1374,7 @@ fn boot_os_kernel(
                 vnc_server = Some(server);
             }
             Err(e) => {
-                eprintln!("\x1b[1;31m[VMM Error] VNC server failed: {e}\x1b[0m");
+                eprintln!("\x1b[1;31m[Cube Error] VNC server failed: {e}\x1b[0m");
                 process::exit(1);
             }
         }
@@ -1392,16 +1400,16 @@ fn boot_os_kernel(
         // EDK2 ASSERTs fdt_check_header() on that address before fw_cfg is used.
         let dtb_addr = DEFAULT_RAM_BASE;
         if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
-            eprintln!("[1;31m[VMM Error] Failed to write DTB to RAM: {e}[0m");
+            eprintln!("[1;31m[Cube Error] Failed to write DTB to RAM: {e}[0m");
             process::exit(1);
         }
-        println!("[VMM] Registered QEMU fw_cfg at GPA 0x{MMIO_FW_CFG_BASE:08x}");
+        println!("[Cube] Registered QEMU fw_cfg at GPA 0x{MMIO_FW_CFG_BASE:08x}");
         if let Err(e) = vm.map_firmware(0, fw) {
-            eprintln!("\x1b[1;31m[VMM Error] {e}\x1b[0m");
+            eprintln!("\x1b[1;31m[Cube Error] {e}\x1b[0m");
             process::exit(1);
         }
         println!(
-            "[VMM] Mapped EDK2 firmware ({:.2} MB) at GPA 0x00000000; PC=0, X0=0 (DTB at RAM base 0x{dtb_addr:08x} for PCD + fw_cfg etc/fdt)",
+            "[Cube] Mapped EDK2 firmware ({:.2} MB) at GPA 0x00000000; PC=0, X0=0 (DTB at RAM base 0x{dtb_addr:08x} for PCD + fw_cfg etc/fdt)",
             fw.len() as f64 / (1024.0 * 1024.0)
         );
         // QEMU virt flash1: EFI NVRAM at 64MiB — CFI MMIO (not raw RAM).
@@ -1413,7 +1421,7 @@ fn boot_os_kernel(
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
-                        "\x1b[1;33m[VMM Warning] Could not read firmware/QEMU_VARS.fd ({e}); using erased 64MiB\x1b[0m"
+                        "\x1b[1;33m[Cube Warning] Could not read firmware/QEMU_VARS.fd ({e}); using erased 64MiB\x1b[0m"
                     );
                     vec![0xffu8; 64 * 1024 * 1024]
                 }
@@ -1425,13 +1433,13 @@ fn boot_os_kernel(
                 .unwrap_or_else(|| format!("{kernel_path}.vars.fd"));
             let store = std::path::Path::new(efi_vars_path.unwrap_or(&default_store));
             let pflash = devices::pflash::CfiPflash::open(store, vars).unwrap_or_else(|e| {
-                eprintln!("[VMM Error] {e}");
+                eprintln!("[Cube Error] {e}");
                 process::exit(1);
             });
             vm.mmio_mut()
                 .register(EFI_VARS_GPA, vars_len, Box::new(pflash));
             println!(
-                "[VMM] EFI vars CFI pflash ({:.2} MB) at GPA 0x{EFI_VARS_GPA:08x} (MMIO)",
+                "[Cube] EFI vars CFI pflash ({:.2} MB) at GPA 0x{EFI_VARS_GPA:08x} (MMIO)",
                 vars_len as f64 / (1024.0 * 1024.0)
             );
         }
@@ -1444,7 +1452,7 @@ fn boot_os_kernel(
             Ok(l) => l,
             Err(e) => {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Failed to load Linux kernel image: {}\x1b[0m",
+                    "\x1b[1;31m[Cube Error] Failed to load Linux kernel image: {}\x1b[0m",
                     e
                 );
                 process::exit(1);
@@ -1453,13 +1461,13 @@ fn boot_os_kernel(
         let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000;
         if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
             eprintln!(
-                "\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m",
+                "\x1b[1;31m[Cube Error] Failed to write DTB to RAM: {}\x1b[0m",
                 e
             );
             process::exit(1);
         }
         println!(
-            "[VMM] DTB at GPA 0x{dtb_addr:08x} ({} bytes); X0=DTB",
+            "[Cube] DTB at GPA 0x{dtb_addr:08x} ({} bytes); X0=DTB",
             dtb_bytes.len()
         );
         (loaded.entry_point, dtb_addr)
@@ -1471,7 +1479,7 @@ fn boot_os_kernel(
             Ok(l) => l,
             Err(e) => {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Failed to load kernel ELF: {}\x1b[0m",
+                    "\x1b[1;31m[Cube Error] Failed to load kernel ELF: {}\x1b[0m",
                     e
                 );
                 process::exit(1);
@@ -1491,13 +1499,13 @@ fn boot_os_kernel(
             let dtb_addr = DEFAULT_RAM_BASE + 0x0800_0000;
             if let Err(e) = vm.memory().write(dtb_addr, &dtb_bytes) {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m",
+                    "\x1b[1;31m[Cube Error] Failed to write DTB to RAM: {}\x1b[0m",
                     e
                 );
                 process::exit(1);
             }
             println!(
-                "[VMM] DTB at GPA 0x{dtb_addr:08x} ({} bytes); X0=DTB",
+                "[Cube] DTB at GPA 0x{dtb_addr:08x} ({} bytes); X0=DTB",
                 dtb_bytes.len()
             );
             dtb_addr
@@ -1510,7 +1518,7 @@ fn boot_os_kernel(
             let dtb_gpa = next;
             if let Err(e) = vm.memory().write(dtb_gpa, &dtb_bytes) {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Failed to write DTB to RAM: {}\x1b[0m",
+                    "\x1b[1;31m[Cube Error] Failed to write DTB to RAM: {}\x1b[0m",
                     e
                 );
                 process::exit(1);
@@ -1528,7 +1536,7 @@ fn boot_os_kernel(
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!(
-                            "\x1b[1;31m[VMM Error] Failed to read module '{path}': {e}\x1b[0m"
+                            "\x1b[1;31m[Cube Error] Failed to read module '{path}': {e}\x1b[0m"
                         );
                         process::exit(1);
                     }
@@ -1536,19 +1544,19 @@ fn boot_os_kernel(
                 let name = module_name_from_path(path);
                 if next + data.len() as u64 > DEFAULT_RAM_BASE + ram_size as u64 {
                     eprintln!(
-                        "\x1b[1;31m[VMM Error] Module '{path}' ({:.2} MB) does not fit in guest RAM\x1b[0m",
+                        "\x1b[1;31m[Cube Error] Module '{path}' ({:.2} MB) does not fit in guest RAM\x1b[0m",
                         data.len() as f64 / (1024.0 * 1024.0)
                     );
                     process::exit(1);
                 }
                 if let Err(e) = vm.memory().write(next, &data) {
                     eprintln!(
-                        "\x1b[1;31m[VMM Error] Failed to write module '{path}' to RAM: {e}\x1b[0m"
+                        "\x1b[1;31m[Cube Error] Failed to write module '{path}' to RAM: {e}\x1b[0m"
                     );
                     process::exit(1);
                 }
                 println!(
-                    "[VMM] Preloaded module '{name}' ({:.2} MB) at GPA 0x{next:08x} (KVA 0x{:016x}) from '{path}'",
+                    "[Cube] Preloaded module '{name}' ({:.2} MB) at GPA 0x{next:08x} (KVA 0x{:016x}) from '{path}'",
                     data.len() as f64 / (1024.0 * 1024.0),
                     to_kva(next)
                 );
@@ -1595,22 +1603,22 @@ fn boot_os_kernel(
             );
             if metadata_gpa + blob.len() as u64 > DEFAULT_RAM_BASE + ram_size as u64 {
                 eprintln!(
-                    "\x1b[1;31m[VMM Error] Preload metadata does not fit in guest RAM\x1b[0m"
+                    "\x1b[1;31m[Cube Error] Preload metadata does not fit in guest RAM\x1b[0m"
                 );
                 process::exit(1);
             }
             if let Err(e) = vm.memory().write(metadata_gpa, &blob) {
-                eprintln!("\x1b[1;31m[VMM Error] Failed to write preload metadata: {e}\x1b[0m");
+                eprintln!("\x1b[1;31m[Cube Error] Failed to write preload metadata: {e}\x1b[0m");
                 process::exit(1);
             }
             let packed = metadata_gpa + blob.len() as u64 - kernel_phys_load;
             println!(
-                "[VMM] DTB at GPA 0x{dtb_gpa:08x} (KVA 0x{:016x}, {} bytes)",
+                "[Cube] DTB at GPA 0x{dtb_gpa:08x} (KVA 0x{:016x}, {} bytes)",
                 to_kva(dtb_gpa),
                 dtb_bytes.len()
             );
             println!(
-                "[VMM] FreeBSD MODINFO at GPA 0x{metadata_gpa:08x} (KVA 0x{:016x}, {} bytes, {} files); packed +{:.2} MB; X0=KVA; KERNEND KVA 0x{:016x}",
+                "[Cube] FreeBSD MODINFO at GPA 0x{metadata_gpa:08x} (KVA 0x{:016x}, {} bytes, {} files); packed +{:.2} MB; X0=KVA; KERNEND KVA 0x{:016x}",
                 to_kva(metadata_gpa),
                 blob.len(),
                 files_kva.len(),
@@ -1624,7 +1632,7 @@ fn boot_os_kernel(
     };
 
     println!(
-        "[VMM] CPU Model: {} (MIDR: 0x{:08x})",
+        "[Cube] CPU Model: {} (MIDR: 0x{:08x})",
         cpu_model.name, cpu_model.midr
     );
 
@@ -1647,19 +1655,19 @@ fn boot_os_kernel(
                 let mut vcpu = match Vcpu::with_manager(cpu_idx, Some(mgr_clone.clone())) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("\x1b[1;31m[VMM Error] Failed to create secondary vCPU {}: {}\x1b[0m", cpu_idx, e);
+                        eprintln!("\x1b[1;31m[Cube Error] Failed to create secondary vCPU {}: {}\x1b[0m", cpu_idx, e);
                         mgr_clone.fail(format!("Failed to create CPU {cpu_idx}: {e}"));
                         return;
                     }
                 };
 
                     if let Err(e) = vcpu.setup_secondary_boot_state(args.entry_point, args.context_id, cpu_model.midr) {
-                        eprintln!("\x1b[1;31m[VMM Error] Failed to setup secondary vCPU {} boot state: {}\x1b[0m", cpu_idx, e);
+                        eprintln!("\x1b[1;31m[Cube Error] Failed to setup secondary vCPU {} boot state: {}\x1b[0m", cpu_idx, e);
                         mgr_clone.fail(format!("Failed to initialize CPU {cpu_idx}: {e}"));
                         return;
                     }
                     if let Err(e) = vcpu.run(&mmio_clone) {
-                        crate::host_log!("[VMM] Secondary CPU {cpu_idx} failed: {e}");
+                        crate::host_log!("[Cube] Secondary CPU {cpu_idx} failed: {e}");
                         mgr_clone.fail(format!("CPU {cpu_idx} failed: {e}"));
                     }
                 }
@@ -1674,7 +1682,7 @@ fn boot_os_kernel(
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "\x1b[1;31m[VMM Error] Failed to create boot vCPU 0: {}\x1b[0m",
+                "\x1b[1;31m[Cube Error] Failed to create boot vCPU 0: {}\x1b[0m",
                 e
             );
             process::exit(1);
@@ -1683,7 +1691,7 @@ fn boot_os_kernel(
 
     if let Err(e) = vcpu0.setup_os_boot_state(entry_point, x0_addr, 0, cpu_model.midr) {
         eprintln!(
-            "\x1b[1;31m[VMM Error] Failed to setup OS boot registers: {}\x1b[0m",
+            "\x1b[1;31m[Cube Error] Failed to setup OS boot registers: {}\x1b[0m",
             e
         );
         process::exit(1);
@@ -1693,13 +1701,13 @@ fn boot_os_kernel(
     if entry_point == 0 {
         let early_sp = DEFAULT_RAM_BASE + 0x0008_0000;
         if let Err(e) = vcpu0.set_sys_reg(crate::hypervisor::HV_SYS_REG_SP_EL1, early_sp) {
-            eprintln!("[1;33m[VMM Warning] UEFI early SP_EL1 failed: {e}[0m");
+            eprintln!("[1;33m[Cube Warning] UEFI early SP_EL1 failed: {e}[0m");
         } else {
-            println!("[VMM] UEFI early SP_EL1 at GPA 0x{early_sp:08x}");
+            println!("[Cube] UEFI early SP_EL1 at GPA 0x{early_sp:08x}");
         }
     }
 
-    println!("[VMM] Entering interactive console (raw terminal). Press Ctrl-] to quit.");
+    println!("[Cube] Entering interactive console (raw terminal). Press Ctrl-] to quit.");
     println!("--------------------------------------------------");
 
     // Set terminal to raw mode so keystrokes are sent immediately to the guest
@@ -1729,7 +1737,7 @@ fn finish_boot(result: Result<bool, String>, no_reboot: bool) {
         Ok(false) => {}
         Ok(true) => {
             if no_reboot {
-                println!("\x1b[1;32m[VMM] VM exited on guest reset (--no-reboot).\x1b[0m");
+                println!("\x1b[1;32m[Cube] VM exited on guest reset (--no-reboot).\x1b[0m");
                 return;
             }
             // All vCPUs, devices and mappings have been dropped before exec.
@@ -1742,11 +1750,11 @@ fn finish_boot(result: Result<bool, String>, no_reboot: bool) {
             let error = process::Command::new(exe)
                 .args(env::args_os().skip(1))
                 .exec();
-            eprintln!("[VMM] Restart failed: {error}");
+            eprintln!("[Cube] Restart failed: {error}");
             process::exit(1);
         }
         Err(e) => {
-            eprintln!("[VMM Error] {e}");
+            eprintln!("[Cube Error] {e}");
             process::exit(1);
         }
     }
@@ -1758,7 +1766,7 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model:
         Ok(vm) => vm,
         Err(e) => {
             eprintln!(
-                "\x1b[1;31m[VMM Error] Failed to initialize VM: {}\x1b[0m",
+                "\x1b[1;31m[Cube Error] Failed to initialize VM: {}\x1b[0m",
                 e
             );
             process::exit(1);
@@ -1772,11 +1780,11 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model:
     );
 
     if let Err(e) = vm.memory().write(DEFAULT_RAM_BASE, payload_data) {
-        eprintln!("\x1b[1;31m[VMM Error] Failed to load payload: {}\x1b[0m", e);
+        eprintln!("\x1b[1;31m[Cube Error] Failed to load payload: {}\x1b[0m", e);
         process::exit(1);
     }
     println!(
-        "[VMM] Loaded {} ({} bytes) at GPA 0x{:08x}",
+        "[Cube] Loaded {} ({} bytes) at GPA 0x{:08x}",
         name,
         payload_data.len(),
         DEFAULT_RAM_BASE
@@ -1785,7 +1793,7 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model:
     let mut vcpu = match Vcpu::new() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("\x1b[1;31m[VMM Error] Failed to create vCPU: {}\x1b[0m", e);
+            eprintln!("\x1b[1;31m[Cube Error] Failed to create vCPU: {}\x1b[0m", e);
             process::exit(1);
         }
     };
@@ -1793,19 +1801,19 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model:
     let stack_top = DEFAULT_RAM_BASE + 0x0100_0000;
     if let Err(e) = vcpu.setup_boot_state(DEFAULT_RAM_BASE, stack_top, cpu_model.midr) {
         eprintln!(
-            "\x1b[1;31m[VMM Error] Failed to configure vCPU: {}\x1b[0m",
+            "\x1b[1;31m[Cube Error] Failed to configure vCPU: {}\x1b[0m",
             e
         );
         process::exit(1);
     }
 
-    println!("[VMM] Entering guest execution loop...");
+    println!("[Cube] Entering guest execution loop...");
     println!("--------------------------------------------------");
 
     let result = run_loop(&mut vcpu, vm.mmio(), None);
     let flush = vm.mmio().shutdown();
     if let Err(e) = result.and(flush.map(|_| VcpuExitStatus::Shutdown)) {
-        eprintln!("[VMM Error] {e}");
+        eprintln!("[Cube Error] {e}");
     }
 }
 
@@ -1829,31 +1837,31 @@ fn run_loop(
             println!("--------------------------------------------------");
             match status {
                 VcpuExitStatus::Shutdown => {
-                    println!("\x1b[1;32m[VMM] VM exited: Guest requested PSCI SYSTEM_OFF.\x1b[0m");
+                    println!("\x1b[1;32m[Cube] VM exited: Guest requested PSCI SYSTEM_OFF.\x1b[0m");
                 }
                 VcpuExitStatus::Reset => {
                     println!(
-                        "\x1b[1;33m[VMM] VM exited: Guest requested PSCI SYSTEM_RESET.\x1b[0m"
+                        "\x1b[1;33m[Cube] VM exited: Guest requested PSCI SYSTEM_RESET.\x1b[0m"
                     );
                 }
                 VcpuExitStatus::Halted => {
                     println!(
-                        "\x1b[1;34m[VMM] VM execution stopped: Guest executed WFI (Halted).\x1b[0m"
+                        "\x1b[1;34m[Cube] VM execution stopped: Guest executed WFI (Halted).\x1b[0m"
                     );
                 }
                 VcpuExitStatus::Canceled => {
-                    println!("\x1b[1;33m[VMM] VM execution canceled.\x1b[0m");
+                    println!("\x1b[1;33m[Cube] VM execution canceled.\x1b[0m");
                 }
             }
         }
         Err(e) => {
             println!("--------------------------------------------------");
-            eprintln!("\x1b[1;31m[VMM Error] Guest execution fault: {}\x1b[0m", e);
+            eprintln!("\x1b[1;31m[Cube Error] Guest execution fault: {}\x1b[0m", e);
         }
     }
 
     if result.is_ok() {
-        println!("[VMM] Guest execution stopped; shutting down devices.");
+        println!("[Cube] Guest execution stopped; shutting down devices.");
     }
     result
 }

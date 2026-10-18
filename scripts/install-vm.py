@@ -256,7 +256,7 @@ def main(argv=None):
     parser.add_argument("--name", help="VM name and directory name (default: freebsd-14-4, or freebsd-15-1-plasma)")
     parser.add_argument("--dest", type=Path, help="parent directory for the VM (default: ~/VMs)")
     parser.add_argument("--iso", type=Path, help="use this disc1 ISO instead of downloading --version")
-    parser.add_argument("--binary", type=Path, help="signed vmm binary (default: target/debug/vmm)")
+    parser.add_argument("--binary", type=Path, help="signed vmm binary (default: target/debug/cube)")
     parser.add_argument("--cache-dir", type=Path,
                         default=Path.home() / "Library/Caches/vmm")
     parser.add_argument("--disk-gib", type=int, default=20)
@@ -306,9 +306,9 @@ def main(argv=None):
                 raise ValueError(f"desktop password file does not exist: {desktop_file}")
         if spec.dest.exists():
             raise ValueError(f"destination already exists: {spec.dest}")
-        binary = (args.binary or (REPO / "target/debug/vmm")).expanduser().resolve()
+        binary = (args.binary or (REPO / "target/debug/cube")).expanduser().resolve()
         if not os.access(binary, os.X_OK):
-            raise ValueError(f"VMM binary is missing or not executable: {binary}. Run make all first.")
+            raise ValueError(f"Cube binary is missing or not executable: {binary}. Run make all first.")
         iso = args.iso.expanduser().resolve() if args.iso else None
         if iso is None:
             iso = ensure_iso(spec.version, args.cache_dir.expanduser())

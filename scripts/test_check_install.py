@@ -93,12 +93,12 @@ ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
 
     def test_early_exit_reports_the_vmm_log_instead_of_the_wait(self):
         vm = self.machine(
-            "import sys; print('\\x1b[1;31m[VMM Error] Cannot start vmnet: "
+            "import sys; print('\\x1b[1;31m[Cube Error] Cannot start vmnet: "
             "vmnet service is not listening\\x1b[0m', file=sys.stderr); "
             "raise SystemExit(1)")
         vm.proc.wait(timeout=5)
         with self.assertRaisesRegex(RuntimeError,
-                                    r"^\[VMM Error\] Cannot start vmnet: vmnet service is not listening$"):
+                                    r"^\[Cube Error\] Cannot start vmnet: vmnet service is not listening$"):
             vm.wait_for(lambda: False, time.monotonic() + 5, "guest command execution")
 
     def invoke_main(self, runner, *extra, euid=501):

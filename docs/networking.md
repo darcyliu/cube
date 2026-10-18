@@ -29,15 +29,17 @@ resolvers. The VMM does not.
 make all
 make vmnet-service          # as your user; the recipe runs sudo on the service only
 make vmnet-service SUBNET=192.168.18.0/24   # ask vmnet for this NAT range
-./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
+./target/debug/cube --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
 # second guest:
-./target/debug/vmm --uefi --disk other.img --net vmnet-proxy --mac 52:54:00:12:34:57
+./target/debug/cube --uefi --disk other.img --net vmnet-proxy --mac 52:54:00:12:34:57
 ```
 
 Do not `sudo` a `--net vmnet-proxy` process. The socket owner is the user who
 started the service, and uid 0 is rejected. `sudo --net vmnet` is still the
 one-shot in-process command. If the service is down, `--net vmnet-proxy` exits.
 It does not fall through to mock or to in-process vmnet.
+
+For external and third-party applications (QEMU, custom hypervisors, packet generators, or testing scripts) connecting to this socket, see the complete [VMMNET Wire Protocol Specification](vmnet_protocol.md).
 
 **Same service, bridged onto the LAN** (no `bridge100`, no PF NAT). Stop the
 NAT service first. Guests still use `--net vmnet-proxy` and a distinct `--mac`.
@@ -47,7 +49,7 @@ the address. DHCP DNS is left as the router sent it.
 ```sh
 make vmnet-service-bridge            # default-route interface
 make vmnet-service-bridge IFACE=en7  # explicit Ethernet interface
-./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
+./target/debug/cube --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
 ```
 
 Wi-Fi can be that interface. On this Mac, `vmm --vmnet-service --bridge`
@@ -74,8 +76,8 @@ so that subnet can reach the internet.
 
 **Bridged (LAN DHCP, no host PF NAT):**
 ```sh
-sudo ./target/debug/vmm ... --net bridge        # default outbound iface (route get default)
-sudo ./target/debug/vmm ... --net bridge:en0    # explicit iface
+sudo ./target/debug/cube ... --net bridge        # default outbound iface (route get default)
+sudo ./target/debug/cube ... --net bridge:en0    # explicit iface
 ```
 Guest gets an address from your LAN router. Creating the interface still needs
 root, or `com.apple.vm.networking` on the binary. Bridge only removes the PF
@@ -95,7 +97,7 @@ Codesigning details: [entitlements.md](entitlements.md).
 Use a repeatable rule with numeric host and guest addresses:
 
 ```sh
-sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk freebsd-installed.img \
+sudo ./target/debug/cube --freebsd boot/kernel/kernel --disk freebsd-installed.img \
   --multiuser --net vmnet --forward 127.0.0.1:2222=192.168.18.7:22 \
   --forward 127.0.0.1:8080=192.168.18.7:80
 ssh -p 2222 root@127.0.0.1
@@ -123,9 +125,9 @@ Regression checks:
 
 ```sh
 cargo test
-python3 scripts/check_network.py target/debug/vmm
+python3 scripts/check_network.py target/debug/cube
 # Choose an unused address on your actual vmnet subnet for the guest check:
-python3 scripts/check_network.py target/debug/vmm \
+python3 scripts/check_network.py target/debug/cube \
   --kernel .iso-boot/boot/kernel/kernel \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --guest-cidr 192.168.18.77/24 --host-ip 192.168.18.1
@@ -182,7 +184,7 @@ The network subsystem provides full-duplex Ethernet connectivity between the ARM
 |  vmnet.framework (VMNET_SHARED_MODE) -> bridge100 (192.168.18.1)        |
 |  macOS bootpd (Built-in DHCP server)                                    |
 |                                                                         |
-|  macOS Packet Filter (pf) NAT Anchor (com.apple/vmm):                   |
+|  macOS Packet Filter (pf) NAT Anchor (com.apple/cube):                   |
 |  nat on en0 from 192.168.18.0/24 to any -> (en0)                        |
 |                                                                         |
 |  Physical Upstream Interface: en0 (Wi-Fi / Ethernet, 192.168.1.97)     |
@@ -227,9 +229,9 @@ During initial testing of FreeBSD 14.4 single-user boot with networking, four di
 ### Root Cause 4: macOS Packet Filter (PF) NAT & Forwarding Drop
 * **Symptom**: Guest could ping host bridge (`192.168.18.1`) and host IP (`192.168.1.97`), but pings to the home router (`192.168.1.254`) and internet IPs (`1.1.1.1`) timed out.
 * **Explanation**: While Apple's `vmnet.framework` in `VMNET_SHARED_MODE` creates `bridge100` and serves DHCP, modern macOS (macOS 14+ and Sequoia) relies on macOS's Packet Filter (`pf`) to translate and forward packets between `bridge100` and physical interfaces (`en0`). By default, PF has no active NAT rule mapping `192.168.18.0/24` out of `en0`. Outbound packets were sent with un-routable private IP source `192.168.18.2` (dropped by upstream routers) or blocked by PF's forward filtering.
-* **Resolution**: Insert NAT translation and pass rules into the active `com.apple/vmm` PF anchor on macOS:
+* **Resolution**: Insert NAT translation and pass rules into the active `com.apple/cube` PF anchor on macOS:
   ```sh
-  printf 'nat on en0 from 192.168.18.0/24 to any -> (en0)\npass in quick on bridge100 all\npass out quick on en0 all\n' | sudo pfctl -a "com.apple/vmm" -f -
+  printf 'nat on en0 from 192.168.18.0/24 to any -> (en0)\npass in quick on bridge100 all\npass out quick on en0 all\n' | sudo pfctl -a "com.apple/cube" -f -
   sudo sysctl -w net.inet.ip.forwarding=1
   ```
 
@@ -268,7 +270,7 @@ To avoid manual `pfctl` commands, shell mounts, and manual route additions in fu
 Integrate PF rule setup directly into the `sudo-freebsd-net` target. When the user starts the VM with `sudo make sudo-freebsd-net`, the Makefile automatically:
 1. Detects the active upstream network interface (e.g. `en0`).
 2. Configures `sysctl net.inet.ip.forwarding=1`.
-3. Populates the `com.apple/vmm` PF anchor.
+3. Populates the `com.apple/cube` PF anchor.
 4. Cleans up the anchor when the VMM terminates.
 
 ```makefile
@@ -277,7 +279,7 @@ NET_IF ?= $(shell route get default 2>/dev/null | awk '/interface:/{print $$2}')
 sudo-freebsd-net: build
 	@echo "[*] Setting up macOS PF NAT forwarding on $(NET_IF)..."
 	@sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null
-	@printf 'nat on $(NET_IF) from 192.168.18.0/24 to any -> ($(NET_IF))\npass in quick on bridge100 all\npass out quick on $(NET_IF) all\n' | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+	@printf 'nat on $(NET_IF) from 192.168.18.0/24 to any -> ($(NET_IF))\npass in quick on bridge100 all\npass out quick on $(NET_IF) all\n' | sudo pfctl -a "com.apple/cube" -f - 2>/dev/null || true
 	@sudo ./target/release/vmm \
 		--kernel boot/kernel/kernel \
 		--initrd boot/kernel/kernel \

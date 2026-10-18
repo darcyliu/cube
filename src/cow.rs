@@ -35,7 +35,7 @@ mod tests {
                 .as_nanos();
             let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
             let path =
-                env::temp_dir().join(format!("vmm-overlay-{}-{stamp}-{sequence}", process::id()));
+                env::temp_dir().join(format!("cube-overlay-{}-{stamp}-{sequence}", process::id()));
             fs::create_dir(&path).unwrap();
             Self(path)
         }

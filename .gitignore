@@ -15,3 +15,13 @@ initrd*.gz
 
 # EDK2 flash images (make fetch-uefi)
 firmware/*.fd
+
+# Build outputs
+/dist/
+scratch/
+
+# Apple Developer Signing & Provisioning Profiles (Private)
+*.provisionprofile
+
+# macOS system files
+.DS_Store

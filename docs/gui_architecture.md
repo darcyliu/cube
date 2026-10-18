@@ -321,9 +321,9 @@ mouse axes and cannot expose this device to an X11 desktop.
 Rebuild/run:
 
 ```bash
-CARGO_TARGET_DIR=/tmp/vmm-target-darcy cargo build
-./target/debug/vmm --freebsd --vnc 127.0.0.1:5901
-# or with CARGO_TARGET_DIR: /tmp/vmm-target-darcy/debug/vmm ...
+CARGO_TARGET_DIR=/tmp/cube-target cargo build
+./target/debug/cube --freebsd --vnc 127.0.0.1:5901
+# or with CARGO_TARGET_DIR: /tmp/cube-target/debug/cube ...
 ```
 
 ## Verified fixes and current scope

@@ -5,14 +5,14 @@
 | Author | TBD |
 | Date | 2026-09-28 |
 | Status | Approved. `--net vmnet` stays in-process; `--net vmnet-proxy` is the socket client. |
-| Workspace | `/Users/darcy/Dev/vmm` |
+| Workspace | `.` (repo root) |
 | Binary | Rust ARM64 VMM (`vmm`), Hypervisor.framework, virtio-mmio, synthesized FDT |
 
 ## Overview
 
-`--net vmnet` today starts macOS `vmnet.framework` inside the VMM process. Shared mode and the PF NAT anchor `com.apple/vmm` both require root, so the whole VMM is launched under `sudo` (`Makefile` targets `sudo-freebsd-net`, `sudo-freebsd-zfs`, `sudo-freebsd-zfs-uefi`). Hypervisor.framework does not need root. The ad-hoc signature in `entitlements.plist` carries only `com.apple.security.hypervisor`. Adding the restricted entitlement `com.apple.vm.networking` to that ad-hoc signature makes AMFI SIGKILL the process (`Killed: 9`); see `docs/entitlements.md`.
+`--net vmnet` today starts macOS `vmnet.framework` inside the VMM process. Shared mode and the PF NAT anchor `com.apple/cube` both require root, so the whole VMM is launched under `sudo` (`Makefile` targets `sudo-freebsd-net`, `sudo-freebsd-zfs`, `sudo-freebsd-zfs-uefi`). Hypervisor.framework does not need root. The ad-hoc signature in `entitlements.plist` carries only `com.apple.security.hypervisor`. Adding the restricted entitlement `com.apple.vm.networking` to that ad-hoc signature makes AMFI SIGKILL the process (`Killed: 9`); see `docs/entitlements.md`.
 
-This design splits the privilege boundary at Ethernet frames. A single long-running process, started once as root with `sudo ./target/debug/vmm --vmnet-service`, owns one `VMNET_SHARED_MODE` interface, the existing PF anchor, and a DHCP option-6 rewrite. Later VMM processes run as the invoking user, connect to a filesystem Unix socket, and exchange raw Ethernet frames. Virtio-net, the guest IRQ, queue processing, `bootpd` on `bridge100`, subnet `192.168.18.0/24`, and `--ssh-port` lease learning stay where they are. `--net vmnet` stays today's in-process shared mode and still calls `vmnet_*`, `pfctl`, and `sysctl -w`. The new unprivileged client is `--net vmnet-proxy`. It does not call them. Bridge mode still calls `vmnet_*` in-process and does not install NAT.
+This design splits the privilege boundary at Ethernet frames. A single long-running process, started once as root with `sudo ./target/debug/cube --vmnet-service`, owns one `VMNET_SHARED_MODE` interface, the existing PF anchor, and a DHCP option-6 rewrite. Later VMM processes run as the invoking user, connect to a filesystem Unix socket, and exchange raw Ethernet frames. Virtio-net, the guest IRQ, queue processing, `bootpd` on `bridge100`, subnet `192.168.18.0/24`, and `--ssh-port` lease learning stay where they are. `--net vmnet` stays today's in-process shared mode and still calls `vmnet_*`, `pfctl`, and `sysctl -w`. The new unprivileged client is `--net vmnet-proxy`. It does not call them. Bridge mode still calls `vmnet_*` in-process and does not install NAT.
 
 The vmnet interface pointer cannot be passed to another process. Only frames cross the socket. If the service is not listening, `--net vmnet-proxy` fails the process. It does not fall through to `UserMockBackend`, and it does not fall through to in-process `--net vmnet`.
 
@@ -33,7 +33,7 @@ The vmnet interface pointer cannot be passed to another process. Only frames cro
 | `VMNET_FAILURE` | 1001 |
 | `VMNET_INTERFACE_PACKETS_AVAILABLE` | 1 |
 
-`vmnet_start_interface` runs with an XPC dictionary key `vmnet_operation_mode`. On `VMNET_SUCCESS` for shared mode, `VmnetBackend::setup_host_nat` runs `sysctl -w net.inet.ip.forwarding=1` and pipes rules into `pfctl -a com.apple/vmm -f -`. The Makefile macro `setup-vmnet-nat` does the same thing before `sudo $(VMM_BIN)`, using `route get default` to find the outbound interface. The rules are:
+`vmnet_start_interface` runs with an XPC dictionary key `vmnet_operation_mode`. On `VMNET_SUCCESS` for shared mode, `VmnetBackend::setup_host_nat` runs `sysctl -w net.inet.ip.forwarding=1` and pipes rules into `pfctl -a com.apple/cube -f -`. The Makefile macro `setup-vmnet-nat` does the same thing before `sudo $(VMM_BIN)`, using `route get default` to find the outbound interface. The rules are:
 
 ```
 nat on IF from 192.168.18.0/24 to any -> (IF)
@@ -68,8 +68,8 @@ The service does not assign addresses. `bootpd` on `bridge100` (`192.168.18.1`) 
 ### Goals
 
 - Run the VMM as the invoking user with working guest internet on the existing shared subnet.
-- One root service, started once: `sudo ./target/debug/vmm --vmnet-service`. Clients: `./target/debug/vmm --net vmnet-proxy ...` with no sudo.
-- One `VMNET_SHARED_MODE` interface for every attached guest. The default is the shared network macOS already created (`bridge100` and `bootpd`). `--subnet CIDR` (or `make vmnet-service SUBNET=192.168.18.0/24`) asks vmnet for an RFC1918 `/8`–`/30`: gateway is the first host, and DHCP runs through the last host. PF NAT follows the prefix vmnet reports, which can differ from the request. Anchor `com.apple/vmm` stays.
+- One root service, started once: `sudo ./target/debug/cube --vmnet-service`. Clients: `./target/debug/cube --net vmnet-proxy ...` with no sudo.
+- One `VMNET_SHARED_MODE` interface for every attached guest. The default is the shared network macOS already created (`bridge100` and `bootpd`). `--subnet CIDR` (or `make vmnet-service SUBNET=192.168.18.0/24`) asks vmnet for an RFC1918 `/8`–`/30`: gateway is the first host, and DHCP runs through the last host. PF NAT follows the prefix vmnet reports, which can differ from the request. Anchor `com.apple/cube` stays.
 - Proxy Ethernet frames only. Virtio-net header strip and RX delivery stay in the VMM.
 - Learn the guest IPv4 from the DHCP ACK on the VMM side of the socket (`dhcp_guest_address` + `forward::GuestAddress`).
 - Refuse a second connection that registers a MAC already attached.
@@ -117,15 +117,15 @@ flowchart LR
     SOCKC <-->|"length-prefixed Ethernet"| LIS
     VMN --> BR["bridge100 192.168.18.1"]
     BR --> BOOT["bootpd"]
-    BR --> PF["pf anchor com.apple/vmm"]
+    BR --> PF["pf anchor com.apple/cube"]
     PF --> PHY["default route interface"]
 ```
 
 The service is not a child of the VMM and is not spawned per guest. Early dispatch matches `--internal-9p-worker`: `main` checks `args[1]` and returns before `run_cli`, the GUI thread, and VM setup.
 
 ```text
-sudo ./target/debug/vmm --vmnet-service [--vmnet-socket PATH]
-./target/debug/vmm --net vmnet-proxy [--vmnet-socket PATH] [--mac MAC] ...
+sudo ./target/debug/cube --vmnet-service [--vmnet-socket PATH]
+./target/debug/cube --net vmnet-proxy [--vmnet-socket PATH] [--mac MAC] ...
 ```
 
 `--vmnet-service` accepts only `--vmnet-socket`. Any kernel, disk, `--net`, or `--share` argument is an error. The service does not call `Vm::new` and does not need the hypervisor entitlement to do its job, but it is the same ad-hoc-signed binary; root is what authorizes `vmnet_start_interface`.
@@ -166,7 +166,7 @@ sequenceDiagram
     Svc->>Svc: euid 0, require SUDO_UID and SUDO_GID
     Svc->>VMN: vmnet_start_interface mode 1001
     VMN-->>Svc: VMNET_SUCCESS, bridge100
-    Svc->>PF: forwarding=1, pfctl -a com.apple/vmm
+    Svc->>PF: forwarding=1, pfctl -a com.apple/cube
     Svc->>Svc: scutil --dns, bind socket, chown, chmod 0600
     Svc->>Svc: setgroups, setgid, setuid to SUDO_UID
     Note over Svc: interface pointer stays valid, PF is not refreshed
@@ -360,7 +360,7 @@ Counters, logged to the service stderr every 60 s only when one of them is nonze
 
 ### Privilege
 
-The service requires `geteuid() == 0`. Otherwise it exits and tells the operator to run `make vmnet-service` (or `sudo ./target/debug/vmm --vmnet-service` directly). It reads `SUDO_UID` and `SUDO_GID` the same way `shared_fs::Backend::start` does, and requires a nonzero uid. That uid is the human who invoked `sudo` in the process that calls `vmnet_start_interface`. Home is `getpwuid(SUDO_UID)->pw_dir`, not `$HOME`. sudo's `env_reset` points `HOME` at `/var/root` while leaving `SUDO_USER` set; using `$HOME` would create root's socket and the user's VMM would never find it. If `pw_name` is available, it must match `SUDO_USER` when that variable is set. Missing `SUDO_UID`, or `SUDO_UID=0`, is a hard error, even for a root shell. The 9p helper already refuses a missing user. Do not stay root and listen on a root-only socket; the unprivileged VMM could not connect. `sudo` from a root `make` records `SUDO_UID` as root on this machine's sudo 1.9.17p2, so `sudo make vmnet-service` fails this check. The Makefile target refuses `id -u` 0 before it runs the inner `sudo`. The working invocations are `make vmnet-service` as the user, and `sudo ./target/debug/vmm --vmnet-service` from a user shell.
+The service requires `geteuid() == 0`. Otherwise it exits and tells the operator to run `make vmnet-service` (or `sudo ./target/debug/cube --vmnet-service` directly). It reads `SUDO_UID` and `SUDO_GID` the same way `shared_fs::Backend::start` does, and requires a nonzero uid. That uid is the human who invoked `sudo` in the process that calls `vmnet_start_interface`. Home is `getpwuid(SUDO_UID)->pw_dir`, not `$HOME`. sudo's `env_reset` points `HOME` at `/var/root` while leaving `SUDO_USER` set; using `$HOME` would create root's socket and the user's VMM would never find it. If `pw_name` is available, it must match `SUDO_USER` when that variable is set. Missing `SUDO_UID`, or `SUDO_UID=0`, is a hard error, even for a root shell. The 9p helper already refuses a missing user. Do not stay root and listen on a root-only socket; the unprivileged VMM could not connect. `sudo` from a root `make` records `SUDO_UID` as root on this machine's sudo 1.9.17p2, so `sudo make vmnet-service` fails this check. The Makefile target refuses `id -u` 0 before it runs the inner `sudo`. The working invocations are `make vmnet-service` as the user, and `sudo ./target/debug/cube --vmnet-service` from a user shell.
 
 Order, all before `setuid`:
 
@@ -418,7 +418,7 @@ Do not pass an already-connected socket through `sudo`. Sudo 1.9.17p2 closes fds
 
 `--net vmnet` stays today's shared-mode path, under the same flag. `VirtioNet::new` calls `VmnetInterface::start_shared` and `install_pf_nat` in this process. The existing `vmm-vmnet-rx` thread stays: `vmnet_read`, `dhcp_guest_address`, then `rewrite_dhcp_dns` with `DhcpDnsScope::GatewayOnly` and `[1.1.1.1]`. The interface is stopped when this VMM exits. One in-process guest is one bridge port, so guest-to-guest traffic between two in-process guests is the bridge's job and does not use the service's local switch.
 
-It requires root, the same as today. A non-root start returns the existing permission error and does not connect to the socket and does not select mock. `sudo ./target/debug/vmm --net vmnet` is the one-shot command. The `sudo-freebsd-*` Makefile targets keep the `sudo` prefix, keep `setup-vmnet-nat`, and keep `--net vmnet`.
+It requires root, the same as today. A non-root start returns the existing permission error and does not connect to the socket and does not select mock. `sudo ./target/debug/cube --net vmnet` is the one-shot command. The `sudo-freebsd-*` Makefile targets keep the `sudo` prefix, keep `setup-vmnet-nat`, and keep `--net vmnet`.
 
 `--net vmnet-proxy` does not inspect euid and then pick a backend. The service client and the in-process backend are different flags, so a root shell cannot silently start a second interface when the operator asked for the proxy. Running the service and one or more `--net vmnet` guests at the same time is the same topology as two sudo VMMs today: two shared-mode ports on `bridge100`, and the same PF anchor written twice. That is supported. The service cannot see an in-process guest's MAC, so it will not reject a collision. The operator must not reuse a MAC across the socket and an in-process VMM, or both guests share one `bootpd` lease.
 
@@ -445,7 +445,7 @@ The service bridge is a different process. `vmm --vmnet-service --bridge` uses t
 
 The string `Initialized user-mode mock` must not appear. `UserMockBackend::new` is only reached for `--net mock`. Unknown modes keep the current error. `scripts/check_network.py` looks for `Unknown network mode` and `Cannot start tap backend` and asserts the mock banner is absent; those checks stay.
 
-`sudo ./target/debug/vmm --net vmnet-proxy` does not start an interface. The peer check rejects uid 0 and the error tells the operator to drop sudo, or to pass `--net vmnet` when they want the in-process interface. The live peer check is sudo'd `--net vmnet-proxy`, expecting status `UNAUTHORIZED`. `getpeereid` is not unit-tested with two OS users. `sudo ./target/debug/vmm --net vmnet` remains the supported in-process command and still starts the interface.
+`sudo ./target/debug/cube --net vmnet-proxy` does not start an interface. The peer check rejects uid 0 and the error tells the operator to drop sudo, or to pass `--net vmnet` when they want the in-process interface. The live peer check is sudo'd `--net vmnet-proxy`, expecting status `UNAUTHORIZED`. `getpeereid` is not unit-tested with two OS users. `sudo ./target/debug/cube --net vmnet` remains the supported in-process command and still starts the interface.
 
 ### Where the code goes
 
@@ -539,14 +539,14 @@ In `src/vmnet_service.rs` or next to `enqueue_frame`, still with no vmnet and no
 
 ### Live check
 
-`python3 scripts/check_network.py target/debug/vmm` (no guest args) stays unprivileged and does not need the service. It covers unknown mode, missing tap, and a busy `--forward` port.
+`python3 scripts/check_network.py target/debug/cube` (no guest args) stays unprivileged and does not need the service. It covers unknown mode, missing tap, and a busy `--forward` port.
 
 The guest check still needs a running service and a working NAT anchor, because it brings `vtnet0` up on `192.168.18.0/24` and pings the bridge address:
 
 ```sh
-sudo ./target/debug/vmm --vmnet-service
+sudo ./target/debug/cube --vmnet-service
 # other terminal, same user, no sudo:
-python3 scripts/check_network.py target/debug/vmm \
+python3 scripts/check_network.py target/debug/cube \
   --kernel .iso-boot/boot/kernel/kernel \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --guest-cidr 192.168.18.77/24 --host-ip 192.168.18.1
@@ -554,7 +554,7 @@ python3 scripts/check_network.py target/debug/vmm \
 
 Do not `sudo` the python process. After this change the VMM would run as uid 0 and the peer check would reject it. The script's guest path uses a static `ifconfig`, not `dhclient`, and `--forward` to that static address. It does not exercise ACK learning. ACK learning stays on the unit test.
 
-`getpeereid` live check, after PR 3, service already up as the user: `sudo ./target/debug/vmm --net vmnet-proxy --freebsd boot/kernel/kernel` (or any boot that reaches `VirtioNet::new`) must exit with `peer uid 0 is not the socket owner` and must not print `Initialized user-mode mock`. `sudo ./target/debug/vmm --net vmnet` still starts the in-process interface.
+`getpeereid` live check, after PR 3, service already up as the user: `sudo ./target/debug/cube --net vmnet-proxy --freebsd boot/kernel/kernel` (or any boot that reaches `VirtioNet::new`) must exit with `peer uid 0 is not the socket owner` and must not print `Initialized user-mode mock`. `sudo ./target/debug/cube --net vmnet` still starts the in-process interface.
 
 Stop-ship before PR 3 is called done, manual, two guests:
 
@@ -569,18 +569,18 @@ The two-guest ping is not the only test of the service. The stale-socket, demux,
 ```sh
 make all
 make vmnet-service
-# not `sudo make vmnet-service`. The recipe runs `sudo ./target/debug/vmm --vmnet-service`.
+# not `sudo make vmnet-service`. The recipe runs `sudo ./target/debug/cube --vmnet-service`.
 # foreground. Ctrl-C stops it. Other terminal:
-./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy \
+./target/debug/cube --uefi --disk freebsd-installed.img --net vmnet-proxy \
   --mac 52:54:00:12:34:56
 # a second guest needs its own MAC:
-./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy \
+./target/debug/cube --uefi --disk freebsd-installed.img --net vmnet-proxy \
   --mac 52:54:00:12:34:57
 # in-process shared mode is unchanged and still needs root:
 sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img
 ```
 
-`make vmnet-service` is the same shape as `make sudo-freebsd-zfs-uefi` today: `make` stays the user, and the recipe calls `sudo`, which sets `SUDO_UID` to that user in the process that calls `vmnet_start_interface`. `sudo make vmnet-service` is rejected by the recipe (`id -u` is 0) and would also fail `invoking_user()` because the inner `sudo` would record `SUDO_UID=0`. `sudo ./target/debug/vmm --vmnet-service` from a user shell remains valid and is what the recipe runs.
+`make vmnet-service` is the same shape as `make sudo-freebsd-zfs-uefi` today: `make` stays the user, and the recipe calls `sudo`, which sets `SUDO_UID` to that user in the process that calls `vmnet_start_interface`. `sudo make vmnet-service` is rejected by the recipe (`id -u` is 0) and would also fail `invoking_user()` because the inner `sudo` would record `SUDO_UID=0`. `sudo ./target/debug/cube --vmnet-service` from a user shell remains valid and is what the recipe runs.
 
 `make freebsd-zfs-uefi` already ends in `VirtioNet::new(..., net_mode.unwrap_or("vmnet"))`. That default stays in-process shared mode, so the target still needs root. `make freebsd-net` already passes `--net vmnet` and stays on that in-process path; it does not talk to the service. Unprivileged internet is an explicit `--net vmnet-proxy` with the service already up. The `sudo-freebsd-*` aliases keep `--net vmnet` and still sudo the VMM.
 
@@ -609,7 +609,7 @@ Do not log frame payloads, DHCP hostnames, or resolver search domains beyond the
 
 `--net vmnet-proxy` has no in-process fallback. If the service is down, the process exits. PR 1 and PR 2 leave today's `"vmnet"` arm calling `VmnetBackend::new`. PR 3 adds a `"vmnet-proxy"` arm and does not rename `"vmnet"`. A service and an in-process `--net vmnet` guest may run together: two shared-mode ports, identical NAT rules, last `pfctl -f` wins. They must not share a MAC.
 
-PR 3 does not delete shared-mode startup. `sudo ./target/debug/vmm --net vmnet` still provides networking. `sudo ./target/debug/vmm --net vmnet-proxy` does not. Bridge still calls vmnet. PR 4 lands with PR 3 so the `sudo-freebsd-*` recipes keep `--net vmnet` and keep sudoing the VMM. Rollback of the client is deleting the `"vmnet-proxy"` arm. `"vmnet"` never changes meaning. The socket protocol has no on-disk state to migrate. `bootpd` leases are the OS's.
+PR 3 does not delete shared-mode startup. `sudo ./target/debug/cube --net vmnet` still provides networking. `sudo ./target/debug/cube --net vmnet-proxy` does not. Bridge still calls vmnet. PR 4 lands with PR 3 so the `sudo-freebsd-*` recipes keep `--net vmnet` and keep sudoing the VMM. Rollback of the client is deleting the `"vmnet-proxy"` arm. `"vmnet"` never changes meaning. The socket protocol has no on-disk state to migrate. `bootpd` leases are the OS's.
 
 `entitlements.plist` is not edited. `make sign` stays hypervisor-only.
 
@@ -636,17 +636,17 @@ Before:
 
 ```text
 sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img
-sudo ./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet
+sudo ./target/debug/cube --uefi --disk freebsd-installed.img --net vmnet
 ```
 
 After:
 
 ```text
 make vmnet-service
-./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
+./target/debug/cube --uefi --disk freebsd-installed.img --net vmnet-proxy --mac 52:54:00:12:34:56
 
 sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img
-sudo ./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet
+sudo ./target/debug/cube --uefi --disk freebsd-installed.img --net vmnet
 ```
 
 New flags:
@@ -728,7 +728,7 @@ Rejected. The user asked for a service that stays up, not a sudo on every launch
 
 ### softnet, or a per-VM private subnet
 
-Rejected after reading it. softnet replaces this address model with a per-VM `/30`, runs its own userspace DHCP server, picks a random RFC1918 subnet, mutates the machine-wide `bootpd` lease time, requires the macOS 26 SDK, and is `publish = false`. That breaks `192.168.18.0/24`, the `com.apple/vmm` anchor, `docs/networking.md`, and `--ssh-port` learning from `bootpd` ACKs. Do not vendor it, do not exec it, and do not take its address plan. The one idea that is reused is dropping euid after the interface exists, and only because PF is not refreshed later. The frame transport is not softnet's protocol.
+Rejected after reading it. softnet replaces this address model with a per-VM `/30`, runs its own userspace DHCP server, picks a random RFC1918 subnet, mutates the machine-wide `bootpd` lease time, requires the macOS 26 SDK, and is `publish = false`. That breaks `192.168.18.0/24`, the `com.apple/cube` anchor, `docs/networking.md`, and `--ssh-port` learning from `bootpd` ACKs. Do not vendor it, do not exec it, and do not take its address plan. The one idea that is reused is dropping euid after the interface exists, and only because PF is not refreshed later. The frame transport is not softnet's protocol.
 
 ### Userspace NAT (slirp)
 
@@ -804,7 +804,7 @@ None that block implementation. Subnet, single interface, frame proxy, `bootpd` 
 
 ## Key Decisions
 
-1. **Long-running service, one shared interface, local switching.** The operator runs `make vmnet-service` (the recipe is `sudo ./target/debug/vmm --vmnet-service`). `sudo make vmnet-service` is rejected because it would set `SUDO_UID` to 0. Guests connect as themselves. A per-launch sudo helper was rejected because sudo closes inherited fds and because the user asked for a process that stays up. One `VMNET_SHARED_MODE` interface serves every attachment so the subnet stays `192.168.18.0/24` on `bridge100` with the existing PF anchor and `bootpd`. The service copies client frames to other clients because `bridge100` does not hairpin that one port. `vmnet_mac_address_key` is not set.
+1. **Long-running service, one shared interface, local switching.** The operator runs `make vmnet-service` (the recipe is `sudo ./target/debug/cube --vmnet-service`). `sudo make vmnet-service` is rejected because it would set `SUDO_UID` to 0. Guests connect as themselves. A per-launch sudo helper was rejected because sudo closes inherited fds and because the user asked for a process that stays up. One `VMNET_SHARED_MODE` interface serves every attachment so the subnet stays `192.168.18.0/24` on `bridge100` with the existing PF anchor and `bootpd`. The service copies client frames to other clients because `bridge100` does not hairpin that one port. `vmnet_mac_address_key` is not set.
 
 2. **Ethernet frames on a Unix stream, not slirp and not datagrams.** `process_tx` still strips the 12-byte header. The RX thread still delivers into the virtqueue. Length-prefixed records (`u32` LE) match the 9p helper and do not drop DHCP ACKs the way `SOCK_DGRAM` would. A length above the negotiated max and at most 65536 is `frame_oversize` and the MAC stays. `1..=13` is `frame_runt`, not `tx_spoof`. A length that cannot be framed (`N == 0`, `N > 65536`, or torn EOF) closes the connection, and the VMM does not reconnect. `ENOBUFS` is not special-cased. `EAGAIN` keeps the partial record in `outbound`. A new frame is queued only when `outq.len() < 64`. The 65th is dropped before any of its bytes are written. `SO_NOSIGPIPE` and `O_NONBLOCK` are set once before `try_clone`. The RX side `poll`s for 50 ms. It does not use `set_read_timeout`.
 
@@ -828,7 +828,7 @@ None that block implementation. Subnet, single interface, frame proxy, `bootpd` 
 
 - **Files:** `src/vmnet_sys.rs` (FFI and `install_pf_nat` extracted from `net.rs`), `src/vmnet_service.rs`, `src/main.rs` (`--vmnet-service` dispatch and `--vmnet-socket`), `src/devices/virtio/net.rs` (bridge and the still-in-process shared backend call `VmnetInterface` instead of a private FFI block).
 - **Depends on:** PR 1.
-- **Description:** `sudo ./target/debug/vmm --vmnet-service` (what `make vmnet-service` will run in PR 4) starts one shared interface, reads `interface_param` without setting `vmnet_mac_address_key`, installs the anchor only when `default_host_iface()` is `Some`, selects DNS, listens, drops privileges, demuxes `vmnet_read`, locally switches client TX, and rewrites option 6 with `SharedBridge`. `sysctl` and `scutil` failures are non-fatal and bounded by 3 seconds. The VMM's `--net vmnet` path keeps calling in-process `VmnetInterface::start_shared`. PR 3 does not rename that arm. Bridge keeps the explicit `en0` fallback. Tests named in the service section (stale socket, demux, local switch, reflection, `outq`, `idle_read_does_not_clear_write_failure_latch`) are in this PR and do not need vmnet. `classify_vmnet_status` treats an idle read as not clearing the write-failure latch. Document in the PR body that a service and an in-process shared guest are two ports on `bridge100` and must not share a MAC. The two-guest ping is not required to merge PR 2. It is required before PR 3 is called done.
+- **Description:** `sudo ./target/debug/cube --vmnet-service` (what `make vmnet-service` will run in PR 4) starts one shared interface, reads `interface_param` without setting `vmnet_mac_address_key`, installs the anchor only when `default_host_iface()` is `Some`, selects DNS, listens, drops privileges, demuxes `vmnet_read`, locally switches client TX, and rewrites option 6 with `SharedBridge`. `sysctl` and `scutil` failures are non-fatal and bounded by 3 seconds. The VMM's `--net vmnet` path keeps calling in-process `VmnetInterface::start_shared`. PR 3 does not rename that arm. Bridge keeps the explicit `en0` fallback. Tests named in the service section (stale socket, demux, local switch, reflection, `outq`, `idle_read_does_not_clear_write_failure_latch`) are in this PR and do not need vmnet. `classify_vmnet_status` treats an idle read as not clearing the write-failure latch. Document in the PR body that a service and an in-process shared guest are two ports on `bridge100` and must not share a MAC. The two-guest ping is not required to merge PR 2. It is required before PR 3 is called done.
 
 ### PR 3 — Unprivileged VMM socket backend
 
@@ -840,7 +840,7 @@ None that block implementation. Subnet, single interface, frame proxy, `bootpd` 
 
 - **Files:** `Makefile`, `README.md`, `docs/networking.md`, `docs/entitlements.md`, `scripts/check_network.py` (module docstring and the comment that says sudo is required), `scripts/vmmctl.py` (`--sudo` help text).
 - **Depends on:** PR 3.
-- **Description:** Add `vmnet-service` without a dependency on `all`, so a root `make` cannot rebuild the binary. The recipe refuses `id -u` 0, requires `$(VMM_BIN)` from a prior `make all`, then runs `sudo $(VMM_BIN) --vmnet-service`. Keep `setup-vmnet-nat`, the `sudo` prefix, and `--net vmnet` on the three aliases below. `make freebsd-net` stays `--net vmnet` (in-process, so it still needs root to bring the interface up). Update the networking and entitlements docs so the unprivileged path is `make vmnet-service` plus `--net vmnet-proxy`, and the one-shot root path is `sudo ./target/debug/vmm --net vmnet`. State the guest DHCP requirement, the distinct-MAC requirement across both modes, and that guest-to-guest traffic between service clients is switched inside the service. Tell `check_network.py` readers not to sudo the script when it launches `--net vmnet-proxy`. Change `vmmctl.py`'s `--sudo` help so it says sudo is for `--net vmnet` and bridge, and that `--net vmnet-proxy` needs `make vmnet-service` and must not be combined with `--sudo`. No VMM runtime change beyond that help string.
+- **Description:** Add `vmnet-service` without a dependency on `all`, so a root `make` cannot rebuild the binary. The recipe refuses `id -u` 0, requires `$(VMM_BIN)` from a prior `make all`, then runs `sudo $(VMM_BIN) --vmnet-service`. Keep `setup-vmnet-nat`, the `sudo` prefix, and `--net vmnet` on the three aliases below. `make freebsd-net` stays `--net vmnet` (in-process, so it still needs root to bring the interface up). Update the networking and entitlements docs so the unprivileged path is `make vmnet-service` plus `--net vmnet-proxy`, and the one-shot root path is `sudo ./target/debug/cube --net vmnet`. State the guest DHCP requirement, the distinct-MAC requirement across both modes, and that guest-to-guest traffic between service clients is switched inside the service. Tell `check_network.py` readers not to sudo the script when it launches `--net vmnet-proxy`. Change `vmmctl.py`'s `--sudo` help so it says sudo is for `--net vmnet` and bridge, and that `--net vmnet-proxy` needs `make vmnet-service` and must not be combined with `--sudo`. No VMM runtime change beyond that help string.
 
 ```makefile
 vmnet-service:

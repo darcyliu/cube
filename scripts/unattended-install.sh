@@ -19,7 +19,7 @@ RAM_MB="1024"
 ISO_PATH=""
 BASE="distsets"
 SEED_ISO="seed.iso"
-VMM_BIN="./target/debug/vmm"
+VMM_BIN="./target/debug/cube"
 USE_SUDO=false
 
 # ANSI color codes
@@ -104,7 +104,7 @@ while [[ $# -gt 0 ]]; do
             echo "      --cpu-model <MOD>  CPU model/MIDR spoofing (e.g. host, m2, neoverse-n2, 0x<hex>)"
             echo "      --base <MODE>      distsets (default) or pkgbase (FreeBSD 15.1+ disc1)"
             echo "      --seed <PATH>      Seed ISO path (default: seed.iso)"
-            echo "      --vmm <PATH>       VMM binary (default: ./target/debug/vmm)"
+            echo "      --vmm <PATH>       Cube binary (default: ./target/debug/cube)"
             echo "      --sudo             In-process vmnet as root (default: vmnet-proxy)"
             exit 0
             ;;
@@ -127,11 +127,11 @@ if [[ -z "$ISO_PATH" ]]; then
     LOCAL_ISO=$(ls FreeBSD*arm64*.iso 2>/dev/null | head -n 1 || true)
     if [[ -n "$LOCAL_ISO" && -f "$LOCAL_ISO" ]]; then
         ISO_PATH="$LOCAL_ISO"
-        echo -e "${GREEN}[VMM] Auto-detected local ARM64 ISO: ${ISO_PATH}${RESET}"
+        echo -e "${GREEN}[Cube] Auto-detected local ARM64 ISO: ${ISO_PATH}${RESET}"
     else
         DEFAULT_ISO="FreeBSD-14.2-RELEASE-arm64-aarch64-disc1.iso"
         DEFAULT_URL="https://download.freebsd.org/releases/arm64/aarch64/ISO-IMAGES/14.2/FreeBSD-14.2-RELEASE-arm64-aarch64-disc1.iso"
-        echo -e "${YELLOW}[VMM] No ARM64 ISO found. Downloading FreeBSD ARM64 disc1 ISO...${RESET}"
+        echo -e "${YELLOW}[Cube] No ARM64 ISO found. Downloading FreeBSD ARM64 disc1 ISO...${RESET}"
         curl -fSL --progress-bar -o "$DEFAULT_ISO" "$DEFAULT_URL"
         ISO_PATH="$DEFAULT_ISO"
     fi
@@ -145,26 +145,26 @@ fi
 # Step 3: Extract ARM64 Kernel safely via bsdtar (zero-mount)
 EXTRACT_DIR=".iso-boot"
 mkdir -p "$EXTRACT_DIR"
-echo -e "${GREEN}[VMM] Extracting kernel from ISO via bsdtar...${RESET}"
+echo -e "${GREEN}[Cube] Extracting kernel from ISO via bsdtar...${RESET}"
 tar -xf "$ISO_PATH" -C "$EXTRACT_DIR" boot/kernel/kernel 2>/dev/null
 EXTRACTED_KERNEL="${EXTRACT_DIR}/boot/kernel/kernel"
 
 # Step 4: Create Destination Sparse Disk
 if [[ ! -f "$TARGET_DISK" ]]; then
-    echo -e "${GREEN}[VMM] Creating sparse destination disk '${TARGET_DISK}' (${DISK_SIZE})...${RESET}"
+    echo -e "${GREEN}[Cube] Creating sparse destination disk '${TARGET_DISK}' (${DISK_SIZE})...${RESET}"
     truncate -s "$DISK_SIZE" "$TARGET_DISK"
 else
-    echo -e "${YELLOW}[VMM] Using existing destination disk '${TARGET_DISK}' (${DISK_SIZE}).${RESET}"
+    echo -e "${YELLOW}[Cube] Using existing destination disk '${TARGET_DISK}' (${DISK_SIZE}).${RESET}"
 fi
 
-# Step 5: Ensure VMM binary is compiled and signed
+# Step 5: Ensure Cube binary is compiled and signed
 if [[ ! -f "$VMM_BIN" ]]; then
-    if [[ "$VMM_BIN" == "./target/debug/vmm" ]]; then
-        echo -e "${GREEN}[VMM] Building VMM binary...${RESET}"
+    if [[ "$VMM_BIN" == "./target/debug/cube" ]]; then
+        echo -e "${GREEN}[Cube] Building Cube binary...${RESET}"
         cargo build
-        codesign -s - --entitlements entitlements.plist --force target/debug/vmm
+        codesign -s - --entitlements entitlements.plist --force target/debug/cube
     else
-        echo -e "${RED}[Error] VMM binary does not exist: ${VMM_BIN}${RESET}"
+        echo -e "${RED}[Error] Cube binary does not exist: ${VMM_BIN}${RESET}"
         exit 1
     fi
 fi
@@ -285,7 +285,7 @@ if [[ $USE_SUDO == true ]]; then
     IF=$(netstat -rn -f inet 2>/dev/null | awk '/default/{print $4; exit}')
     if [[ -n "$IF" ]]; then
         sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
-        printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$IF" "$IF" | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+        printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$IF" "$IF" | sudo pfctl -a "com.apple/cube" -f - 2>/dev/null || true
     fi
 fi
 
@@ -324,7 +324,7 @@ echo -e "${BOLD}${GREEN}======================================================${
 echo -e "Your automated FreeBSD VM is ready on ${BOLD}${TARGET_DISK}${RESET}."
 echo -e "Boot your new VM with:"
 if [[ $USE_SUDO == true ]]; then
-    echo -e "${CYAN}sudo ./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}\n"
+    echo -e "${CYAN}sudo ./target/debug/cube --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}\n"
 else
-    echo -e "${CYAN}./target/debug/vmm --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet-proxy --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}\n"
+    echo -e "${CYAN}./target/debug/cube --freebsd ${EXTRACTED_KERNEL} --disk ${TARGET_DISK} --net vmnet-proxy --cpus ${CPUS} --multiuser --ssh-port 2222${RESET}\n"
 fi

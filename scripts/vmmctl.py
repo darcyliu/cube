@@ -74,9 +74,9 @@ def ensure_control_root(control):
 def launch_spec(config_path, state_dir, args):
     config = read_config(config_path)
     base = config_path.parent
-    binary = path_from(args.binary or config.get("binary", str(REPO / "target/debug/vmm")),
+    binary = path_from(args.binary or config.get("binary", str(REPO / "target/debug/cube")),
                        Path.cwd() if args.binary else base)
-    require(Path(binary).is_file(), f"VMM binary does not exist: {binary}")
+    require(Path(binary).is_file(), f"Cube binary does not exist: {binary}")
     boot = config.get("boot", {})
     require(isinstance(boot, dict), "boot must be an object")
     mode = boot.get("mode")

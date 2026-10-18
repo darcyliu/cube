@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::{self, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
-use vmm::cow::{CLUSTER_SIZE, MAGIC, TABLE_START};
+use cube::cow::{CLUSTER_SIZE, MAGIC, TABLE_START};
 
 #[test]
 fn inspect_and_export_commands_use_read_only_sources() {
@@ -9,7 +9,7 @@ fn inspect_and_export_commands_use_read_only_sources() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!("vmm-overlay-cli-{}-{stamp}", process::id()));
+    let directory = std::env::temp_dir().join(format!("cube-overlay-cli-{}-{stamp}", process::id()));
     fs::create_dir(&directory).unwrap();
     let base = directory.join("base.img");
     let overlay = directory.join("base.img.cow");
@@ -30,7 +30,7 @@ fn inspect_and_export_commands_use_read_only_sources() {
     bytes.extend_from_slice(&vec![7u8; CLUSTER_SIZE as usize]);
     fs::write(&overlay, &bytes).unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_vmm-overlay");
+    let binary = env!("CARGO_BIN_EXE_cube-overlay");
     let inspected = Command::new(binary)
         .args(["inspect"])
         .arg(&base)

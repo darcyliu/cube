@@ -442,14 +442,14 @@ def patch_machine_id(fs):
     """Replace the first-boot sentinel with a real machine-id."""
     ino = fs.resolve_path('/etc/machine-id')
     if ino is None:
-        print("[VMM] /etc/machine-id not found — skipping")
+        print("[Cube] /etc/machine-id not found — skipping")
         return
     current = fs.read_file(ino).strip()
     if len(current) == 32 and all(c in b'0123456789abcdef' for c in current.lower()):
-        print(f"[VMM] /etc/machine-id already set ({current.decode()[:8]}...)")
+        print(f"[Cube] /etc/machine-id already set ({current.decode()[:8]}...)")
         return
     new_id = os.urandom(16).hex().encode('ascii') + b'\n'
-    print(f"[VMM] Writing /etc/machine-id (was {current!r}) to skip systemd-firstboot")
+    print(f"[Cube] Writing /etc/machine-id (was {current!r}) to skip systemd-firstboot")
     fs.write_file(ino, new_id)
 
 def patch_serial_autologin(fs):
@@ -457,21 +457,21 @@ def patch_serial_autologin(fs):
     path = '/usr/lib/systemd/system/serial-getty@.service'
     ino = fs.resolve_path(path)
     if ino is None:
-        print(f"[VMM] {path} not found — skipping autologin")
+        print(f"[Cube] {path} not found — skipping autologin")
         return
     data = fs.read_file(ino)
     if b'--autologin' in data:
-        print("[VMM] serial-getty already has --autologin")
+        print("[Cube] serial-getty already has --autologin")
         return
     old = b'ExecStart=-/sbin/agetty '
     if old not in data:
-        print("[VMM] serial-getty unit has no agetty ExecStart — skipping")
+        print("[Cube] serial-getty unit has no agetty ExecStart — skipping")
         return
     new_data = data.replace(old, b'ExecStart=-/sbin/agetty --autologin root ', 1)
     if new_data == data:
-        print("[VMM] serial-getty ExecStart unchanged — skipping")
+        print("[Cube] serial-getty ExecStart unchanged — skipping")
         return
-    print("[VMM] Enabling serial-getty autologin as root")
+    print("[Cube] Enabling serial-getty autologin as root")
     fs.write_file(ino, new_data)
 
 # ---------------------------------------------------------------------------
@@ -538,8 +538,8 @@ def main():
         print(f"[Error] Disk image not found: {disk_path}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[VMM] Preparing nocloud image for serial login: {disk_path}")
-    print(f"[VMM] Setting root password to: '{password}'")
+    print(f"[Cube] Preparing nocloud image for serial login: {disk_path}")
+    print(f"[Cube] Setting root password to: '{password}'")
 
     try:
         f = open(disk_path, 'r+b')
@@ -550,17 +550,17 @@ def main():
 
     with f:
         part_offset = find_linux_partition(f)
-        print(f"[VMM] Linux partition at offset: {part_offset} (0x{part_offset:X})")
+        print(f"[Cube] Linux partition at offset: {part_offset} (0x{part_offset:X})")
 
         fs = Ext4(f, part_offset)
-        print(f"[VMM] Block size: {fs.sb.block_size}, Inode size: {fs.sb.inode_size}, "
+        print(f"[Cube] Block size: {fs.sb.block_size}, Inode size: {fs.sb.inode_size}, "
               f"metadata_csum={'yes' if fs.sb.has_metadata_csum else 'no'}")
 
         shadow_ino = fs.resolve_path('/etc/shadow')
         if shadow_ino is None:
             print("[Error] /etc/shadow not found in filesystem", file=sys.stderr)
             sys.exit(1)
-        print(f"[VMM] Found /etc/shadow at inode {shadow_ino}")
+        print(f"[Cube] Found /etc/shadow at inode {shadow_ino}")
 
         shadow_ibuf, _ = fs.read_inode_raw(shadow_ino)
         if not fs.verify_inode_checksum(shadow_ino, shadow_ibuf):
@@ -569,22 +569,22 @@ def main():
             sys.exit(1)
 
         shadow_content = fs.read_file(shadow_ino)
-        print(f"[VMM] Read {len(shadow_content)} bytes from /etc/shadow")
+        print(f"[Cube] Read {len(shadow_content)} bytes from /etc/shadow")
 
         for line in shadow_content.decode('utf-8', errors='replace').splitlines():
             if line.startswith('root:'):
-                print(f"[VMM] Current root entry: root:{line.split(':')[1][:25]}...")
+                print(f"[Cube] Current root entry: root:{line.split(':')[1][:25]}...")
                 break
 
         new_shadow = patch_shadow(shadow_content, password)
-        print(f"[VMM] Patched shadow ({len(shadow_content)}B -> {len(new_shadow)}B)")
+        print(f"[Cube] Patched shadow ({len(shadow_content)}B -> {len(new_shadow)}B)")
         fs.write_file(shadow_ino, new_shadow)
 
         patch_machine_id(fs)
         patch_serial_autologin(fs)
 
-    print(f"[VMM] Done. Root password in {disk_path} set to '{password}'")
-    print(f"[VMM] Serial console autologin is enabled; password login is root:{password}")
+    print(f"[Cube] Done. Root password in {disk_path} set to '{password}'")
+    print(f"[Cube] Serial console autologin is enabled; password login is root:{password}")
 
 if __name__ == '__main__':
     main()

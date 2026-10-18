@@ -1,6 +1,6 @@
 //! Long-running shared-mode vmnet process.
 //!
-//! Started as root (`sudo vmm --vmnet-service`), then `setuid` to `SUDO_UID`.
+//! Started with the VM Networking entitlement, or as root then dropped to `SUDO_UID`.
 //! Guests connect with `--net vmnet-proxy`. `--net vmnet` does not use this module.
 
 use std::ffi::{CStr, CString};
@@ -33,18 +33,15 @@ unsafe extern "C" fn on_stop(_: i32) {
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let parsed = parse_service_args(args)?;
-    if unsafe { libc::geteuid() } != 0 {
-        return Err(
-            "vmnet service requires root. Run `make vmnet-service`, or `sudo ./target/debug/vmm --vmnet-service` from your user shell."
-                .into(),
-        );
+    if parsed.subnet.is_some() && unsafe { libc::geteuid() } != 0 {
+        return Err("custom subnets require root for PF NAT configuration; omit --subnet for unprivileged Apple NAT".into());
     }
     let user = invoking_user()?;
     let custom_socket = parsed.socket.is_some();
     let path = parsed
         .socket
         .clone()
-        .unwrap_or_else(|| user.home.join("Library/Application Support/vmm/vmnet.sock"));
+        .unwrap_or_else(|| user.home.join("Library/Application Support/cube/vmnet.sock"));
     check_sun_path(&path)?;
 
     let mut port = match &parsed.net {
@@ -79,7 +76,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .shared_cidr
             .clone()
             .or_else(|| parsed.subnet.as_ref().map(|subnet| subnet.cidr.clone()))
-            .unwrap_or_else(|| "192.168.18.0/24".to_string());
+            .unwrap_or_else(|| "192.168.64.0/24".to_string());
         if let (Some(requested), Some(actual)) = (&parsed.subnet, &port.shared_cidr) {
             if requested.cidr != *actual {
                 eprintln!(
@@ -88,8 +85,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 );
             }
         }
-        enable_forwarding();
-        install_pf_nat(&nat_cidr);
+        if parsed.subnet.is_some() {
+            enable_forwarding()?;
+            install_pf_nat(&nat_cidr)?;
+        } else {
+            eprintln!("[vmnet] using Apple default NAT for {nat_cidr}; skipping PF NAT");
+        }
         Some(
             network_scope(&nat_cidr).unwrap_or(crate::vmnet_proto::DhcpDnsScope::SharedBridge),
         )
@@ -131,7 +132,7 @@ pub fn default_socket_path() -> Result<PathBuf, String> {
 
 pub fn socket_path_for(uid: u32) -> Result<PathBuf, String> {
     let (_name, home) = lookup_user(uid)?;
-    Ok(home.join("Library/Application Support/vmm/vmnet.sock"))
+    Ok(home.join("Library/Application Support/cube/vmnet.sock"))
 }
 
 enum ServiceNet {
@@ -275,12 +276,19 @@ struct Invoker {
 }
 
 fn invoking_user() -> Result<Invoker, String> {
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let (_name, home) = lookup_user(uid)?;
+        return Ok(Invoker { uid, gid, home });
+    }
     let uid = std::env::var("SUDO_UID")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|uid| *uid != 0)
         .ok_or(
-            "missing SUDO_UID, or SUDO_UID=0. Run `make vmnet-service` as your user, or `sudo ./target/debug/vmm --vmnet-service` from a user shell.",
+            "missing SUDO_UID, or SUDO_UID=0. Run `make vmnet-service` as your user, or `sudo ./target/debug/cube --vmnet-service` from a user shell.",
         )?;
     let gid = std::env::var("SUDO_GID")
         .ok()
@@ -350,13 +358,15 @@ fn repair_socket_dir(dir: &Path, uid: u32, gid: u32) -> Result<(), String> {
     }
     let c_path = CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| format!("socket directory {} contains a NUL", dir.display()))?;
-    let chown_rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
-    if chown_rc != 0 {
-        return Err(format!(
-            "chown {}: {}",
-            dir.display(),
-            io::Error::last_os_error()
-        ));
+    if unsafe { libc::geteuid() } == 0 {
+        let chown_rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+        if chown_rc != 0 {
+            return Err(format!(
+                "chown {}: {}",
+                dir.display(),
+                io::Error::last_os_error()
+            ));
+        }
     }
     let chmod_rc = unsafe { libc::chmod(c_path.as_ptr(), 0o700) };
     if chmod_rc != 0 {
@@ -577,6 +587,9 @@ impl Drop for BoundSocket {
 }
 
 fn drop_privileges(uid: u32, gid: u32) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
     if std::env::var("VMM_VMNET_KEEP_ROOT").ok().as_deref() == Some("1") {
         eprintln!("[vmnet] VMM_VMNET_KEEP_ROOT=1: process remains root");
         return Ok(());
@@ -670,7 +683,12 @@ fn command_with_stdin(
 }
 
 fn eprint_network_interface(name: &str) {
-    eprintln!("[vmnet] network interface \x1b[1;36m{name}\x1b[0m");
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        eprintln!("[vmnet] network interface \x1b[1;36m{name}\x1b[0m");
+    } else {
+        eprintln!("[vmnet] network interface {name}");
+    }
 }
 
 fn log_shared_interface(gateway: Option<Ipv4Addr>) {
@@ -773,25 +791,23 @@ fn describe_ifconfig_inet(text: &str) -> Option<String> {
     None
 }
 
-fn enable_forwarding() {
-    let failed = |detail: String| {
-        eprintln!(
-            "[vmnet] sysctl net.inet.ip.forwarding=1 failed ({detail}). Guest packets can leave with source 192.168.18.x and die upstream."
-        );
-    };
-    match command_output(
-        Command::new("sysctl").args(["-w", "net.inet.ip.forwarding=1"]),
+fn enable_forwarding() -> Result<(), String> {
+    let output = command_output(
+        Command::new("/usr/sbin/sysctl").args(["-w", "net.inet.ip.forwarding=1"]),
         Duration::from_secs(3),
-    ) {
-        Ok(output) if output.status.success() => {
-            eprintln!("[vmnet] net.inet.ip.forwarding=1");
-        }
-        Ok(output) => failed(format!(
-            "{} {}",
+    )?;
+    require_network_setup_success("enable IPv4 forwarding", output)
+}
+
+fn require_network_setup_success(operation: &str, output: std::process::Output) -> Result<(), String> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{operation} failed ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
-        )),
-        Err(err) => failed(err),
+        ))
     }
 }
 
@@ -814,28 +830,19 @@ fn default_host_iface() -> Option<String> {
     None
 }
 
-fn install_pf_nat(cidr: &str) {
-    let Some(iface) = default_host_iface() else {
-        eprintln!("[vmnet] no default route; skipping PF NAT");
-        return;
-    };
+fn install_pf_nat(cidr: &str) -> Result<(), String> {
+    let iface = default_host_iface().ok_or("cannot configure PF NAT: no default route")?;
     let rules = format!(
         "nat on {iface} from {cidr} to any -> ({iface})\npass in quick on bridge100 all\npass out quick on {iface} all\n"
     );
-    match command_with_stdin(
-        Command::new("pfctl").args(["-a", "com.apple/vmm", "-f", "-"]),
+    let output = command_with_stdin(
+        Command::new("/sbin/pfctl").args(["-a", "com.apple/cube", "-f", "-"]),
         rules.as_bytes(),
         Duration::from_secs(3),
-    ) {
-        Ok(output) if output.status.success() => {
-            eprintln!("[vmnet] PF NAT on {iface} for {cidr}");
-        }
-        Ok(output) => eprintln!(
-            "[vmnet] pfctl failed on {iface}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(err) => eprintln!("[vmnet] pfctl failed on {iface}: {err}"),
-    }
+    )?;
+    require_network_setup_success("install PF NAT", output)?;
+    eprintln!("[vmnet] PF NAT on {iface} for {cidr}");
+    Ok(())
 }
 
 fn load_resolvers() -> Vec<Ipv4Addr> {
@@ -1502,6 +1509,20 @@ mod tests {
             assert_eq!(rc, 0, "{}", io::Error::last_os_error());
             libc::close(fd);
         }
+    }
+
+    #[test]
+    fn network_setup_failure_is_fatal() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |code| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: b"Permission denied".to_vec(),
+        };
+        assert!(require_network_setup_success("PF NAT", output(0)).is_ok());
+        let error = require_network_setup_success("PF NAT", output(1)).unwrap_err();
+        assert!(error.contains("PF NAT"));
+        assert!(error.contains("Permission denied"));
     }
 
     #[test]

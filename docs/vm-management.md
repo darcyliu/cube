@@ -16,7 +16,7 @@ Place a file such as `vms/freebsd-zfs.json` in the repository:
 ```json
 {
   "name": "freebsd-zfs",
-  "binary": "../target/debug/vmm",
+  "binary": "../target/debug/cube",
   "boot": {"mode": "uefi", "firmware": "../firmware/QEMU_EFI.fd"},
   "disks": [{"path": "/path/to/freebsd-zfs.img"}],
   "ram_mb": 2048,
@@ -100,7 +100,7 @@ the VMM's PSCI `SYSTEM_OFF` record. The source disk is never opened for writing.
 Use `--efi-vars` to clone a matching EFI store when booting it depends on one.
 
 ```sh
-python3 -B scripts/check_vm_shutdown.py target/debug/vmm \
+python3 -B scripts/check_vm_shutdown.py target/debug/cube \
   --disk /path/to/install-artifacts/installed.img \
   --ssh-key /path/to/install-artifacts/id_ed25519 \
   --firmware firmware/QEMU_EFI.fd \

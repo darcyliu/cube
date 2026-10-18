@@ -267,7 +267,7 @@ in that same `vmm-install-*` directory:
 
 ```sh
 INSTALL=test-results/vmm-verify-XXXX/vmm-install-YYYY
-./target/debug/vmm \
+./target/debug/cube \
   --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
   --disk "$INSTALL/installed.img" \
   --ram 2048 --cpus 2 \
@@ -279,7 +279,7 @@ A ZFS disk uses the EDK2 firmware passed to `verify.py` and that directory's
 `efi-vars.fd`:
 
 ```sh
-./target/debug/vmm \
+./target/debug/cube \
   --uefi firmware/QEMU_EFI.fd \
   --disk "$INSTALL/installed.img" \
   --ram 2048 --cpus 2 \

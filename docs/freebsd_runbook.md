@@ -11,10 +11,10 @@ From your project directory:
 ```bash
 # Rebuild and sign with entitlements (if changes made)
 cargo build
-codesign -s - --entitlements entitlements.plist --force target/debug/vmm
+codesign -s - --entitlements entitlements.plist --force target/debug/cube
 
 # Launch with 2 vCPUs, 4GB disk, and vmnet NAT networking
-sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus 2
+sudo ./target/debug/cube --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus 2
 ```
 
 > [!TIP]
@@ -148,7 +148,7 @@ Press **`Ctrl-]`** to exit the VM back to macOS.
 Once provisioned, boot FreeBSD directly in multi-user mode with port forwarding:
 
 ```bash
-sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus 2 --multiuser --ssh-port 2222
+sudo ./target/debug/cube --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus 2 --multiuser --ssh-port 2222
 ```
 
 FreeBSD will boot `/sbin/init`, run `/etc/rc`, bring up `vtnet0` via DHCP (`192.168.18.2`), start `sshd`, and present a login prompt on `ttyu0`.
@@ -174,7 +174,7 @@ The VMM supports attaching multiple block devices simultaneously. Each disk appe
 
 ```bash
 # Example: Boot OS on vtbd0 and attach a secondary data disk on vtbd1
-sudo ./target/debug/vmm --freebsd boot/kernel/kernel \
+sudo ./target/debug/cube --freebsd boot/kernel/kernel \
     --disk mini-memstick.img \
     --disk /path/to/secondary_data.img \
     --net vmnet --cpus 2 --multiuser --ssh-port 2222
@@ -193,7 +193,7 @@ mkdir -p /mnt/data && mount /dev/vtbd1p1 /mnt/data
 ### Attaching Read-Only ISOs or Cloud-Init Seed Drives
 To attach an installer ISO or cloud-init config drive:
 ```bash
-sudo ./target/debug/vmm --freebsd boot/kernel/kernel \
+sudo ./target/debug/cube --freebsd boot/kernel/kernel \
     --disk mini-memstick.img \
     --cdrom seed.iso \
     --net vmnet --cpus 2 --multiuser
@@ -203,7 +203,7 @@ sudo ./target/debug/vmm --freebsd boot/kernel/kernel \
 To experiment or test changes without modifying your base image, enable COW:
 ```bash
 # Enables COW for all attached disks (creates <disk>.cow overlay file)
-sudo ./target/debug/vmm --freebsd boot/kernel/kernel \
+sudo ./target/debug/cube --freebsd boot/kernel/kernel \
     --disk mini-memstick.img \
     --cow \
     --net vmnet --cpus 2 --multiuser
@@ -281,7 +281,7 @@ FreeBSD publishes official, pre-installed, and pre-configured virtual machine im
 
 3. **Boot Directly in Multi-User Mode**:
    ```bash
-   sudo ./target/debug/vmm --freebsd boot/kernel/kernel \
+   sudo ./target/debug/cube --freebsd boot/kernel/kernel \
        --disk freebsd-cloud.img \
        --net vmnet --cpus 2 --multiuser --ssh-port 2222
    ```
@@ -295,7 +295,7 @@ FreeBSD publishes official, pre-installed, and pre-configured virtual machine im
 You can install a fresh FreeBSD system onto a virtual hard drive from the official FreeBSD CD/DVD installer ISO (`disc1.iso` or `bootonly.iso`).
 
 ### 1. Automated Installation Tool
-We provide a dedicated tool [`scripts/install-from-iso.sh`](file:///Users/darcy/Dev/vmm/scripts/install-from-iso.sh) that automates the entire process:
+We provide a dedicated tool [`scripts/install-from-iso.sh`](../scripts/install-from-iso.sh) that automates the entire process:
 
 ```bash
 # Run the automated installer tool (or pass an explicit ISO path)
@@ -384,7 +384,7 @@ dhclient vtnet0
 ### 6. Booting the Newly Installed System
 Once installation is finished, boot directly from your newly installed virtual drive:
 ```bash
-sudo ./target/debug/vmm --freebsd .iso-boot/boot/kernel/kernel \
+sudo ./target/debug/cube --freebsd .iso-boot/boot/kernel/kernel \
     --disk freebsd-installed.img \
     --net vmnet --cpus 2 --multiuser --ssh-port 2222
 ```
@@ -396,7 +396,7 @@ sudo ./target/debug/vmm --freebsd .iso-boot/boot/kernel/kernel \
 To achieve a fully automated, hands-off installation without answering any prompts, you can attach an automated **Seed Drive** (`CIDATA`) containing FreeBSD's `installerconfig` and Cloud-Init metadata.
 
 ### 1. The Seed Generator Tool (`scripts/create-seed.sh`)
-We provide [`scripts/create-seed.sh`](file:///Users/darcy/Dev/vmm/scripts/create-seed.sh) which builds a standard `CIDATA` seed ISO directly on macOS using user-space tools (zero root or mounting required):
+We provide [`scripts/create-seed.sh`](../scripts/create-seed.sh) which builds a standard `CIDATA` seed ISO directly on macOS using user-space tools (zero root or mounting required):
 
 ```bash
 # Generate seed.iso with default password 'root' and auto-detected SSH key
@@ -437,7 +437,7 @@ make install-seed
 ### 3. Booting Your Unattended VM
 Boot directly from your freshly provisioned disk:
 ```bash
-sudo ./target/debug/vmm --freebsd .iso-boot/boot/kernel/kernel \
+sudo ./target/debug/cube --freebsd .iso-boot/boot/kernel/kernel \
     --disk freebsd-unattended.img \
     --net vmnet --cpus 2 --multiuser --ssh-port 2222
 ```
@@ -450,7 +450,7 @@ ssh root@localhost -p 2222
 
 ## 12. Workspace & Instance Cleanup Tool (`make clean-vm`)
 
-To reset your workspace and test installations from scratch without manually removing multi-gigabyte disk images or killing stale processes, use [`scripts/clean-vms.sh`](file:///Users/darcy/Dev/vmm/scripts/clean-vms.sh):
+To reset your workspace and test installations from scratch without manually removing multi-gigabyte disk images or killing stale processes, use [`scripts/clean-vms.sh`](../scripts/clean-vms.sh):
 
 ```bash
 # Interactive cleanup (prompts for confirmation and lists files)
@@ -518,7 +518,7 @@ You can override the CPU identity using the `--cpu-model` CLI option:
 #### Example Commands:
 ```bash
 # Boot with ARM Neoverse-N2 server identity:
-sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk freebsd-installed.img --cpus 2 --cpu-model neoverse-n2
+sudo ./target/debug/cube --freebsd boot/kernel/kernel --disk freebsd-installed.img --cpus 2 --cpu-model neoverse-n2
 
 # Install with Apple M2 Avalanche identity:
 ./scripts/install-from-iso.sh --cpu-model m2

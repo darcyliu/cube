@@ -428,14 +428,14 @@ impl VmnetBackend {
             _ => "192.168.18.0/24".to_string(),
         };
 
-        // Configure macOS Packet Filter NAT anchor com.apple/vmm
+        // Configure macOS Packet Filter NAT anchor com.apple/cube
         let rules = format!(
             "nat on {} from {} to any -> ({})\npass in quick on bridge100 all\npass out quick on {} all\n",
             iface, nat_from, iface, iface
         );
 
         if let Ok(mut child) = std::process::Command::new("pfctl")
-            .args(["-a", "com.apple/vmm", "-f", "-"])
+            .args(["-a", "com.apple/cube", "-f", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

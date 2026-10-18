@@ -35,7 +35,7 @@ make all
 sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img
 ```
 
-That target also installs a small PF NAT anchor (`com.apple/vmm`) so the guest
+That target also installs a small PF NAT anchor (`com.apple/cube`) so the guest
 subnet `192.168.18.0/24` can reach the internet via your default interface.
 See [networking.md](networking.md).
 
@@ -51,7 +51,7 @@ Build as your user, start the service once, then boot without sudo:
 ```sh
 make all
 make vmnet-service
-./target/debug/vmm --uefi --disk freebsd-installed.img --net vmnet-proxy
+./target/debug/cube --uefi --disk freebsd-installed.img --net vmnet-proxy
 ```
 
 `--net vmnet` is still the in-process shared interface and still needs root.

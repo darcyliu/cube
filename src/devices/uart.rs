@@ -76,7 +76,7 @@ impl Pl011Uart {
         let mut guard = q.lock().unwrap();
         for &b in bytes {
             if b == 0x1d {
-                eprintln!("\r\n[VMM] Escape key Ctrl-] pressed. Exiting VM.\r\n");
+                eprintln!("\r\n[Cube] Escape key Ctrl-] pressed. Exiting VM.\r\n");
                 crate::vcpu::request_host_shutdown();
                 return;
             }

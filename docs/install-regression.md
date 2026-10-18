@@ -94,7 +94,7 @@ From the repository root:
 
 ```sh
 make all
-python3 scripts/check_install.py target/debug/vmm \
+python3 scripts/check_install.py target/debug/cube \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso
 ```
 

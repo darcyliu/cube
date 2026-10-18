@@ -70,8 +70,8 @@ it is not proof that the release media boots and mounts successfully here.
 New flags, **not currently implemented**:
 
 ```sh
-vmm <existing boot options> --share work /Users/darcy/Dev/project
-vmm <existing boot options> --share-rw work /Users/darcy/Dev/project
+cube <existing boot options> --share work ~/Dev/project
+cube <existing boot options> --share-rw work ~/Dev/project
 ```
 
 Each option takes two arguments (tag and path), is repeatable, and avoids

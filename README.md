@@ -1,6 +1,6 @@
-# macOS ARM64 Hypervisor.framework VMM
+# Cube: macOS ARM64 Hypervisor.framework VMM
 
-A lightweight, zero-external-dependency Virtual Machine Monitor (VMM) written in **Rust** using Apple's native **`Hypervisor.framework`** on Apple Silicon (ARM64).
+A lightweight, zero-external-dependency Virtual Machine Monitor (VMM) and menu bar companion written in **Rust** and **Swift** using Apple's native **`Hypervisor.framework`** on Apple Silicon (ARM64).
 
 It supports booting both custom baremetal ARM64 payloads at EL1 and full operating system kernels like **FreeBSD 14-RELEASE**.
 
@@ -85,14 +85,14 @@ sudo make sudo-freebsd-net
 # `make vmnet-service` must be run as your user (it sudo's only the service).
 make all
 make vmnet-service
-./target/debug/vmm --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet-proxy
+./target/debug/cube --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet-proxy
 
 # LAN addresses instead of bridge100 NAT. Stop the NAT service first.
 make vmnet-service-bridge
 # or: make vmnet-service-bridge IFACE=en7
 
 # For offline unprivileged use, explicitly disable networking:
-./target/debug/vmm --freebsd boot/kernel/kernel --net none
+./target/debug/cube --freebsd boot/kernel/kernel --net none
 ```
 Inside the FreeBSD single-user shell:
 ```sh
@@ -146,8 +146,8 @@ there is no disk. Use `--efi-vars PATH` for an explicit per-VM store. Writable
 disk images, COW overlays, and variable stores are exclusively locked while open;
 read-only images and COW base images use shared locks. Malformed or truncated
 nonempty COW overlays are rejected rather than reinitialized.
-Use `vmm-overlay inspect BASE OVERLAY` to validate an offline COW image or
-`vmm-overlay export BASE OVERLAY OUTPUT` to create a standalone raw disk. See
+Use `cube-overlay inspect BASE OVERLAY` to validate an offline COW image or
+`cube-overlay export BASE OVERLAY OUTPUT` to create a standalone raw disk. See
 [offline overlay management](docs/overlay-management.md).
 
 UART file injection is opt-in: set `VMM_UART_IN` to a dedicated file path.
@@ -179,11 +179,11 @@ complete commands, and a flowchart of the three suites.
 
 Individual checks remain available. Run `cargo test` and `cargo test --release`
 for device regression tests. On Apple
-Silicon macOS, after building and signing the VMM, run the diskless integration
+Silicon macOS, after building and signing Cube, run the diskless integration
 checks with:
 
 ```sh
-python3 scripts/check_vm_lifecycle.py target/debug/vmm \
+python3 scripts/check_vm_lifecycle.py target/debug/cube \
   --kernel .iso-boot/boot/kernel/kernel --firmware firmware/QEMU_EFI.fd
 ```
 
@@ -245,7 +245,8 @@ vmm/
 ├── entitlements.plist       # com.apple.security.hypervisor entitlement
 ├── Makefile                 # Convenient build, sign, and run automation
 ├── docs/
-│   └── networking.md        # VirtIO-Net architecture, troubleshooting & UX guide
+│   ├── networking.md        # VirtIO-Net architecture, troubleshooting & UX guide
+│   └── vmnet_protocol.md    # VMMNET wire protocol specification for third-party clients
 ├── guest/
 │   └── payload.S            # Baremetal ARM64 assembly test program
 └── src/

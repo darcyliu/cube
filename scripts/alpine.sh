@@ -84,30 +84,30 @@ cd "$ROOT_DIR"
 # 1. Download Alpine netboot media if missing
 mkdir -p boot/alpine
 if [[ ! -f boot/alpine/vmlinuz-virt ]]; then
-    echo -e "${YELLOW}[VMM] Downloading Alpine Linux virt kernel...${RESET}"
+    echo -e "${YELLOW}[Cube] Downloading Alpine Linux virt kernel...${RESET}"
     curl -fSL https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/netboot/vmlinuz-virt -o boot/alpine/vmlinuz-virt
 fi
 if [[ ! -f boot/alpine/initramfs-virt ]]; then
-    echo -e "${YELLOW}[VMM] Downloading Alpine Linux virt initramfs...${RESET}"
+    echo -e "${YELLOW}[Cube] Downloading Alpine Linux virt initramfs...${RESET}"
     curl -fSL https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/netboot/initramfs-virt -o boot/alpine/initramfs-virt
 fi
 if [[ ! -f boot/alpine/modloop-virt ]]; then
-    echo -e "${YELLOW}[VMM] Downloading Alpine Linux virt modloop...${RESET}"
+    echo -e "${YELLOW}[Cube] Downloading Alpine Linux virt modloop...${RESET}"
     curl -fSL https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/netboot/modloop-virt -o boot/alpine/modloop-virt
 fi
 
 # 2. Determine mode: Install or Run
 IS_NEW_DISK=0
 if [[ ! -f "$TARGET_DISK" ]]; then
-    echo -e "${GREEN}[VMM] Creating sparse virtual disk '${TARGET_DISK}' (${DISK_SIZE})...${RESET}"
+    echo -e "${GREEN}[Cube] Creating sparse virtual disk '${TARGET_DISK}' (${DISK_SIZE})...${RESET}"
     truncate -s "$DISK_SIZE" "$TARGET_DISK"
     IS_NEW_DISK=1
 fi
 
-# 3. Ensure VMM binary is compiled and signed
-VMM_BIN="${VMM_BIN:-target/debug/vmm}"
+# 3. Ensure Cube binary is compiled and signed
+VMM_BIN="${VMM_BIN:-target/debug/cube}"
 if [[ ! -f "$VMM_BIN" ]]; then
-    echo -e "${GREEN}[VMM] Building and signing VMM binary...${RESET}"
+    echo -e "${GREEN}[Cube] Building and signing Cube binary...${RESET}"
     cargo build
     codesign -s - --entitlements entitlements.plist --force "$VMM_BIN"
 fi
@@ -130,9 +130,9 @@ if [[ $EUID -eq 0 ]]; then
     else
         NAT_FROM="192.168.18.0/24"
     fi
-    echo -e "${GREEN}[VMM] Setting up macOS PF NAT forwarding on ${IF} for ${NAT_FROM}...${RESET}"
+    echo -e "${GREEN}[Cube] Setting up macOS PF NAT forwarding on ${IF} for ${NAT_FROM}...${RESET}"
     sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1 || true
-    printf 'nat on %s from %s to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$NAT_FROM" "$IF" "$IF" | pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
+    printf 'nat on %s from %s to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$IF" "$NAT_FROM" "$IF" "$IF" | pfctl -a "com.apple/cube" -f - 2>/dev/null || true
 fi
 
 if [[ $IS_NEW_DISK -eq 1 || $FORCE_INSTALL -eq 1 ]]; then

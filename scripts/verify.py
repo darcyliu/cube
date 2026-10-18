@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run VMM checks sequentially, retaining logs and JSON/JUnit reports for CI."""
+"""Run Cube checks sequentially, retaining logs and JSON/JUnit reports for CI."""
 import argparse
 from dataclasses import dataclass
 import ipaddress
@@ -109,7 +109,7 @@ def parse_args(argv=None):
 
 
 def make_plan(args, directory):
-    binary = args.binary or args.target_dir / "debug/vmm"
+    binary = args.binary or args.target_dir / "debug/cube"
     def check(name, script, extra=(), needs=(), timeout=300, privileged=False):
         return Step(name, [sys.executable, "-u", "-B", "-c", PYTHON_CHECK,
                           str(REPO / "scripts" / script), *map(str, extra)],

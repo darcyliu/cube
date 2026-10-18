@@ -204,7 +204,7 @@ There is no host-only or bridged backend yet.
 
 | Mode | Guest IP | Who answers DHCP? | Internet | Isolation |
 |:-----|:---------|:------------------|:---------|:----------|
-| **Shared** (`VMNET_SHARED_MODE`, this VMM) | Private subnet. Apple’s default is often `192.168.64.0/24`; this VMM’s NAT/scripts assume **`192.168.18.0/24`**, gateway `192.168.18.1` | macOS `bootpd` on `bridge100` | NAT through the Mac (plus PF `com.apple/vmm` on current macOS) | Guest is **not** on the LAN |
+| **Shared** (`VMNET_SHARED_MODE`, this VMM) | Private subnet. Apple’s default is often `192.168.64.0/24`; this VMM’s NAT/scripts assume **`192.168.18.0/24`**, gateway `192.168.18.1` | macOS `bootpd` on `bridge100` | NAT through the Mac (plus PF `com.apple/cube` on current macOS) | Guest is **not** on the LAN |
 | **Host** (`VMNET_HOST_MODE`) | Same style of private subnet | `bootpd` again, or none if a net UUID isolates the network | **No** — host and other host-mode VMs only | Stronger isolation |
 | **Bridged** (`VMNET_BRIDGED_MODE`) | Same subnet as the Mac (`en0`) | **The home/office router**, not `bootpd` | Direct on the LAN | Guest looks like another machine on Wi-Fi/Ethernet |
 
@@ -266,7 +266,7 @@ VirtIO-MMIO net  TX ──► vmnet_write() ──► bootpd (IP + router, no Op
                            └── patch_dhcp_response() injects 1.1.1.1 / 8.8.8.8
         │
         ▼
-bridge100 + pf NAT (com.apple/vmm) ──► en0 ──► Internet
+bridge100 + pf NAT (com.apple/cube) ──► en0 ──► Internet
 ```
 
 Plus Linux bootargs (Alpine / Debian), which **bypass DHCP entirely**:

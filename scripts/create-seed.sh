@@ -86,7 +86,7 @@ if [[ -z "$SSH_PUB_KEY" ]]; then
     fi
 fi
 
-echo -e "${BOLD}${CYAN}[VMM] Generating Seed ISO '${OUTPUT_ISO}' (Volume: CIDATA)...${RESET}"
+echo -e "${BOLD}${CYAN}[Cube] Generating Seed ISO '${OUTPUT_ISO}' (Volume: CIDATA)...${RESET}"
 
 rm -rf "$SEED_DIR" "$OUTPUT_ISO"
 mkdir -p "$SEED_DIR"
@@ -182,7 +182,7 @@ hdiutil makehybrid -o "$OUTPUT_ISO" -iso -joliet -default-volume-name CIDATA "$S
 
 rm -rf "$SEED_DIR"
 
-echo -e "${GREEN}[VMM] Seed ISO created successfully: ${OUTPUT_ISO}${RESET}"
+echo -e "${GREEN}[Cube] Seed ISO created successfully: ${OUTPUT_ISO}${RESET}"
 echo -e "  Volume Label : CIDATA"
 echo -e "  Hostname     : ${HOSTNAME}"
 echo -e "  Root Password: ${PASSWORD}"
