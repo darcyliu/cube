@@ -11,7 +11,7 @@ fn review_test_dir(label: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn test_delete_preserves_shared_boot_files_and_read_only_media() {
+fn test_delete_removes_vm_directory_but_preserves_external_boot_files() {
     let root = review_test_dir("safe-delete");
     let vm = root.join("vms/example");
     fs::create_dir_all(&vm).unwrap();
@@ -20,7 +20,7 @@ fn test_delete_preserves_shared_boot_files_and_read_only_media() {
     for path in [&kernel, &module] { fs::write(path, b"shared").unwrap(); }
     // Exercise canonical containment through both parent traversal and symlinks.
     std::os::unix::fs::symlink(&module, vm.join("module-link")).unwrap();
-    for name in ["installer.iso", "readonly.img", "notes.txt", "disk.img", "local-module"] {
+    for name in ["kernel", "installer.iso", "readonly.img", "notes.txt", "disk.img", "local-module"] {
         fs::write(vm.join(name), b"data").unwrap();
     }
     let config = vm.join("example.json");
@@ -37,11 +37,32 @@ fn test_delete_preserves_shared_boot_files_and_read_only_media() {
         .arg("delete").arg(&config).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     for path in [&kernel, &module] { assert!(path.exists(), "lost {}", path.display()); }
-    for name in ["installer.iso", "readonly.img", "notes.txt", "module-link"] {
-        assert!(vm.join(name).exists(), "lost {name}");
+    assert!(!vm.exists(), "VM directory and all local artifacts must be deleted");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_delete_keep_disks_preserves_vm_directory_contents() {
+    let root = review_test_dir("keep-disks");
+    let vm = root.join("vms/example");
+    fs::create_dir_all(&vm).unwrap();
+    for name in ["kernel", "disk.img", "installer.iso", "notes.txt"] {
+        fs::write(vm.join(name), b"data").unwrap();
     }
-    for name in ["example.json", "disk.img", "local-module"] {
-        assert!(!vm.join(name).exists(), "did not remove {name}");
+    let config = vm.join("example.json");
+    fs::write(&config, serde_json::json!({
+        "name": "example",
+        "boot": {"mode": "freebsd", "kernel": "kernel"},
+        "disks": ["disk.img", {"path": "installer.iso", "read_only": true}]
+    }).to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cubectl"))
+        .env("CUBE_VMS_DIR", root.join("vms"))
+        .arg("--state-root").arg(root.join("state"))
+        .arg("delete").arg(&config).arg("--keep-disks").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!config.exists());
+    for name in ["kernel", "disk.img", "installer.iso", "notes.txt"] {
+        assert!(vm.join(name).exists(), "lost {name}");
     }
     fs::remove_dir_all(root).unwrap();
 }
@@ -115,7 +136,7 @@ fn test_cubectl_cli_lifecycle_and_conflicts() {
     let fake_cube = temp_dir.join("fake-cube");
     fs::write(
         &fake_cube,
-        "#!/bin/sh\nwhile true; do sleep 0.1; done\n",
+        "#!/bin/sh\nprintf '{\"version\":1,\"instance_id\":\"%s\",\"ip\":null}' \"$CUBE_INSTANCE_ID\" > \"$CUBE_RUNTIME_STATUS_PATH\"\nwhile true; do sleep 0.1; done\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cube, fs::Permissions::from_mode(0o755)).unwrap();
@@ -179,6 +200,17 @@ fn test_cubectl_cli_lifecycle_and_conflicts() {
     let start_json: serde_json::Value = serde_json::from_str(&start_stdout).expect("valid json output");
     assert_eq!(start_json.get("state").and_then(|s| s.as_str()), Some("running"));
     assert_eq!(start_json.get("name").and_then(|n| n.as_str()), Some("vm-one"));
+    assert_eq!(start_json.get("ip"), Some(&serde_json::Value::Null));
+
+    let runtime_path = state_root.join("vm-one/runtime.json");
+    let initial_runtime: serde_json::Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+    assert_eq!(initial_runtime["instance_id"], start_json["id"], "manager must pass launch identity to cube");
+    // A misleading log message must not override structured runtime status.
+    fs::write(state_root.join("vm-one/vmm.log"),
+        "[VirtIO-Net] Guest DHCP address: 192.168.64.99 (--ssh-port destination)\n".repeat(2000)).unwrap();
+    fs::write(&runtime_path, serde_json::json!({
+        "version": 1, "instance_id": start_json["id"], "ip": "192.168.64.3"
+    }).to_string()).unwrap();
 
     // 5. Query status by name
     let status_out = Command::new(cubectl_bin)
@@ -191,6 +223,7 @@ fn test_cubectl_cli_lifecycle_and_conflicts() {
     assert!(status_out.status.success());
     let status_json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&status_out.stdout)).unwrap();
     assert_eq!(status_json.get("state").and_then(|s| s.as_str()), Some("running"));
+    assert_eq!(status_json["ip"], "192.168.64.3");
 
     // 6. Test resource collision: try to start a second VM claiming the same disk and port
     let config2 = vms_dir.join("vm-two.json");
@@ -237,8 +270,10 @@ fn test_cubectl_cli_lifecycle_and_conflicts() {
     assert_eq!(list_items.len(), 2);
     assert_eq!(list_items[0].get("name").and_then(|n| n.as_str()), Some("vm-one"));
     assert_eq!(list_items[0].get("state").and_then(|s| s.as_str()), Some("running"));
+    assert_eq!(list_items[0]["ip"], "192.168.64.3");
     assert_eq!(list_items[1].get("name").and_then(|n| n.as_str()), Some("vm-two"));
     assert_eq!(list_items[1].get("state").and_then(|s| s.as_str()), Some("stopped"));
+    assert_eq!(list_items[1].get("ip"), Some(&serde_json::Value::Null));
 
     // 8. Stop vm-one
     let stop_out = Command::new(cubectl_bin)
@@ -276,6 +311,7 @@ fn test_cubectl_cli_lifecycle_and_conflicts() {
         .unwrap();
     let final_json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&final_status.stdout)).unwrap();
     assert_eq!(final_json.get("state").and_then(|s| s.as_str()), Some("stopped"));
+    assert_eq!(final_json.get("ip"), Some(&serde_json::Value::Null));
 
     // Cleanup
     let _ = fs::remove_dir_all(&temp_dir);

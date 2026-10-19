@@ -8,6 +8,7 @@ mod linux;
 mod memory;
 mod native;
 mod preload;
+mod runtime_status;
 mod shared_fs;
 mod terminal;
 mod vmnet_proto;
@@ -182,6 +183,7 @@ fn run_cli(args: Vec<String>) {
     let mut display_size = (devices::display::FB_WIDTH, devices::display::FB_HEIGHT);
     let mut display_requested = false;
     let mut no_reboot = false;
+    let mut mem_prealloc = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -462,12 +464,18 @@ fn run_cli(args: Vec<String>) {
             "--no-reboot" => {
                 no_reboot = true;
             }
+            "--mem-prealloc" | "--prealloc" => {
+                mem_prealloc = true;
+            }
             "--help" | "-h" => {
                 println!("Usage: cube [OPTIONS] [PAYLOAD/KERNEL]");
                 println!();
                 println!("Options:");
                 println!(
                     "      --no-reboot          Exit instead of rebooting when guest requests reset"
+                );
+                println!(
+                    "      --mem-prealloc       Pre-allocate guest RAM upfront (disable demand-paging)"
                 );
                 println!(
                     "  --share TAG PATH         Export a host directory read-only (repeatable)"
@@ -731,6 +739,7 @@ fn run_cli(args: Vec<String>) {
                 ssh_port,
                 &shares,
                 vmnet_socket.as_deref(),
+                mem_prealloc,
             ),
             no_reboot,
         );
@@ -798,6 +807,7 @@ fn run_cli(args: Vec<String>) {
                     ssh_port,
                     &shares,
                     vmnet_socket.as_deref(),
+                    mem_prealloc,
                 ),
                 no_reboot,
             );
@@ -851,6 +861,7 @@ fn run_cli(args: Vec<String>) {
                     ssh_port,
                     &shares,
                     vmnet_socket.as_deref(),
+                    mem_prealloc,
                 ),
                 no_reboot,
             );
@@ -954,6 +965,7 @@ fn boot_os_kernel(
     ssh_port: Option<u16>,
     shares: &[shared_fs::ShareConfig],
     vmnet_socket: Option<&Path>,
+    mem_prealloc: bool,
 ) -> Result<bool, String> {
     let layout = devices::layout::dynamic_devices(disk_configs.len(), shares.len())?;
     let share_backends = shares
@@ -988,14 +1000,15 @@ fn boot_os_kernel(
         );
     }
     println!(
-        "[Cube] Allocating {}MB RAM at GPA 0x{:08x}...",
+        "[Cube] Allocating {}MB RAM at GPA 0x{:08x}{}...",
         ram_size / (1024 * 1024),
-        DEFAULT_RAM_BASE
+        DEFAULT_RAM_BASE,
+        if mem_prealloc { " (pre-allocated)" } else { " (demand-paged)" }
     );
     println!("[Cube] Configuring {} virtual CPUs (SMP)...", cpus);
     println!("[Cube] Bootargs: \"{}\"", bootargs);
 
-    let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
+    let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size, mem_prealloc) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!(
@@ -1103,6 +1116,7 @@ fn boot_os_kernel(
     }
 
     // Attach VirtIO-MMIO Network Device
+    let mut runtime_address = Arc::new(Mutex::new(None));
     if effective_net != "none" {
         let virtio_net = VirtioNet::new(
             mac_addr,
@@ -1111,6 +1125,7 @@ fn boot_os_kernel(
             effective_net,
             vmnet_socket,
         )?;
+        runtime_address = virtio_net.guest_address();
         if let Some(port) = ssh_port {
             _forwards.push(forward::start_ssh_forward(
                 port,
@@ -1132,6 +1147,8 @@ fn boot_os_kernel(
             MMIO_VIRTIO_NET_BASE, VIRTIO_NET_IRQ
         );
     }
+
+    let _runtime_status = runtime_status::Publisher::from_environment(runtime_address)?;
 
     // Attach VirtIO-MMIO Random Number Generator
     let virtio_rng = VirtioRng::new(VIRTIO_RNG_IRQ, vm.memory());
@@ -1766,7 +1783,7 @@ fn finish_boot(result: Result<bool, String>, no_reboot: bool) {
 
 /// Boots a raw flat binary payload (like the baremetal test).
 fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model: CpuModel) {
-    let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size) {
+    let mut vm = match Vm::new(DEFAULT_RAM_BASE, ram_size, false) {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!(

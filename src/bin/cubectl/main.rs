@@ -206,6 +206,9 @@ pub struct StartArgs {
 
     #[arg(long, help = "Exit instead of rebooting when guest requests reset")]
     pub no_reboot: bool,
+
+    #[arg(long, help = "Pre-allocate RAM upfront (disable demand-paging)")]
+    pub mem_prealloc: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -340,6 +343,10 @@ pub struct CreateArgs {
     /// vCPUs allocated during the installation phase (default: same as --cpus)
     #[arg(long = "installer-cpus")]
     pub installer_cpus: Option<u32>,
+
+    /// Pre-allocate RAM upfront (disable demand-paging)
+    #[arg(long = "mem-prealloc")]
+    pub mem_prealloc: bool,
 }
 
 #[derive(Parser, Debug, Clone)]

@@ -43,6 +43,7 @@ app: build sign
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
 	swiftc -O -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
+		app/Cube/Sources/SystemMetrics.swift \
 		app/Cube/Sources/VMManager.swift \
 		app/Cube/Sources/NewVMWindowController.swift \
 		app/Cube/Sources/DashboardWindowController.swift \

@@ -19,6 +19,12 @@ struct VMInfo: Decodable {
     }
 }
 
+struct VMShareConfig {
+    var tag: String
+    var path: String
+    var read_only: Bool
+}
+
 struct CreateVMOptions {
     var name: String
     var osVersion: String // "14.4", "15.1", or "custom"
@@ -32,6 +38,10 @@ struct CreateVMOptions {
     var sshPort: Int?
     var vncPort: Int?
     var destinationDir: String?
+    var sharePath: String?
+    var shareTag: String?
+    var shareReadOnly: Bool = false
+    var memPrealloc: Bool = false
 }
 
 class VMManager {
@@ -367,6 +377,19 @@ class VMManager {
             args.extend(["--vnc", "127.0.0.1:\(vnc)"])
         }
 
+        if let sharePath = options.sharePath, !sharePath.isEmpty {
+            let tag = (options.shareTag?.trimmingCharacters(in: .whitespaces).isEmpty == false) ? options.shareTag! : "shared"
+            if options.shareReadOnly {
+                args.extend(["--share", tag, sharePath])
+            } else {
+                args.extend(["--share-rw", tag, sharePath])
+            }
+        }
+
+        if options.memPrealloc {
+            args.append("--mem-prealloc")
+        }
+
         DispatchQueue.global(qos: .userInitiated).async {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: bin)
@@ -401,6 +424,35 @@ class VMManager {
                     completion(false, error.localizedDescription)
                 }
             }
+        }
+    }
+
+    func updateShares(for vmName: String, shares: [VMShareConfig], completion: @escaping (Bool, String?) -> Void) {
+        guard let vm = vms.first(where: { $0.name == vmName }) else {
+            completion(false, "Virtual machine not found.")
+            return
+        }
+        if vm.isRunning {
+            completion(false, "Cannot modify shared folders while the VM is running. Stop the VM first.")
+            return
+        }
+        let configPath = vm.config ?? "\(vmsDirectory)/\(vmName)/\(vmName).json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+              var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            completion(false, "Failed to read VM configuration file.")
+            return
+        }
+
+        let sharesDicts = shares.map { ["tag": $0.tag, "path": $0.path, "read_only": $0.read_only] }
+        json["shares"] = sharesDicts
+
+        do {
+            let updatedData = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try updatedData.write(to: URL(fileURLWithPath: configPath), options: .atomic)
+            refreshVMs()
+            completion(true, nil)
+        } catch {
+            completion(false, "Failed to write updated configuration: \(error.localizedDescription)")
         }
     }
 
@@ -684,6 +736,8 @@ struct DetailedVMConfig {
     var netMode: String = "vmnet-proxy"
     var sshPort: Int?
     var vnc: String?
+    var shares: [VMShareConfig] = []
+    var memPrealloc: Bool = false
 }
 
 extension VMInfo {
@@ -705,6 +759,16 @@ extension VMInfo {
             }
             if let v = json["vnc"] as? [String: Any], let bind = v["bind"] as? String {
                 cfg.vnc = bind
+            }
+            if let sharesList = json["shares"] as? [[String: Any]] {
+                cfg.shares = sharesList.compactMap { s in
+                    guard let tag = s["tag"] as? String, let p = s["path"] as? String else { return nil }
+                    let ro = s["read_only"] as? Bool ?? false
+                    return VMShareConfig(tag: tag, path: p, read_only: ro)
+                }
+            }
+            if let mp = json["mem_prealloc"] as? Bool {
+                cfg.memPrealloc = mp
             }
         }
         return cfg

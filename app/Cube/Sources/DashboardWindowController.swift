@@ -17,6 +17,34 @@ private class VerticallyCenteredTextFieldCell: NSTextFieldCell {
     }
 }
 
+// MARK: - Cube Design System Tokens
+private enum CubeTokens {
+    // Colors
+    static let cardBackground = NSColor.controlBackgroundColor
+    static let cardBorder = NSColor.separatorColor
+    static let accent = NSColor.systemBlue
+    static let runningGreen = NSColor(red: 0.20, green: 0.78, blue: 0.35, alpha: 1.0)
+    static let stoppedGray = NSColor.secondaryLabelColor
+    static let primaryText = NSColor.labelColor
+    static let secondaryText = NSColor.secondaryLabelColor
+    static let tertiaryText = NSColor.tertiaryLabelColor
+    static let subtleTagBg = NSColor.quaternaryLabelColor.withAlphaComponent(0.08)
+
+    // Typography
+    static let heroTitleFont = NSFont.systemFont(ofSize: 21, weight: .bold)
+    static let sectionHeaderFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+    static let bodyLabelFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+    static let bodyValueFont = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+    static let badgeFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
+    static let sidebarTitleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+    static let sidebarSubtitleFont = NSFont.systemFont(ofSize: 10.5, weight: .regular)
+
+    // Layout Metrics & Radii
+    static let cardCornerRadius: CGFloat = 10
+    static let badgeCornerRadius: CGFloat = 5
+    static let cardBorderWidth: CGFloat = 1.0
+}
+
 class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     static let shared = DashboardWindowController()
 
@@ -54,11 +82,31 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
     private var ipLabel: NSTextField!
     private var sshCommandLabel: NSTextField!
     private var vncLabel: NSTextField!
+    private var sharesListLabel: NSTextField!
+    private var copyMountCmdButton: NSButton!
+    private var manageSharesButton: NSButton!
+
+    // Empty & Welcome State
+    private var emptyTitleLabel: NSTextField!
+    private var emptySubtitleLabel: NSTextField!
+    private var emptyCardsContainer: NSView!
+    private var emptyCreateButton: NSButton!
+    private var emptyCliTipLabel: NSTextField!
+
+    #if ENABLE_VM_TELEMETRY
+    // Runtime Performance Card
+    private var vmMemoryUsageLabel: NSTextField!
+    private var vmCPULoadLabel: NSTextField!
+    private var vmProcessInfoLabel: NSTextField!
+    #endif
 
     // Bottom Status Bar
     private var statusBarView: NSView!
     private var serviceStatusDot: NSTextField!
     private var serviceStatusLabel: NSTextField!
+    #if ENABLE_VM_TELEMETRY
+    private var hostTelemetryLabel: NSTextField!
+    #endif
     private var serviceToggleButton: NSButton!
 
     private var selectedVMName: String?
@@ -66,13 +114,13 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 580),
+            contentRect: NSRect(x: 0, y: 0, width: 920, height: 620),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Cube Dashboard"
-        window.minSize = NSSize(width: 760, height: 480)
+        window.minSize = NSSize(width: 800, height: 560)
         window.center()
         window.isReleasedWhenClosed = false
 
@@ -169,9 +217,22 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         serviceStatusLabel = NSTextField(labelWithString: "Cube Network Service: Checking...")
         serviceStatusLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         serviceStatusLabel.textColor = .secondaryLabelColor
-        serviceStatusLabel.frame = NSRect(x: 30, y: 6, width: 480, height: 18)
+        #if ENABLE_VM_TELEMETRY
+        serviceStatusLabel.frame = NSRect(x: 30, y: 6, width: 280, height: 18)
+        #else
+        serviceStatusLabel.frame = NSRect(x: 30, y: 6, width: parent.bounds.width - 245, height: 18)
         serviceStatusLabel.autoresizingMask = [.width]
+        #endif
+        serviceStatusLabel.lineBreakMode = .byTruncatingTail
         statusBarView.addSubview(serviceStatusLabel)
+
+        #if ENABLE_VM_TELEMETRY
+        hostTelemetryLabel = NSTextField(labelWithString: "Host: Calculating...")
+        hostTelemetryLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        hostTelemetryLabel.textColor = .secondaryLabelColor
+        hostTelemetryLabel.frame = NSRect(x: 320, y: 6, width: 260, height: 18)
+        statusBarView.addSubview(hostTelemetryLabel)
+        #endif
 
         let openPrefsBtn = NSButton(title: "Preferences...", target: self, action: #selector(openPreferencesClicked))
         openPrefsBtn.bezelStyle = .rounded
@@ -242,23 +303,27 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         bottomBar.addSubview(refreshBtn)
         sidebarView.addSubview(bottomBar)
 
-        // Scrollable Table View
+        // Scrollable Table View (clean without scrollbars or horizontal scroll)
         let scrollView = NSScrollView(frame: NSRect(x: 0, y: 38, width: 240, height: max(100, barHeight - 80)))
         scrollView.autoresizingMask = [.width, .height]
-        scrollView.hasVerticalScroller = true
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.horizontalScrollElasticity = .none
         scrollView.borderType = .noBorder
 
         tableView = NSTableView(frame: scrollView.bounds)
         tableView.headerView = nil
         tableView.autoresizingMask = [.width, .height]
-        tableView.rowHeight = 44
+        tableView.rowHeight = 46
         tableView.backgroundColor = .controlBackgroundColor
         tableView.selectionHighlightStyle = .regular
+        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         tableView.target = self
         tableView.doubleAction = #selector(tableDoubleClicked)
 
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("VMColumn"))
-        col.width = 240
+        col.width = scrollView.contentSize.width
+        col.resizingMask = .autoresizingMask
         tableView.addTableColumn(col)
 
         tableView.dataSource = self
@@ -270,42 +335,78 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
     private func setupDetailArea() {
         detailContainerView.autoresizingMask = [.width, .height]
 
-        // 1. Empty State View
+        // 1. Empty & Welcome State View
         emptyStateView = NSView(frame: detailContainerView.bounds)
         emptyStateView.autoresizingMask = [.width, .height]
 
-        let emptyContainer = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 220))
-        emptyContainer.autoresizingMask = []
+        let emptyContainer = DashboardFlippedView(frame: NSRect(x: 0, y: 0, width: 540, height: 380))
+        emptyContainer.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin, .maxYMargin]
 
-        let iconView = NSImageView(frame: NSRect(x: 130, y: 130, width: 80, height: 80))
-        let config = NSImage.SymbolConfiguration(pointSize: 52, weight: .light)
+        let iconView = NSImageView(frame: NSRect(x: 244, y: 12, width: 52, height: 52))
+        let config = NSImage.SymbolConfiguration(pointSize: 42, weight: .regular)
         if let img = NSImage(systemSymbolName: "macmini", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
             iconView.image = img
-            iconView.contentTintColor = .tertiaryLabelColor
+            iconView.contentTintColor = .systemBlue
         }
         emptyContainer.addSubview(iconView)
 
-        let emptyTitle = NSTextField(labelWithString: "No Virtual Machine Selected")
-        emptyTitle.font = NSFont.boldSystemFont(ofSize: 15)
-        emptyTitle.alignment = .center
-        emptyTitle.frame = NSRect(x: 0, y: 95, width: 340, height: 22)
-        emptyContainer.addSubview(emptyTitle)
+        emptyTitleLabel = NSTextField(labelWithString: "Welcome to Cube")
+        emptyTitleLabel.font = NSFont.boldSystemFont(ofSize: 20)
+        emptyTitleLabel.alignment = .center
+        emptyTitleLabel.frame = NSRect(x: 0, y: 72, width: 540, height: 26)
+        emptyContainer.addSubview(emptyTitleLabel)
 
-        let emptyDesc = NSTextField(labelWithString: "Select an existing virtual machine from the sidebar\nor create a new FreeBSD / ARM64 guest.")
-        emptyDesc.font = NSFont.systemFont(ofSize: 12)
-        emptyDesc.textColor = .secondaryLabelColor
-        emptyDesc.alignment = .center
-        emptyDesc.frame = NSRect(x: 0, y: 55, width: 340, height: 32)
-        emptyContainer.addSubview(emptyDesc)
+        emptySubtitleLabel = NSTextField(labelWithString: "Native Apple Silicon Virtualization for FreeBSD")
+        emptySubtitleLabel.font = NSFont.systemFont(ofSize: 12.5)
+        emptySubtitleLabel.textColor = .secondaryLabelColor
+        emptySubtitleLabel.alignment = .center
+        emptySubtitleLabel.frame = NSRect(x: 0, y: 102, width: 540, height: 18)
+        emptyContainer.addSubview(emptySubtitleLabel)
 
-        let createBtn = NSButton(title: "+ Create Virtual Machine...", target: self, action: #selector(newVMClicked))
-        createBtn.bezelStyle = .rounded
-        createBtn.frame = NSRect(x: 70, y: 10, width: 200, height: 32)
-        emptyContainer.addSubview(createBtn)
+        // 3 Feature Cards
+        emptyCardsContainer = NSView(frame: NSRect(x: 0, y: 134, width: 540, height: 122))
+        let card1 = createQuickStartCard(
+            icon: "bolt.fill",
+            iconColor: .systemOrange,
+            title: "1-Click Setup",
+            text: "Official FreeBSD releases auto-downloaded with automated ZFS install and root SSH.",
+            frame: NSRect(x: 0, y: 0, width: 168, height: 122)
+        )
+        let card2 = createQuickStartCard(
+            icon: "network",
+            iconColor: .systemBlue,
+            title: "Zero-Config NAT",
+            text: "High-speed userland proxy with automatic DHCP and SSH forwarding.",
+            frame: NSRect(x: 186, y: 0, width: 168, height: 122)
+        )
+        let card3 = createQuickStartCard(
+            icon: "folder.badge.gearshape",
+            iconColor: .systemPurple,
+            title: "Host Sharing",
+            text: "Mount host Mac directories directly into your guest using high-speed VirtIO-9P.",
+            frame: NSRect(x: 372, y: 0, width: 168, height: 122)
+        )
+        emptyCardsContainer.addSubview(card1)
+        emptyCardsContainer.addSubview(card2)
+        emptyCardsContainer.addSubview(card3)
+        emptyContainer.addSubview(emptyCardsContainer)
+
+        emptyCreateButton = NSButton(title: "+ Create Virtual Machine...", target: self, action: #selector(newVMClicked))
+        emptyCreateButton.bezelStyle = .rounded
+        emptyCreateButton.font = NSFont.boldSystemFont(ofSize: 13)
+        emptyCreateButton.frame = NSRect(x: 155, y: 272, width: 230, height: 34)
+        emptyContainer.addSubview(emptyCreateButton)
+
+        emptyCliTipLabel = NSTextField(labelWithString: "💡 Prefer the terminal? Manage VMs with 'cubectl list' & 'cubectl start'.")
+        emptyCliTipLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        emptyCliTipLabel.textColor = .secondaryLabelColor
+        emptyCliTipLabel.alignment = .center
+        emptyCliTipLabel.frame = NSRect(x: 0, y: 318, width: 540, height: 18)
+        emptyContainer.addSubview(emptyCliTipLabel)
 
         emptyContainer.setFrameOrigin(NSPoint(
-            x: max(0, (detailContainerView.bounds.width - 340) / 2),
-            y: max(0, (detailContainerView.bounds.height - 220) / 2)
+            x: max(0, (detailContainerView.bounds.width - 540) / 2),
+            y: max(0, (detailContainerView.bounds.height - 380) / 2)
         ))
         emptyStateView.addSubview(emptyContainer)
         detailContainerView.addSubview(emptyStateView)
@@ -324,147 +425,245 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         let heroConfig = NSImage.SymbolConfiguration(pointSize: 26, weight: .regular)
         if let heroImg = NSImage(systemSymbolName: "server.rack", accessibilityDescription: nil)?.withSymbolConfiguration(heroConfig) {
             iconBadge.image = heroImg
-            iconBadge.contentTintColor = .systemBlue
+            iconBadge.contentTintColor = CubeTokens.accent
         }
         detailView.addSubview(iconBadge)
 
         vmNameLabel = NSTextField(labelWithString: "VM Name")
-        vmNameLabel.font = NSFont.boldSystemFont(ofSize: 20)
+        vmNameLabel.font = CubeTokens.heroTitleFont
         vmNameLabel.frame = NSRect(x: margin + 48, y: y, width: 320, height: 26)
         detailView.addSubview(vmNameLabel)
 
-        statusBadge = NSTextField(frame: NSRect(x: margin + 48, y: y + 26, width: 100, height: 20))
+        statusBadge = NSTextField(frame: NSRect(x: margin + 48, y: y + 27, width: 92, height: 20))
         statusBadge.cell = VerticallyCenteredTextFieldCell(textCell: "STOPPED")
-        statusBadge.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold)
+        statusBadge.font = CubeTokens.badgeFont
         statusBadge.isBezeled = false
         statusBadge.drawsBackground = false
         statusBadge.isEditable = false
         statusBadge.isSelectable = false
-        statusBadge.textColor = .secondaryLabelColor
+        statusBadge.textColor = CubeTokens.secondaryText
         statusBadge.alignment = .center
         statusBadge.wantsLayer = true
-        statusBadge.layer?.cornerRadius = 5
+        statusBadge.layer?.cornerRadius = CubeTokens.badgeCornerRadius
         statusBadge.layer?.borderWidth = 1
-        statusBadge.layer?.borderColor = NSColor.separatorColor.cgColor
+        statusBadge.layer?.borderColor = CubeTokens.cardBorder.cgColor
         statusBadge.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         detailView.addSubview(statusBadge)
-        y += 56
+        y += 58
 
         // Toolbar Action Buttons
         startStopButton = NSButton(title: "Start VM", target: self, action: #selector(toggleVMClicked))
         startStopButton.bezelStyle = .rounded
-        startStopButton.frame = NSRect(x: margin, y: y, width: 100, height: 30)
+        startStopButton.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        startStopButton.frame = NSRect(x: margin, y: y, width: 96, height: 30)
         detailView.addSubview(startStopButton)
 
         sshButton = NSButton(title: "SSH Terminal", target: self, action: #selector(sshClicked))
         sshButton.bezelStyle = .rounded
-        sshButton.frame = NSRect(x: margin + 106, y: y, width: 115, height: 30)
+        sshButton.font = NSFont.systemFont(ofSize: 12)
+        sshButton.frame = NSRect(x: margin + 102, y: y, width: 114, height: 30)
         detailView.addSubview(sshButton)
 
         vncButton = NSButton(title: "VNC Display", target: self, action: #selector(vncClicked))
         vncButton.bezelStyle = .rounded
-        vncButton.frame = NSRect(x: margin + 227, y: y, width: 110, height: 30)
+        vncButton.font = NSFont.systemFont(ofSize: 12)
+        vncButton.frame = NSRect(x: margin + 222, y: y, width: 108, height: 30)
         detailView.addSubview(vncButton)
 
         logsButton = NSButton(title: "VM Logs...", target: self, action: #selector(logsClicked))
         logsButton.bezelStyle = .rounded
-        logsButton.frame = NSRect(x: margin + 343, y: y, width: 95, height: 30)
+        logsButton.font = NSFont.systemFont(ofSize: 12)
+        logsButton.frame = NSRect(x: margin + 336, y: y, width: 94, height: 30)
         detailView.addSubview(logsButton)
 
         deleteButton = NSButton(title: "Delete...", target: self, action: #selector(deleteClicked))
         deleteButton.bezelStyle = .rounded
-        deleteButton.frame = NSRect(x: margin + 444, y: y, width: 90, height: 30)
+        deleteButton.font = NSFont.systemFont(ofSize: 12)
+        deleteButton.frame = NSRect(x: margin + 436, y: y, width: 88, height: 30)
         detailView.addSubview(deleteButton)
-        y += 42
-
-        // Separator
-        let sep1 = NSBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 1))
-        sep1.boxType = .separator
-        detailView.addSubview(sep1)
-        y += 18
+        y += 44
 
         // Card 1: Operating System & Hardware Specifications
-        let hwTitle = NSTextField(labelWithString: "Operating System & Hardware")
-        hwTitle.font = NSFont.boldSystemFont(ofSize: 13)
-        hwTitle.frame = NSRect(x: margin, y: y, width: contentWidth, height: 18)
-        detailView.addSubview(hwTitle)
-        y += 24
+        let card1Height: CGFloat = 176
+        let hwCard = createCard(frame: NSRect(x: margin, y: y, width: contentWidth, height: card1Height))
+        detailView.addSubview(hwCard)
 
-        osVersionLabel = addPropertyRow(label: "Operating System:", value: "FreeBSD", in: detailView, y: y)
-        y += 22
-        archLabel = addPropertyRow(label: "Architecture:", value: "ARM64 (Apple Silicon Hypervisor.framework)", in: detailView, y: y)
-        y += 22
-        cpusLabel = addPropertyRow(label: "vCPUs:", value: "2 Cores", in: detailView, y: y)
-        y += 22
-        ramLabel = addPropertyRow(label: "Memory (RAM):", value: "2048 MB", in: detailView, y: y)
-        y += 22
-        bootModeLabel = addPropertyRow(label: "Boot Mode:", value: "UEFI (QEMU_EFI.fd)", in: detailView, y: y)
-        y += 22
+        let hwTitle = NSTextField(labelWithString: "OPERATING SYSTEM & HARDWARE")
+        hwTitle.font = CubeTokens.sectionHeaderFont
+        hwTitle.textColor = CubeTokens.secondaryText
+        hwTitle.frame = NSRect(x: 18, y: 14, width: contentWidth - 36, height: 16)
+        hwCard.addSubview(hwTitle)
 
-        diskPathLabel = addPropertyRow(label: "Virtual Disk:", value: "rootfs.img", in: detailView, y: y)
+        var cy: CGFloat = 36
+        osVersionLabel = addPropertyRow(label: "Operating System:", value: "FreeBSD", in: hwCard, y: cy)
+        cy += 22
+        archLabel = addPropertyRow(label: "Architecture:", value: "ARM64 (Apple Silicon Hypervisor.framework)", in: hwCard, y: cy)
+        cy += 22
+        cpusLabel = addPropertyRow(label: "vCPUs:", value: "2 Cores", in: hwCard, y: cy)
+        cy += 22
+        ramLabel = addPropertyRow(label: "Memory (RAM):", value: "2048 MB", in: hwCard, y: cy)
+        cy += 22
+        bootModeLabel = addPropertyRow(label: "Boot Mode:", value: "UEFI (QEMU_EFI.fd)", in: hwCard, y: cy)
+        cy += 22
+
+        diskPathLabel = addPropertyRow(label: "Virtual Disk:", value: "rootfs.img", in: hwCard, y: cy, valueWidth: contentWidth - 145 - 110)
         let revealDiskBtn = NSButton(title: "Reveal Disk", target: self, action: #selector(revealDiskClicked))
         revealDiskBtn.bezelStyle = .rounded
         revealDiskBtn.controlSize = .small
         revealDiskBtn.font = NSFont.systemFont(ofSize: 11)
-        revealDiskBtn.frame = NSRect(x: margin + contentWidth - 92, y: y - 3, width: 92, height: 21)
-        detailView.addSubview(revealDiskBtn)
-        y += 30
+        revealDiskBtn.frame = NSRect(x: contentWidth - 18 - 88, y: cy - 2, width: 88, height: 21)
+        hwCard.addSubview(revealDiskBtn)
 
-        // Separator 2
-        let sep2 = NSBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 1))
-        sep2.boxType = .separator
-        detailView.addSubview(sep2)
-        y += 18
+        y += card1Height + 14
 
         // Card 2: Networking & Connectivity
-        let netTitle = NSTextField(labelWithString: "Networking & Remote Access")
-        netTitle.font = NSFont.boldSystemFont(ofSize: 13)
-        netTitle.frame = NSRect(x: margin, y: y, width: contentWidth, height: 18)
-        detailView.addSubview(netTitle)
-        y += 24
+        let card2Height: CGFloat = 154
+        let netCard = createCard(frame: NSRect(x: margin, y: y, width: contentWidth, height: card2Height))
+        detailView.addSubview(netCard)
 
-        netModeLabel = addPropertyRow(label: "Network Mode:", value: "vmnet-proxy (Shared NAT)", in: detailView, y: y)
-        y += 22
+        let netTitle = NSTextField(labelWithString: "NETWORKING & REMOTE ACCESS")
+        netTitle.font = CubeTokens.sectionHeaderFont
+        netTitle.textColor = CubeTokens.secondaryText
+        netTitle.frame = NSRect(x: 18, y: 14, width: contentWidth - 36, height: 16)
+        netCard.addSubview(netTitle)
 
-        ipLabel = addPropertyRow(label: "Guest IPv4:", value: "Detecting...", in: detailView, y: y)
+        cy = 36
+        netModeLabel = addPropertyRow(label: "Network Mode:", value: "vmnet-proxy (Shared NAT)", in: netCard, y: cy)
+        cy += 22
+
+        ipLabel = addPropertyRow(label: "Guest IPv4:", value: "Detecting...", in: netCard, y: cy, valueWidth: contentWidth - 145 - 80)
         let copyIPBtn = NSButton(title: "Copy", target: self, action: #selector(copyIPClicked(_:)))
         copyIPBtn.bezelStyle = .rounded
         copyIPBtn.controlSize = .small
         copyIPBtn.font = NSFont.systemFont(ofSize: 11)
-        copyIPBtn.frame = NSRect(x: margin + contentWidth - 66, y: y - 3, width: 66, height: 21)
-        detailView.addSubview(copyIPBtn)
-        y += 22
+        copyIPBtn.frame = NSRect(x: contentWidth - 18 - 62, y: cy - 2, width: 62, height: 21)
+        netCard.addSubview(copyIPBtn)
+        cy += 22
 
-        sshCommandLabel = addPropertyRow(label: "SSH Command:", value: "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@127.0.0.1", in: detailView, y: y)
+        sshCommandLabel = addPropertyRow(label: "SSH Command:", value: "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 root@127.0.0.1", in: netCard, y: cy, valueWidth: contentWidth - 145 - 80)
         sshCommandLabel.lineBreakMode = .byTruncatingMiddle
         let copySSHBtn = NSButton(title: "Copy", target: self, action: #selector(copySSHClicked(_:)))
         copySSHBtn.bezelStyle = .rounded
         copySSHBtn.controlSize = .small
         copySSHBtn.font = NSFont.systemFont(ofSize: 11)
-        copySSHBtn.frame = NSRect(x: margin + contentWidth - 66, y: y - 3, width: 66, height: 21)
-        detailView.addSubview(copySSHBtn)
-        y += 22
+        copySSHBtn.frame = NSRect(x: contentWidth - 18 - 62, y: cy - 2, width: 62, height: 21)
+        netCard.addSubview(copySSHBtn)
+        cy += 22
 
-        vncLabel = addPropertyRow(label: "VNC Console:", value: "127.0.0.1:5901", in: detailView, y: y)
-        y += 24
+        vncLabel = addPropertyRow(label: "VNC Console:", value: "127.0.0.1:5901", in: netCard, y: cy)
+        cy += 22
+
+        sharesListLabel = addPropertyRow(label: "Shared Folders:", value: "None configured", in: netCard, y: cy, valueWidth: contentWidth - 145 - 198)
+
+        copyMountCmdButton = NSButton(title: "Copy Mount", target: self, action: #selector(copyMountCmdClicked))
+        copyMountCmdButton.bezelStyle = .rounded
+        copyMountCmdButton.controlSize = .small
+        copyMountCmdButton.font = NSFont.systemFont(ofSize: 11)
+        copyMountCmdButton.frame = NSRect(x: contentWidth - 18 - 186, y: cy - 2, width: 88, height: 21)
+        copyMountCmdButton.isHidden = true
+        netCard.addSubview(copyMountCmdButton)
+
+        manageSharesButton = NSButton(title: "+ Add Folder...", target: self, action: #selector(manageSharesClicked))
+        manageSharesButton.bezelStyle = .rounded
+        manageSharesButton.controlSize = .small
+        manageSharesButton.font = NSFont.systemFont(ofSize: 11)
+        manageSharesButton.frame = NSRect(x: contentWidth - 18 - 92, y: cy - 2, width: 92, height: 21)
+        netCard.addSubview(manageSharesButton)
+
+        y += card2Height + 14
+
+        #if ENABLE_VM_TELEMETRY
+        let card3Height: CGFloat = 114
+        let telemetryCard = createCard(frame: NSRect(x: margin, y: y, width: contentWidth, height: card3Height))
+        detailView.addSubview(telemetryCard)
+
+        let telemetryTitle = NSTextField(labelWithString: "REAL-TIME PERFORMANCE & TELEMETRY")
+        telemetryTitle.font = CubeTokens.sectionHeaderFont
+        telemetryTitle.textColor = CubeTokens.secondaryText
+        telemetryTitle.frame = NSRect(x: 18, y: 14, width: contentWidth - 36, height: 16)
+        telemetryCard.addSubview(telemetryTitle)
+
+        cy = 36
+        vmMemoryUsageLabel = addPropertyRow(label: "Memory Footprint:", value: "Offline", in: telemetryCard, y: cy)
+        cy += 22
+        vmCPULoadLabel = addPropertyRow(label: "vCPU Activity:", value: "Offline", in: telemetryCard, y: cy)
+        cy += 22
+        vmProcessInfoLabel = addPropertyRow(label: "Hypervisor Engine:", value: "Apple Silicon Hypervisor.framework (ARM64)", in: telemetryCard, y: cy)
+        #endif
 
         detailContainerView.addSubview(detailView)
     }
 
-    private func addPropertyRow(label: String, value: String, in view: NSView, y: CGFloat) -> NSTextField {
-        let margin: CGFloat = 28
+    private func createCard(frame: NSRect) -> DashboardFlippedView {
+        let card = DashboardFlippedView(frame: frame)
+        card.wantsLayer = true
+        card.layer?.cornerRadius = CubeTokens.cardCornerRadius
+        card.layer?.borderWidth = CubeTokens.cardBorderWidth
+        card.layer?.borderColor = CubeTokens.cardBorder.cgColor
+        card.layer?.backgroundColor = CubeTokens.cardBackground.cgColor
+        return card
+    }
+
+    private func createQuickStartCard(icon: String, iconColor: NSColor, title: String, text: String, frame: NSRect) -> NSView {
+        let card = DashboardFlippedView(frame: frame)
+        card.wantsLayer = true
+        card.layer?.cornerRadius = CubeTokens.cardCornerRadius
+        card.layer?.borderWidth = CubeTokens.cardBorderWidth
+        card.layer?.borderColor = CubeTokens.cardBorder.cgColor
+        card.layer?.backgroundColor = CubeTokens.cardBackground.cgColor
+
+        let iconView = NSImageView(frame: NSRect(x: 14, y: 14, width: 20, height: 20))
+        let cfg = NSImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+        if let img = NSImage(systemSymbolName: icon, accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
+            iconView.image = img
+            iconView.contentTintColor = iconColor
+        }
+        card.addSubview(iconView)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 12.5)
+        titleLabel.textColor = CubeTokens.primaryText
+        titleLabel.frame = NSRect(x: 38, y: 15, width: frame.width - 48, height: 18)
+        card.addSubview(titleLabel)
+
+        let descLabel = NSTextField(wrappingLabelWithString: text)
+        descLabel.font = NSFont.systemFont(ofSize: 11)
+        descLabel.textColor = CubeTokens.secondaryText
+        descLabel.frame = NSRect(x: 14, y: 40, width: frame.width - 28, height: frame.height - 48)
+        card.addSubview(descLabel)
+
+        return card
+    }
+
+    private func updateEmptyState(hasVMs: Bool) {
+        if hasVMs {
+            emptyTitleLabel.stringValue = "No Virtual Machine Selected"
+            emptySubtitleLabel.stringValue = "Select an existing virtual machine from the sidebar to inspect its settings."
+            emptyCardsContainer.isHidden = true
+            emptyCliTipLabel.isHidden = true
+            emptyCreateButton.title = "+ Create Another VM..."
+        } else {
+            emptyTitleLabel.stringValue = "Welcome to Cube"
+            emptySubtitleLabel.stringValue = "Native Apple Silicon Virtualization for FreeBSD"
+            emptyCardsContainer.isHidden = false
+            emptyCliTipLabel.isHidden = false
+            emptyCreateButton.title = "+ Create Virtual Machine..."
+        }
+    }
+
+    private func addPropertyRow(label: String, value: String, in view: NSView, y: CGFloat, labelX: CGFloat = 18, valueX: CGFloat = 145, valueWidth: CGFloat = 340) -> NSTextField {
         let lbl = NSTextField(labelWithString: label)
-        lbl.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        lbl.textColor = .secondaryLabelColor
-        lbl.frame = NSRect(x: margin, y: y, width: 110, height: 18)
+        lbl.font = CubeTokens.bodyLabelFont
+        lbl.textColor = CubeTokens.secondaryText
+        lbl.frame = NSRect(x: labelX, y: y, width: valueX - labelX - 10, height: 18)
         view.addSubview(lbl)
 
         let val = NSTextField(labelWithString: value)
-        val.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        val.textColor = .labelColor
+        val.font = CubeTokens.bodyValueFont
+        val.textColor = CubeTokens.primaryText
         val.isSelectable = true
         val.lineBreakMode = .byTruncatingMiddle
-        val.frame = NSRect(x: margin + 115, y: y, width: 395, height: 18)
+        val.frame = NSRect(x: valueX, y: y, width: valueWidth, height: 18)
         view.addSubview(val)
         return val
     }
@@ -497,6 +696,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
             } else {
                 self.emptyStateView.isHidden = false
                 self.detailView.isHidden = true
+                self.updateEmptyState(hasVMs: !vms.isEmpty)
             }
 
             self.updateServiceBanner()
@@ -513,17 +713,17 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         if isRunning {
             let pidStr = vm.pid.map { " (PID \($0))" } ?? ""
             badgeText = "● RUNNING\(pidStr)"
-            badgeColor = .systemGreen
-            bgColor = NSColor.systemGreen.withAlphaComponent(0.08)
-            statusBadge.layer?.borderColor = NSColor.systemGreen.withAlphaComponent(0.4).cgColor
+            badgeColor = CubeTokens.runningGreen
+            bgColor = CubeTokens.runningGreen.withAlphaComponent(0.12)
+            statusBadge.layer?.borderColor = CubeTokens.runningGreen.withAlphaComponent(0.4).cgColor
             startStopButton.title = "Stop VM"
             sshButton.isEnabled = true
             vncButton.isEnabled = true
         } else {
             badgeText = "○ STOPPED"
-            badgeColor = .secondaryLabelColor
-            bgColor = NSColor.windowBackgroundColor
-            statusBadge.layer?.borderColor = NSColor.separatorColor.cgColor
+            badgeColor = CubeTokens.stoppedGray
+            bgColor = CubeTokens.subtleTagBg
+            statusBadge.layer?.borderColor = CubeTokens.cardBorder.cgColor
             startStopButton.title = "Start VM"
             sshButton.isEnabled = true
             vncButton.isEnabled = true
@@ -533,16 +733,16 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         statusBadge.textColor = badgeColor
         statusBadge.layer?.backgroundColor = bgColor.cgColor
 
-        let font = statusBadge.font ?? NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold)
+        let font = statusBadge.font ?? CubeTokens.badgeFont
         let textWidth = (badgeText as NSString).size(withAttributes: [.font: font]).width
-        let badgeWidth = max(95, ceil(textWidth) + 20)
-        statusBadge.frame = NSRect(x: 28 + 48, y: 24 + 26, width: badgeWidth, height: 20)
+        let badgeWidth = max(90, ceil(textWidth) + 18)
+        statusBadge.frame = NSRect(x: 28 + 48, y: 24 + 27, width: badgeWidth, height: 20)
 
         let cfg = vm.loadConfig()
         let os = vm.os ?? cfg.os ?? "FreeBSD"
         osVersionLabel.stringValue = "\(os) (ARM64)"
-        cpusLabel.stringValue = "\(cfg.cpus) vCPUs"
-        ramLabel.stringValue = "\(cfg.ramMB) MB"
+        let memMode = cfg.memPrealloc ? "Pre-allocated" : "On-Demand"
+        ramLabel.stringValue = "\(cfg.ramMB) MB (\(memMode))"
         bootModeLabel.stringValue = cfg.bootMode.uppercased()
 
         if let dp = cfg.diskPath {
@@ -568,6 +768,41 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
                 vncButton.isEnabled = false
             }
         }
+
+        if let first = cfg.shares.first {
+            let mode = first.read_only ? "RO" : "RW"
+            let shortPath = first.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+            sharesListLabel.stringValue = "\(first.tag) ➔ \(shortPath) (\(mode))"
+            sharesListLabel.toolTip = "\(first.tag) -> \(first.path) (\(first.read_only ? "Read-Only" : "Read/Write"))"
+            copyMountCmdButton.isHidden = false
+            manageSharesButton.title = "Remove"
+            manageSharesButton.isEnabled = !isRunning
+        } else {
+            sharesListLabel.stringValue = "None configured"
+            sharesListLabel.toolTip = nil
+            copyMountCmdButton.isHidden = true
+            manageSharesButton.title = "+ Add Folder..."
+            manageSharesButton.isEnabled = !isRunning
+        }
+
+        #if ENABLE_VM_TELEMETRY
+        if isRunning, let pid = vm.pid, let stats = SystemMetrics.shared.sampleProcess(pid: pid_t(pid)) {
+            let allocatedMB = cfg.ramMB
+            let pct = allocatedMB > 0 ? (stats.residentMemoryMB / Double(allocatedMB)) * 100.0 : 0
+            vmMemoryUsageLabel.stringValue = String(format: "%.1f MB footprint (of %d MB allocated, %.1f%%)", stats.residentMemoryMB, allocatedMB, pct)
+            vmCPULoadLabel.stringValue = String(format: "%.1f%% vCPU (%d active threads)", stats.cpuPercent, stats.threadCount)
+            vmProcessInfoLabel.stringValue = "PID \(pid) • Apple Silicon Hypervisor.framework (ARM64)"
+        } else if isRunning {
+            let pidStr = vm.pid.map { "PID \($0) • " } ?? ""
+            vmMemoryUsageLabel.stringValue = "Active (measuring resident pages...)"
+            vmCPULoadLabel.stringValue = "Active"
+            vmProcessInfoLabel.stringValue = "\(pidStr)Apple Silicon Hypervisor.framework (ARM64)"
+        } else {
+            vmMemoryUsageLabel.stringValue = "Offline (0 MB RAM)"
+            vmCPULoadLabel.stringValue = "Offline (0% CPU)"
+            vmProcessInfoLabel.stringValue = "Stopped"
+        }
+        #endif
     }
 
     private func updateServiceBanner() {
@@ -576,17 +811,25 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
             let mode = (ServiceManager.shared.activeMode ?? ServiceManager.shared.currentMode).description
             serviceStatusDot.stringValue = "●"
             serviceStatusDot.textColor = .systemGreen
-            serviceStatusLabel.stringValue = "Cube Network Service: Active (\(mode))"
+            let text = "Cube Network Service: Active (\(mode))"
+            serviceStatusLabel.stringValue = text
+            serviceStatusLabel.toolTip = text
             serviceStatusLabel.textColor = .labelColor
             serviceToggleButton.title = "Stop Service"
         } else {
             serviceStatusDot.stringValue = "○"
             serviceStatusDot.textColor = .secondaryLabelColor
-            serviceStatusLabel.stringValue = "Cube Network Service: Stopped"
+            let text = "Cube Network Service: Stopped"
+            serviceStatusLabel.stringValue = text
+            serviceStatusLabel.toolTip = text
             serviceStatusLabel.textColor = .secondaryLabelColor
             serviceToggleButton.title = "Start Service"
         }
         serviceToggleButton.isEnabled = true
+        #if ENABLE_VM_TELEMETRY
+        let hostStats = SystemMetrics.shared.sampleHost()
+        hostTelemetryLabel.stringValue = "Host: \(hostStats.formattedCPU) CPU  •  \(hostStats.formattedMemory) RAM"
+        #endif
     }
 
     @objc private func toggleServiceClicked() {
@@ -626,8 +869,9 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         let cellId = NSUserInterfaceItemIdentifier("VMCell")
         var cell = tableView.makeView(withIdentifier: cellId, owner: nil)
         if cell == nil {
-            let v = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 44))
+            let v = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 46))
             v.identifier = cellId
+            v.autoresizingMask = [.width]
 
             let dot = NSTextField(labelWithString: "●")
             dot.tag = 101
@@ -636,15 +880,19 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
 
             let title = NSTextField(labelWithString: "")
             title.tag = 102
-            title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-            title.frame = NSRect(x: 28, y: 22, width: 195, height: 18)
+            title.font = CubeTokens.sidebarTitleFont
+            title.lineBreakMode = .byTruncatingTail
+            title.frame = NSRect(x: 28, y: 23, width: 200, height: 18)
+            title.autoresizingMask = [.width]
             v.addSubview(title)
 
             let subtitle = NSTextField(labelWithString: "")
             subtitle.tag = 103
-            subtitle.font = NSFont.systemFont(ofSize: 10)
-            subtitle.textColor = .secondaryLabelColor
-            subtitle.frame = NSRect(x: 28, y: 5, width: 195, height: 15)
+            subtitle.font = CubeTokens.sidebarSubtitleFont
+            subtitle.textColor = CubeTokens.secondaryText
+            subtitle.lineBreakMode = .byTruncatingTail
+            subtitle.frame = NSRect(x: 28, y: 6, width: 200, height: 15)
+            subtitle.autoresizingMask = [.width]
             v.addSubview(subtitle)
 
             cell = v
@@ -652,7 +900,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
 
         if let dot = cell?.viewWithTag(101) as? NSTextField {
             dot.stringValue = vm.isRunning ? "●" : "○"
-            dot.textColor = vm.isRunning ? .systemGreen : .secondaryLabelColor
+            dot.textColor = vm.isRunning ? CubeTokens.runningGreen : CubeTokens.stoppedGray
         }
         if let title = cell?.viewWithTag(102) as? NSTextField {
             title.stringValue = vm.name
@@ -660,7 +908,21 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         if let subtitle = cell?.viewWithTag(103) as? NSTextField {
             let os = vm.os ?? "FreeBSD"
             if vm.isRunning {
-                subtitle.stringValue = "\(os) • Running"
+                #if ENABLE_VM_TELEMETRY
+                if let pid = vm.pid, let stats = SystemMetrics.shared.sampleProcess(pid: pid_t(pid)) {
+                    subtitle.stringValue = "\(os) • \(stats.formattedMemory) • \(stats.formattedCPU)"
+                } else if let ip = vm.ip {
+                    subtitle.stringValue = "\(os) • \(ip)"
+                } else {
+                    subtitle.stringValue = "\(os) • Running"
+                }
+                #else
+                if let ip = vm.ip {
+                    subtitle.stringValue = "\(os) • \(ip)"
+                } else {
+                    subtitle.stringValue = "\(os) • Running"
+                }
+                #endif
             } else {
                 subtitle.stringValue = "\(os) • Stopped"
             }
@@ -808,6 +1070,110 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
 
     @objc private func openPreferencesClicked() {
         PreferencesWindowController.shared.showTab("network")
+    }
+
+    @objc private func copyMountCmdClicked() {
+        guard let name = selectedVMName,
+              let vm = VMManager.shared.vms.first(where: { $0.name == name }) else { return }
+        let cfg = vm.loadConfig()
+        guard let share = cfg.shares.first else { return }
+
+        let isLinux = (vm.os ?? cfg.os ?? "").lowercased().contains("linux") ||
+                      (vm.os ?? cfg.os ?? "").lowercased().contains("ubuntu") ||
+                      (vm.os ?? cfg.os ?? "").lowercased().contains("debian")
+        let cmd = isLinux ? "mount -t 9p -o trans=virtio,version=9p2000.L \(share.tag) /mnt/host" : "mount -t p9fs \(share.tag) /mnt/host"
+
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(cmd, forType: .string)
+
+        let orig = copyMountCmdButton.title
+        copyMountCmdButton.title = "Copied ✓"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.copyMountCmdButton.title = orig
+        }
+    }
+
+    @objc private func manageSharesClicked() {
+        guard let name = selectedVMName,
+              let vm = VMManager.shared.vms.first(where: { $0.name == name }) else { return }
+        if vm.isRunning {
+            showError("Cannot Modify Shared Folders", "Please stop '\(name)' before modifying shared folder configurations.")
+            return
+        }
+
+        let cfg = vm.loadConfig()
+        if let existing = cfg.shares.first {
+            let alert = NSAlert()
+            alert.messageText = "Manage Shared Folder"
+            let mode = existing.read_only ? "Read-Only" : "Read/Write"
+            alert.informativeText = "Current export tag: '\(existing.tag)'\nPath: \(existing.path)\nMode: \(mode)"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Remove Share")
+            alert.addButton(withTitle: "Change Folder...")
+            alert.addButton(withTitle: "Cancel")
+
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                VMManager.shared.updateShares(for: name, shares: []) { [weak self] success, err in
+                    if success {
+                        self?.reloadData()
+                    } else if let e = err {
+                        self?.showError("Failed to Remove Share", e)
+                    }
+                }
+            } else if response == .alertSecondButtonReturn {
+                promptAddShare(for: name, defaultTag: existing.tag)
+            }
+        } else {
+            promptAddShare(for: name, defaultTag: nil)
+        }
+    }
+
+    private func promptAddShare(for vmName: String, defaultTag: String?) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose Folder"
+        panel.message = "Select a host directory to share with '\(vmName)'"
+
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 56))
+        let tagLabel = NSTextField(labelWithString: "Mount Tag:")
+        tagLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        tagLabel.frame = NSRect(x: 0, y: 30, width: 70, height: 18)
+        accessory.addSubview(tagLabel)
+
+        let tagField = NSTextField(frame: NSRect(x: 75, y: 28, width: 235, height: 22))
+        tagField.placeholderString = defaultTag ?? "e.g. host-share (default: folder name)"
+        if let defaultTag = defaultTag {
+            tagField.stringValue = defaultTag
+        }
+        accessory.addSubview(tagField)
+
+        let roBox = NSButton(checkboxWithTitle: "Read-Only access inside guest VM", target: nil, action: nil)
+        roBox.font = NSFont.systemFont(ofSize: 11)
+        roBox.frame = NSRect(x: 75, y: 4, width: 235, height: 20)
+        accessory.addSubview(roBox)
+
+        panel.accessoryView = accessory
+
+        if panel.runModal() == .OK, let url = panel.url {
+            var tag = tagField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if tag.isEmpty {
+                tag = url.lastPathComponent.lowercased().replacingOccurrences(of: " ", with: "-")
+            }
+            let isReadOnly = (roBox.state == .on)
+            let newShare = VMShareConfig(tag: tag, path: url.path, read_only: isReadOnly)
+            VMManager.shared.updateShares(for: vmName, shares: [newShare]) { [weak self] success, err in
+                if success {
+                    self?.reloadData()
+                } else if let e = err {
+                    self?.showError("Failed to Add Shared Folder", e)
+                }
+            }
+        }
     }
 
     private func showError(_ title: String, _ message: String) {

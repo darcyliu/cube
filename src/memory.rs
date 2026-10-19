@@ -2,7 +2,6 @@
 
 #![allow(dead_code)]
 
-use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU16, Ordering};
 
@@ -15,7 +14,6 @@ pub const GUEST_PAGE_SIZE: usize = 0x4000;
 
 pub struct GuestMemory {
     ptr: NonNull<u8>,
-    layout: Layout,
     guest_base: u64,
     size: usize,
     mapped: bool,
@@ -27,7 +25,9 @@ unsafe impl Sync for GuestMemory {}
 impl GuestMemory {
     /// Allocates and maps a block of guest physical memory at `guest_base`.
     /// `size` will be rounded up to the nearest 16KB page multiple.
-    pub fn new(guest_base: u64, requested_size: usize) -> HvResult<Self> {
+    /// When `prealloc` is false, anonymous mmap is demand-paged by the host OS.
+    /// When `prealloc` is true, pages are pre-faulted upfront on launch.
+    pub fn new(guest_base: u64, requested_size: usize, prealloc: bool) -> HvResult<Self> {
         let size = requested_size
             .checked_add(GUEST_PAGE_SIZE - 1)
             .map(|n| n & !(GUEST_PAGE_SIZE - 1))
@@ -35,12 +35,32 @@ impl GuestMemory {
             .ok_or(crate::hypervisor::HvError(
                 crate::hypervisor::HV_BAD_ARGUMENT,
             ))?;
-        let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE)
-            .map_err(|_| crate::hypervisor::HvError(crate::hypervisor::HV_BAD_ARGUMENT))?;
 
-        // Allocate zeroed memory
-        let raw_ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(raw_ptr).ok_or(crate::hypervisor::HvError(
+        // Allocate memory via anonymous mmap: page-aligned and zero-filled by the OS
+        let raw_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if raw_ptr == libc::MAP_FAILED || raw_ptr.is_null() {
+            return Err(crate::hypervisor::HvError(
+                crate::hypervisor::HV_NO_RESOURCES,
+            ));
+        }
+
+        // If pre-allocation is explicitly requested, pre-fault all pages upfront
+        if prealloc {
+            unsafe {
+                std::ptr::write_bytes(raw_ptr as *mut u8, 0, size);
+            }
+        }
+
+        let ptr = NonNull::new(raw_ptr as *mut u8).ok_or(crate::hypervisor::HvError(
             crate::hypervisor::HV_NO_RESOURCES,
         ))?;
 
@@ -48,14 +68,13 @@ impl GuestMemory {
         let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
         unsafe {
             if let Err(e) = check_hv(hv_vm_map(ptr.as_ptr() as *mut _, guest_base, size, flags)) {
-                dealloc(ptr.as_ptr(), layout);
+                libc::munmap(raw_ptr, size);
                 return Err(e);
             }
         }
 
         Ok(Self {
             ptr,
-            layout,
             guest_base,
             size,
             mapped: true,
@@ -64,11 +83,20 @@ impl GuestMemory {
 
     #[cfg(test)]
     pub fn new_test(guest_base: u64, size: usize) -> Self {
-        let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE).unwrap();
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
+        let raw_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert!(raw_ptr != libc::MAP_FAILED && !raw_ptr.is_null());
+        let ptr = NonNull::new(raw_ptr as *mut u8).unwrap();
         Self {
             ptr,
-            layout,
             guest_base,
             size,
             mapped: false,
@@ -180,7 +208,7 @@ impl Drop for GuestMemory {
             if self.mapped {
                 let _ = hv_vm_unmap(self.guest_base, self.size);
             }
-            dealloc(self.ptr.as_ptr(), self.layout);
+            libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.size);
         }
     }
 }

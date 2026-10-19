@@ -331,6 +331,7 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         efi_vars: None,
         shutdown,
         no_reboot: false,
+        mem_prealloc: args.mem_prealloc,
     };
 
     let json_text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())? + "\n";
@@ -675,9 +676,15 @@ pub fn do_delete(target: &str, state_root: &Path, force: bool, keep_disks: bool)
                     _ => vm_dir.starts_with(&root) && vm_dir != root,
                 };
                 if is_sub {
-                    // Only remove an empty directory. Read-only media and
-                    // unrelated user files must survive VM deletion.
-                    if fs::remove_dir(vm_dir).is_ok() {
+                    if !keep_disks {
+                        // Deleting a managed VM also removes all remaining
+                        // contents of its directory, including local media.
+                        fs::remove_dir_all(vm_dir).map_err(|e| {
+                            format!("cannot remove VM directory {}: {}", vm_dir.display(), e)
+                        })?;
+                        removed_files.push(vm_dir.display().to_string());
+                        break;
+                    } else if fs::remove_dir(vm_dir).is_ok() {
                         removed_files.push(vm_dir.display().to_string());
                         break;
                     }
@@ -826,10 +833,13 @@ pub fn do_status(target: &str, state_root: &Path) -> Result<(), String> {
     let last_path = state_dir.join("last.json");
     if last_path.is_file() {
         let content = fs::read_to_string(&last_path).map_err(|e| e.to_string())?;
-        let parsed: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        let mut parsed: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("ip".into(), serde_json::Value::Null);
+        }
         println!("{}", serde_json::to_string_pretty(&parsed).unwrap());
     } else {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"state": "stopped"})).unwrap());
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"state": "stopped", "ip": null})).unwrap());
     }
     Ok(())
 }
@@ -975,6 +985,11 @@ pub fn do_list(state_root: &Path, as_json: bool) -> Result<(), String> {
     }
 
     for item in &mut list {
+        if item.get("state").and_then(|s| s.as_str()) != Some("running") {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("ip".into(), serde_json::Value::Null);
+            }
+        }
         enrich_vm_item(item, state_root);
     }
 

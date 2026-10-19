@@ -16,11 +16,18 @@ class NewVMWindowController: NSWindowController {
     private var unattendedCheckbox: NSButton!
     private var cpuPopUp: NSPopUpButton!
     private var ramPopUp: NSPopUpButton!
+    private var memPreallocCheckbox: NSButton!
     private var diskField: NSTextField!
     private var passwordField: NSTextField!
     private var netPopUp: NSPopUpButton!
     private var sshPortField: NSTextField!
     private var vncPortField: NSTextField!
+
+    // Shared Folder
+    private var sharePathField: NSTextField!
+    private var shareBrowseButton: NSButton!
+    private var shareTagField: NSTextField!
+    private var shareReadOnlyCheckbox: NSButton!
 
     private var progressIndicator: NSProgressIndicator!
     private var statusLabel: NSTextField!
@@ -38,7 +45,7 @@ class NewVMWindowController: NSWindowController {
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 675),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 735),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -74,6 +81,7 @@ class NewVMWindowController: NSWindowController {
         unattendedCheckbox.state = .on
         cpuPopUp.selectItem(at: 1) // 2 vCPUs
         ramPopUp.selectItem(at: 1) // 2048 MB
+        memPreallocCheckbox?.state = .off
         diskField.stringValue = "20"
         passwordField.stringValue = "root"
         netPopUp.selectItem(at: 0)
@@ -87,6 +95,9 @@ class NewVMWindowController: NSWindowController {
         copyLogsButton.isHidden = true
         customStorageDir = nil
         updateStoragePathDisplay()
+        sharePathField?.stringValue = ""
+        shareTagField?.stringValue = "shared"
+        shareReadOnlyCheckbox?.state = .off
         setFormEnabled(true)
     }
 
@@ -117,6 +128,7 @@ class NewVMWindowController: NSWindowController {
         y = addRow(label: "VM Name:", in: contentView, y: y) {
             nameField = NSTextField(frame: NSRect(x: 150, y: y, width: 330, height: 22))
             nameField.placeholderString = "e.g. freebsd-work"
+            nameField.toolTip = "Unique name identifying this virtual machine in Cube.app and cubectl CLI."
             NotificationCenter.default.addObserver(self, selector: #selector(nameFieldChanged), name: NSControl.textDidChangeNotification, object: nameField)
             return nameField
         }
@@ -127,6 +139,7 @@ class NewVMWindowController: NSWindowController {
             osPopUp.addItem(withTitle: "FreeBSD 14.4 (RELEASE) - Official Netboot")
             osPopUp.addItem(withTitle: "FreeBSD 15.1 (RELEASE) - Packaged Base")
             osPopUp.addItem(withTitle: "Custom Installer ISO...")
+            osPopUp.toolTip = "Choose an official FreeBSD ARM64 release (auto-downloaded and verified) or provide a custom boot ISO."
             osPopUp.target = self
             osPopUp.action = #selector(osSelectionChanged)
             return osPopUp
@@ -136,6 +149,7 @@ class NewVMWindowController: NSWindowController {
         let isoRow = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 24))
         isoPathField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
         isoPathField.placeholderString = "Select an .iso image"
+        isoPathField.toolTip = "Path to a local bootable installer ISO image on your Mac."
         isoPathField.isEnabled = false
         isoRow.addSubview(isoPathField)
 
@@ -149,9 +163,17 @@ class NewVMWindowController: NSWindowController {
         // Unattended checkbox
         unattendedCheckbox = NSButton(checkboxWithTitle: "Run Automated Unattended Installation (Zero Prompts)", target: nil, action: nil)
         unattendedCheckbox.state = .on
+        unattendedCheckbox.toolTip = "Automates disk partitioning (ZFS), root user account setup, and SSH service configuration with zero installer prompts."
         unattendedCheckbox.frame = NSRect(x: 150, y: y, width: 340, height: 18)
         contentView.addSubview(unattendedCheckbox)
-        y += 28
+        y += 20
+
+        let unattendedHint = NSTextField(labelWithString: "💡 Auto-provisions ZFS root filesystem, accounts, and SSH automatically.")
+        unattendedHint.font = NSFont.systemFont(ofSize: 10.5)
+        unattendedHint.textColor = .secondaryLabelColor
+        unattendedHint.frame = NSRect(x: 170, y: y, width: 320, height: 14)
+        contentView.addSubview(unattendedHint)
+        y += 20
 
         // Separator
         let sep1 = NSBox(frame: NSRect(x: 24, y: y, width: 472, height: 1))
@@ -164,24 +186,36 @@ class NewVMWindowController: NSWindowController {
             cpuPopUp = NSPopUpButton(frame: NSRect(x: 150, y: y - 2, width: 140, height: 26))
             cpuPopUp.addItems(withTitles: ["1 Core", "2 Cores", "4 Cores", "8 Cores"])
             cpuPopUp.selectItem(at: 1)
+            cpuPopUp.toolTip = "Number of virtual CPU cores allocated to the guest VM (1 to 8 cores)."
             return cpuPopUp
         }
 
         // Hardware: RAM
         y = addRow(label: "Memory (RAM):", in: contentView, y: y) {
-            ramPopUp = NSPopUpButton(frame: NSRect(x: 150, y: y - 2, width: 140, height: 26))
+            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 26))
+            ramPopUp = NSPopUpButton(frame: NSRect(x: 0, y: -2, width: 140, height: 26))
             ramPopUp.addItems(withTitles: ["1024 MB (1 GB)", "2048 MB (2 GB)", "4096 MB (4 GB)", "8192 MB (8 GB)", "16384 MB (16 GB)"])
             ramPopUp.selectItem(at: 1)
-            return ramPopUp
+            ramPopUp.toolTip = "Guest physical memory size. By default, host memory is allocated on-demand as guest pages are used."
+            container.addSubview(ramPopUp)
+
+            memPreallocCheckbox = NSButton(checkboxWithTitle: "Pre-allocate RAM", target: nil, action: nil)
+            memPreallocCheckbox.font = NSFont.systemFont(ofSize: 11)
+            memPreallocCheckbox.toolTip = "Pre-faults all RAM upfront on launch (disables lazy on-demand paging)"
+            memPreallocCheckbox.frame = NSRect(x: 150, y: 0, width: 180, height: 22)
+            container.addSubview(memPreallocCheckbox)
+            return container
         }
 
         // Hardware: Disk Size
         y = addRow(label: "Virtual Disk Size:", in: contentView, y: y) {
-            let container = NSView(frame: NSRect(x: 150, y: y, width: 140, height: 22))
+            let container = NSView(frame: NSRect(x: 150, y: y, width: 180, height: 22))
             diskField = NSTextField(frame: NSRect(x: 0, y: 0, width: 80, height: 22))
             diskField.stringValue = "20"
-            let gbLabel = NSTextField(labelWithString: "GB (sparse)")
-            gbLabel.frame = NSRect(x: 85, y: 2, width: 70, height: 18)
+            diskField.toolTip = "Virtual disk capacity in GB. Disks are created as sparse files, only consuming disk space as data is written."
+            let gbLabel = NSTextField(labelWithString: "GB (sparse ZFS)")
+            gbLabel.toolTip = "Allocated sparsely; only written blocks take up actual storage on your Mac drive."
+            gbLabel.frame = NSRect(x: 85, y: 2, width: 95, height: 18)
             container.addSubview(diskField)
             container.addSubview(gbLabel)
             return container
@@ -214,13 +248,15 @@ class NewVMWindowController: NSWindowController {
         y = addRow(label: "Root Password:", in: contentView, y: y) {
             passwordField = NSSecureTextField(frame: NSRect(x: 150, y: y, width: 180, height: 22))
             passwordField.stringValue = "root"
+            passwordField.toolTip = "Root password for guest console login and SSH connections (default: root)."
             return passwordField
         }
 
         // Network Mode Row
         y = addRow(label: "Network Mode:", in: contentView, y: y) {
+            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 42))
             let hasEntitlement = VMManager.shared.hasNetworkingEntitlement()
-            netPopUp = NSPopUpButton(frame: NSRect(x: 150, y: y, width: 330, height: 26), pullsDown: false)
+            netPopUp = NSPopUpButton(frame: NSRect(x: 0, y: 16, width: 330, height: 26), pullsDown: false)
             if hasEntitlement {
                 netPopUp.addItem(withTitle: "Shared Proxy (vmnet-proxy)")
                 netPopUp.addItem(withTitle: "Direct vmnet NAT (vmnet) — Entitled ✓")
@@ -233,8 +269,17 @@ class NewVMWindowController: NSWindowController {
                 netPopUp.addItem(withTitle: "Offline / Disabled (none)")
             }
             netPopUp.selectItem(at: 0)
-            return netPopUp
+            netPopUp.toolTip = "Shared Proxy (vmnet-proxy) provides fast user-mode NAT with DHCP (no root/sudo privileges needed)."
+            container.addSubview(netPopUp)
+
+            let hint = NSTextField(labelWithString: "💡 Shared Proxy runs in user-mode with DHCP (no root/sudo needed)")
+            hint.font = NSFont.systemFont(ofSize: 10)
+            hint.textColor = .secondaryLabelColor
+            hint.frame = NSRect(x: 2, y: 0, width: 328, height: 14)
+            container.addSubview(hint)
+            return container
         }
+        y += 12
 
         // Ports Row
         y = addRow(label: "Network Ports:", in: contentView, y: y) {
@@ -243,11 +288,13 @@ class NewVMWindowController: NSWindowController {
             sshLabel.frame = NSRect(x: 0, y: 2, width: 35, height: 18)
             sshPortField = NSTextField(frame: NSRect(x: 36, y: 0, width: 65, height: 22))
             sshPortField.stringValue = "\(VMManager.shared.nextAvailableSSHPort())"
+            sshPortField.toolTip = "Host port forwarded to guest SSH (port 22). Connect with: ssh root@127.0.0.1 -p <port>"
 
             let vncLabel = NSTextField(labelWithString: "VNC:")
             vncLabel.frame = NSRect(x: 125, y: 2, width: 35, height: 18)
             vncPortField = NSTextField(frame: NSRect(x: 162, y: 0, width: 65, height: 22))
             vncPortField.stringValue = "\(VMManager.shared.nextAvailableVNCPort())"
+            vncPortField.toolTip = "Host port for VNC graphical display console (port 5900+). Connect with: open vnc://127.0.0.1:<port>"
 
             container.addSubview(sshLabel)
             container.addSubview(sshPortField)
@@ -255,6 +302,67 @@ class NewVMWindowController: NSWindowController {
             container.addSubview(vncPortField)
             return container
         }
+
+        // Separator
+        let sep3 = NSBox(frame: NSRect(x: 24, y: y, width: 472, height: 1))
+        sep3.boxType = .separator
+        contentView.addSubview(sep3)
+        y += 14
+
+        // Shared Folder Row
+        y = addRow(label: "Shared Folder:", in: contentView, y: y) {
+            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 26))
+            sharePathField = NSTextField(frame: NSRect(x: 0, y: 2, width: 232, height: 22))
+            sharePathField.placeholderString = "Optional host folder (e.g. ~/Dev)"
+            sharePathField.font = NSFont.systemFont(ofSize: 11)
+            sharePathField.isEditable = false
+            sharePathField.toolTip = "Mac directory shared into guest via VirtIO-9P. Mount inside guest: mount -t p9fs <tag> /mnt/host"
+
+            shareBrowseButton = NSButton(title: "Choose...", target: self, action: #selector(chooseSharedFolderClicked))
+            shareBrowseButton.bezelStyle = .rounded
+            shareBrowseButton.font = NSFont.systemFont(ofSize: 11)
+            shareBrowseButton.frame = NSRect(x: 238, y: -2, width: 92, height: 26)
+
+            container.addSubview(sharePathField)
+            container.addSubview(shareBrowseButton)
+            return container
+        }
+
+        // Share Options Row
+        y = addRow(label: "Share Options:", in: contentView, y: y) {
+            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 38))
+            let tagLabel = NSTextField(labelWithString: "Tag:")
+            tagLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            tagLabel.frame = NSRect(x: 0, y: 18, width: 28, height: 18)
+
+            shareTagField = NSTextField(frame: NSRect(x: 30, y: 16, width: 105, height: 22))
+            shareTagField.stringValue = "shared"
+            shareTagField.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+            shareTagField.toolTip = "VirtIO-9P mount tag used as the source in the guest mount command."
+
+            shareReadOnlyCheckbox = NSButton(checkboxWithTitle: "Read-Only", target: nil, action: nil)
+            shareReadOnlyCheckbox.font = NSFont.systemFont(ofSize: 11)
+            shareReadOnlyCheckbox.frame = NSRect(x: 145, y: 18, width: 95, height: 18)
+            shareReadOnlyCheckbox.toolTip = "When checked, the guest VM cannot modify or write files to this host directory."
+
+            let clearBtn = NSButton(title: "Clear", target: self, action: #selector(clearSharedFolderClicked))
+            clearBtn.bezelStyle = .rounded
+            clearBtn.font = NSFont.systemFont(ofSize: 10)
+            clearBtn.frame = NSRect(x: 245, y: 14, width: 60, height: 24)
+
+            let hint = NSTextField(labelWithString: "💡 Mount inside guest: mount -t p9fs <tag> /mnt/host")
+            hint.font = NSFont.systemFont(ofSize: 10)
+            hint.textColor = .secondaryLabelColor
+            hint.frame = NSRect(x: 0, y: 0, width: 330, height: 14)
+
+            container.addSubview(tagLabel)
+            container.addSubview(shareTagField)
+            container.addSubview(shareReadOnlyCheckbox)
+            container.addSubview(clearBtn)
+            container.addSubview(hint)
+            return container
+        }
+        y += 10
 
         y += 10
 
@@ -398,6 +506,10 @@ class NewVMWindowController: NSWindowController {
         let vncPort = Int(vncPortField.stringValue)
 
         let destDir = customStorageDir.map { "\($0)/\(name)" }
+        let sharePath = sharePathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shareTag = shareTagField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shareReadOnly = (shareReadOnlyCheckbox.state == .on)
+
         let options = CreateVMOptions(
             name: name,
             osVersion: osVersion,
@@ -410,7 +522,11 @@ class NewVMWindowController: NSWindowController {
             netMode: netMode,
             sshPort: sshPort,
             vncPort: vncPort,
-            destinationDir: destDir
+            destinationDir: destDir,
+            sharePath: sharePath.isEmpty ? nil : sharePath,
+            shareTag: shareTag.isEmpty ? nil : shareTag,
+            shareReadOnly: shareReadOnly,
+            memPrealloc: (memPreallocCheckbox.state == .on)
         )
 
         isBusy = true
@@ -474,12 +590,16 @@ class NewVMWindowController: NSWindowController {
         unattendedCheckbox.isEnabled = enabled
         cpuPopUp.isEnabled = enabled
         ramPopUp.isEnabled = enabled
+        memPreallocCheckbox?.isEnabled = enabled
         diskField.isEnabled = enabled
         passwordField.isEnabled = enabled
         netPopUp.isEnabled = enabled
         sshPortField.isEnabled = enabled
         vncPortField.isEnabled = enabled
         customizeStorageButton.isEnabled = enabled
+        shareBrowseButton?.isEnabled = enabled
+        shareTagField?.isEnabled = enabled
+        shareReadOnlyCheckbox?.isEnabled = enabled
         createButton.isEnabled = enabled
         if enabled {
             osSelectionChanged()
@@ -487,6 +607,30 @@ class NewVMWindowController: NSWindowController {
             isoPathField.isEnabled = false
             browseButton.isEnabled = false
         }
+    }
+
+    @objc private func chooseSharedFolderClicked() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Select a host directory to share with the guest VM"
+        if panel.runModal() == .OK, let url = panel.url {
+            sharePathField.stringValue = url.path
+            let folderName = url.lastPathComponent.lowercased()
+                .replacingOccurrences(of: " ", with: "-")
+            if shareTagField.stringValue == "shared" || shareTagField.stringValue.isEmpty {
+                shareTagField.stringValue = folderName
+            }
+        }
+    }
+
+    @objc private func clearSharedFolderClicked() {
+        sharePathField.stringValue = ""
+        shareTagField.stringValue = "shared"
+        shareReadOnlyCheckbox.state = .off
     }
 
     private func showError(_ text: String) {

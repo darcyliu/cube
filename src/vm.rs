@@ -18,12 +18,12 @@ pub struct Vm {
 
 impl Vm {
     /// Initializes a new Virtual Machine instance and maps physical RAM.
-    pub fn new(ram_base: u64, ram_size: usize) -> HvResult<Self> {
+    pub fn new(ram_base: u64, ram_size: usize, prealloc: bool) -> HvResult<Self> {
         unsafe {
             check_hv(hv_vm_create(std::ptr::null()))?;
         }
 
-        let memory = match GuestMemory::new(ram_base, ram_size) {
+        let memory = match GuestMemory::new(ram_base, ram_size, prealloc) {
             Ok(memory) => Arc::new(memory),
             Err(e) => {
                 unsafe {
@@ -45,7 +45,7 @@ impl Vm {
 
     /// Map a ROM/flash image at `base` (typically GPA 0 for EDK2).
     pub fn map_firmware(&mut self, base: u64, data: &[u8]) -> Result<(), String> {
-        let flash = GuestMemory::new(base, data.len())
+        let flash = GuestMemory::new(base, data.len(), false)
             .map_err(|e| format!("Failed to map firmware at 0x{base:x}: {e}"))?;
         flash.write(base, data)?;
         self.flash = Some(flash);
@@ -54,7 +54,7 @@ impl Vm {
 
     /// Map writable EFI variable store (QEMU virt flash1 at 0x0400_0000).
     pub fn map_firmware_vars(&mut self, base: u64, data: &[u8]) -> Result<(), String> {
-        let flash = GuestMemory::new(base, data.len())
+        let flash = GuestMemory::new(base, data.len(), false)
             .map_err(|e| format!("Failed to map EFI vars at 0x{base:x}: {e}"))?;
         flash.write(base, data)?;
         self.flash_vars = Some(flash);

@@ -143,6 +143,16 @@ relative to the current directory. An override affects that run only; it does
 not rewrite the configuration file. The effective VMM command and resource
 claims are retained in `launch.json` for inspection.
 
+`cubectl status` and `cubectl list --json` include an `ip` field for running
+VMs. The hypervisor publishes its NIC's learned DHCP address to `runtime.json`
+in the instance state directory. Updates are atomic, carry a version and launch
+ID, and are checked every 250 ms; the file is rewritten only when the address
+changes. The manager rejects data from previous launches and returns `null`
+when no address is known or the VM is stopped. NIC resets clear the address.
+Discovery does not parse logs or macOS DHCP lease files. Static guest addresses
+are not detected by this mechanism. After upgrading, rebuild the app and restart
+the VM to enable the structured status publisher and manager.
+
 The local regression suite starts two fake VMM processes concurrently and
 checks instance identity, private runtime paths, conflicting resources, and
 shutdown/stop behavior. `scripts/check_vm_management.py` boots two real FreeBSD

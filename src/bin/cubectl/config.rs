@@ -35,6 +35,8 @@ pub struct VmConfig {
     pub shutdown: Option<ShutdownConfig>,
     #[serde(default)]
     pub no_reboot: bool,
+    #[serde(default)]
+    pub mem_prealloc: bool,
 }
 
 fn default_ram() -> u64 {
@@ -457,6 +459,11 @@ pub fn build_launch_spec(
     });
     if cli_overrides.no_reboot || config.no_reboot || has_attached_iso {
         command.push("--no-reboot".into());
+    }
+
+    // 10. Memory pre-allocation: enabled via CLI override or config property
+    if cli_overrides.mem_prealloc || config.mem_prealloc {
+        command.push("--mem-prealloc".into());
     }
 
     // 10. Collision check within this spec

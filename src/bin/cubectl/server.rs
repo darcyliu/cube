@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
@@ -18,6 +19,52 @@ pub fn live_status(state_dir: &Path) -> Option<serde_json::Value> {
     }
     let req = serde_json::json!({"action": "status"});
     query_socket(&sock, &req, Duration::from_millis(1500)).ok()
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeStatus {
+    version: u32,
+    instance_id: String,
+    ip: Option<Ipv4Addr>,
+}
+
+fn guest_ip_from_runtime(state_dir: &Path, instance_id: &str) -> Option<Ipv4Addr> {
+    let file = fs::File::open(state_dir.join("runtime.json")).ok()?;
+    let mut bytes = Vec::new();
+    file.take(4096).read_to_end(&mut bytes).ok()?;
+    let status: RuntimeStatus = serde_json::from_slice(&bytes).ok()?;
+    if status.version != 1 || status.instance_id != instance_id {
+        return None;
+    }
+    status.ip.filter(|ip| !ip.is_unspecified() && !ip.is_broadcast()
+        && !ip.is_multicast() && !ip.is_loopback())
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_stale_invalid_and_unsupported_runtime_status() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("cube-runtime-reader-{}-{stamp}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("runtime.json");
+        assert_eq!(guest_ip_from_runtime(&dir, "current"), None);
+        for (version, id, ip) in [
+            (1, "old", "10.0.0.2"), (2, "current", "10.0.0.2"),
+            (1, "current", "invalid"), (1, "current", "0.0.0.0"),
+            (1, "current", "127.0.0.1"), (1, "current", "224.0.0.1"),
+        ] {
+            fs::write(&path, serde_json::json!({"version": version, "instance_id": id, "ip": ip}).to_string()).unwrap();
+            assert_eq!(guest_ip_from_runtime(&dir, "current"), None);
+        }
+        fs::write(&path, b"{\"version\":").unwrap();
+        assert_eq!(guest_ip_from_runtime(&dir, "current"), None);
+        fs::write(&path, serde_json::json!({"version": 1, "instance_id": "current", "ip": "10.0.0.2"}).to_string()).unwrap();
+        assert_eq!(guest_ip_from_runtime(&dir, "current"), Some(Ipv4Addr::new(10, 0, 0, 2)));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 pub fn active_resources(root: &Path, skip: &Path) -> HashSet<String> {
@@ -90,15 +137,28 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         .map_err(|e| format!("cannot open vmm.log: {}", e))?;
 
     let uart_path = state_dir.join("uart");
+    let runtime_path = state_dir.canonicalize().map_err(|e| e.to_string())?.join("runtime.json");
+    match fs::remove_file(&runtime_path) {
+        Ok(()) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("cannot clear runtime status: {e}")),
+    }
+    let runtime_env = [
+        format!("CUBE_RUNTIME_STATUS_PATH={}", runtime_path.display()),
+        format!("CUBE_INSTANCE_ID={}", spec.id),
+    ];
     let mut cmd = if spec.sudo {
         let mut c = Command::new("sudo");
         c.args(["-n", "/usr/bin/env", &format!("VMM_UART_IN={}", uart_path.display())]);
+        c.args(&runtime_env);
         c.args(&spec.command);
         c
     } else {
         let mut c = Command::new(&spec.command[0]);
         c.args(&spec.command[1..]);
         c.env("VMM_UART_IN", &uart_path);
+        c.env("CUBE_RUNTIME_STATUS_PATH", &runtime_path);
+        c.env("CUBE_INSTANCE_ID", &spec.id);
         c
     };
 
@@ -194,6 +254,7 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
     let _ = write_json_atomic(&state_dir.join("last.json"), &last);
     let _ = fs::remove_file(&control);
     let _ = fs::remove_file(state_dir.join("instance.json"));
+    let _ = fs::remove_file(&runtime_path);
 
     if spec.interactive && exit_code != 0 {
         return Err(format!("VM exited with code {exit_code}"));
@@ -225,6 +286,7 @@ fn handle_client_request(
                 serde_json::json!({
                     "ok": false,
                     "state": "stopped",
+                    "ip": null,
                     "error": "VM process has terminated",
                     "id": record.id,
                     "name": record.name,
@@ -235,6 +297,7 @@ fn handle_client_request(
                 serde_json::json!({
                     "ok": true,
                     "state": "running",
+                    "ip": guest_ip_from_runtime(state_dir, &record.id),
                     "id": record.id,
                     "name": record.name,
                     "config": record.config,
