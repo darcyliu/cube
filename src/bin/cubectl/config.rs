@@ -13,6 +13,8 @@ use crate::StartArgs;
 pub struct VmConfig {
     pub name: String,
     #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
     pub binary: Option<String>,
     pub boot: BootConfig,
     #[serde(default = "default_ram")]
@@ -157,6 +159,10 @@ pub struct LaunchSpec {
     pub sudo: bool,
     #[serde(default)]
     pub interactive: bool,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    #[serde(default)]
+    pub vnc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +185,10 @@ pub struct InstanceRecord {
     pub control_socket: String,
     #[serde(default)]
     pub shares: Vec<ShareItem>,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    #[serde(default)]
+    pub vnc: Option<String>,
 }
 
 pub fn validate_vm_name(name: &str) -> Result<(), String> {
@@ -419,9 +429,9 @@ pub fn build_launch_spec(
         }
     }
 
-    if let Some(bind) = vnc_bind {
+    if let Some(ref bind) = vnc_bind {
         command.extend(["--vnc".into(), bind.clone()]);
-        let port_part = bind.rsplit(':').next().unwrap_or(&bind);
+        let port_part = bind.rsplit(':').next().unwrap_or(bind);
         resources.push(format!("listen-port:{}", port_part));
         if let Some(disp) = vnc_display {
             command.extend(["--display".into(), disp]);
@@ -481,6 +491,8 @@ pub fn build_launch_spec(
         shares,
         sudo: cli_overrides.sudo,
         interactive: cli_overrides.interactive,
+        ssh_port,
+        vnc: vnc_bind,
     })
 }
 
@@ -490,9 +502,9 @@ pub fn find_config_for_target(target: &str, state_root: &Path) -> Result<PathBuf
         return Ok(path);
     }
 
-    // Check in state_dir (launch.json or last.json)
+    // Check the creation registration, then metadata from earlier launches.
     let state_dir = state_root.join(target);
-    for meta_name in &["launch.json", "last.json"] {
+    for meta_name in &["registration.json", "launch.json", "last.json"] {
         let meta_file = state_dir.join(meta_name);
         if let Ok(c) = fs::read_to_string(&meta_file) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&c) {
@@ -512,11 +524,11 @@ pub fn find_config_for_target(target: &str, state_root: &Path) -> Result<PathBuf
         return Ok(candidate);
     }
 
-    // Check fallback ~/VMs/<target>/<target>.json
+    // Check fallback ~/Cube/<target>/<target>.json if default_vms_root was custom
     if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join("VMs").join(target).join(format!("{}.json", target));
-        if candidate.is_file() {
-            return Ok(candidate);
+        let candidate_cube = PathBuf::from(&home).join("Cube").join(target).join(format!("{}.json", target));
+        if candidate_cube.is_file() {
+            return Ok(candidate_cube);
         }
     }
 

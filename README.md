@@ -203,7 +203,7 @@ python3 -B scripts/install-vm.py --version 15 --unattended --desktop plasma --na
 `--version 15` is 15.1. 14.4 is the default. 14.5 uses the same distribution-set
 install as 14.4. 15.1 installs the packaged base system from disc1. 15.0 is
 interactive only: its scripted installer cannot use the packages on that disc.
-The VM is created under `~/VMs/<name>/`. The command prints a `vmmctl` start
+The VM is created under `~/Cube/<name>/`. The command prints a `vmmctl` start
 line and a direct `vmm` command for that disk. A desktop install needs guest
 internet for packages. Add `--skip-verify` to a desktop install to stop after
 the packages, login account, and Xorg configuration are written, and skip the

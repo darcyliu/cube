@@ -23,23 +23,42 @@ pub fn find_default_firmware(user_fw: Option<&PathBuf>, base: &Path) -> Result<P
         return canonical_path_buf(&p2);
     }
 
-    if let Ok(cube_bin) = find_cube_binary(None, None, base) {
-        if let Some(bin_dir) = cube_bin.parent() {
-            let candidate = bin_dir.join("firmware/QEMU_EFI.fd");
-            if candidate.is_file() {
-                return canonical_path_buf(&candidate);
+    // Check ancestors of current executable (e.g. target/debug/cubectl or Cube.app/Contents/MacOS/cubectl)
+    if let Ok(current_exe) = std::env::current_exe() {
+        let mut curr = current_exe.clone();
+        for _ in 0..6 {
+            if let Some(parent) = curr.parent() {
+                let cand_res = parent.join("Resources/firmware/QEMU_EFI.fd");
+                if cand_res.is_file() {
+                    return canonical_path_buf(&cand_res);
+                }
+                let cand_fw = parent.join("firmware/QEMU_EFI.fd");
+                if cand_fw.is_file() {
+                    return canonical_path_buf(&cand_fw);
+                }
+                curr = parent.to_path_buf();
+            } else {
+                break;
             }
-            if let Some(repo_dir) = bin_dir.parent() {
-                let candidate = repo_dir.join("firmware/QEMU_EFI.fd");
-                if candidate.is_file() {
-                    return canonical_path_buf(&candidate);
+        }
+    }
+
+    // Check ancestors of cube binary
+    if let Ok(cube_bin) = find_cube_binary(None, None, base) {
+        let mut curr = cube_bin.clone();
+        for _ in 0..6 {
+            if let Some(parent) = curr.parent() {
+                let cand_res = parent.join("Resources/firmware/QEMU_EFI.fd");
+                if cand_res.is_file() {
+                    return canonical_path_buf(&cand_res);
                 }
-                if let Some(repo_parent) = repo_dir.parent() {
-                    let candidate = repo_parent.join("firmware/QEMU_EFI.fd");
-                    if candidate.is_file() {
-                        return canonical_path_buf(&candidate);
-                    }
+                let cand_fw = parent.join("firmware/QEMU_EFI.fd");
+                if cand_fw.is_file() {
+                    return canonical_path_buf(&cand_fw);
                 }
+                curr = parent.to_path_buf();
+            } else {
+                break;
             }
         }
     }
@@ -90,6 +109,24 @@ pub fn resolve_ssh_public_key(specified: Option<&str>) -> (Option<String>, Optio
             }
         }
         return (Some(trimmed.to_string()), Some("inline SSH public key".into()), None);
+    }
+
+    // Check user preference from settings.json if configured
+    let state_root = crate::util::default_state_root();
+    let settings = crate::util::load_cube_settings(&state_root);
+    if let Some(ref custom_path) = settings.ssh_key_path {
+        if let Ok(resolved) = crate::util::resolve_path(custom_path, Path::new(".")) {
+            if resolved.is_file() {
+                if let Ok(content) = fs::read_to_string(&resolved) {
+                    let key_str = content.trim().to_string();
+                    if !key_str.is_empty() {
+                        let priv_candidate = resolved.with_extension("");
+                        let priv_key = if priv_candidate.is_file() { Some(priv_candidate) } else { None };
+                        return (Some(key_str), Some(format!("{} (configured in preferences)", custom_path)), priv_key);
+                    }
+                }
+            }
+        }
     }
 
     if let Some(home) = std::env::var_os("HOME") {
@@ -366,9 +403,11 @@ pub fn run_unattended_install(
     cmd.arg("--ram").arg(ram_mb.to_string());
     cmd.arg("--serial-log").arg(&console_log);
     cmd.env("VMM_UART_IN", &uart_path);
+    let stderr_log = staging_dir.join("stderr.log");
+    let stderr_file = fs::File::create(&stderr_log).map_err(|e| format!("cannot create stderr log: {}", e))?;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    cmd.stderr(Stdio::from(stderr_file));
 
     let mut child = cmd.spawn().map_err(|e| format!("failed to launch installer VM: {}", e))?;
 
@@ -401,13 +440,26 @@ pub fn run_unattended_install(
                     break;
                 } else {
                     let tail = read_log_tail(&console_log, 20);
+                    let err_tail = read_log_tail(&stderr_log, 20);
                     let failed_log = dest_dir.join("install-failed.log");
-                    let _ = fs::copy(&console_log, &failed_log);
+                    let mut combined = fs::read_to_string(&console_log).unwrap_or_default();
+                    if let Ok(err_content) = fs::read_to_string(&stderr_log) {
+                        if !err_content.is_empty() {
+                            combined.push_str("\n--- VM STDERR ---\n");
+                            combined.push_str(&err_content);
+                        }
+                    }
+                    let _ = fs::write(&failed_log, combined);
+                    let msg = if !err_tail.trim().is_empty() {
+                        format!("VM error output:\n{}\nLast console output:\n{}", err_tail, tail)
+                    } else {
+                        format!("Last console output:\n{}", tail)
+                    };
                     return Err(format!(
-                        "installer VM exited unexpectedly (status: {}). Diagnostic log saved to {}.\nLast console output:\n{}",
+                        "installer VM exited unexpectedly (status: {}). Diagnostic log saved to {}.\n{}",
                         status,
                         failed_log.display(),
-                        tail
+                        msg
                     ));
                 }
             }

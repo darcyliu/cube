@@ -164,6 +164,7 @@ class ServiceManager {
             return
         }
         servicePid = proc.processIdentifier
+        if isRunning { return }
         isRunning = Self.socketPeer(at: defaultSocketPath) == proc.processIdentifier
     }
 

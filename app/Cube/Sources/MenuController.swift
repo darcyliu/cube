@@ -15,6 +15,10 @@ class MenuController: NSObject {
     private var actionMenuItem: NSMenuItem!
     private var currentHostIP: String? = nil
 
+    private var vmHeaderMenuItem: NSMenuItem!
+    private var vmMenuItems: [NSMenuItem] = []
+    private var newVMMenuItem: NSMenuItem!
+
     
     override init() {
         super.init()
@@ -118,6 +122,22 @@ class MenuController: NSObject {
         
         statusMenu.addItem(NSMenuItem.separator())
         
+        // 6. Virtual Machines Section
+        let vmHeader = NSMenuItem(title: "Virtual Machines", action: nil, keyEquivalent: "")
+        vmHeader.isEnabled = false
+        statusMenu.addItem(vmHeader)
+        vmHeaderMenuItem = vmHeader
+
+        let dashboardItem = NSMenuItem(title: "Open Dashboard...", action: #selector(openDashboard), keyEquivalent: "d")
+        dashboardItem.target = self
+        statusMenu.addItem(dashboardItem)
+
+        newVMMenuItem = NSMenuItem(title: "+ New Virtual Machine...", action: #selector(openNewVMWindow), keyEquivalent: "n")
+        newVMMenuItem.target = self
+        statusMenu.addItem(newVMMenuItem)
+
+        statusMenu.addItem(NSMenuItem.separator())
+
         // 7. Utility Actions
         let copyItem = NSMenuItem(title: "Copy Socket Path to Clipboard", action: #selector(copySocketPath), keyEquivalent: "c")
         copyItem.target = self
@@ -153,8 +173,15 @@ class MenuController: NSObject {
     private func startMonitoring() {
         updateTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             ServiceManager.shared.checkStatus()
+            VMManager.shared.refreshVMs { [weak self] _ in
+                self?.updateVMMenu()
+            }
             self?.updateMenuState()
             self?.updateStatusIcon()
+        }
+        // Initial VM load
+        VMManager.shared.refreshVMs { [weak self] _ in
+            self?.updateVMMenu()
         }
     }
     
@@ -300,39 +327,61 @@ class MenuController: NSObject {
     
     @objc private func openTerminalInProject() {
         let home = NSHomeDirectory()
-        let projectDir = "\(home)/Dev/vmm"
-        
-        // Ensure ~/.local/bin/cube symlink exists
-        // Prefer the Apple Developer-signed cube inside Cube.app helper bundle, fallback to repo target/debug/cube
         let binDir = "\(home)/.local/bin"
-        let symlinkPath = "\(binDir)/cube"
-        let helperCube = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/cube.app/Contents/MacOS/cube").path
-        let debugCube = "\(projectDir)/target/debug/cube"
-        let targetPath = FileManager.default.fileExists(atPath: helperCube) ? helperCube : debugCube
+        try? FileManager.default.createDirectory(atPath: binDir, withIntermediateDirectories: true)
         
-        if FileManager.default.fileExists(atPath: targetPath) {
-            try? FileManager.default.createDirectory(atPath: binDir, withIntermediateDirectories: true)
+        // 1. Always prefer the signed binary inside the app bundle
+        let symlinkPath = "\(binDir)/cube"
+        let devCube = "\(home)/Dev/vmm/target/debug/cube"
+        let cubeTarget = ServiceManager.shared.findCubeBinary() ??
+            (FileManager.default.isExecutableFile(atPath: devCube) ? devCube : nil)
+        
+        if let target = cubeTarget {
             try? FileManager.default.removeItem(atPath: symlinkPath)
-            try? FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: targetPath)
+            try? FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: target)
+        }
+
+        // 2. Always prefer the bundled cubectl binary
+        let cubectlSymlink = "\(binDir)/cubectl"
+        if let cubectlTarget = VMManager.shared.findCubectlBinary() {
+            try? FileManager.default.removeItem(atPath: cubectlSymlink)
+            try? FileManager.default.createSymbolicLink(atPath: cubectlSymlink, withDestinationPath: cubectlTarget)
         }
         
         let appSupport = "\(home)/Library/Application Support/cube"
         try? FileManager.default.createDirectory(atPath: appSupport, withIntermediateDirectories: true)
         let scriptPath = "\(appSupport)/open-terminal.command"
         
+        // 3. Resolve working directory: prefer ~/Cube or $HOME; fallback to repo only when running from source
+        let vmsDir = VMManager.shared.vmsDirectory
+        let devDir = "\(home)/Dev/vmm"
+        let workingDir: String
+        if !Bundle.main.bundlePath.hasPrefix("/Applications") && FileManager.default.fileExists(atPath: devDir) {
+            workingDir = devDir
+        } else if FileManager.default.fileExists(atPath: vmsDir) {
+            workingDir = vmsDir
+        } else {
+            workingDir = home
+        }
+        
         let scriptContent = """
         #!/bin/bash
-        cd "\(projectDir)"
-        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+        cd "\(workingDir)"
+        export PATH="$HOME/.local/bin:$PATH"
         clear
         echo "=================================================="
-        echo "  Cube Development Environment"
+        echo "  Cube Environment"
         echo "  Working Directory: $(pwd)"
         echo "  Cube Binary:       $(which cube 2>/dev/null || echo 'not found')"
-        echo "  vmnet Socket:      \\(ServiceManager.shared.defaultSocketPath)"
+        echo "  Cubectl Binary:    $(which cubectl 2>/dev/null || echo 'not found')"
+        echo "  vmnet Socket:      \(ServiceManager.shared.defaultSocketPath)"
         echo "=================================================="
         echo ""
-        echo "The 'cube' command is ready. Try: cube"
+        echo "Ready commands:"
+        echo "  cubectl list               - list virtual machines"
+        echo "  cubectl start <vm-name>    - start a virtual machine"
+        echo "  cubectl --help             - view cubectl commands"
+        echo "  cube --help                - view hypervisor engine options"
         echo ""
         exec "${SHELL:-/bin/zsh}" -l
         """
@@ -341,15 +390,36 @@ class MenuController: NSObject {
         let permissions = [FileAttributeKey.posixPermissions: 0o755]
         try? FileManager.default.setAttributes(permissions, ofItemAtPath: scriptPath)
         
-        NSWorkspace.shared.open(URL(fileURLWithPath: scriptPath))
+        let termAppUrl = VMManager.shared.resolveTerminalAppURL()
+        let scriptUrl = URL(fileURLWithPath: scriptPath)
+        let config = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open([scriptUrl], withApplicationAt: termAppUrl, configuration: config) { _, error in
+            if error != nil {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                proc.arguments = ["-a", termAppUrl.path, scriptPath]
+                do {
+                    try proc.run()
+                } catch {
+                    let fallbackProc = Process()
+                    fallbackProc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                    fallbackProc.arguments = ["-a", "Terminal", scriptPath]
+                    try? fallbackProc.run()
+                }
+            }
+        }
     }
     
     @objc private func showAboutWindow() {
-        let options: [NSApplication.AboutPanelOptionKey: Any] = [
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [
             .applicationVersion: "Build \(AppVersion.build)",
             .version: AppVersion.version,
             .applicationName: "Cube"
         ]
+        if let creditsURL = Bundle.main.url(forResource: "Credits", withExtension: "rtf"),
+           let creditsAttr = try? NSAttributedString(url: creditsURL, options: [:], documentAttributes: nil) {
+            options[.credits] = creditsAttr
+        }
         NSApp.orderFrontStandardAboutPanel(options: options)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -365,5 +435,174 @@ class MenuController: NSObject {
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+
+    // MARK: - Virtual Machine Menu & Actions
+
+    private func updateVMMenu() {
+        for item in vmMenuItems {
+            statusMenu.removeItem(item)
+        }
+        vmMenuItems.removeAll()
+
+        let headerIndex = statusMenu.index(of: vmHeaderMenuItem)
+        guard headerIndex >= 0 else { return }
+        var insertIndex = headerIndex + 1
+
+        let vms = VMManager.shared.vms
+        if vms.isEmpty {
+            let emptyItem = NSMenuItem(title: "  (No Virtual Machines)", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            statusMenu.insertItem(emptyItem, at: insertIndex)
+            vmMenuItems.append(emptyItem)
+        } else {
+            for vm in vms {
+                let statusDot = vm.isRunning ? "●" : "○"
+                let vmItem = NSMenuItem(title: "  \(statusDot) \(vm.name)", action: nil, keyEquivalent: "")
+
+                let attrTitle = NSMutableAttributedString(
+                    string: "  \(statusDot) ",
+                    attributes: [
+                        .foregroundColor: vm.isRunning ? NSColor.systemGreen : NSColor.systemGray,
+                        .font: NSFont.boldSystemFont(ofSize: 13)
+                    ]
+                )
+                let os = vm.os ?? "FreeBSD"
+                let detailText = vm.isRunning ? "\(vm.name) (\(os), running)" : "\(vm.name) (\(os), stopped)"
+                attrTitle.append(NSAttributedString(
+                    string: detailText,
+                    attributes: [.font: NSFont.systemFont(ofSize: 13)]
+                ))
+                vmItem.attributedTitle = attrTitle
+
+                let subMenu = NSMenu()
+
+                let inspectItem = NSMenuItem(title: "Inspect in Dashboard...", action: #selector(inspectInDashboardAction(_:)), keyEquivalent: "")
+                inspectItem.representedObject = vm
+                inspectItem.target = self
+                subMenu.addItem(inspectItem)
+
+                let logsItem = NSMenuItem(title: "View Logs...", action: #selector(viewLogsAction(_:)), keyEquivalent: "")
+                logsItem.representedObject = vm
+                logsItem.target = self
+                subMenu.addItem(logsItem)
+                subMenu.addItem(NSMenuItem.separator())
+
+                if vm.isRunning {
+                    let cfg = vm.loadConfig()
+                    let effectiveSSH = vm.ssh_port ?? cfg.sshPort
+                    if let sshPort = effectiveSSH {
+                        let sshItem = NSMenuItem(title: "Connect via SSH (port \(sshPort))", action: #selector(openSSHAction(_:)), keyEquivalent: "")
+                        sshItem.representedObject = vm
+                        sshItem.target = self
+                        subMenu.addItem(sshItem)
+                    }
+
+                    let effectiveVNC = vm.vnc ?? cfg.vnc
+                    if let vnc = effectiveVNC {
+                        let vncItem = NSMenuItem(title: "Open Screen Sharing (VNC: \(vnc))", action: #selector(openVNCAction(_:)), keyEquivalent: "")
+                        vncItem.representedObject = vm
+                        vncItem.target = self
+                        subMenu.addItem(vncItem)
+                    }
+
+                    if effectiveSSH != nil || effectiveVNC != nil {
+                        subMenu.addItem(NSMenuItem.separator())
+                    }
+
+                    let stopItem = NSMenuItem(title: "Stop Virtual Machine", action: #selector(stopVMAction(_:)), keyEquivalent: "")
+                    stopItem.representedObject = vm
+                    stopItem.target = self
+                    subMenu.addItem(stopItem)
+                } else {
+                    let startItem = NSMenuItem(title: "Start Virtual Machine", action: #selector(startVMAction(_:)), keyEquivalent: "")
+                    startItem.representedObject = vm
+                    startItem.target = self
+                    subMenu.addItem(startItem)
+
+                    let deleteItem = NSMenuItem(title: "Delete Virtual Machine...", action: #selector(deleteVMAction(_:)), keyEquivalent: "")
+                    deleteItem.representedObject = vm
+                    deleteItem.target = self
+                    subMenu.addItem(deleteItem)
+                }
+
+                vmItem.submenu = subMenu
+                statusMenu.insertItem(vmItem, at: insertIndex)
+                vmMenuItems.append(vmItem)
+                insertIndex += 1
+            }
+        }
+    }
+
+    @objc private func openDashboard() {
+        DashboardWindowController.shared.showWindow(nil)
+    }
+
+    @objc private func inspectInDashboardAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        DashboardWindowController.shared.selectVM(name: vm.name)
+    }
+
+    @objc private func viewLogsAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        VMLogWindowController.show(for: vm.name)
+    }
+
+    @objc private func openNewVMWindow() {
+        NewVMWindowController.show()
+    }
+
+    @objc private func startVMAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        VMManager.shared.startVM(name: vm.name) { [weak self] success, errorMsg in
+            if !success {
+                self?.showAlert(title: "Failed to Start VM", message: errorMsg ?? "Unknown error")
+            }
+            VMManager.shared.refreshVMs { [weak self] _ in
+                self?.updateVMMenu()
+            }
+        }
+    }
+
+    @objc private func stopVMAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        VMManager.shared.stopVM(name: vm.name) { [weak self] success, errorMsg in
+            if !success {
+                self?.showAlert(title: "Failed to Stop VM", message: errorMsg ?? "Unknown error")
+            }
+            VMManager.shared.refreshVMs { [weak self] _ in
+                self?.updateVMMenu()
+            }
+        }
+    }
+
+    @objc private func deleteVMAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete Virtual Machine '\(vm.name)'?"
+        alert.informativeText = "This will permanently remove the VM directory and its virtual disk image. This action cannot be undone."
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            VMManager.shared.deleteVM(name: vm.name) { [weak self] success, errorMsg in
+                if !success {
+                    self?.showAlert(title: "Failed to Delete VM", message: errorMsg ?? "Unknown error")
+                }
+                VMManager.shared.refreshVMs { [weak self] _ in
+                    self?.updateVMMenu()
+                }
+            }
+        }
+    }
+
+    @objc private func openSSHAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        VMManager.shared.openTerminalSSH(for: vm)
+    }
+
+    @objc private func openVNCAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        VMManager.shared.openVNC(for: vm)
     }
 }

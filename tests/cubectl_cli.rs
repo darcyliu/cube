@@ -3,6 +3,105 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{self, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+fn review_test_dir(label: &str) -> std::path::PathBuf {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("cubectl-{label}-{}-{stamp}", process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    dir.canonicalize().unwrap()
+}
+
+#[test]
+fn test_delete_preserves_shared_boot_files_and_read_only_media() {
+    let root = review_test_dir("safe-delete");
+    let vm = root.join("vms/example");
+    fs::create_dir_all(&vm).unwrap();
+    let kernel = root.join("shared-kernel");
+    let module = root.join("shared-module");
+    for path in [&kernel, &module] { fs::write(path, b"shared").unwrap(); }
+    // Exercise canonical containment through both parent traversal and symlinks.
+    std::os::unix::fs::symlink(&module, vm.join("module-link")).unwrap();
+    for name in ["installer.iso", "readonly.img", "notes.txt", "disk.img", "local-module"] {
+        fs::write(vm.join(name), b"data").unwrap();
+    }
+    let config = vm.join("example.json");
+    fs::write(&config, serde_json::json!({
+        "name": "example",
+        "boot": {"mode": "freebsd", "kernel": "../../shared-kernel",
+                 "modules": ["module-link", "local-module"]},
+        "disks": ["disk.img", {"path": "installer.iso", "read_only": true},
+                  {"path": "readonly.img", "read_only": true}]
+    }).to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cubectl"))
+        .env("CUBE_VMS_DIR", root.join("vms"))
+        .arg("--state-root").arg(root.join("state"))
+        .arg("delete").arg(&config).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    for path in [&kernel, &module] { assert!(path.exists(), "lost {}", path.display()); }
+    for name in ["installer.iso", "readonly.img", "notes.txt", "module-link"] {
+        assert!(vm.join(name).exists(), "lost {name}");
+    }
+    for name in ["example.json", "disk.img", "local-module"] {
+        assert!(!vm.join(name).exists(), "did not remove {name}");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_list_discovers_vms_without_state_directory() {
+    let root = review_test_dir("fresh-list");
+    let vm = root.join("Cube/fresh");
+    fs::create_dir_all(&vm).unwrap();
+    fs::write(vm.join("fresh.json"), serde_json::json!({
+        "name": "fresh", "boot": {"mode": "uefi", "firmware": "fw.fd"}, "disks": []
+    }).to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cubectl"))
+        .env("HOME", &root).env_remove("CUBE_VMS_DIR")
+        .args(["list", "--json"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let items: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(items[0]["name"], "fresh");
+    assert_eq!(items[0]["state"], "stopped");
+    assert!(!root.join(".local/state/cube").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn test_custom_destination_is_listed_and_can_start_by_name() {
+    let root = review_test_dir("custom-destination");
+    let state = root.join("state");
+    let destination = root.join("custom/example");
+    let firmware = root.join("fw.fd");
+    fs::write(&firmware, b"firmware").unwrap();
+    let fake_cube = root.join("fake-cube");
+    fs::write(&fake_cube, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    fs::set_permissions(&fake_cube, fs::Permissions::from_mode(0o755)).unwrap();
+    let cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cubectl"));
+        command.env("HOME", &root).env("CUBE_VMS_DIR", root.join("default-vms"))
+            .arg("--state-root").arg(&state);
+        command
+    };
+    let created = cli().args(["create", "example", "--net", "none", "--disk", "disk.img:1M"])
+        .arg("--dest").arg(&destination).arg("--firmware").arg(&firmware)
+        .arg("--binary").arg(&fake_cube).output().unwrap();
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let listed = cli().args(["list", "--json"]).output().unwrap();
+    assert!(listed.status.success());
+    let items: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(items[0]["name"], "example");
+    assert_eq!(items[0]["config"], destination.join("example.json").to_str().unwrap());
+    let started = cli().args(["start", "example"]).output().unwrap();
+    // Always stop before asserting, so failed assertions cannot leak a guest.
+    let stopped = cli().args(["stop", "example", "--timeout", "1"]).output().unwrap();
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
+    let deleted = cli().args(["delete", "example"]).output().unwrap();
+    assert!(deleted.status.success(), "{}", String::from_utf8_lossy(&deleted.stderr));
+    assert!(!destination.join("example.json").exists());
+    assert!(!state.join("example").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn test_cubectl_cli_lifecycle_and_conflicts() {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -196,6 +295,7 @@ fn test_cubectl_create_command() {
     let create_out = Command::new(cubectl_bin)
         .args([
             "create", "my-test-vm",
+            "--state-root", temp_dir.join("state").to_str().unwrap(),
             "--dest", vm_dest.to_str().unwrap(),
             "--boot", "uefi",
             "--firmware", dummy_fw.to_str().unwrap(),
@@ -236,6 +336,7 @@ fn test_cubectl_create_command() {
     let dup_out = Command::new(cubectl_bin)
         .args([
             "create", "my-test-vm",
+            "--state-root", temp_dir.join("state").to_str().unwrap(),
             "--dest", vm_dest.to_str().unwrap(),
             "--firmware", dummy_fw.to_str().unwrap(),
         ])
@@ -266,6 +367,7 @@ fn test_cubectl_iso_workflow_and_eject() {
     let create_out = Command::new(cubectl_bin)
         .args([
             "create", "ubuntu-vm",
+            "--state-root", temp_dir.join("state").to_str().unwrap(),
             "--dest", vm_dest.to_str().unwrap(),
             "--firmware", dummy_fw.to_str().unwrap(),
             "--iso", dummy_iso.to_str().unwrap(),
@@ -276,15 +378,18 @@ fn test_cubectl_iso_workflow_and_eject() {
     let create_stdout = String::from_utf8_lossy(&create_out.stdout);
     assert!(create_out.status.success(), "create failed: {}", String::from_utf8_lossy(&create_out.stderr));
     assert!(create_stdout.contains("installer ISO, read-only"));
-    assert!(create_stdout.contains("open vnc://127.0.0.1:5901"));
 
     // 2. Check JSON configuration
     let config_file = vm_dest.join("ubuntu-vm.json");
     let config_val: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_file).unwrap()).unwrap();
+    let vnc_bind = config_val["vnc"]["bind"].as_str().unwrap();
+    assert!(create_stdout.contains(&format!("open vnc://{}", vnc_bind)));
     let disks = config_val.get("disks").and_then(|d| d.as_array()).unwrap();
     assert_eq!(disks.len(), 2, "expected primary disk and iso disk");
     assert_eq!(disks[1].get("read_only").and_then(|ro| ro.as_bool()), Some(true));
-    assert_eq!(config_val["vnc"].get("bind").and_then(|b| b.as_str()), Some("127.0.0.1:5901"));
+    let address: std::net::SocketAddr = vnc_bind.parse().unwrap();
+    assert_eq!(address.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert!(address.port() >= 5901);
 
     // 3. Eject the ISO
     let eject_out = Command::new(cubectl_bin)
@@ -382,6 +487,53 @@ fn test_cubectl_delete_command() {
     assert!(!disk_file.exists());
 
     let _ = fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn test_cubectl_delete_kernel_and_directory() {
+    let cubectl_bin = env!("CARGO_BIN_EXE_cubectl");
+    let test_root = std::path::PathBuf::from("target/test-vms-delete-root");
+    let _ = fs::remove_dir_all(&test_root);
+    fs::create_dir_all(&test_root).unwrap();
+
+    let vm_dir = test_root.join("test-bsd-vm");
+    fs::create_dir_all(&vm_dir).unwrap();
+
+    let disk_file = vm_dir.join("disk.raw");
+    fs::write(&disk_file, b"disk data").unwrap();
+
+    let kernel_file = vm_dir.join("kernel");
+    fs::write(&kernel_file, b"kernel data").unwrap();
+
+    let marker_file = vm_dir.join(".installed");
+    fs::write(&marker_file, b"installed marker").unwrap();
+
+    let config_file = vm_dir.join("test-bsd-vm.json");
+    let config_json = serde_json::json!({
+        "name": "test-bsd-vm",
+        "boot": { "mode": "freebsd", "kernel": "kernel" },
+        "disks": ["disk.raw"]
+    });
+    fs::write(&config_file, serde_json::to_string_pretty(&config_json).unwrap()).unwrap();
+
+    assert!(config_file.is_file());
+    assert!(kernel_file.is_file());
+    assert!(disk_file.is_file());
+    assert!(marker_file.is_file());
+
+    // Run cubectl delete with CUBE_VMS_DIR pointing to test_root
+    let del_out = Command::new(cubectl_bin)
+        .env("CUBE_VMS_DIR", test_root.to_str().unwrap())
+        .args(["delete", "test-bsd-vm"])
+        .output()
+        .unwrap();
+    assert!(del_out.status.success(), "delete failed: {}", String::from_utf8_lossy(&del_out.stderr));
+
+    // Verify VM directory and its contents (kernel, disk, installed marker) were deleted
+    assert!(!vm_dir.exists(), "VM directory should have been removed");
+    assert!(!kernel_file.exists(), "kernel file should have been removed");
+
+    let _ = fs::remove_dir_all(&test_root);
 }
 
 #[test]
@@ -615,3 +767,42 @@ fn test_cubectl_create_with_version_and_existing_cache() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_cubectl_config_commands() {
+    let cubectl_bin = env!("CARGO_BIN_EXE_cubectl");
+    let state_dir = std::env::temp_dir().join(format!("cubectl-cfg-test-{}", std::process::id()));
+    let custom_vms = state_dir.join("MyCustomVMs");
+    fs::create_dir_all(&state_dir).unwrap();
+
+    // 1. List default config
+    let list_out = Command::new(cubectl_bin)
+        .args(["--state-root", state_dir.to_str().unwrap(), "config", "list"])
+        .output()
+        .unwrap();
+    assert!(list_out.status.success());
+    let list_str = String::from_utf8_lossy(&list_out.stdout);
+    assert!(list_str.contains("vms-dir ="));
+
+    // 2. Set custom vms-dir
+    let set_out = Command::new(cubectl_bin)
+        .args(["--state-root", state_dir.to_str().unwrap(), "config", "set", "vms-dir", custom_vms.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(set_out.status.success());
+    assert!(custom_vms.is_dir());
+
+    // 3. Verify settings.json exists
+    let settings_file = state_dir.join("settings.json");
+    assert!(settings_file.is_file());
+
+    // 4. Reset vms-dir to default
+    let reset_out = Command::new(cubectl_bin)
+        .args(["--state-root", state_dir.to_str().unwrap(), "config", "set", "vms-dir", "default"])
+        .output()
+        .unwrap();
+    assert!(reset_out.status.success());
+
+    let _ = fs::remove_dir_all(&state_dir);
+}
+

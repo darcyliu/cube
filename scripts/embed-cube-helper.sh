@@ -34,3 +34,22 @@ if [ -f "$CUBECTL_SRC" ]; then
     cp -f "$CUBECTL_SRC" "$CONTENTS/MacOS/cubectl"
     chmod 755 "$CONTENTS/MacOS/cubectl"
 fi
+
+# Embed UEFI firmware and licenses into Contents/Resources if present
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -f "$REPO_ROOT/firmware/QEMU_EFI.fd" ]; then
+    mkdir -p "$CONTENTS/Resources/firmware"
+    cp -f "$REPO_ROOT/firmware/QEMU_EFI.fd" "$CONTENTS/Resources/firmware/QEMU_EFI.fd"
+fi
+
+if [ -f "$REPO_ROOT/firmware/LICENSE.txt" ]; then
+    mkdir -p "$CONTENTS/Resources/firmware" "$CONTENTS/Resources/Licenses"
+    cp -f "$REPO_ROOT/firmware/LICENSE.txt" "$CONTENTS/Resources/firmware/LICENSE.txt"
+    cp -f "$REPO_ROOT/firmware/LICENSE.txt" "$CONTENTS/Resources/Licenses/EDK2-LICENSE.txt"
+fi
+
+if [ -f "$REPO_ROOT/app/Cube/Resources/Credits.rtf" ]; then
+    cp -f "$REPO_ROOT/app/Cube/Resources/Credits.rtf" "$CONTENTS/Resources/Credits.rtf"
+fi
+

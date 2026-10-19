@@ -122,10 +122,36 @@ pub enum Commands {
         password: String,
     },
 
+    /// Manage cubectl global configuration (e.g. default VM disk storage location)
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
+
     #[command(name = "_serve", hide = true)]
     _Serve {
         state_dir: PathBuf,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommands {
+    /// Get the value of a configuration key
+    Get {
+        /// Configuration key (e.g. vms-dir)
+        key: String,
+    },
+
+    /// Set the value of a configuration key
+    Set {
+        /// Configuration key (e.g. vms-dir)
+        key: String,
+        /// New value (or 'default' to reset to ~/Cube)
+        value: String,
+    },
+
+    /// List all configuration settings
+    List,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -199,7 +225,7 @@ pub struct CreateArgs {
     #[arg(short = 'f', long = "force")]
     pub force: bool,
 
-    /// Destination directory for VM files (default: ~/VMs/<name>)
+    /// Destination directory for VM files (default: ~/Cube/<name>)
     #[arg(long)]
     pub dest: Option<PathBuf>,
 
@@ -367,7 +393,7 @@ fn main() {
     let state_root = cli.state_root.unwrap_or_else(util::default_state_root);
 
     let res = match cli.command {
-        Commands::Create(args) => commands::do_create(args),
+        Commands::Create(args) => commands::do_create(args, &state_root),
         Commands::Install(args) => commands::do_install(args, &state_root),
         Commands::Eject { target } => commands::do_eject(&target, &state_root),
         Commands::Delete { target, force, keep_disks } => commands::do_delete(&target, &state_root, force, keep_disks),
@@ -387,6 +413,11 @@ fn main() {
         Commands::PatchShadow { disk, password } => {
             ext4::patch_cloud_shadow(&disk, &password)
         }
+        Commands::Config { action } => match action {
+            ConfigCommands::Get { key } => commands::do_config_get(&key, &state_root),
+            ConfigCommands::Set { key, value } => commands::do_config_set(&key, &value, &state_root),
+            ConfigCommands::List => commands::do_config_list(&state_root),
+        },
         Commands::_Serve { state_dir } => server::serve(&state_dir),
     };
 

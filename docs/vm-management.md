@@ -6,10 +6,10 @@ The native `cubectl` CLI is built in Rust, requires no Python runtime, and is bu
 ### Where VM files are stored
 
 By default, VMs are separated into two directories:
-1. **VM Files & Virtual Disks**: stored under `~/VMs/<NAME>/` (e.g. `~/VMs/my-freebsd/my-freebsd.json`, `rootfs.img`).
-   - **Customizing per VM**: Pass `--dest <PATH>` when creating (e.g. `cubectl create my-vm --dest /Volumes/Data/VMs/my-vm`).
-   - **Changing the global default**: Set `export CUBE_VMS_DIR=/Volumes/Data/VMs` in your shell profile.
-   - **Moving existing VMs**: Move the directory (`mv ~/VMs/my-vm /new/path/my-vm`) and update any absolute disk paths in the `.json` file.
+1. **VM Files & Virtual Disks**: stored under `~/Cube/<NAME>/` (e.g. `~/Cube/my-freebsd/my-freebsd.json`, `rootfs.img`).
+   - **Customizing per VM**: Pass `--dest <PATH>` when creating (e.g. `cubectl create my-vm --dest /Volumes/Data/Cube/my-vm`).
+   - **Changing the global default**: Run `cubectl config set vms-dir <PATH>` or set `export CUBE_VMS_DIR=/Volumes/Data/Cube` in your shell profile.
+   - **Moving existing VMs**: Move the directory (`mv ~/Cube/my-vm /new/path/my-vm`) and update any absolute disk paths in the `.json` file.
 2. **Runtime State, Logs & Sockets**: stored under `~/.local/state/cube/<NAME>/` (or override with `--state-root <DIR>`). The manager control socket lives under `/tmp/cubectl-UID/`.
 
 Place a file such as `vms/freebsd-zfs.json` in the repository:

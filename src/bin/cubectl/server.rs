@@ -72,7 +72,7 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
     let spec_data = fs::read_to_string(&spec_path).map_err(|e| format!("cannot read {:?}: {}", spec_path, e))?;
     let spec: LaunchSpec = serde_json::from_str(&spec_data).map_err(|e| e.to_string())?;
 
-    let mut disk_locks = crate::util::lock_resources(&spec.resources)?;
+    drop(crate::util::lock_resources(&spec.resources)?);
 
     let control = control_socket_path(state_dir);
     ensure_control_root(&control)?;
@@ -140,6 +140,8 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         resources: spec.resources.clone(),
         control_socket: control.to_string_lossy().into_owned(),
         shares: spec.shares.clone(),
+        ssh_port: spec.ssh_port,
+        vnc: spec.vnc.clone(),
     };
     write_json_atomic(&state_dir.join("instance.json"), &serde_json::to_value(&record).unwrap())?;
 
@@ -159,9 +161,6 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_ok() && !line.is_empty() {
                     let resp = handle_client_request(&line, &mut child, &spec, state_dir, &record, &mut output_thread);
-                    if child.try_wait().ok().flatten().is_some() {
-                        disk_locks.clear();
-                    }
                     let mut payload = serde_json::to_string(&resp).unwrap();
                     payload.push('\n');
                     let _ = stream.write_all(payload.as_bytes());
@@ -175,7 +174,6 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
     };
 
     if let Some(thread) = output_thread.take() { let _ = thread.join(); }
-    drop(disk_locks);
     let ended = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
     let last = serde_json::json!({
         "id": record.id,
@@ -187,6 +185,8 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         "resources": record.resources,
         "control_socket": record.control_socket,
         "shares": record.shares,
+        "ssh_port": record.ssh_port,
+        "vnc": record.vnc,
         "state": "stopped",
         "exit_code": exit_code,
         "ended": ended
@@ -220,19 +220,35 @@ fn handle_client_request(
     };
 
     match action {
-        "status" => serde_json::json!({
-            "ok": true,
-            "state": "running",
-            "id": record.id,
-            "name": record.name,
-            "config": record.config,
-            "pid": record.pid,
-            "manager_pid": record.manager_pid,
-            "started": record.started,
-            "resources": record.resources,
-            "control_socket": record.control_socket,
-            "shares": record.shares
-        }),
+        "status" => {
+            if child.try_wait().ok().flatten().is_some() {
+                serde_json::json!({
+                    "ok": false,
+                    "state": "stopped",
+                    "error": "VM process has terminated",
+                    "id": record.id,
+                    "name": record.name,
+                    "ssh_port": record.ssh_port,
+                    "vnc": record.vnc
+                })
+            } else {
+                serde_json::json!({
+                    "ok": true,
+                    "state": "running",
+                    "id": record.id,
+                    "name": record.name,
+                    "config": record.config,
+                    "pid": record.pid,
+                    "manager_pid": record.manager_pid,
+                    "started": record.started,
+                    "resources": record.resources,
+                    "control_socket": record.control_socket,
+                    "shares": record.shares,
+                    "ssh_port": record.ssh_port,
+                    "vnc": record.vnc
+                })
+            }
+        }
         "stop" => {
             let timeout = req.get("timeout").and_then(|t| t.as_u64()).unwrap_or(10);
             let signal = force_stop_child(child, spec.sudo, spec.interactive, Duration::from_secs(timeout));

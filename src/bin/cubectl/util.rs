@@ -109,6 +109,40 @@ pub fn sha256_hex(data: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CubeSettings {
+    #[serde(default)]
+    pub vms_dir: Option<String>,
+    #[serde(default)]
+    pub ssh_key_path: Option<String>,
+    #[serde(default)]
+    pub terminal_app: Option<String>,
+}
+
+pub fn settings_path(state_root: &Path) -> PathBuf {
+    state_root.join("settings.json")
+}
+
+pub fn load_cube_settings(state_root: &Path) -> CubeSettings {
+    let path = settings_path(state_root);
+    if let Ok(data) = fs::read(&path) {
+        if let Ok(settings) = serde_json::from_slice::<CubeSettings>(&data) {
+            return settings;
+        }
+    }
+    CubeSettings::default()
+}
+
+pub fn save_cube_settings(state_root: &Path, settings: &CubeSettings) -> Result<(), String> {
+    fs::create_dir_all(state_root).map_err(|e| format!("cannot create state root {:?}: {}", state_root, e))?;
+    let path = settings_path(state_root);
+    let json = serde_json::to_string_pretty(settings).map_err(|e| format!("cannot serialize settings: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("cannot write settings {:?}: {}", path, e))?;
+    Ok(())
+}
+
 pub fn default_state_root() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let cube_state = home.join(".local/state/cube");
@@ -118,14 +152,6 @@ pub fn default_state_root() -> PathBuf {
     } else {
         cube_state
     }
-}
-
-pub fn default_vms_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CUBE_VMS_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    home.join("VMs")
 }
 
 pub fn resolve_path(value: &str, base: &Path) -> Result<PathBuf, String> {
@@ -140,6 +166,31 @@ pub fn resolve_path(value: &str, base: &Path) -> Result<PathBuf, String> {
         path
     };
     Ok(expanded)
+}
+
+pub fn default_vms_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CUBE_VMS_DIR") {
+        let val = dir.to_string_lossy().trim().to_string();
+        if !val.is_empty() {
+            if let Ok(resolved) = resolve_path(&val, Path::new(".")) {
+                return resolved;
+            }
+            return PathBuf::from(val);
+        }
+    }
+    let state_root = default_state_root();
+    let settings = load_cube_settings(&state_root);
+    if let Some(ref dir) = settings.vms_dir {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            if let Ok(resolved) = resolve_path(trimmed, Path::new(".")) {
+                return resolved;
+            }
+            return PathBuf::from(trimmed);
+        }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join("Cube")
 }
 
 pub fn canonical_path_str(path: &Path) -> Result<String, String> {

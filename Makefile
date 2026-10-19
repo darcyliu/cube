@@ -43,6 +43,10 @@ app: build sign
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
 	swiftc -O -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
+		app/Cube/Sources/VMManager.swift \
+		app/Cube/Sources/NewVMWindowController.swift \
+		app/Cube/Sources/DashboardWindowController.swift \
+		app/Cube/Sources/VMLogWindowController.swift \
 		app/Cube/Sources/MenuController.swift \
 		app/Cube/Sources/PreferencesWindowController.swift \
 		app/Cube/Sources/AppDelegate.swift \
@@ -52,6 +56,7 @@ app: build sign
 	@BUILD_NUM=$$(git rev-list --count HEAD 2>/dev/null || echo 1); \
 	sed -i '' "s/<string>33<\/string>/<string>$$BUILD_NUM<\/string>/g" "$(CUBE_APP)"/Contents/Info.plist 2>/dev/null || true
 	cp app/Cube/Resources/AppIcon.icns "$(CUBE_APP)"/Contents/Resources/AppIcon.icns
+	[ -f app/Cube/Resources/Credits.rtf ] && cp app/Cube/Resources/Credits.rtf "$(CUBE_APP)"/Contents/Resources/Credits.rtf || true
 	./scripts/embed-cube-helper.sh "$(CUBE_BIN)" "$(CUBE_APP)"
 	@if [ -n "$$PROFILE" ] || ls *.provisionprofile >/dev/null 2>&1; then \
 		echo "[Cube] Provisioning profile detected, signing with Developer identity & com.apple.vm.networking..."; \
@@ -70,6 +75,10 @@ debug-app: build
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
 	swiftc -g -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
+		app/Cube/Sources/VMManager.swift \
+		app/Cube/Sources/NewVMWindowController.swift \
+		app/Cube/Sources/DashboardWindowController.swift \
+		app/Cube/Sources/VMLogWindowController.swift \
 		app/Cube/Sources/MenuController.swift \
 		app/Cube/Sources/PreferencesWindowController.swift \
 		app/Cube/Sources/AppDelegate.swift \
@@ -77,6 +86,7 @@ debug-app: build
 		-o "$(CUBE_APP)"/Contents/MacOS/CubeBar
 	cp app/Cube/Resources/Info.plist "$(CUBE_APP)"/Contents/Info.plist
 	cp app/Cube/Resources/AppIcon.icns "$(CUBE_APP)"/Contents/Resources/AppIcon.icns
+	[ -f app/Cube/Resources/Credits.rtf ] && cp app/Cube/Resources/Credits.rtf "$(CUBE_APP)"/Contents/Resources/Credits.rtf || true
 	./scripts/embed-cube-helper.sh "$(CUBE_BIN)" "$(CUBE_APP)"
 	codesign --force --deep --sign - --entitlements app/Cube/Resources/Cube.debug.entitlements "$(CUBE_APP)"
 	@echo "[Cube] Built Debug macOS Menu Bar App (debugger-attachable) → $(CUBE_APP)"

@@ -180,10 +180,26 @@ fn start_forward(bind: SocketAddr, destination: Destination) -> Result<PortForwa
                     } else {
                         let target_address = match destination.resolve() {
                             Ok(address) => address,
-                            Err(e) => { crate::host_log!("[Port Forward] {bind}: {e}"); continue; }
+                            Err(_) => {
+                                let mut found = None;
+                                for _ in 0..10 {
+                                    thread::sleep(Duration::from_millis(100));
+                                    if let Ok(addr) = destination.resolve() {
+                                        found = Some(addr);
+                                        break;
+                                    }
+                                }
+                                match found {
+                                    Some(addr) => addr,
+                                    None => {
+                                        crate::host_log!("[Port Forward] {bind}: guest address not yet discovered via DHCP; dropping connection");
+                                        continue;
+                                    }
+                                }
+                            }
                         };
                         let connection = (|| -> io::Result<Connection> {
-                            let target = TcpStream::connect_timeout(&target_address, Duration::from_millis(500))?;
+                            let target = TcpStream::connect_timeout(&target_address, Duration::from_millis(2000))?;
                             client.set_nonblocking(true)?;
                             target.set_nonblocking(true)?;
                             Ok(Connection { client, target, upstream: Direction::new(), downstream: Direction::new() })

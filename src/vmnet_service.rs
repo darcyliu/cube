@@ -478,7 +478,7 @@ fn configure_listener(
     if unsafe { libc::listen(fd, 16) } != 0 {
         return Err(format!("listen: {}", io::Error::last_os_error()));
     }
-    set_nosigpipe(fd)?;
+    set_nosigpipe(fd).map_err(|e| format!("SO_NOSIGPIPE: {}", e))?;
     // fchown and fchmod return EINVAL when the fd is a socket. fstat on that
     // fd stays mode 0666 and its inode is not the directory entry.
     let c_path = CString::new(path.as_os_str().as_bytes())
@@ -556,7 +556,7 @@ fn configure_listener(
     Ok(())
 }
 
-fn set_nosigpipe(fd: i32) -> Result<(), String> {
+fn set_nosigpipe(fd: i32) -> Result<(), io::Error> {
     let one: libc::c_int = 1;
     let rc = unsafe {
         libc::setsockopt(
@@ -568,7 +568,7 @@ fn set_nosigpipe(fd: i32) -> Result<(), String> {
         )
     };
     if rc != 0 {
-        return Err(format!("SO_NOSIGPIPE: {}", io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -1130,7 +1130,12 @@ fn peer_uid(fd: i32) -> io::Result<u32> {
 fn adopt(table: &mut Table, mut stream: UnixStream) {
     let fd = stream.as_raw_fd();
     if let Err(err) = set_nosigpipe(fd) {
-        eprintln!("[vmnet] {err}");
+        let code = err.raw_os_error();
+        // A probe connection (e.g. status monitor) may close the socket immediately.
+        // On Darwin, setsockopt on an already-closed socket returns EINVAL (os error 22).
+        if code != Some(libc::EINVAL) && code != Some(libc::ENOTCONN) && code != Some(libc::EPIPE) {
+            eprintln!("[vmnet] SO_NOSIGPIPE: {err}");
+        }
         return;
     }
     let peer = match peer_uid(fd) {
