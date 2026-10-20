@@ -29,7 +29,7 @@ a particular macOS vmnet subnet. Static addresses use an explicit rule.
 
 Local regression tests cover rule parsing, a 128 KiB bidirectional transfer,
 TCP half-close, listener cleanup, occupied-port startup failure, and backend
-failure without fallback. `scripts/check_network.py` checks CLI failures and has
+failure without fallback. `tests/cube/check_network.py` checks CLI failures and has
 an optional real guest SSH check using read-only installer media. The user
 confirmed the rebuilt `--ssh-port` fix works after the guest moved from the
 assumed `192.168.18.2` to `192.168.2.2`. All 38 tests pass in debug and release.
@@ -158,7 +158,7 @@ See [GUI architecture](gui_architecture.md) and the
 
 ## 5. Per-VM configuration and management
 
-`scripts/vmmctl.py` provides a named JSON configuration and a host-side manager.
+Native `cubectl` provides a named JSON configuration and a host-side manager.
 See the [VM management runbook](vm-management.md). The user confirmed the
 privileged SSH-triggered poweroff check passed on 2026-09-23.
 

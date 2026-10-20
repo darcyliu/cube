@@ -8,7 +8,7 @@ import unittest
 
 sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location(
-    "verify_bridge", Path(__file__).with_name("verify-bridge.py"))
+    "verify_bridge", (Path(__file__).resolve().parents[1] / "verify-bridge.py"))
 bridge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge)
 

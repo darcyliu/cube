@@ -288,7 +288,7 @@ pub struct CreateArgs {
     #[arg(long)]
     pub firmware: Option<PathBuf>,
 
-    /// Kernel path (required for freebsd mode unless boot/kernel/kernel exists)
+    /// Kernel path (required for freebsd mode unless boot/freebsd/kernel exists)
     #[arg(long)]
     pub kernel: Option<PathBuf>,
 

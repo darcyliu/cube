@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Verify managed guest SSH poweroff using a cloned installed FreeBSD disk."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import json
 import os
-from pathlib import Path
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 
-import vmmctl
+from support.cubectl import Cubectl
 
 
 def clone(source, destination):
@@ -24,6 +27,7 @@ def clone(source, destination):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--cubectl", type=Path, required=True)
     parser.add_argument("--disk", type=Path, required=True)
     parser.add_argument("--ssh-key", type=Path, required=True)
     parser.add_argument("--firmware", type=Path, required=True)
@@ -53,6 +57,7 @@ def main():
         parser.error("timeouts must be positive")
     directory = Path(tempfile.mkdtemp(prefix="vmm-shutdown-"))
     state_root = directory / "state"
+    ctl = Cubectl(args.cubectl, state_root)
     state = state_root / "shutdown-smoke"
     passed = False
     print(f"Artifacts: {directory}", flush=True)
@@ -74,10 +79,7 @@ def main():
             "shutdown": {"host": "127.0.0.1", "port": port,
                          "user": "root", "identity_file": str(key)},
         }))
-        options = argparse.Namespace(binary=None, ram=None, cpus=None, net=None,
-                                     mac=None, ssh_port=None, forward=None, vnc=None,
-                                     display=None, efi_vars=None, disk=None, sudo=False)
-        vmmctl.start(config, state_root, state, options)
+        ctl.call("start", config)
         ssh = ["ssh", "-F", "/dev/null", "-i", str(key), "-p", str(port),
                "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                "-o", "ConnectTimeout=2", "-o", "StrictHostKeyChecking=accept-new",
@@ -88,23 +90,21 @@ def main():
             result = subprocess.run(ssh, capture_output=True, text=True, timeout=8)
             if result.returncode == 0 and result.stdout == "VMM_SSH_OK":
                 break
-            if not vmmctl.live_status(state):
+            if not ctl.running(state.name):
                 raise RuntimeError("VM exited before SSH was ready; see vmm.log and console.log")
             if time.monotonic() >= deadline:
                 raise RuntimeError("SSH did not become ready; see vmm.log and console.log")
             time.sleep(1)
         print("PASS installed guest SSH is reachable", flush=True)
-        response = vmmctl.query(state, {"action": "shutdown",
-                                        "timeout": args.shutdown_timeout,
-                                        "force_after": False},
-                                timeout=args.shutdown_timeout + 25)
+        response = ctl.call("shutdown", state.name, "--timeout", args.shutdown_timeout,
+                            timeout=args.shutdown_timeout + 30)
         if response.get("result") != "guest-poweroff":
             raise RuntimeError("managed guest shutdown failed: " + json.dumps(response))
         print("PASS SSH-coordinated guest PSCI poweroff (no forced stop)", flush=True)
         passed = True
     finally:
-        if vmmctl.live_status(state):
-            vmmctl.query(state, {"action": "stop", "timeout": 10}, timeout=20)
+        if ctl.running(state.name):
+            ctl.call("stop", state.name, "--timeout", 10)
         if passed and not args.keep:
             # A sudo-launched VMM may own its EFI/serial files. This directory
             # was created exclusively by this check and contains only its clones.

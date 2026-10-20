@@ -11,8 +11,8 @@ Start the vmnet service once with `make vmnet-service`. The installer then
 uses `vmnet-proxy` as your user. Add `--sudo` to run `check_install.py` as
 root with in-process vmnet. Direct `check_install.py --net bridge:en0` is the
 in-process bridge on that Ethernet interface; it also runs as root, and the
-guest takes a LAN address. The saved config and the printed `vmmctl` start
-line follow that choice. The same run prints a direct `vmm` command with the
+guest takes a LAN address. The saved config and the printed `cubectl` start
+line follow that choice. The same run prints a direct `cube` command with the
 binary, kernel, disk, memory, CPUs, network mode, SSH port, and VNC display
 filled in. Add `--skip-verify` to write the packages, login account, and Xorg
 configuration, then skip the X11 input check, reboot, and cold-start check.
@@ -39,7 +39,7 @@ flowchart TD
   skip -->|yes| early["Power off. Skip the X11 check, reboot, and cold start"]
   skip -->|no| x11["Probe the tablet, start Xorg, run check_desktop.py"]
   x11 --> reboot["Reboot and require the marker to persist, then power off"]
-  early --> out["Keep the directory: reuse-vm.json, vmmctl line, direct vmm command"]
+  early --> out["Keep the directory: reuse-vm.json, cubectl line, direct cube command"]
   reboot --> out
 ```
 
@@ -125,20 +125,9 @@ The desktop options affect new installations, not an existing `installed.img`.
 
 `unattended-install.sh` defaults to `root:root`, but this regression installer
 passes a generated root password to the same `create-seed.sh` script unless
-`--root-password-file` is supplied. For an already installed VM, boot it with
-`--ssh-port 2222` and set root to the password recorded in `desktop-login.txt`:
-
-```sh
-INSTALL="$HOME/VMs/vmm-install-uwtcnyim"  # replace with your artifact path
-bash scripts/set_freebsd_root_password.sh "$INSTALL"
-```
-
-The helper authenticates with the artifact's SSH key and passes the password
-to FreeBSD's `pw` over SSH standard input. It then updates `root-login.txt`.
-Pass a different password file as its second argument to choose another root
-password. The guest must be running and its SSH forward must be reachable; the
-third argument overrides port 2222. Use the desktop account for graphical login
-and root for terminal/SSH administration.
+`--root-password-file` is supplied. The password is recorded in `root-login.txt`
+and `desktop-login.txt` in the VM directory. Use the desktop account for graphical
+login and root for terminal/SSH administration.
 
 The XFCE path installs XFCE, Xorg/scfb, D-Bus, LightDM and its GTK greeter,
 plus DejaVu fonts and Adwaita icons so the login screen has readable labels.
@@ -160,16 +149,16 @@ artifact path below:
 
 ```sh
 INSTALL=/path/to/vmm-install-XXXXXX
-python3 -B scripts/vmmctl.py start "$INSTALL/reuse-vm.json"
-python3 -B scripts/vmmctl.py status "$INSTALL/reuse-vm.json"
+cubectl start "$INSTALL/reuse-vm.json"
+cubectl status "$INSTALL/reuse-vm.json"
 # Connect a VNC viewer to 127.0.0.1:5901; log in as vmm.
 cat "$INSTALL/desktop-login.txt"
-python3 -B scripts/vmmctl.py shutdown "$INSTALL/reuse-vm.json"
+cubectl shutdown "$INSTALL/reuse-vm.json"
 # Run start again whenever you want to use this same disk.
 ```
 
 To run the same XFCE VM **in the foreground**, as with
-`unattended-install.sh`, stop any `vmmctl` instance using this disk first.
+`unattended-install.sh`, stop any `cubectl` instance using this disk first.
 Then run from the repository root:
 
 ```sh
@@ -231,31 +220,15 @@ Configure guest font/UI scaling to 200% if you want the same apparent size as
 the default mode. The default native mode keeps the guest at 1024×768 and
 scales each pixel sharply to 2×2 screen pixels.
 
-Older XFCE artifacts may have an unusable greeter with empty-square text and
-no mouse. They lack an explicit font set and the boot-time `vmm_hid` service.
-While the guest is running with `--ssh-port 2222`, repair that installed disk
-from the repository root:
+New XFCE installs configure explicit font sets, icons, a readable LightDM GTK theme,
+and the boot-time `vmm_hid` tablet service automatically. If an X11 session does not
+pick up the tablet on first boot, shut down and boot the VM again.
 
-```sh
-bash scripts/repair_freebsd_desktop.sh "$INSTALL"
-```
-
-The repair installs fonts and icons, selects a readable LightDM GTK theme,
-enables FreeBSD's USB HID/evdev path, and reprobes the tablet by its USB
-descriptor rather than its changing `ugen` number. It restarts LightDM, which
-ends the current greeter/session; reconnect VNC and log in as `vmm`. New XFCE
-installs configure the same greeter assets and boot-time tablet service
-automatically. If the current X11 session does not pick up the tablet, shut
-down and boot the VM again.
-The in-place repair was confirmed on the 2026-09-23 FreeBSD XFCE guest: the
-greeter text and mouse worked after restarting LightDM. Persistence across a
-subsequent guest reboot still needs a live check.
-
-The config uses SSH forwarding on port 2222 for `vmmctl shutdown`, and the
+The config uses SSH forwarding on port 2222 for `cubectl shutdown`, and the
 installed disk remains writable across later starts. Override occupied ports
 with `--ssh-port` and `--vnc` on `start` (and update the shutdown port in the
 JSON if SSH changes). The binary path in the config is absolute; edit it if
-the checkout moves. Unlike the regression's temporary process, `vmmctl` keeps
+the checkout moves. Unlike the regression's temporary process, `cubectl` keeps
 the guest running until it is shut down or stopped. See [VM management](vm-management.md)
 for stop commands. The regression checks that the tablet attaches after reboot;
 a full XFCE login and pointer-input replay on a later start still need an
@@ -354,7 +327,7 @@ $SSH 'until env DISPLAY=:0 xdpyinfo >/dev/null 2>&1; do sleep 1; done; \
 Run the verifier from the host:
 
 ```sh
-python3 scripts/check_desktop.py \
+python3 tests/cube/check_desktop.py \
   --vnc 127.0.0.1:5901 --ssh-port 2222 \
   --identity "$INSTALL/id_ed25519" \
   --artifacts "$INSTALL/desktop-results"

@@ -78,21 +78,18 @@ Press `Enter` to access the live FreeBSD root `#` prompt!
 
 ### 3. Boot FreeBSD with VirtIO-Net Networking (NAT & Internet Access)
 ```bash
-# Run with root privileges to automatically enable macOS vmnet.framework NAT:
-sudo make sudo-freebsd-net
-
-# Or keep the VMM unprivileged: start the vmnet service once, then use --net vmnet-proxy.
+# Keep the VMM unprivileged: start the vmnet service once, then use --net vmnet-proxy.
 # `make vmnet-service` must be run as your user (it sudo's only the service).
 make all
 make vmnet-service
-./target/debug/cube --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet-proxy
+./target/debug/cube --freebsd boot/freebsd/kernel --disk mini-memstick.img --net vmnet-proxy
 
 # LAN addresses instead of bridge100 NAT. Stop the NAT service first.
 make vmnet-service-bridge
 # or: make vmnet-service-bridge IFACE=en7
 
 # For offline unprivileged use, explicitly disable networking:
-./target/debug/cube --freebsd boot/kernel/kernel --net none
+./target/debug/cube --freebsd boot/freebsd/kernel --net none
 ```
 Inside the FreeBSD single-user shell:
 ```sh
@@ -156,7 +153,7 @@ mailbox for each run, and prints the retained console-log path. Prompt timeouts
 stop automation without dispatching installer commands.
 
 For named VM configurations, isolated EFI/console runtime files, status, guest
-shutdown over SSH, and explicit host stop, use `scripts/vmmctl.py`. See the
+shutdown over SSH, and explicit host stop, use `cubectl`. See the
 [VM management runbook](docs/vm-management.md).
 
 For shared host folders, add `--share TAG PATH` (read-only) or
@@ -183,8 +180,8 @@ Silicon macOS, after building and signing Cube, run the diskless integration
 checks with:
 
 ```sh
-python3 scripts/check_vm_lifecycle.py target/debug/cube \
-  --kernel .iso-boot/boot/kernel/kernel --firmware firmware/QEMU_EFI.fd
+python3 scripts/cube/check_vm_lifecycle.py target/debug/cube \
+  --kernel boot/freebsd/kernel --firmware firmware/QEMU_EFI.fd
 ```
 
 The kernel and firmware arguments are optional. The checks cover parked CPUs,
@@ -203,14 +200,14 @@ python3 -B scripts/install-vm.py --version 15 --unattended --desktop plasma --na
 `--version 15` is 15.1. 14.4 is the default. 14.5 uses the same distribution-set
 install as 14.4. 15.1 installs the packaged base system from disc1. 15.0 is
 interactive only: its scripted installer cannot use the packages on that disc.
-The VM is created under `~/Cube/<name>/`. The command prints a `vmmctl` start
-line and a direct `vmm` command for that disk. A desktop install needs guest
+The VM is created under `~/Cube/<name>/`. The command prints a `cubectl` start
+line and a direct `cube` command for that disk. A desktop install needs guest
 internet for packages. Add `--skip-verify` to a desktop install to stop after
 the packages, login account, and Xorg configuration are written, and skip the
 X11 input check, reboot, and cold-start check. Installers use
 `vmnet-proxy` and the vmnet service (`make vmnet-service`); they do not use
 sudo. Pass `--sudo` to run the installer as root with in-process vmnet instead.
-The saved config, the `vmmctl` line, and the direct `vmm` command follow that choice.
+The saved config, the `cubectl` line, and the direct `cube` command follow that choice.
 
 For a disposable full installation, installed-disk SSH, and reboot/persistence
 check, see [the installation regression runbook](docs/install-regression.md).
@@ -218,7 +215,7 @@ That runbook has flowcharts of `install-vm.py` and of `check_install.py`.
 `scripts/check_install.py` and `scripts/unattended-plasma-install.sh` remain that
 regression path; see the [desktop runbook](docs/freebsd-desktop.md).
 With `--keep`, the run also writes `reuse-vm.json` beside the installed disk for
-later starts through `scripts/vmmctl.py`.
+later starts through `cubectl`.
 Use `--desktop-user` and `--desktop-password-file` to choose the desktop login
 credentials for a new install. The root account has a separate 8-character generated password;
 use `--root-password-file` to choose it, or read `root-login.txt` in retained

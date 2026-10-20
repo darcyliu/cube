@@ -7,6 +7,8 @@ import threading
 import unittest
 
 sys.dont_write_bytecode = True
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_desktop import (read, update, validate_events, xi2_events,
                            pointer_position, wait_for_pointer)
 

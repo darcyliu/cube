@@ -30,7 +30,7 @@ that have been unlinked and changes in process privileges [2].
 | Storage | `src/devices/virtio/block.rs`: raw/COW sector backends | A directory cannot be passed to `--disk`; filesystem sharing requires file operations and metadata, not sectors. |
 | Discovery | `src/main.rs` builds a list consumed by `src/fdt.rs::generate_dtb` | Add one device and mount tag per share through the same device list for direct and UEFI boots. |
 | Async lifecycle | `src/devices/virtio/net.rs` has a worker and shutdown/join hooks; `src/main.rs` stops vCPUs before device shutdown | Reuse lifecycle patterns, with explicit protection against completions after queue reset. |
-| Management | `scripts/vmmctl.py::launch_spec` builds CLI arguments and resource records | Add typed share configuration, relative-path handling, and share status. |
+| Management | `cubectl::config::build_launch_spec` builds CLI arguments and resource records | Add typed share configuration, relative-path handling, and share status. |
 | Networking | VirtIO-net, vmnet/bridge/TAP, host TCP forwarding | Network filesystems are possible alternatives, but depend on guest networking and a server. |
 
 ### Prerequisite: device address and interrupt allocation
@@ -223,7 +223,7 @@ and with the VMM launched using sudo.
 
 ### 5. Regression, documentation and performance
 
-Add `scripts/check_shared_folders.py`, integrate it into `scripts/verify.py`,
+Add `tests/cube/check_shared_folders.py`, integrate it into `scripts/verify.py`,
 and add a runbook. Use fresh temporary exports and disposable guest disks. SSH
 may orchestrate installed-guest tests; separately prove sharing without a NIC
 through the existing serial automation. Cover UFS direct boot and UEFI/ZFS,

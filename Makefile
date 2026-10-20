@@ -1,4 +1,4 @@
-.PHONY: all build sign sign-networking run freebsd freebsd-zfs sudo-freebsd-zfs freebsd-zfs-uefi sudo-freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify alpine debian debian-cloud app cube run-cube debug-app sign-cube-networking debug-run-cube install install-cli
+.PHONY: all build sign sign-networking run freebsd freebsd-zfs freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify alpine debian debian-cloud app cube run-cube debug-app sign-cube-networking debug-run-cube install install-cli
 
 all: build sign
 
@@ -15,9 +15,16 @@ install-cli:
 	@echo "[Cube] Linked CLI: $(HOME)/.local/bin/cube → $(CURDIR)/$(CUBE_BIN)"
 	@echo "[Cube] Linked CLI: $(HOME)/.local/bin/cubectl → $(CURDIR)/$(CUBECTL_BIN)"
 
-# VERIFY_ARGS can select offline/full suites and supply media paths.
+# VERIFY_ARGS can select components, offline/full suites, and media paths.
 verify:
 	python3 -B scripts/verify.py $(VERIFY_ARGS)
+
+.PHONY: verify-cube verify-cubectl
+verify-cube:
+	python3 -B scripts/verify.py --component cube $(VERIFY_ARGS)
+
+verify-cubectl:
+	python3 -B scripts/verify.py --component cubectl $(VERIFY_ARGS)
 
 .PHONY: test-vm-management
 test-vm-management:
@@ -123,23 +130,21 @@ run: all
 	$(CUBE_BIN)
 
 fetch-freebsd:
-	@mkdir -p boot
-	@NEED=""; \
-	if [ ! -f boot/kernel/kernel ]; then NEED="$$NEED boot/kernel/kernel"; fi; \
-	if [ ! -f boot/kernel/zfs.ko ]; then NEED="$$NEED boot/kernel/zfs.ko"; fi; \
-	if [ -n "$$NEED" ]; then \
+	@mkdir -p boot/freebsd
+	@if [ ! -f boot/freebsd/kernel ] || [ ! -f boot/freebsd/zfs.ko ]; then \
 		echo "[Cube] Downloading official FreeBSD 14.4-RELEASE ARM64 kernel.txz..."; \
-		curl -fSL https://download.freebsd.org/releases/arm64/14.4-RELEASE/kernel.txz | tar -xf - $$NEED; \
-		echo "[Cube] Extracted:$$NEED"; \
+		curl -fSL https://download.freebsd.org/releases/arm64/14.4-RELEASE/kernel.txz | tar -xf - boot/kernel/kernel boot/kernel/zfs.ko; \
+		mv boot/kernel/kernel boot/freebsd/ && mv boot/kernel/zfs.ko boot/freebsd/ && rmdir boot/kernel 2>/dev/null || true; \
+		echo "[Cube] Extracted boot/freebsd/kernel and boot/freebsd/zfs.ko"; \
 	else \
-		echo "[Cube] boot/kernel/kernel and boot/kernel/zfs.ko already present."; \
+		echo "[Cube] boot/freebsd/kernel and boot/freebsd/zfs.ko already present."; \
 	fi
 
 CPUS ?= 2
 NET  ?= vmnet-proxy
 
 freebsd: all fetch-freebsd
-	$(CUBE_BIN) --freebsd boot/kernel/kernel --net $(NET)
+	$(CUBE_BIN) --freebsd boot/freebsd/kernel --net $(NET)
 
 fetch-image:
 	@if [ ! -f mini-memstick.img ]; then \
@@ -151,21 +156,7 @@ fetch-image:
 	fi
 
 freebsd-root: all fetch-freebsd fetch-image
-	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net $(NET)
-
-
-# Shared-mode vmnet needs root. Also install a small PF NAT anchor so the
-# guest subnet (192.168.18.0/24) can reach the internet via the default iface.
-define setup-vmnet-nat
-	@IF="$$(route get default 2>/dev/null | awk '/interface:/{print $$2}')"; \
-	if [ -n "$$IF" ]; then \
-		echo "[Cube] PF NAT on $$IF for vmnet guest subnet 192.168.18.0/24..."; \
-		sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null; \
-		printf 'nat on %s from 192.168.18.0/24 to any -> (%s)\npass in quick on bridge100 all\npass out quick on %s all\n' "$$IF" "$$IF" "$$IF" | sudo pfctl -a "com.apple/cube" -f - 2>/dev/null || true; \
-	else \
-		echo "[Cube] Warning: no default interface; skipping PF NAT setup"; \
-	fi
-endef
+	$(CUBE_BIN) --freebsd boot/freebsd/kernel --disk mini-memstick.img --net $(NET)
 
 # Long-running vmnet proxy. Build as your user first (`make all`), then `make vmnet-service`.
 # The recipe sudo's only the service. Guests use `--net vmnet-proxy` without sudo.
@@ -184,11 +175,7 @@ vmnet-service-bridge:
 	sudo $(CUBE_BIN) --vmnet-service --bridge $(IFACE)
 
 freebsd-net: all fetch-freebsd fetch-image
-	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net $(NET) --cpus $(CPUS)
-
-sudo-freebsd-net: all fetch-freebsd fetch-image
-	$(setup-vmnet-nat)
-	sudo $(CUBE_BIN) --freebsd boot/kernel/kernel --disk mini-memstick.img --net vmnet --cpus $(CPUS)
+	$(CUBE_BIN) --freebsd boot/freebsd/kernel --disk mini-memstick.img --net $(NET) --cpus $(CPUS)
 
 install-iso: all
 	./scripts/install-from-iso.sh
@@ -240,12 +227,6 @@ freebsd-zfs-uefi: all fetch-uefi
 	fi
 	$(CUBE_BIN) --uefi --disk "$(DISK)" --net $(NET) --cpus $(CPUS)
 
-sudo-freebsd-zfs-uefi: all fetch-uefi
-	@if [ ! -f "$(DISK)" ]; then echo "[Cube] Missing $(DISK)"; exit 1; fi
-	@echo "[Cube] UEFI + ZFS with real vmnet NIC (requires sudo)"
-	$(setup-vmnet-nat)
-	sudo $(CUBE_BIN) --uefi --disk "$(DISK)" --net vmnet --cpus $(CPUS)
-
 # Strategy 1 (experimental): direct ELF + zfs.ko preload — often hangs after MODINFO.
 # Prefer freebsd-zfs-uefi for root-on-ZFS.
 # Example after install-from-iso with Auto (ZFS):
@@ -255,13 +236,7 @@ CPUS ?= 2
 
 freebsd-zfs: all fetch-freebsd
 	@if [ ! -f "$(DISK)" ]; then 		echo "[Cube] Missing $(DISK). Run: make install-iso   (choose Auto ZFS in bsdinstall)"; 		exit 1; 	fi
-	$(CUBE_BIN) --freebsd boot/kernel/kernel --disk "$(DISK)" --net $(NET) --cpus $(CPUS)
-
-sudo-freebsd-zfs: all fetch-freebsd
-	@if [ ! -f "$(DISK)" ]; then echo "[Cube] Missing $(DISK)"; exit 1; fi
-	@echo "[Cube] Direct kernel + ZFS with real vmnet NIC (requires sudo)"
-	$(setup-vmnet-nat)
-	sudo $(CUBE_BIN) --freebsd boot/kernel/kernel --disk "$(DISK)" --net vmnet --cpus $(CPUS)
+	$(CUBE_BIN) --freebsd boot/freebsd/kernel --disk "$(DISK)" --net $(NET) --cpus $(CPUS)
 
 clean:
 	cargo clean

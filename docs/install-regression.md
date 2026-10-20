@@ -20,7 +20,7 @@ flowchart TD
   seed --> shellBoot["bsdinstall with --net none"]
   hand --> saved["installed.img under ~/VMs/name"]
   shellBoot --> saved
-  saved --> lines["Copy the kernel, write the vmmctl config, print both start lines"]
+  saved --> lines["Copy the kernel, write the cubectl config, print both start lines"]
   py --> below["The check_install flow below"]
 ```
 
@@ -68,7 +68,7 @@ flowchart TD
   after{"--keep"}
   after -->|no| rm["Delete the directory"]
   after -->|yes| kept{"xfce or plasma"}
-  kept -->|yes| reuse["reuse-vm.json, plus the vmmctl line and the direct vmm command"]
+  kept -->|yes| reuse["reuse-vm.json, plus the cubectl line and the direct cube command"]
   kept -->|no| plain["Keep the directory, with no reuse-vm.json"]
 ```
 
@@ -178,7 +178,7 @@ VMM log.
 The runner's failure guards can be tested without a guest or sudo:
 
 ```sh
-python3 -B scripts/test_check_install.py
+python3 -B -m unittest tests.cube.test_check_install
 ```
 
 ## Recorded validation, 2026-09-21

@@ -1,6 +1,6 @@
 # Named VM configuration and management
 
-`cubectl` (also available via `scripts/vmmctl.py`) manages one Cube VMM process per named JSON configuration.
+Native `cubectl` manages one Cube VMM process per named JSON configuration.
 The native `cubectl` CLI is built in Rust, requires no Python runtime, and is bundled inside `Cube.app`.
 
 ### Where VM files are stored
@@ -155,7 +155,7 @@ the VM to enable the structured status publisher and manager.
 
 The local regression suite starts two fake VMM processes concurrently and
 checks instance identity, private runtime paths, conflicting resources, and
-shutdown/stop behavior. `scripts/check_vm_management.py` boots two real FreeBSD
+shutdown/stop behavior. `tests/cubectl/check_vm_management.py` boots two real FreeBSD
 guests concurrently from the same read-only ISO, checks their separate EFI,
 serial, UART, and VNC resources, and rejects a third conflicting listener. It
 passed on Apple Silicon on 2026-09-23 and runs in the offline/full verifier
@@ -169,7 +169,8 @@ the VMM's PSCI `SYSTEM_OFF` record. The source disk is never opened for writing.
 Use `--efi-vars` to clone a matching EFI store when booting it depends on one.
 
 ```sh
-python3 -B scripts/check_vm_shutdown.py target/debug/cube \
+python3 -B tests/cubectl/check_vm_shutdown.py target/debug/cube \
+  --cubectl target/debug/cubectl \
   --disk /path/to/install-artifacts/installed.img \
   --ssh-key /path/to/install-artifacts/id_ed25519 \
   --firmware firmware/QEMU_EFI.fd \

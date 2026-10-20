@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Boot two read-only FreeBSD VMs concurrently through vmmctl (Apple Silicon)."""
+"""Boot two read-only FreeBSD VMs concurrently through cubectl (Apple Silicon)."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import json
-from pathlib import Path
 import shutil
 import socket
 import tempfile
 import time
 
-import vmmctl
+from support.cubectl import Cubectl
 
 
 def free_port():
@@ -17,15 +21,10 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def options():
-    return argparse.Namespace(binary=None, ram=None, cpus=None, net=None, mac=None,
-                              ssh_port=None, forward=None, vnc=None, display=None,
-                              efi_vars=None, disk=None, sudo=False)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--cubectl", type=Path, required=True)
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--iso", type=Path, required=True)
     parser.add_argument("--keep", action="store_true")
@@ -36,6 +35,7 @@ def main():
             parser.error(f"missing input: {path}")
     directory = Path(tempfile.mkdtemp(prefix="vmm-management-"))
     state_root = directory / "state"
+    ctl = Cubectl(args.cubectl, state_root)
     ports = [free_port(), free_port()]
     while ports[1] == ports[0]:
         ports[1] = free_port()
@@ -53,7 +53,7 @@ def main():
                 "ram_mb": 1024, "cpus": 2, "network": {"mode": "none"},
                 "vnc": {"bind": f"127.0.0.1:{port}", "display": "800x600"},
             }))
-            result = vmmctl.start(config, state_root, state_root / name, options())
+            result = ctl.call("start", config)
             assert result["state"] == "running"
             active.append(state_root / name)
             assert "listen-port:" + str(port) in result["resources"]
@@ -69,10 +69,10 @@ def main():
             console = state / "console.log"
             while "start_init: trying /sbin/init" not in (console.read_text(errors="replace")
                                                            if console.exists() else ""):
-                assert vmmctl.live_status(state), f"VM exited before init: {state}"
+                assert ctl.running(state.name), f"VM exited before init: {state}"
                 assert time.monotonic() < deadline, f"Timed out booting {state}"
                 time.sleep(0.2)
-        assert all(vmmctl.live_status(state) for state in active)
+        assert all(ctl.running(state.name) for state in active)
         for port in ports:
             with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
                 assert client.recv(12) == b"RFB 003.008\n"
@@ -83,8 +83,8 @@ def main():
         third["vnc"]["bind"] = f"127.0.0.1:{ports[0]}"
         collision.write_text(json.dumps(third))
         try:
-            vmmctl.start(collision, state_root, state_root / "collision", options())
-        except ValueError as error:
+            ctl.call("start", collision)
+        except RuntimeError as error:
             assert "resource already used" in str(error), error
         else:
             raise AssertionError("conflicting VNC port was accepted")
@@ -92,8 +92,8 @@ def main():
         passed = True
     finally:
         for state in active:
-            if vmmctl.live_status(state):
-                vmmctl.query(state, {"action": "stop", "timeout": 10}, timeout=20)
+            if ctl.running(state.name):
+                ctl.call("stop", state.name, "--timeout", 10)
         if passed and not args.keep:
             shutil.rmtree(directory)
         else:

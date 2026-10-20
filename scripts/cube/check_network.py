@@ -16,45 +16,26 @@ Choose an unused guest address on the vmnet shared subnet, or on the LAN for
 bridge. The guest check opens no writable disk. In-process --net vmnet uses
 the VMM's host PF/NAT setup. In-process bridge does not.
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import ipaddress
 import os
-from pathlib import Path
-import re
 import re
 import shlex
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 
 sys.dont_write_bytecode = True
-from check_vm_lifecycle import VM, kernel
+from support.process import VM, kernel
 
 
-def publish(path, command):
-    deadline = time.monotonic() + 10
-    while path.exists():
-        if time.monotonic() > deadline:
-            raise AssertionError("UART command was not consumed")
-        time.sleep(0.05)
-    pending = path.with_suffix(".next")
-    pending.write_text(command + "\n")
-    pending.replace(path)
-
-
-def guest_net(sudo, requested):
-    mode = "vmnet" if sudo and requested is None else (requested or "vmnet-proxy")
-    iface = mode.removeprefix("bridge:")
-    valid = mode in ("vmnet-proxy", "vmnet", "bridge") or (
-        mode.startswith("bridge:") and iface != mode
-        and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", iface) is not None)
-    return mode, valid
-
-
-def in_process_net(mode):
-    return mode == "vmnet" or mode == "bridge" or mode.startswith("bridge:")
+from support.guest import publish, guest_net, in_process_net
 
 
 def main():

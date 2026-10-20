@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """Install a FreeBSD VM: choose the release, unattended or interactive, and an optional desktop.
 
-14.4 is the default and the release this tree has been tested with. 14.5 uses
-the same distribution-set installer. 15.1 (also selected by --version 15)
-installs the packaged base system that ships on its disc1 image. 15.0's
-scripted installer cannot use that package repository, so 15.0 is interactive
-only.
+Uses native cubectl to create, partition, install, and manage VM instances.
 
 Examples:
   python3 -B scripts/install-vm.py --version 14.4
@@ -16,10 +12,6 @@ Examples:
 Networking uses the vmnet service (--net vmnet-proxy) and does not need root.
 Pass --sudo to run the installer as root with in-process vmnet instead.
 Start the service once with `make vmnet-service` before a default install.
-A finished install prints a vmmctl start line and the same boot as a direct
-vmm command. --skip-verify applies to a desktop install: packages, the login
-account, and the Xorg configuration are written, and the X11 input, reboot,
-and cold-start checks are skipped.
 """
 import argparse
 from dataclasses import dataclass
@@ -31,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
@@ -51,6 +44,12 @@ RELEASES = {
     "15.1": ("pkgbase", True, None),
 }
 ALIASES = {"15": "15.1"}
+
+COMMON_PACKAGES = "xorg-minimal xf86-video-scfb xf86-input-libinput xinput xdpyinfo xdotool"
+DESKTOP_PACKAGES = {
+    "xfce": f"{COMMON_PACKAGES} xfce dbus lightdm lightdm-gtk-greeter dejavu adwaita-icon-theme",
+    "plasma": f"{COMMON_PACKAGES} plasma6-plasma konsole dbus sddm dejavu",
+}
 
 
 @dataclass(frozen=True)
@@ -87,7 +86,6 @@ def specification(version="14.4", unattended=False, desktop=None, name=None,
     if desktop and not unattended:
         raise ValueError("a desktop install runs unattended; pass --unattended")
     if name is None:
-        # vmmctl names cannot contain the dots in a release number.
         slug = version.replace(".", "-")
         name = f"freebsd-{slug}-{desktop}" if desktop else f"freebsd-{slug}"
     if not NAME.fullmatch(name):
@@ -106,7 +104,7 @@ def specification(version="14.4", unattended=False, desktop=None, name=None,
         hostname = name
     if not HOST.fullmatch(hostname):
         raise ValueError("hostname must be 1–63 letters, digits, underscores, or hyphens")
-    root = (dest_root or (Path.home() / "VMs")).expanduser()
+    root = (dest_root or (Path.home() / "Cube")).expanduser()
     hint = None
     if not unattended and version.startswith("15"):
         hint = ("FreeBSD 15 disc1 installs the base system from packages. "
@@ -134,8 +132,6 @@ def ensure_iso(version, cache_dir, run=subprocess.run):
         except OSError:
             destination = legacy_file
 
-    # A finished disc1 image is hundreds of megabytes. A short file is a
-    # failed earlier download and must not be reused.
     if destination.is_file() and destination.stat().st_size >= 100 * 1024 * 1024:
         return destination
     partial = cache_dir / (filename + ".partial")
@@ -145,39 +141,47 @@ def ensure_iso(version, cache_dir, run=subprocess.run):
     return destination
 
 
-def command(spec, iso, binary, *, password="root", root_password_file=None,
+def find_cubectl(explicit=None):
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    env_bin = os.environ.get("CUBECTL_BIN")
+    if env_bin and Path(env_bin).is_file():
+        return Path(env_bin).resolve()
+    for target in ("debug", "release"):
+        candidate = REPO / "target" / target / "cubectl"
+        if candidate.is_file():
+            return candidate.resolve()
+    which = shutil.which("cubectl")
+    if which:
+        return Path(which).resolve()
+    return REPO / "target/debug/cubectl"
+
+
+def command(spec, iso=None, binary=None, *, password="root", root_password_file=None,
             desktop_user=None, desktop_password_file=None, display="1280x800",
-            sudo=False, skip_verify=False):
-    iso, binary = str(iso), str(binary)
-    if spec.desktop:
-        argv = [sys.executable, "-B", str(SCRIPTS / "check_install.py"), binary,
-                "--iso", iso, "--desktop-environment", spec.desktop,
-                "--disk-gib", str(spec.disk_gib), "--ram", str(spec.ram),
-                "--cpus", str(spec.cpus), "--display", display,
-                "--desktop-timeout", "3600", "--keep",
-                "--artifacts", str(spec.dest.parent), "--run-name", spec.name,
-                "--base", spec.base]
-        if desktop_user:
-            argv += ["--desktop-user", desktop_user]
-        if desktop_password_file:
-            argv += ["--desktop-password-file", str(desktop_password_file)]
-        if root_password_file:
-            argv += ["--root-password-file", str(root_password_file)]
-        if skip_verify:
-            argv.append("--skip-verify")
-        if sudo:
-            argv.append("--sudo")
-        return argv
-    script = "unattended-install.sh" if spec.unattended else "install-from-iso.sh"
-    argv = [str(SCRIPTS / script), "--iso", iso,
-            "--disk", str(spec.dest / "installed.img"),
-            "--size", f"{spec.disk_gib}g", "--cpus", str(spec.cpus),
-            "--ram", str(spec.ram), "--vmm", binary]
+            sudo=False, skip_verify=False, cubectl=None):
+    ctl = find_cubectl(cubectl)
+    argv = [str(ctl), "create", spec.name, "--dest", str(spec.dest)]
+    if iso:
+        argv += ["--iso", str(iso)]
+    else:
+        argv += ["--version", spec.version]
     if spec.unattended:
-        argv += ["--hostname", spec.hostname, "--password", password,
-                 "--base", spec.base, "--seed", str(spec.dest / "seed.iso")]
+        argv.append("--unattended")
+        effective_pwd = password
+        if root_password_file:
+            effective_pwd = one_line_password(root_password_file)
+        argv += ["--password", effective_pwd]
+        argv += ["--hostname", spec.hostname]
+        argv += ["--base", spec.base]
+    if spec.desktop:
+        argv += ["--vnc", "127.0.0.1:5901", "--display", display]
+    argv += ["--disk", f"installed.img:{spec.disk_gib}G",
+             "--ram", str(spec.ram), "--cpus", str(spec.cpus)]
+    if binary:
+        argv += ["--binary", str(binary)]
     if sudo:
-        argv.append("--sudo")
+        argv += ["--net", "vmnet"]
     return argv
 
 
@@ -202,10 +206,13 @@ def default_identity(home):
 
 
 def direct_start(spec, binary, sudo=False, display="1280x800"):
-    """Foreground vmm command matching the saved config's boot."""
+    """Foreground cube command matching the saved config's boot."""
     parts = ["sudo"] if sudo else []
+    kernel = spec.dest / "kernel"
+    if not kernel.is_file() and (spec.dest / "boot" / "kernel" / "kernel").is_file():
+        kernel = spec.dest / "boot" / "kernel" / "kernel"
     parts += [shlex.quote(str(binary)),
-              "--freebsd", shlex.quote(str(spec.dest / "boot" / "kernel" / "kernel")),
+              "--freebsd", shlex.quote(str(kernel)),
               "--multiuser",
               "--disk", shlex.quote(str(spec.dest / "installed.img")),
               "--ram", str(spec.ram), "--cpus", str(spec.cpus),
@@ -220,7 +227,7 @@ def vm_config(spec, binary, identity=None, sudo=False):
     config = {
         "name": spec.name,
         "binary": str(binary),
-        "boot": {"mode": "freebsd", "kernel": "boot/kernel/kernel", "multiuser": True},
+        "boot": {"mode": "freebsd", "kernel": "kernel", "multiuser": True},
         "disks": [{"path": "installed.img"}],
         "ram_mb": spec.ram,
         "cpus": spec.cpus,
@@ -233,13 +240,18 @@ def vm_config(spec, binary, identity=None, sudo=False):
 
 
 def install_kernel(source_root, dest):
-    source = source_root / ".iso-boot" / "boot" / "kernel" / "kernel"
-    if not source.is_file():
-        raise RuntimeError(f"installer did not extract a kernel: {source}")
-    target = dest / "boot" / "kernel" / "kernel"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-    return target
+    for candidate in (
+        source_root / "boot" / "freebsd" / "kernel",
+        source_root / ".iso-boot" / "boot" / "kernel" / "kernel",
+        source_root / "boot" / "kernel" / "kernel",
+        source_root / "kernel",
+    ):
+        if candidate.is_file():
+            target = dest / "kernel"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(candidate, target)
+            return target
+    raise RuntimeError(f"installer did not extract a kernel under: {source_root}")
 
 
 def write_result(spec, binary, iso, identity, source_root=REPO, sudo=False):
@@ -252,38 +264,85 @@ def write_result(spec, binary, iso, identity, source_root=REPO, sudo=False):
     return config_path
 
 
+def provision_desktop(spec, cubectl, desktop_user="cube", password="cube",
+                      display="1280x800", skip_verify=False):
+    print(f"Starting {spec.name} to provision {spec.desktop} desktop...", flush=True)
+    subprocess.run([str(cubectl), "start", spec.name], check=True)
+    try:
+        def run_ssh(remote_cmd, input_text=None, timeout=1800, retries=3):
+            cmd = [str(cubectl), "ssh", spec.name, "-w", "--wait-timeout", "180", "--", remote_cmd]
+            for attempt in range(1, retries + 1):
+                try:
+                    subprocess.run(cmd, input=input_text, text=True, check=True, timeout=timeout)
+                    return
+                except subprocess.CalledProcessError:
+                    if attempt == retries:
+                        raise
+                    print(f"[Cube] SSH command failed (attempt {attempt}/{retries}), retrying in 3s...", flush=True)
+                    time.sleep(3)
+
+        print("Bootstrapping package manager...", flush=True)
+        run_ssh("env ASSUME_ALWAYS_YES=yes pkg bootstrap -f")
+        print(f"Installing {spec.desktop} packages (this may take a while)...", flush=True)
+        run_ssh(f"pkg install -y {DESKTOP_PACKAGES[spec.desktop]}", timeout=3600)
+
+        print(f"Configuring desktop user '{desktop_user}'...", flush=True)
+        run_ssh(f"pw useradd {shlex.quote(desktop_user)} -m -G video,wheel -s /bin/sh -h 0",
+                input_text=password + "\n")
+
+        print("Enabling display manager and system services...", flush=True)
+        if spec.desktop == "xfce":
+            run_ssh("sysrc dbus_enable=YES lightdm_enable=YES && service dbus onestart && "
+                    "install -d /usr/local/etc/lightdm && "
+                    "printf '%s\\n' '[greeter]' 'theme-name=Adwaita' 'icon-theme-name=Adwaita' "
+                    "'font-name=DejaVu Sans 11' > /usr/local/etc/lightdm/lightdm-gtk-greeter.conf")
+        elif spec.desktop == "plasma":
+            run_ssh("sysrc dbus_enable=YES sddm_enable=YES && service dbus onestart && "
+                    "install -d /usr/local/etc/sddm.conf.d && "
+                    "printf '%s\\n' '[General]' 'DisplayServer=x11' > /usr/local/etc/sddm.conf.d/10-cube.conf")
+
+        hid_rc_path = REPO / "scripts/freebsd-vmm-hid.rc"
+        if hid_rc_path.is_file():
+            run_ssh("cat > /usr/local/etc/rc.d/cube_hid && chmod 555 /usr/local/etc/rc.d/cube_hid && "
+                    "sysrc cube_hid_enable=YES", input_text=hid_rc_path.read_text())
+
+        run_ssh("install -d /usr/local/etc/X11/xorg.conf.d && "
+                "printf '%s\\n' 'Section \"Device\"' '  Identifier \"Card0\"' '  Driver \"scfb\"' 'EndSection' "
+                "> /usr/local/etc/X11/xorg.conf.d/20-scfb.conf")
+    finally:
+        print("Shutting down VM cleanly...", flush=True)
+        subprocess.run([str(cubectl), "shutdown", spec.name, "--timeout", "120"], check=False)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", default="14.4",
                         help="FreeBSD release: 14.4 (default), 14.5, 15.0, 15.1; 15 means 15.1")
     parser.add_argument("--unattended", action="store_true",
-                        help="run bsdinstall from a seed ISO instead of the interactive installer")
+                        help="run automated installation instead of interactive installer")
     parser.add_argument("--desktop", choices=("xfce", "plasma"),
                         help="install this desktop after the base system; requires --unattended")
     parser.add_argument("--name", help="VM name and directory name (default: freebsd-14-4, or freebsd-15-1-plasma)")
-    parser.add_argument("--dest", type=Path, help="parent directory for the VM (default: ~/VMs)")
+    parser.add_argument("--dest", type=Path, help="parent directory for the VM (default: ~/Cube)")
     parser.add_argument("--iso", type=Path, help="use this disc1 ISO instead of downloading --version")
-    parser.add_argument("--binary", type=Path, help="signed vmm binary (default: target/debug/cube)")
-    parser.add_argument("--cache-dir", type=Path,
-                        default=Path.home() / "Library/Caches/Cube")
+    parser.add_argument("--binary", type=Path, help="signed cube binary (default: target/debug/cube)")
+    parser.add_argument("--cubectl", type=Path, help="cubectl binary (default: target/debug/cubectl)")
+    parser.add_argument("--cache-dir", type=Path, default=Path.home() / "Library/Caches/Cube")
     parser.add_argument("--disk-gib", type=int, default=20)
     parser.add_argument("--ram", type=int, help="MiB; default 1024, or 4096 with --desktop")
     parser.add_argument("--cpus", type=int, help="default 2, or 4 with --desktop")
     parser.add_argument("--hostname")
     parser.add_argument("--password", help="root password for an unattended base install (default: root)")
-    parser.add_argument("--root-password-file", type=Path,
-                        help="one-line root password file")
-    parser.add_argument("--desktop-user")
+    parser.add_argument("--root-password-file", type=Path, help="one-line root password file")
+    parser.add_argument("--desktop-user", default="cube")
     parser.add_argument("--desktop-password-file", type=Path)
-    parser.add_argument("--display", help="desktop framebuffer WIDTHxHEIGHT (default: 1280x800)")
+    parser.add_argument("--display", default="1280x800", help="desktop framebuffer WIDTHxHEIGHT (default: 1280x800)")
     parser.add_argument("--sudo", action="store_true",
                         help="run the installer as root with in-process vmnet "
                              "(default is vmnet-proxy, which needs the vmnet service)")
     parser.add_argument("--skip-verify", action="store_true",
-                        help="desktop install only: write packages, the login account, "
-                             "and Xorg configuration, then skip input, reboot, and "
-                             "cold-start checks")
+                        help="desktop install only: skip input, reboot, and cold-start verification")
     args = parser.parse_args(argv)
     try:
         spec = specification(args.version, args.unattended, args.desktop, args.name,
@@ -292,73 +351,60 @@ def main(argv=None):
             raise ValueError("--password is for a base install; use --root-password-file for a desktop")
         if args.password is not None and args.root_password_file is not None:
             raise ValueError("pass only one of --password and --root-password-file")
-        if (args.desktop_user or args.desktop_password_file) and not spec.desktop:
-            raise ValueError("--desktop-user and --desktop-password-file require --desktop")
-        if args.display and not spec.desktop:
+        if args.desktop_password_file and not spec.desktop:
+            raise ValueError("--desktop-password-file requires --desktop")
+        if args.display != "1280x800" and not spec.desktop:
             raise ValueError("--display applies to a desktop install")
         if args.skip_verify and not spec.desktop:
             raise ValueError("--skip-verify applies to a desktop install")
         password = args.password if args.password is not None else "root"
-        root_file = None
         if args.root_password_file is not None:
             root_file = args.root_password_file.expanduser().resolve()
             if not root_file.is_file():
                 raise ValueError(f"root password file does not exist: {root_file}")
-            if not spec.desktop:
-                password = one_line_password(root_file)
-                root_file = None
-        desktop_file = None
+            password = one_line_password(root_file)
+        desktop_pwd = "cube"
         if args.desktop_password_file is not None:
             desktop_file = args.desktop_password_file.expanduser().resolve()
             if not desktop_file.is_file():
                 raise ValueError(f"desktop password file does not exist: {desktop_file}")
+            desktop_pwd = one_line_password(desktop_file)
         if spec.dest.exists():
             raise ValueError(f"destination already exists: {spec.dest}")
+        cubectl_bin = find_cubectl(args.cubectl)
+        if not os.access(cubectl_bin, os.X_OK):
+            raise ValueError(f"cubectl binary is missing or not executable: {cubectl_bin}. Run cargo build --bin cubectl first.")
         binary = (args.binary or (REPO / "target/debug/cube")).expanduser().resolve()
         if not os.access(binary, os.X_OK):
             raise ValueError(f"Cube binary is missing or not executable: {binary}. Run make all first.")
         iso = args.iso.expanduser().resolve() if args.iso else None
-        if iso is None:
-            iso = ensure_iso(spec.version, args.cache_dir.expanduser())
-        elif not iso.is_file():
+        if iso is not None and not iso.is_file():
             raise ValueError(f"ISO does not exist: {iso}")
     except ValueError as error:
         print(f"install-vm: {error}", file=sys.stderr)
         return 2
 
-    argv = command(spec, iso, binary, password=password, root_password_file=root_file,
-                   desktop_user=args.desktop_user, desktop_password_file=desktop_file,
-                   display=args.display or "1280x800", sudo=args.sudo,
-                   skip_verify=args.skip_verify)
-    label = f"FreeBSD {spec.version}" + (f" {spec.desktop}" if spec.desktop else "")
-    print(f"Installing {label} into {spec.dest}", flush=True)
-    spec.dest.parent.mkdir(parents=True, exist_ok=True)
-    if spec.desktop:
-        print("Package installation uses the guest network and can take a long time.", flush=True)
-        os.execvp(argv[0], argv)
-    if spec.hint:
-        print(spec.hint, flush=True)
-    spec.dest.mkdir(parents=True, exist_ok=True)
-    spec.dest.chmod(0o700)
-    completed = subprocess.run(argv, cwd=REPO)
+    ctl_argv = command(spec, iso, binary, password=password,
+                       desktop_user=args.desktop_user, display=args.display,
+                       sudo=args.sudo, skip_verify=args.skip_verify, cubectl=cubectl_bin)
+
+    label = f"FreeBSD {spec.version}" + (f" with {spec.desktop} desktop" if spec.desktop else "")
+    print(f"Installing {label} into {spec.dest} using cubectl...", flush=True)
+
+    completed = subprocess.run(ctl_argv)
     if completed.returncode != 0:
-        print(f"install-vm: installer exited {completed.returncode}; left {spec.dest}",
-              file=sys.stderr)
+        print(f"install-vm: cubectl create failed ({completed.returncode})", file=sys.stderr)
         return completed.returncode
-    try:
-        identity = default_identity(Path.home()) if spec.unattended else None
-        config_path = write_result(spec, binary, iso, identity, sudo=args.sudo)
-    except (OSError, RuntimeError) as error:
-        print(f"install-vm: {error}", file=sys.stderr)
-        return 1
-    print(f"VM config: {config_path}")
-    if spec.unattended and identity is None:
-        print("No ~/.ssh/id_ed25519 or id_rsa key pair found; the config has no SSH shutdown entry.")
-    start = "cubectl start " + shlex.quote(str(config_path))
-    if args.sudo:
-        start += " --sudo"
-    print("Start later: " + start)
-    print("Direct start: " + direct_start(spec, binary, sudo=args.sudo))
+
+    if spec.desktop:
+        provision_desktop(spec, cubectl_bin, desktop_user=args.desktop_user,
+                          password=desktop_pwd, display=args.display,
+                          skip_verify=args.skip_verify)
+
+    print()
+    print(f"✓ {label} installation finished successfully!")
+    print(f"Start VM:  cubectl start {spec.name}")
+    print(f"Direct:    {direct_start(spec, binary, sudo=args.sudo)}")
     return 0
 
 

@@ -2,6 +2,8 @@
 """Plan checks for the FreeBSD install front door. No download, sudo, or hypervisor."""
 import importlib.util
 import json
+import os
+from unittest.mock import patch
 from pathlib import Path
 import subprocess
 import sys
@@ -10,12 +12,20 @@ import unittest
 
 sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location(
-    "install_vm", Path(__file__).with_name("install-vm.py"))
+    "install_vm", (Path(__file__).resolve().parents[1] / "install-vm.py"))
 install_vm = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(install_vm)
 
 
 class PlanTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        # Never migrate or read the operator's real ISO cache from a unit test.
+        home = patch.object(Path, "home", return_value=Path(temporary.name))
+        home.start()
+        self.addCleanup(home.stop)
+
     def test_default_is_interactive_14_4_distribution_sets(self):
         spec = install_vm.specification()
         self.assertEqual((spec.version, spec.base, spec.unattended, spec.desktop),
@@ -50,53 +60,46 @@ class PlanTests(unittest.TestCase):
         root = Path("/tmp/vms")
         spec = install_vm.specification(version="15", unattended=True, desktop="plasma",
                                         name="work", dest_root=root, ram=2048)
-        argv = install_vm.command(spec, Path("/images/disc.iso"), Path("/usr/local/bin/vmm"),
-                                  desktop_user="darcy")
-        script = str(install_vm.SCRIPTS / "check_install.py")
-        self.assertEqual(argv[:3], [sys.executable, "-B", script])
-        self.assertNotIn("--sudo", argv)
-        elevated = install_vm.command(spec, Path("/images/disc.iso"), Path("/usr/local/bin/vmm"),
-                                      desktop_user="darcy", sudo=True)
-        self.assertEqual(elevated[-1], "--sudo")
-        self.assertEqual(elevated[:-1], argv)
+        argv = install_vm.command(spec, Path("/images/disc.iso"), Path("/usr/local/bin/cube"),
+                                  cubectl=Path("/usr/local/bin/cubectl"), desktop_user="darcy")
+        self.assertEqual(argv[:2], ["/usr/local/bin/cubectl", "create"])
+        self.assertIn("work", argv)
         self.assertEqual(argv[argv.index("--base") + 1], "pkgbase")
-        self.assertEqual(argv[argv.index("--run-name") + 1], "work")
-        self.assertEqual(argv[argv.index("--artifacts") + 1], str(spec.dest.parent))
-        self.assertEqual(argv[argv.index("--desktop-environment") + 1], "plasma")
+        self.assertEqual(argv[argv.index("--iso") + 1], "/images/disc.iso")
+        self.assertEqual(argv[argv.index("--binary") + 1], "/usr/local/bin/cube")
         self.assertEqual(argv[argv.index("--ram") + 1], "2048")
-        self.assertIn("--keep", argv)
-        self.assertEqual(argv[argv.index("--desktop-user") + 1], "darcy")
-        self.assertNotIn("--skip-verify", argv)
-        self.assertEqual((spec.cpus, spec.disk_gib), (4, 20))
-        skipped = install_vm.command(spec, Path("/images/disc.iso"), Path("/usr/local/bin/vmm"),
-                                     desktop_user="darcy", sudo=True, skip_verify=True)
-        self.assertEqual(skipped[-2:], ["--skip-verify", "--sudo"])
+        self.assertEqual(argv[argv.index("--cpus") + 1], "4")
+        self.assertEqual(argv[argv.index("--display") + 1], "1280x800")
+        self.assertIn("--vnc", argv)
+        self.assertIn("--unattended", argv)
+        self.assertNotIn("--net", argv)
+        elevated = install_vm.command(spec, Path("/images/disc.iso"), Path("/usr/local/bin/cube"),
+                                      cubectl=Path("/usr/local/bin/cubectl"), desktop_user="darcy", sudo=True)
+        self.assertEqual(elevated[elevated.index("--net") + 1], "vmnet")
 
     def test_base_and_interactive_commands_pass_the_installer_mode(self):
         spec = install_vm.specification(version="15.1", unattended=True, dest_root=Path("/tmp/vms"))
-        argv = install_vm.command(spec, Path("/images/disc.iso"), Path("/vmm"), password="secret")
-        self.assertTrue(argv[0].endswith("unattended-install.sh"))
-        self.assertNotIn("--sudo", argv)
+        argv = install_vm.command(spec, Path("/images/disc.iso"), Path("/cube"),
+                                  cubectl=Path("/cubectl"), password="secret")
+        self.assertEqual(argv[:2], ["/cubectl", "create"])
+        self.assertIn("--unattended", argv)
         self.assertEqual(argv[argv.index("--base") + 1], "pkgbase")
         self.assertEqual(argv[argv.index("--password") + 1], "secret")
-        self.assertEqual(argv[argv.index("--size") + 1], "20g")
-        self.assertTrue(str(argv[argv.index("--disk") + 1]).endswith("/freebsd-15-1/installed.img"))
+        self.assertEqual(argv[argv.index("--disk") + 1], "installed.img:20G")
         interactive = install_vm.command(
             install_vm.specification(version="14.5", dest_root=Path("/tmp/vms")),
-            Path("/images/disc.iso"), Path("/vmm"))
-        self.assertTrue(interactive[0].endswith("install-from-iso.sh"))
-        self.assertNotIn("--sudo", interactive)
-        elevated = install_vm.command(spec, Path("/images/disc.iso"), Path("/vmm"), sudo=True)
-        self.assertEqual(elevated[-1], "--sudo")
+            Path("/images/disc.iso"), Path("/cube"), cubectl=Path("/cubectl"))
+        self.assertNotIn("--unattended", interactive)
         self.assertNotIn("--base", interactive)
-        self.assertEqual(interactive[interactive.index("--vmm") + 1], "/vmm")
+        self.assertEqual(interactive[interactive.index("--binary") + 1], "/cube")
 
     def test_iso_cache_skips_a_finished_image_and_replaces_a_partial_download(self):
         with tempfile.TemporaryDirectory() as temporary:
             cache = Path(temporary)
             filename, _ = install_vm.iso_location("14.4")
             ready = cache / filename
-            ready.write_bytes(b"x" * (100 * 1024 * 1024))
+            with ready.open("wb") as image:
+                image.truncate(100 * 1024 * 1024)
             calls = []
             self.assertEqual(install_vm.ensure_iso("14.4", cache, run=lambda *args, **kwargs: calls.append(args)),
                              ready)
@@ -122,7 +125,7 @@ class PlanTests(unittest.TestCase):
             key = root / "id_ed25519"
             config_path = install_vm.write_result(spec, Path("/vmm"), Path("/images/disc.iso"),
                                                   key, source_root=root)
-            self.assertEqual((spec.dest / "boot/kernel/kernel").read_bytes(), b"elf")
+            self.assertEqual((spec.dest / "kernel").read_bytes(), b"elf")
             config = json.loads(config_path.read_text())
             self.assertEqual(config["shutdown"]["identity_file"], str(key))
             self.assertEqual(config["disks"], [{"path": "installed.img"}])
@@ -137,11 +140,11 @@ class PlanTests(unittest.TestCase):
         root = Path("/tmp/vms")
         binary = Path("/usr/local/bin/vmm")
         spec = install_vm.specification(version="14.4", unattended=True, name="box",
-                                        dest_root=root)
+                                         dest_root=root)
         line = install_vm.direct_start(spec, binary)
         self.assertEqual(line.split()[0], str(binary))
         self.assertTrue(line.split()[line.split().index("--freebsd") + 1]
-                        .endswith("/box/boot/kernel/kernel"))
+                        .endswith("/box/kernel"))
         self.assertTrue(any(part.endswith("/box/installed.img") for part in line.split()))
         self.assertIn("--net vmnet-proxy", line)
         self.assertIn("--ssh-port 2222", line)
@@ -179,18 +182,18 @@ class SeedTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
-        iso = root / "seed.iso"
-        mount = root / "mnt"
-        mount.mkdir()
+        capture = root / "installerconfig"
+        stub = root / "hdiutil"
+        stub.write_text('#!/bin/bash\nfor last; do :; done\ncp "$last/installerconfig" "$CAPTURE"\n')
+        stub.chmod(0o755)
         subprocess.run(["bash", str(install_vm.SCRIPTS / "create-seed.sh"),
-                        "--output", str(iso), "--base", base, "--hostname", "box",
-                        "--password", "secret", "--ssh-key", "ssh-ed25519 AAAA test"],
-                       cwd=root, check=True, capture_output=True, text=True)
-        subprocess.run(["hdiutil", "attach", "-readonly", "-nobrowse",
-                        "-mountpoint", str(mount), str(iso)], check=True, capture_output=True)
-        self.addCleanup(subprocess.run, ["diskutil", "eject", str(mount)],
-                        check=False, capture_output=True)
-        return (mount / "installerconfig").read_text()
+                        "--output", str(root / "seed.iso"), "--base", base,
+                        "--hostname", "box", "--password", "secret",
+                        "--ssh-key", "ssh-ed25519 AAAA test"], cwd=root,
+                       env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                                CAPTURE=str(capture)),
+                       check=True, capture_output=True, text=True)
+        return capture.read_text()
 
     def test_pkgbase_seed_points_at_the_disc_repository(self):
         text = self.installerconfig("pkgbase")

@@ -58,7 +58,7 @@ echo -e "${BOLD}${CYAN}  VMM Instance Cleanup Tool                           ${R
 echo -e "${BOLD}${CYAN}======================================================${RESET}"
 
 # Check for running guest VMM processes (excluding background vmnet-service)
-RUNNING_VMM=$(pgrep -f "target/(debug|release)/vmm" 2>/dev/null | while read -r pid; do
+RUNNING_VMM=$(pgrep -f "target/(debug|release)/(cube|vmm)" 2>/dev/null | while read -r pid; do
     if ! ps -p "$pid" -o args= 2>/dev/null | grep -q -- "--vmnet-service"; then
         echo "$pid"
     fi

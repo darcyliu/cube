@@ -10,7 +10,7 @@ class FreeBSDHidStartup(unittest.TestCase):
     def test_reprobes_only_the_descriptor_matched_tablet(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            source = Path(__file__).with_name("freebsd-vmm-hid.rc").read_text()
+            source = (Path(__file__).resolve().parents[1] / "freebsd-vmm-hid.rc").read_text()
             source = source.replace(
                 ". /etc/rc.subr",
                 'load_rc_config() { :; }; run_rc_command() { "$start_cmd"; }')

@@ -2,6 +2,7 @@
 """Runner selection, failure reporting, and cancellation without starting a VM."""
 import contextlib
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,12 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
-import verify
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "scripts"))
+try:
+    import verify
+except ImportError:
+    from scripts import verify
 
 
 class VerifyTests(unittest.TestCase):
@@ -30,6 +36,74 @@ class VerifyTests(unittest.TestCase):
         if suite == "full":
             argv += ["--guest-cidr", "192.168.2.77/24", "--host-ip", "192.168.2.1"]
         return verify.parse_args([*argv, *extra])
+
+    def test_component_plans_select_only_their_public_executable(self):
+        for component in ("cube", "cubectl"):
+            with self.subTest(component=component):
+                args = self.options("offline", "--component", component)
+                steps = verify.make_plan(args, self.directory)
+                self.assertTrue(all(step.component in ("shared", component) for step in steps))
+                rust = next(step.command for step in steps if step.name == "rust-debug")
+                if component == "cube":
+                    self.assertNotIn("cubectl", rust)
+                    self.assertNotIn("build-cubectl", [step.name for step in steps])
+                else:
+                    self.assertIn("cubectl_cli", rust)
+                    self.assertNotIn("--lib", rust)
+                    managed = next(step for step in steps if step.name == "vm-management")
+                    self.assertIn("--cubectl", managed.command)
+                    self.assertIn("build-cubectl", managed.needs)
+                    self.assertTrue({"cubectl-install-ufs", "cubectl-install-zfs"}
+                                    <= {step.name for step in steps})
+
+    def test_cubectl_quick_builds_manager_before_python_and_needs_no_guest(self):
+        steps = verify.make_plan(self.options("quick", "--component", "cubectl"), self.directory)
+        names = [step.name for step in steps]
+        self.assertLess(names.index("build-cubectl"), names.index("python-tests"))
+        self.assertNotIn("signed-binary", names)
+        self.assertFalse(any(step.component == "cube" for step in steps))
+
+    def test_existing_cubectl_binary_is_used_without_rebuilding_it(self):
+        args = self.options("offline", "--component", "cubectl", "--cubectl", sys.executable)
+        steps = verify.make_plan(args, self.directory)
+        self.assertNotIn("build-cubectl", [step.name for step in steps])
+        managed = next(step for step in steps if step.name == "vm-management")
+        index = managed.command.index("--cubectl")
+        self.assertEqual(managed.command[index + 1], str(Path(sys.executable).resolve()))
+
+    def test_native_full_suite_does_not_require_alternate_network_addresses(self):
+        args = verify.parse_args(["--component", "cubectl", "--suite", "full",
+                                  "--iso", "test.iso", "--firmware", "test.fd"])
+        steps = verify.make_plan(args, self.directory)
+        self.assertNotIn("network-guest-ssh", [step.name for step in steps])
+        for step in steps:
+            if step.name.startswith("cubectl-install-"):
+                self.assertIn("vmnet-proxy", step.command)
+
+    def test_full_suite_auto_detects_vmnet_when_addresses_omitted(self):
+        with patch.object(verify, "detect_vmnet_subnet",
+                          return_value=(ipaddress.IPv4Interface("192.168.18.77/24"), ipaddress.IPv4Address("192.168.18.1"))):
+            args = verify.parse_args(["--component", "cube", "--suite", "full", "--sudo",
+                                      "--iso", "test.iso", "--firmware", "test.fd"])
+            self.assertEqual(str(args.guest_cidr), "192.168.18.77/24")
+            self.assertEqual(str(args.host_ip), "192.168.18.1")
+
+    def test_full_suite_auto_detects_bridge_when_addresses_omitted(self):
+        with patch.object(verify, "detect_lan_network",
+                          return_value=("en0", "Wi-Fi", ipaddress.IPv4Interface("192.168.50.254/24"),
+                                       ipaddress.IPv4Address("192.168.50.37"), None)):
+            args = verify.parse_args(["--component", "cube", "--suite", "full", "--bridge",
+                                      "--iso", "test.iso", "--firmware", "test.fd"])
+            self.assertEqual(args.bridge, "en0")
+            self.assertEqual(str(args.guest_cidr), "192.168.50.254/24")
+            self.assertEqual(str(args.host_ip), "192.168.50.37")
+
+    def test_full_suite_rejects_only_one_address_specified(self):
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                verify.parse_args(["--component", "cube", "--suite", "full", "--sudo",
+                                  "--iso", "test.iso", "--firmware", "test.fd",
+                                  "--guest-cidr", "192.168.2.77/24"])
 
     def test_normal_user_does_not_drop_privileges(self):
         with patch.object(verify.os, "geteuid", return_value=501), \

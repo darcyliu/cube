@@ -143,11 +143,12 @@ if [[ ! -f "$ISO_PATH" ]]; then
 fi
 
 # Step 3: Extract ARM64 Kernel safely via bsdtar (zero-mount)
-EXTRACT_DIR=".iso-boot"
-mkdir -p "$EXTRACT_DIR"
+mkdir -p boot/freebsd
 echo -e "${GREEN}[Cube] Extracting kernel from ISO via bsdtar...${RESET}"
-tar -xf "$ISO_PATH" -C "$EXTRACT_DIR" boot/kernel/kernel 2>/dev/null
-EXTRACTED_KERNEL="${EXTRACT_DIR}/boot/kernel/kernel"
+tar -xf "$ISO_PATH" boot/kernel/kernel 2>/dev/null
+mv boot/kernel/kernel boot/freebsd/
+rmdir boot/kernel 2>/dev/null || true
+EXTRACTED_KERNEL="boot/freebsd/kernel"
 
 # Step 4: Create Destination Sparse Disk
 if [[ ! -f "$TARGET_DISK" ]]; then

@@ -124,7 +124,8 @@ INITRD_PRESEED="initrd-trixie-preseed.gz"
 INITRD_NET_PRESEED="initrd-trixie-netpreseed.gz"
 PRESEED_CFG="$SCRIPT_DIR/debian-preseed.cfg"
 NET_PRESEED_CFG="$SCRIPT_DIR/debian-net-preseed.cfg"
-CUBECTL_BIN="$(dirname "$VMM_BIN")/cubectl"
+VMM_BIN="${VMM_BIN:-target/debug/cube}"
+CUBECTL_BIN="${CUBECTL_BIN:-$(dirname "$VMM_BIN")/cubectl}"
 
 build_preseed_initrd() {
     local in_initrd="$1"

@@ -228,6 +228,8 @@ fn run_cli(args: Vec<String>) {
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     i += 1;
                     kernel_path = Some(args[i].clone());
+                } else if std::path::Path::new("boot/freebsd/kernel").exists() {
+                    kernel_path = Some("boot/freebsd/kernel".to_string());
                 } else if std::path::Path::new("boot/kernel/kernel").exists() {
                     kernel_path = Some("boot/kernel/kernel".to_string());
                 }
@@ -484,7 +486,7 @@ fn run_cli(args: Vec<String>) {
                     "  --share-rw TAG PATH      Export a host directory read-write (repeatable)"
                 );
                 println!(
-                    "  -f, --freebsd [PATH]     Boot FreeBSD kernel ELF (defaults to boot/kernel/kernel)"
+                    "  -f, --freebsd [PATH]     Boot FreeBSD kernel ELF (defaults to boot/freebsd/kernel)"
                 );
                 println!(
                     "  -l, --linux <PATH>       Boot Linux ARM64 kernel Image/vmlinuz"
@@ -633,8 +635,12 @@ fn run_cli(args: Vec<String>) {
         firmware_path = Some(DEFAULT_UEFI_FW.to_string());
     }
 
-    if is_freebsd && kernel_path.is_none() && std::path::Path::new("boot/kernel/kernel").exists() {
-        kernel_path = Some("boot/kernel/kernel".to_string());
+    if is_freebsd && kernel_path.is_none() {
+        if std::path::Path::new("boot/freebsd/kernel").exists() {
+            kernel_path = Some("boot/freebsd/kernel".to_string());
+        } else if std::path::Path::new("boot/kernel/kernel").exists() {
+            kernel_path = Some("boot/kernel/kernel".to_string());
+        }
     }
 
     // Default root: GPT UFS or zfs:zroot/ROOT/default. Never guess ufs p2 on a ZFS disk
@@ -678,15 +684,21 @@ fn run_cli(args: Vec<String>) {
             .iter()
             .any(|p| std::path::Path::new(p).file_stem().and_then(|s| s.to_str()) == Some("zfs"))
     {
-        let default_zfs = "boot/kernel/zfs.ko";
-        if std::path::Path::new(default_zfs).exists() {
-            module_paths.push(default_zfs.to_string());
+        let zfs_path = if std::path::Path::new("boot/freebsd/zfs.ko").exists() {
+            Some("boot/freebsd/zfs.ko")
+        } else if std::path::Path::new("boot/kernel/zfs.ko").exists() {
+            Some("boot/kernel/zfs.ko")
+        } else {
+            None
+        };
+        if let Some(path) = zfs_path {
+            module_paths.push(path.to_string());
         } else {
             eprintln!(
-                "\x1b[1;31m[Cube Error] Root-on-ZFS requires preloaded zfs.ko, but '{default_zfs}' was not found.\x1b[0m"
+                "\x1b[1;31m[Cube Error] Root-on-ZFS requires preloaded zfs.ko, but 'boot/freebsd/zfs.ko' was not found.\x1b[0m"
             );
             eprintln!(
-                "\x1b[1;33m[Cube Hint] Run 'make fetch-freebsd' to extract boot/kernel/kernel and boot/kernel/zfs.ko from kernel.txz.\x1b[0m"
+                "\x1b[1;33m[Cube Hint] Run 'make fetch-freebsd' to extract boot/freebsd/kernel and boot/freebsd/zfs.ko from kernel.txz.\x1b[0m"
             );
             eprintln!(
                 "\x1b[1;33m[Cube Hint] Or pass --module /path/to/zfs.ko (and --root zfs:pool/ROOT/default if the dataset is not zroot/ROOT/default).\x1b[0m"

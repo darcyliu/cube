@@ -125,9 +125,9 @@ Regression checks:
 
 ```sh
 cargo test
-python3 scripts/check_network.py target/debug/cube
+python3 tests/cube/check_network.py target/debug/cube
 # Choose an unused address on your actual vmnet subnet for the guest check:
-python3 scripts/check_network.py target/debug/cube \
+python3 tests/cube/check_network.py target/debug/cube \
   --kernel .iso-boot/boot/kernel/kernel \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
   --guest-cidr 192.168.18.77/24 --host-ip 192.168.18.1

@@ -4,10 +4,14 @@
 The guest must be disposable, have Xorg/scfb, twm, xterm and xinput installed,
 and expose root SSH on localhost. See docs/freebsd-desktop.md.
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import json
 import math
-from pathlib import Path
 import re
 import socket
 import struct
@@ -15,36 +19,7 @@ import subprocess
 import time
 
 
-def read(sock, size):
-    result = b""
-    while len(result) < size:
-        data = sock.recv(size - len(result))
-        if not data:
-            raise EOFError("VNC disconnected")
-        result += data
-    return result
-
-
-def connect(host, port):
-    sock = socket.create_connection((host, port), timeout=10)
-    assert read(sock, 12) == b"RFB 003.008\n"
-    sock.sendall(b"RFB 003.008\n")
-    assert read(sock, 2) == b"\x01\x01"
-    sock.sendall(b"\x01")
-    assert read(sock, 4) == bytes(4)
-    sock.sendall(b"\x01")
-    init = read(sock, 24)
-    width, height = struct.unpack_from("!HH", init)
-    read(sock, struct.unpack_from("!I", init, 20)[0])
-    return sock, (width, height)
-
-
-def key(sock, symbol, down):
-    sock.sendall(struct.pack("!BBHI", 4, down, 0, symbol))
-
-
-def pointer(sock, mask, x, y):
-    sock.sendall(struct.pack("!BBHH", 5, mask, x, y))
+from support.vnc import read, connect, key, pointer
 
 
 def update(sock, width, height, incremental):

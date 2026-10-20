@@ -4,21 +4,24 @@
 Usage: python3 scripts/check_unattended_console.py /path/to/signed/vmm KERNEL ISO
 No destination disk is attached and bsdinstall is never invoked.
 """
-import os
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import os
 import pty
 import subprocess
-import sys
 import tempfile
 import tty
 
 sys.dont_write_bytecode = True
-from check_vm_lifecycle import VM
+from support.process import VM
 
 
 def main():
     binary, kernel, iso = map(lambda p: str(Path(p).resolve()), sys.argv[1:])
-    installer = Path(__file__).with_name("unattended-install.sh").read_text()
+    installer = (Path(__file__).resolve().parents[1] / "unattended-install.sh").read_text()
     helpers = installer.split("automator_log() {", 1)[1].split(
         "# Background console automation feeder", 1
     )[0]

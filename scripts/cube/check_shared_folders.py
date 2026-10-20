@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Boot a disposable FreeBSD 14.4 ISO and verify host directory sharing without a NIC."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import os
-from pathlib import Path
 import tempfile
 import time
 
-from check_vm_lifecycle import VM
+from support.process import VM
+from support.guest import publish
 
 
 def prepare_export(directory):
@@ -60,9 +65,7 @@ def main():
         "--share", "readonly", export, "--share-rw", "work", export,
     ], env=dict(os.environ, VMM_UART_IN=str(mailbox)))
     def send(cmd):
-        pending = mailbox.with_suffix(".next")
-        pending.write_text(cmd + "\n")
-        pending.replace(mailbox)
+        publish(mailbox, cmd)
     def check(cmd, marker):
         encoded = "".join("\\%03o" % ord(c) for c in marker + "\n")
         send(f"({cmd}) && printf '{encoded}'")

@@ -11,11 +11,15 @@ into the disposable UFS guest. Failure artifacts are always retained.
 the login account, and the Xorg configuration). It skips the boot, input,
 reboot, and cold-start checks.
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import shlex
@@ -23,7 +27,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -96,17 +99,7 @@ def desktop_username(value):
     return value
 
 
-def guest_net(sudo, requested):
-    mode = "vmnet" if sudo and requested is None else (requested or "vmnet-proxy")
-    iface = mode.removeprefix("bridge:")
-    valid = mode in ("vmnet-proxy", "vmnet", "bridge") or (
-        mode.startswith("bridge:") and iface != mode
-        and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", iface) is not None)
-    return mode, valid
-
-
-def in_process_net(mode):
-    return mode == "vmnet" or mode == "bridge" or mode.startswith("bridge:")
+from support.guest import guest_net, in_process_net
 
 
 def password_from_file(path, default, account):
@@ -138,7 +131,7 @@ def direct_command(args, directory):
 
 
 def write_reuse_config(args, directory):
-    """Give a retained desktop install a stable launch recipe for vmmctl."""
+    """Give a retained desktop install a stable launch recipe for cubectl."""
     config = {
         "name": directory.name,
         "binary": str(args.binary),
@@ -268,7 +261,7 @@ def run(args, directory):
             login = directory / "desktop-login.txt"
             login.write_text(f"Username: {args.desktop_user}\nPassword: {login_password}\n")
             login.chmod(0o600)
-        command(["bash", Path(__file__).with_name("create-seed.sh").resolve(),
+        command(["bash", (Path(__file__).resolve().parents[1] / "create-seed.sh").resolve(),
                  "--output", directory / "seed.iso", "--ssh-key", key.with_suffix(".pub"),
                  "--hostname", "vmm-install-test", "--password", password,
                  "--filesystem", args.filesystem, "--base", args.base])
@@ -451,7 +444,7 @@ def run(args, directory):
                 require(services is not None and services.returncode == 0,
                         f"Could not configure {args.desktop_environment}/D-Bus/login manager; "
                         "see ssh.log")
-                hid_service = Path(__file__).with_name("freebsd-vmm-hid.rc").read_text()
+                hid_service = (Path(__file__).resolve().parents[1] / "freebsd-vmm-hid.rc").read_text()
                 persist_hid = execute(
                     "cat > /usr/local/etc/rc.d/vmm_hid && "
                     "chmod 555 /usr/local/etc/rc.d/vmm_hid && "
@@ -754,7 +747,7 @@ def main():
         if args.keep and args.desktop_environment in ("xfce", "plasma"):
             config = write_reuse_config(args, directory)
             print(f"Reusable VM config: {config}", flush=True)
-            start = "python3 -B scripts/vmmctl.py start " + shlex.quote(str(config))
+            start = "cubectl start " + shlex.quote(str(config))
             if in_process_net(args.net_mode):
                 start += " --sudo"
             print("Start later: " + start, flush=True)

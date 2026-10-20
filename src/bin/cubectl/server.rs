@@ -368,31 +368,44 @@ fn guest_shutdown(
         None => return serde_json::json!({"ok": false, "error": "no guest SSH shutdown configured; use stop"}),
     };
 
-    let known_hosts = state_dir.join("known_hosts");
     let target = format!("{}@{}", cfg.user, cfg.host);
     let port_str = cfg.port.to_string();
 
     let start = Instant::now();
-    let ssh_out = Command::new("ssh")
-        .args([
-            "-F", "/dev/null",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=5",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", &format!("UserKnownHostsFile={}", known_hosts.display()),
-            "-i", &cfg.identity_file,
-            "-p", &port_str,
-            &target,
-            "/sbin/shutdown -p now",
-        ])
-        .output();
-
-    let ssh_err = match ssh_out {
-        Ok(ref o) => String::from_utf8_lossy(&o.stderr).into_owned(),
-        Err(ref e) => e.to_string(),
-    };
+    let mut ssh_sent = false;
+    let mut ssh_err = String::new();
 
     while start.elapsed() < timeout {
+        if !ssh_sent {
+            let ssh_out = Command::new("ssh")
+                .args([
+                    "-F", "/dev/null",
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=5",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "LogLevel=ERROR",
+                    "-i", &cfg.identity_file,
+                    "-p", &port_str,
+                    &target,
+                    "/sbin/shutdown -p now",
+                ])
+                .output();
+
+            match ssh_out {
+                Ok(ref o) if o.status.success() => {
+                    ssh_sent = true;
+                    ssh_err.clear();
+                }
+                Ok(ref o) => {
+                    ssh_err = String::from_utf8_lossy(&o.stderr).into_owned();
+                }
+                Err(ref e) => {
+                    ssh_err = e.to_string();
+                }
+            }
+        }
+
         if let Ok(Some(code)) = child.try_wait() {
             if let Some(thread) = output_thread.take() { let _ = thread.join(); }
             let log_text = fs::read_to_string(state_dir.join("vmm.log")).unwrap_or_default();
@@ -404,7 +417,7 @@ fn guest_shutdown(
                 "ssh": ssh_err
             });
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(if ssh_sent { 100 } else { 500 }));
     }
 
     if force_after {

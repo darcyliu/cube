@@ -1,5 +1,4 @@
 /target
-/test-results/
 __pycache__/
 guest/*.o
 guest/*.bin
@@ -7,6 +6,7 @@ guest/*.bin
 *.txz
 *.img
 *.cow
+*.raw
 *.vars.fd
 *.iso
 /.iso-boot

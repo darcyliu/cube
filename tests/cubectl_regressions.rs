@@ -81,10 +81,24 @@ fn relative_create_destination_can_be_started() {
 fn interactive_lifecycle_and_disk_ownership() {
     let f = Fixture::new();
     f.file("fw", b"firmware"); f.file("disk", b"original disk"); f.file("other-disk", b"other");
-    f.script("fake", "#!/bin/sh\nexec sleep 30\n");
+    // cube owns disk locks while running. The fake guest must implement
+    // that contract to exercise aliases across names and state roots.
+    f.script("fake", r#"#!/usr/bin/env python3
+import fcntl, pathlib, sys, time
+locks = []
+for i, arg in enumerate(sys.argv[:-1]):
+    if arg == "--disk":
+        path = sys.argv[i + 1]
+        handle = open(path, "rb")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locks.append(handle)
+        pathlib.Path(path + ".locked").touch()
+time.sleep(30)
+"#);
     f.config("one", "disk"); f.config("two", "other-disk"); f.config("alias", "disk");
     let mut one = ChildGuard::spawn(f.cmd().args(["start", "one.json", "-i"]).stdin(Stdio::null()).stdout(Stdio::null()));
     wait_for(|| String::from_utf8_lossy(&f.run(&["status", "one"]).stdout).contains("running"));
+    wait_for(|| f.0.join("disk.locked").exists());
     let install = f.run(&["install", "one.json", "--iso", "missing.iso"]);
     assert!(!install.status.success());
     assert!(String::from_utf8_lossy(&install.stderr).contains("running VM"));

@@ -119,25 +119,18 @@ fi
 # Step 2: Architecture verification
 echo -e "${GREEN}[Cube] Verifying ISO image architecture...${RESET}"
 
-# Create temporary directory for kernel extraction
-EXTRACT_DIR=".iso-boot"
-mkdir -p "$EXTRACT_DIR"
-
 # Extract kernel directly using macOS bsdtar (no mounting required)
+mkdir -p boot/freebsd
 echo -e "${GREEN}[Cube] Extracting kernel from ISO via bsdtar (no root required)...${RESET}"
-if ! tar -xf "$ISO_PATH" -C "$EXTRACT_DIR" boot/kernel/kernel 2>/dev/null; then
+if ! tar -xf "$ISO_PATH" boot/kernel/kernel boot/kernel/zfs.ko 2>/dev/null; then
     echo -e "${RED}[Error] Could not find 'boot/kernel/kernel' inside ${ISO_PATH}.${RESET}"
     echo -e "${YELLOW}Please ensure this is a standard FreeBSD installation ISO.${RESET}"
     exit 1
 fi
-EXTRACTED_KERNEL="${EXTRACT_DIR}/boot/kernel/kernel"
-
-# Same ISO also ships zfs.ko. Cache it next to the kernel so a later Auto (ZFS)
-# install can boot. This is not a filesystem choice; UFS ignores the file.
-mkdir -p boot/kernel
-if tar -xf "$ISO_PATH" -C . boot/kernel/zfs.ko 2>/dev/null; then
-    echo -e "${GREEN}[Cube] Cached boot/kernel/zfs.ko from ISO (used only if the disk GPT is ZFS).${RESET}"
-fi
+mv boot/kernel/kernel boot/freebsd/
+[[ -f boot/kernel/zfs.ko ]] && mv boot/kernel/zfs.ko boot/freebsd/
+rmdir boot/kernel 2>/dev/null || true
+EXTRACTED_KERNEL="boot/freebsd/kernel"
 
 # Inspect architecture with file
 KERNEL_INFO=$(file "$EXTRACTED_KERNEL")

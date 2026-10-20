@@ -19,6 +19,8 @@ import time
 import xml.etree.ElementTree as ET
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+from support.network import detect_lan_network, detect_vmnet_subnet
 
 # Let each existing script execute its finally/cleanup blocks on CI cancellation.
 # In particular, check_install's VMs use their own process sessions.
@@ -26,7 +28,8 @@ PYTHON_CHECK = (
     "import os,runpy,signal,sys; "
     "signal.signal(signal.SIGTERM, lambda *_: "
     "(_ for _ in ()).throw(KeyboardInterrupt())); "
-    "sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(sys.argv[0])); "
+    "sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(os.path.dirname(sys.argv[0]))); "
+    "sys.path.insert(0,os.path.dirname(sys.argv[0])); "
     "runpy.run_path(sys.argv[0],run_name='__main__')"
 )
 
@@ -50,6 +53,7 @@ class Step:
     timeout: int = 300
     privileged: bool = False
     as_user: bool = False
+    component: str = "shared"
     status: str = "pending"
     seconds: float = 0
     message: str = ""
@@ -58,14 +62,16 @@ class Step:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--component", choices=("cube", "cubectl", "all"), default="all")
+    parser.add_argument("--cubectl", type=Path, help="use an existing native manager binary")
     parser.add_argument("--suite", choices=("quick", "offline", "full"), default="quick")
     parser.add_argument("--iso", type=Path, help="ARM64 disc1 ISO; required for offline/full")
     parser.add_argument("--firmware", type=Path, help="EDK2 firmware; required for offline/full")
     parser.add_argument("--binary", type=Path, help="use an existing signed binary; skip build/sign")
     parser.add_argument("--target-dir", type=Path,
                         default=Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")))
-    parser.add_argument("--artifacts", type=Path, default=REPO / "test-results",
-                        help="parent for a new private run directory (default: test-results)")
+    parser.add_argument("--artifacts", type=Path, default=REPO / "target/test-results",
+                        help="parent for a new private run directory (default: target/test-results)")
     parser.add_argument("--sudo", action="store_true",
                         help="run full-suite guest checks as root with in-process vmnet "
                              "(default is vmnet-proxy)")
@@ -78,21 +84,38 @@ def parse_args(argv=None):
                         help="run full-suite guest checks as root with in-process bridge. "
                              "Optional Ethernet name, such as en0; bare --bridge uses the host default")
     parser.add_argument("--guest-cidr", type=ipaddress.IPv4Interface,
-                        help="unused static guest address on the vmnet or LAN subnet; required for full")
+                        help="unused static guest address on the vmnet or LAN subnet; auto-detected when omitted")
     parser.add_argument("--host-ip", type=ipaddress.IPv4Address,
-                        help="reachable host address on that subnet; required for full")
+                        help="reachable host address on that subnet; auto-detected when omitted")
     parser.add_argument("--list", action="store_true", help="print selected commands without running")
     args = parser.parse_args(argv)
     if args.suite != "quick" and not (args.iso and args.firmware):
         parser.error("offline/full requires --iso and --firmware")
-    if args.suite == "full" and not (args.guest_cidr and args.host_ip):
-        parser.error("full requires --guest-cidr and --host-ip for the alternate-address SSH check")
     if args.suite != "full" and (args.sudo or args.bridge is not None or args.guest_cidr or args.host_ip):
         parser.error("--sudo, --bridge, --guest-cidr, and --host-ip apply only to --suite full")
     if args.sudo and args.bridge is not None:
         parser.error("pass --sudo for in-process vmnet, or --bridge for in-process bridge")
     if args.bridge and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", args.bridge):
         parser.error("--bridge expects an interface name such as en0")
+    if args.suite == "full" and args.component != "cubectl":
+        if bool(args.guest_cidr) != bool(args.host_ip):
+            parser.error("specify both --guest-cidr and --host-ip, or omit both to auto-detect")
+        elif not (args.guest_cidr and args.host_ip):
+            if args.bridge is not None:
+                try:
+                    name, label, guest_cidr, host_ip, warning = detect_lan_network(args.bridge or None)
+                    if args.bridge == "":
+                        args.bridge = name
+                    args.guest_cidr = guest_cidr
+                    args.host_ip = host_ip
+                    if warning:
+                        print(f"[verify] {warning}", file=sys.stderr)
+                    print(f"[verify] Auto-detected LAN network: host {args.host_ip}, guest {args.guest_cidr} on {name} ({label})", file=sys.stderr)
+                except Exception as e:
+                    parser.error(f"cannot auto-detect LAN network for bridge: {e}")
+            else:
+                args.guest_cidr, args.host_ip = detect_vmnet_subnet()
+                print(f"[verify] Auto-detected vmnet network: host {args.host_ip}, guest {args.guest_cidr}", file=sys.stderr)
     if args.suite == "quick" and (args.iso or args.firmware):
         parser.error("select --suite offline or full to use guest media")
     if args.guest_cidr and args.host_ip not in args.guest_cidr.network:
@@ -102,7 +125,7 @@ def parse_args(argv=None):
     if args.guest_cidr and args.guest_cidr.ip in (args.guest_cidr.network.network_address,
                                                args.guest_cidr.network.broadcast_address):
         parser.error("--guest-cidr must identify a usable guest address")
-    for name in ("iso", "firmware", "binary", "target_dir", "artifacts"):
+    for name in ("iso", "firmware", "binary", "cubectl", "target_dir", "artifacts"):
         if getattr(args, name) is not None:
             setattr(args, name, getattr(args, name).expanduser().resolve())
     return args
@@ -111,15 +134,28 @@ def parse_args(argv=None):
 def make_plan(args, directory):
     binary = args.binary or args.target_dir / "debug/cube"
     def check(name, script, extra=(), needs=(), timeout=300, privileged=False):
+        component = "cubectl" if script in ("check_vm_management.py", "check_vm_shutdown.py", "check_installation.py") else "cube"
         return Step(name, [sys.executable, "-u", "-B", "-c", PYTHON_CHECK,
-                          str(REPO / "scripts" / script), *map(str, extra)],
-                    needs, timeout, privileged)
+                          str(REPO / "scripts" / component / script), *map(str, extra)],
+                    needs, timeout, privileged, component=component)
+    rust_targets = {
+        "all": [],
+        "cube": ["--lib", "--bin", "cube", "--bin", "cube-overlay", "--test", "overlay_cli"],
+        "cubectl": ["--bin", "cubectl", "--test", "cubectl_cli", "--test", "cubectl_regressions"],
+    }[args.component]
     steps = [
-        Step("rust-debug", ["cargo", "test", "--locked"], timeout=900),
-        Step("rust-release", ["cargo", "test", "--locked", "--release"], timeout=900),
-        Step("python-tests", [sys.executable, "-u", "-B", "-m", "unittest", "discover",
-                              "-s", "scripts", "-p", "test_*.py", "-v"], as_user=True),
+        Step("rust-debug", ["cargo", "test", "--locked", *rust_targets], timeout=900),
+        Step("rust-release", ["cargo", "test", "--locked", "--release", *rust_targets], timeout=900),
     ]
+    manager = args.cubectl or args.target_dir / "debug/cubectl"
+    manager_needs = ()
+    if args.component != "cube":
+        if not args.cubectl:
+            steps.append(Step("build-cubectl", ["cargo", "build", "--locked", "--bin", "cubectl"], timeout=900))
+            manager_needs = ("build-cubectl",)
+    steps.append(Step("python-tests", [sys.executable, "-u", "-B", "-m", "unittest", "discover",
+                                      "-s", "scripts", "-p", "test_*.py", "-v"],
+                      needs=manager_needs, as_user=True))
     if args.binary:
         steps.append(Step("signed-binary", ["codesign", "--verify", "--strict", str(binary)]))
     else:
@@ -147,8 +183,8 @@ def make_plan(args, directory):
                            [binary, "--kernel", kernel, "--iso", args.iso], ready,
                            timeout=300))
         steps.append(check("vm-management", "check_vm_management.py",
-                           [binary, "--kernel", kernel, "--iso", args.iso], ready,
-                           timeout=240))
+                           [binary, "--cubectl", manager, "--kernel", kernel, "--iso", args.iso],
+                           (*ready, *manager_needs), timeout=240))
         for fs in ("ufs", "zfs"):
             extra = [binary, "--iso", args.iso, "--artifacts", directory,
                      "--filesystem", fs, "--console-only"]
@@ -177,6 +213,32 @@ def make_plan(args, directory):
             extra += guest_net
             steps.append(check(f"install-{fs}-ssh", "check_install.py", extra, ready,
                                timeout=3000 if fs == "ufs" else 1800, privileged=privileged))
+    if args.suite != "quick" and args.component != "cube":
+        native_net = ("none" if args.suite == "offline" else
+                      "bridge" if args.bridge == "" else
+                      "bridge:" + args.bridge if args.bridge else
+                      "vmnet" if args.sudo else "vmnet-proxy")
+        for fs in ("ufs", "zfs"):
+            steps.append(check(f"cubectl-install-{fs}", "check_installation.py",
+                               [binary, "--cubectl", manager, "--iso", args.iso,
+                                "--firmware", args.firmware, "--filesystem", fs,
+                                "--artifacts", directory, "--net", native_net],
+                               (*ready, *manager_needs), timeout=1500,
+                               privileged=args.suite == "full" and (args.sudo or args.bridge is not None)))
+    steps = [step for step in steps if step.component in ("shared", args.component)
+             or args.component == "all"]
+    # Keep only prerequisites reachable from selected checks and always-run tests.
+    if args.component == "cubectl":
+        roots = {step.name for step in steps if step.component == "cubectl"
+                 or step.name in ("rust-debug", "rust-release", "python-tests", "runner-tests")}
+        by_name = {step.name: step for step in steps}
+        pending = list(roots)
+        while pending:
+            for dependency in by_name[pending.pop()].needs:
+                if dependency not in roots:
+                    roots.add(dependency)
+                    pending.append(dependency)
+        steps = [step for step in steps if step.name in roots]
     return steps
 
 
@@ -217,7 +279,7 @@ def preflight(args):
         for tool in ("tar", "hdiutil", "ssh"):
             if not shutil.which(tool):
                 raise RuntimeError(f"Missing prerequisite: {tool}")
-    for name in ("iso", "firmware", "binary"):
+    for name in ("iso", "firmware", "binary", "cubectl"):
         path = getattr(args, name)
         if path is not None and not path.is_file():
             raise RuntimeError(f"{name} is not a file: {path}")
@@ -249,7 +311,8 @@ def stop(proc, privileged=False):
 
 def run_step(step, args, directory):
     step.log = str(directory / (step.name + ".log"))
-    env = dict(os.environ, CARGO_TARGET_DIR=str(args.target_dir), PYTHONUNBUFFERED="1",
+    env = dict(os.environ, CUBECTL_BIN=str(args.cubectl or args.target_dir / "debug/cubectl"),
+               CARGO_TARGET_DIR=str(args.target_dir), PYTHONUNBUFFERED="1",
                PYTHONDONTWRITEBYTECODE="1")
     # Keep temporary resources from older scripts inside this run too.
     env["TMPDIR"] = str(directory)

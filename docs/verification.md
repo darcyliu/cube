@@ -1,10 +1,56 @@
 # Running the verification suites
 
 Use `scripts/verify.py` as the single entry point after code changes and in CI.
-It builds and signs a debug VMM, runs Rust tests in debug and release, discovers
-all `scripts/test_*.py` tests, and invokes the existing integration scripts.
+It selects tests by `--component cube|cubectl|all` (default: `all`) and depth
+`--suite quick|offline|full` (default: `quick`). Rust tests run in debug and
+release; Python tests are discovered under `scripts/`. Guest checks build and
+sign `cube`, while managed checks also build native `cubectl`.
 Checks run sequentially, except the management check intentionally boots two
 isolated VMs together to exercise concurrent ownership.
+
+## Components and layout
+
+- `tests/`: Rust Cargo integration tests (`cubectl_cli.rs`, `cubectl_regressions.rs`, `overlay_cli.rs`).
+- `scripts/cube/`: direct hypervisor checks and their Python unit tests.
+- `scripts/cubectl/`: native CLI contracts with fake guests, plus real management, installation, and shutdown checks.
+- `scripts/runner/`: verification runner and installation front-end tests.
+- `scripts/support/`: shared process fixtures, native CLI invocation (`cubectl.py`), VNC, and guest helpers.
+- Rust unit tests remain alongside their implementation in `src/`. `cubectl_cli.rs` and
+  `cubectl_regressions.rs` belong to `cubectl`; library, `cube`, and overlay tests
+  belong to `cube`. Selecting `all` runs all Cargo targets.
+
+```sh
+make verify-cube
+make verify-cubectl
+python3 -B scripts/verify.py --component cubectl --suite offline \
+  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
+  --firmware firmware/QEMU_EFI.fd
+
+# Python checks alone; build the manager before running its contract tests:
+cargo build --locked --bin cubectl
+python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
+```
+
+`--binary PATH` supplies an existing signed `cube`; `--cubectl PATH` supplies
+an existing native manager. Otherwise the manager is built under `--target-dir`.
+For standalone Python CLI tests, `CUBECTL_BIN` selects the native executable.
+Missing binaries fail with an instruction to build them; tests never silently skip.
+
+The `cubectl` quick suite uses fake guests and needs no ISO or hypervisor launch.
+Its offline suite boots two managed guests and runs native create/install/start/stop
+for both UFS and ZFS. Its full suite additionally verifies SSH and managed guest
+poweroff in those installation workflows. For `cube`/`all` full suites,
+`--guest-cidr` and `--host-ip` are auto-detected when omitted (or can be passed explicitly).
+The separate `check_vm_shutdown.py` accepts an existing disk and tests a clone;
+it requires an explicit `--cubectl` path and is useful for targeted regressions.
+
+`cube` installation checks retain independent persistence, EFI, reboot, and
+cold-start assertions. They deliberately invoke `cube` directly. The legacy
+`scripts/check_install.py` remains a small compatibility entry point because
+user-facing desktop installation wrappers call it.
+
+The diagram and matrix below describe the combined (`all`) suite. Native
+installation checks add a create/install/start workflow to offline/full runs.
 
 ```mermaid
 flowchart TD
@@ -88,8 +134,7 @@ guest checks do not elevate. Do not put `sudo` in front of `python3`.
 ```sh
 python3 -B scripts/verify.py --suite full \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
-  --firmware firmware/QEMU_EFI.fd \
-  --guest-cidr 192.168.2.77/24 --host-ip 192.168.2.1
+  --firmware firmware/QEMU_EFI.fd
 ```
 
 In-process `vmnet`. Start the process with `sudo` and pass `--sudo --keep-root`.
@@ -98,13 +143,13 @@ ticket. `--sudo` passes `--net vmnet` to the three guest checks. This path
 can modify host IP forwarding and the PF NAT anchor. The Cargo `target`
 directory is owned by root. The result directory is handed back to the
 `sudo` user, and the Python unit tests run as that user so they can create
-temporary directories in it.
+temporary directories in it. Network addresses are auto-detected (or can
+be overridden with `--guest-cidr` and `--host-ip`).
 
 ```sh
 sudo python3 -B scripts/verify.py --suite full --sudo --keep-root \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
-  --firmware firmware/QEMU_EFI.fd \
-  --guest-cidr 192.168.2.77/24 --host-ip 192.168.2.1
+  --firmware firmware/QEMU_EFI.fd
 ```
 
 In-process bridge. Stop the vmnet service first so the guest is attached only
@@ -142,7 +187,7 @@ the guest checks. Pass an already signed binary with `--binary` so the suite
 does not re-sign it.
 The shell installers (`unattended-install.sh`, `install-from-iso.sh`) already
 prefix `sudo` only on the `vmm` binary. `check_install.py`, `check_network.py`,
-and `vmmctl.py` still re-enter root for the whole driver when in-process
+still re-enter root for the whole driver when in-process
 networking is selected: that driver has to stop the VM, and the EFI store and
 serial log are created by the same user that executes `vmm`.
 If `check_shared_folders.py` itself is started as root, it creates its
@@ -164,7 +209,9 @@ Run the full suite on an appropriate test host.
 | `check_network.py`: startup and bind errors | yes | yes | yes |
 | `check_unattended_console.py` | — | yes | yes |
 | Shared folders: host/guest changes, permissions and reboot | — | yes | yes |
-| Two concurrent managed FreeBSD VMs and listener collision | — | yes | yes |
+| Two concurrent native-managed FreeBSD VMs and listener collision | — | yes | yes |
+| Native `cubectl` UFS/ZFS create/install/start | — | yes | yes |
+| Native `cubectl` SSH and guest shutdown after install | — | — | yes |
 | `check_install.py`: UFS offline | — | yes | yes |
 | `check_install.py`: UEFI/ZFS offline, reboot/cold start | — | yes | yes |
 | Network: alternate static address and SSH forwarding | — | — | yes |
@@ -196,7 +243,7 @@ framebuffer updates averaged 38.4 updates/s and 14.0 MiB/s raw payload.
   still compile and run. Use this to validate a separately built release binary.
   Without it, integration checks use the newly built debug binary.
 - `--artifacts PATH` selects the parent of a new private `vmm-verify-*` directory.
-  The default is the gitignored `test-results/` directory. Paths supplied on the
+  The default is the gitignored `target/test-results/` directory. Paths supplied on the
   command line resolve relative to the caller's current directory; commands run
   from the repository root.
 
@@ -255,7 +302,7 @@ bootable when the step log contains `PASS unattended installation and clean
 poweroff`. The root password is in `root-login.txt`. `id_ed25519` is the SSH
 key the seed authorized. The guest hostname is `vmm-install-test`.
 
-The suite does not pass `--keep` and does not write a `vmmctl` config. To keep
+The suite does not pass `--keep` and does not write a `cubectl` config. To keep
 a guest after a run that passes, use `scripts/install-vm.py` or
 `scripts/check_install.py --keep`.
 
@@ -266,7 +313,7 @@ root, a UFS disk (`"filesystem": "ufs"` in `run.json`) boots with the kernel
 in that same `vmm-install-*` directory:
 
 ```sh
-INSTALL=test-results/vmm-verify-XXXX/vmm-install-YYYY
+INSTALL=target/test-results/vmm-verify-XXXX/vmm-install-YYYY
 ./target/debug/cube \
   --freebsd "$INSTALL/boot/kernel/kernel" --multiuser \
   --disk "$INSTALL/installed.img" \
@@ -309,11 +356,11 @@ firmware ahead of time. The same command works without CI-specific wrappers:
 python3 -B scripts/verify.py --suite offline \
   --iso /path/to/FreeBSD-arm64-disc1.iso \
   --firmware /path/to/QEMU_EFI.fd \
-  --artifacts "$PWD/test-results"
+  --artifacts "$PWD/target/test-results"
 ```
 
 Preserve the command's exit status. Configure the CI system to collect
-`test-results/vmm-verify-*/junit.xml`, `summary.json`, and top-level `*.log` even
+`target/test-results/vmm-verify-*/junit.xml`, `summary.json`, and top-level `*.log` even
 when the command fails. Do not recursively publish retained guest disks, keys,
 or seed images as public CI artifacts. Set the job timeout above the expected
 suite duration so normal cancellation can run cleanup.

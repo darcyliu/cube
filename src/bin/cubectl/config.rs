@@ -375,6 +375,8 @@ pub fn build_launch_spec(
         forwards: Vec::new(),
     });
     let net_mode = cli_overrides.net.clone().unwrap_or(net.mode);
+    require(!(cli_overrides.sudo && net_mode == "vmnet-proxy"),
+        "--sudo cannot launch vmnet-proxy; omit --sudo and use the vmnet service")?;
     command.extend(["--net".into(), net_mode.clone()]);
 
     let mac = if let Some(ref m) = cli_overrides.mac {

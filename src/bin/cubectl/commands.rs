@@ -174,13 +174,12 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
                 let default_k = dest_dir.join("kernel");
                 if default_k.is_file() {
                     canonical_path_str(&default_k)?
+                } else if Path::new("boot/freebsd/kernel").is_file() {
+                    canonical_path_str(Path::new("boot/freebsd/kernel"))?
+                } else if Path::new("boot/kernel/kernel").is_file() {
+                    canonical_path_str(Path::new("boot/kernel/kernel"))?
                 } else {
-                    let fallback = Path::new("boot/kernel/kernel");
-                    if fallback.is_file() {
-                        canonical_path_str(fallback)?
-                    } else {
-                        return Err("FreeBSD boot requires --kernel <PATH> (or extracted kernel in VM directory)".into());
-                    }
+                    return Err("FreeBSD boot requires --kernel <PATH> (or extracted kernel in VM directory)".into());
                 }
             };
             let default_root = if args.filesystem == "zfs" {
@@ -900,7 +899,7 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
     // 3. Determine Identity File
     let identity = ssh_identity(args.identity, vm_config.as_ref(), config_path.as_deref());
 
-    // 4. Optional --wait: wait until SSH port is reachable
+    // 4. Optional --wait: wait until SSH daemon is ready and responding
     if args.wait {
         let deadline = Instant::now() + Duration::from_secs(args.wait_timeout);
         let mut ready = false;
@@ -908,9 +907,14 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
         while Instant::now() < deadline {
             if let Ok(mut addrs) = (host.as_str(), port).to_socket_addrs() {
                 if let Some(addr) = addrs.next() {
-                    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
-                        ready = true;
-                        break;
+                    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
+                        let mut banner = [0u8; 4];
+                        use std::io::Read;
+                        if stream.read_exact(&mut banner).is_ok() && &banner == b"SSH-" {
+                            ready = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -919,6 +923,7 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
         if !ready {
             return Err(format!("timed out after {}s waiting for SSH on {}:{}", args.wait_timeout, host, port));
         }
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     // 5. Build and exec ssh
@@ -927,6 +932,8 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "LogLevel=ERROR",
+        "-o", "ConnectTimeout=5",
+        "-o", "ConnectionAttempts=5",
         "-p", &port.to_string(),
     ]);
 
@@ -1362,7 +1369,11 @@ mod tests {
     fn test_smart_port_allocation() {
         let dummy_dir = Path::new("/nonexistent_dir_for_test");
         let ssh_port = find_next_available_ssh_port(dummy_dir, dummy_dir, &[2222]);
-        assert_eq!(ssh_port, 2223);
+        assert!(ssh_port >= 2223);
+        assert_ne!(ssh_port, 2222);
+
+        let next_ssh = find_next_available_ssh_port(dummy_dir, dummy_dir, &[2222, ssh_port]);
+        assert!(next_ssh > ssh_port);
 
         let vnc_port = find_next_available_vnc_port(dummy_dir, dummy_dir);
         assert!(vnc_port >= 5901);

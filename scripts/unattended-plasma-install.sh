@@ -52,7 +52,7 @@ if [[ ! -x $VMM_BINARY ]]; then
     exit 2
 fi
 
-exec python3 -B "$SCRIPT_DIR/check_install.py" "$VMM_BINARY" \
+exec python3 -B "$SCRIPT_DIR/cube/check_install.py" "$VMM_BINARY" \
     --desktop-environment plasma \
     --disk-gib 20 --ram 4096 --cpus 4 \
     --display 1280x800 --desktop-timeout 3600 \

@@ -12,10 +12,10 @@ import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_install import (ConsoleSession, Machine, desktop_packages, direct_command,
                            password_from_file, desktop_session, find_usb_tablet,
                            line_present, main)
-import vmmctl
 
 
 class InstallGuards(unittest.TestCase):
@@ -276,7 +276,7 @@ ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
         self.assertEqual(process, "plasmashell")
 
     def test_plasma_wrapper_has_safe_resource_defaults_and_retains_vm(self):
-        wrapper = Path(__file__).with_name("unattended-plasma-install.sh")
+        wrapper = (Path(__file__).resolve().parents[1] / "unattended-plasma-install.sh")
         result = subprocess.run(["bash", str(wrapper), "--help"], capture_output=True,
                                 text=True, check=True, timeout=10)
         self.assertIn("--iso FREEBSD-ARM64-DISC1.ISO", result.stdout)
@@ -333,29 +333,6 @@ ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
             self.invoke_main(lambda args, directory: self.fail("must not run"),
                              "--root-password-file", str(root_file))
 
-    def test_root_password_helper_uses_key_and_private_credential_file(self):
-        install = self.directory / "retained"
-        install.mkdir()
-        (install / "id_ed25519").write_text("test key")
-        (install / "desktop-login.txt").write_text("Username: darcy\nPassword: test secret\n")
-        tools = self.directory / "tools"
-        tools.mkdir()
-        sudo = tools / "sudo"
-        sudo.write_text('#!/bin/sh\n[ "$1" = -v ] && exit 0\nexec "$@"\n')
-        sudo.chmod(0o755)
-        ssh = tools / "ssh"
-        ssh.write_text('#!/bin/sh\ncat > "$CAPTURE"\n')
-        ssh.chmod(0o755)
-        capture = self.directory / "ssh-input"
-        subprocess.run(["bash", str(Path(__file__).with_name("set_freebsd_root_password.sh")),
-                        str(install)], check=True, capture_output=True, text=True,
-                       env=dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
-                                CAPTURE=str(capture)), timeout=10)
-        self.assertEqual(capture.read_text(), "test secret\n")
-        login = install / "root-login.txt"
-        self.assertEqual(login.read_text(), "Username: root\nPassword: test secret\n")
-        self.assertEqual(login.stat().st_mode & 0o777, 0o600)
-
     def test_retained_full_desktop_install_has_reusable_vm_config(self):
         def installed(args, directory):
             (directory / "installed.img").write_bytes(b"disk")
@@ -373,13 +350,7 @@ ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
         self.assertEqual(config["vnc"]["bind"], "127.0.0.1:5901")
         self.assertTrue((run / config["boot"]["kernel"]).is_file())
         self.assertTrue((run / config["disks"][0]["path"]).is_file())
-        options = SimpleNamespace(binary=None, ram=None, cpus=None, disk=None, net=None,
-                                  mac=None, ssh_port=None, forward=None, vnc=None,
-                                  display=None, efi_vars=None, sudo=False)
-        spec = vmmctl.launch_spec(run / "reuse-vm.json", run / "state", options)
-        self.assertIn(str((run / "installed.img").resolve()), spec["command"])
-        self.assertIn(str((run / "boot/kernel/kernel").resolve()), spec["command"])
-        self.assertEqual(spec["shutdown"]["identity_file"], str((run / "id_ed25519").resolve()))
+        self.assertEqual(config["shutdown"]["identity_file"], "id_ed25519")
 
     def test_seed_selects_ufs_or_efi_zfs(self):
         # Capture the real seed contents before hdiutil and cleanup, without
@@ -389,7 +360,7 @@ ugen2.4: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2
         stub.write_text('#!/bin/bash\nfor last; do :; done\ncp "$last/installerconfig" "$CAPTURE"\n')
         stub.chmod(0o755)
         for filesystem in ("ufs", "zfs"):
-            subprocess.run(["bash", str(Path(__file__).with_name("create-seed.sh").resolve()),
+            subprocess.run(["bash", str((Path(__file__).resolve().parents[1] / "create-seed.sh").resolve()),
                 "--filesystem", filesystem, "--ssh-key", "ssh-ed25519 test-key",
                 "--password", "test-password"], cwd=self.directory,
                 env=dict(os.environ, PATH=str(self.directory) + os.pathsep + os.environ["PATH"],

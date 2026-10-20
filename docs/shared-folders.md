@@ -46,7 +46,7 @@ the filesystem helper under its effective identity.
 
 ## VM manager
 
-Add this field to an existing `vmmctl.py` JSON configuration:
+Add this field to an existing `cubectl` JSON configuration:
 
 ```json
 "shares": [
@@ -129,7 +129,7 @@ change; the first boot disk's address is preserved.
 ## Verification
 
 ```sh
-python3 -B scripts/check_shared_folders.py /path/to/signed/vmm \
+python3 -B tests/cube/check_shared_folders.py /path/to/signed/vmm \
   --kernel .iso-boot/boot/kernel/kernel \
   --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso --keep
 ```
