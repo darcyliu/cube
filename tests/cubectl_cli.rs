@@ -842,3 +842,33 @@ fn test_cubectl_config_commands() {
     let _ = fs::remove_dir_all(&state_dir);
 }
 
+#[test]
+fn test_cubectl_ssh_command_behavior() {
+    let cubectl_bin = env!("CARGO_BIN_EXE_cubectl");
+    let root = review_test_dir("ssh-test");
+
+    // 1. Verify --help output contains expected options
+    let help_out = Command::new(cubectl_bin)
+        .args(["ssh", "--help"])
+        .output()
+        .unwrap();
+    assert!(help_out.status.success());
+    let help_str = String::from_utf8_lossy(&help_out.stdout);
+    assert!(help_str.contains("-u, --user <USER>"));
+    assert!(help_str.contains("-i, --identity <IDENTITY>"));
+    assert!(help_str.contains("-p, --port <PORT>"));
+    assert!(help_str.contains("-w, --wait"));
+    assert!(help_str.contains("[COMMAND]..."));
+
+    // 2. Calling ssh on a stopped / non-existent VM returns clear error
+    let ssh_out = Command::new(cubectl_bin)
+        .args(["--state-root", root.join("state").to_str().unwrap(), "ssh", "inactive-vm"])
+        .output()
+        .unwrap();
+    assert!(!ssh_out.status.success());
+    let stderr = String::from_utf8_lossy(&ssh_out.stderr);
+    assert!(stderr.contains("VM 'inactive-vm' is not running. Start it first with 'cubectl start inactive-vm'"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+

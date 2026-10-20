@@ -43,6 +43,11 @@ if [ -f "$REPO_ROOT/firmware/QEMU_EFI.fd" ]; then
     cp -f "$REPO_ROOT/firmware/QEMU_EFI.fd" "$CONTENTS/Resources/firmware/QEMU_EFI.fd"
 fi
 
+if [ -f "$REPO_ROOT/firmware/QEMU_VARS.fd" ]; then
+    mkdir -p "$CONTENTS/Resources/firmware"
+    cp -f "$REPO_ROOT/firmware/QEMU_VARS.fd" "$CONTENTS/Resources/firmware/QEMU_VARS.fd"
+fi
+
 if [ -f "$REPO_ROOT/firmware/LICENSE.txt" ]; then
     mkdir -p "$CONTENTS/Resources/firmware" "$CONTENTS/Resources/Licenses"
     cp -f "$REPO_ROOT/firmware/LICENSE.txt" "$CONTENTS/Resources/firmware/LICENSE.txt"

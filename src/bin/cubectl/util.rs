@@ -564,7 +564,15 @@ pub fn ensure_freebsd_iso(version: &str, cache_dir: Option<&Path>) -> Result<Pat
         Some(d) => d.to_path_buf(),
         None => {
             let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-            PathBuf::from(home).join("Library/Caches/vmm")
+            let cube_cache = PathBuf::from(&home).join("Library/Caches/Cube");
+            let legacy_cache = PathBuf::from(&home).join("Library/Caches/vmm");
+            let legacy_file = legacy_cache.join(&filename);
+            let cube_file = cube_cache.join(&filename);
+            if legacy_file.is_file() && !cube_file.exists() {
+                let _ = fs::create_dir_all(&cube_cache);
+                let _ = fs::rename(&legacy_file, &cube_file);
+            }
+            cube_cache
         }
     };
     fs::create_dir_all(&cache).map_err(|e| format!("cannot create cache directory {:?}: {}", cache, e))?;

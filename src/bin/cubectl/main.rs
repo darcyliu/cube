@@ -16,7 +16,18 @@ pub mod commands;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "cubectl", about = "Launch and manage named Cube VM instances from JSON configuration files", version)]
+#[command(
+    name = "cubectl",
+    about = "Launch and manage named Cube VM instances from JSON configuration files",
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (build ",
+        env!("CUBE_BUILD_NUMBER"),
+        ", commit ",
+        env!("CUBE_BUILD_GIT_HASH"),
+        ")"
+    )
+)]
 pub struct Cli {
     #[arg(long, global = true, help = "Base directory for VM instances (default: ~/.local/state/cube)")]
     pub state_root: Option<PathBuf>,
@@ -56,6 +67,9 @@ pub enum Commands {
 
     /// Start a named VM instance in the background
     Start(StartArgs),
+
+    /// Connect to a running VM instance via SSH
+    Ssh(SshArgs),
 
     /// Query the status of a running or stopped VM instance
     Status {
@@ -209,6 +223,36 @@ pub struct StartArgs {
 
     #[arg(long, help = "Pre-allocate RAM upfront (disable demand-paging)")]
     pub mem_prealloc: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct SshArgs {
+    /// Path to config or VM name
+    pub target: String,
+
+    /// Guest username (defaults to config shutdown user or 'root')
+    #[arg(short = 'u', long = "user")]
+    pub user: Option<String>,
+
+    /// Path to SSH private key identity file
+    #[arg(short = 'i', long = "identity")]
+    pub identity: Option<PathBuf>,
+
+    /// Remote port override (default: auto-detected from VM or ssh_port)
+    #[arg(short = 'p', long = "port")]
+    pub port: Option<u16>,
+
+    /// Wait for SSH to become ready before connecting
+    #[arg(short = 'w', long = "wait")]
+    pub wait: bool,
+
+    /// Maximum seconds to wait when --wait is enabled (default: 60)
+    #[arg(long, default_value_t = 60)]
+    pub wait_timeout: u64,
+
+    /// Extra options or remote command to execute on the guest
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -405,6 +449,7 @@ fn main() {
         Commands::Eject { target } => commands::do_eject(&target, &state_root),
         Commands::Delete { target, force, keep_disks } => commands::do_delete(&target, &state_root, force, keep_disks),
         Commands::Start(args) => commands::do_start(args, &state_root),
+        Commands::Ssh(args) => commands::do_ssh(args, &state_root),
         Commands::Status { target } => commands::do_status(&target, &state_root),
         Commands::List { json } => commands::do_list(&state_root, json),
         Commands::Shutdown { target, timeout, force_after_timeout } => {

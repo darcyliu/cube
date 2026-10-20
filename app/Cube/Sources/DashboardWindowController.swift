@@ -18,7 +18,7 @@ private class VerticallyCenteredTextFieldCell: NSTextFieldCell {
 }
 
 // MARK: - Cube Design System Tokens
-private enum CubeTokens {
+enum CubeTokens {
     // Colors
     static let cardBackground = NSColor.controlBackgroundColor
     static let cardBorder = NSColor.separatorColor
@@ -67,6 +67,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
     private var sshButton: NSButton!
     private var vncButton: NSButton!
     private var logsButton: NSButton!
+    private var commandsButton: NSButton!
     private var deleteButton: NSButton!
 
     // Hardware Card
@@ -455,31 +456,37 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         startStopButton = NSButton(title: "Start VM", target: self, action: #selector(toggleVMClicked))
         startStopButton.bezelStyle = .rounded
         startStopButton.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        startStopButton.frame = NSRect(x: margin, y: y, width: 96, height: 30)
+        startStopButton.frame = NSRect(x: margin, y: y, width: 88, height: 30)
         detailView.addSubview(startStopButton)
 
         sshButton = NSButton(title: "SSH Terminal", target: self, action: #selector(sshClicked))
         sshButton.bezelStyle = .rounded
         sshButton.font = NSFont.systemFont(ofSize: 12)
-        sshButton.frame = NSRect(x: margin + 102, y: y, width: 114, height: 30)
+        sshButton.frame = NSRect(x: margin + 94, y: y, width: 104, height: 30)
         detailView.addSubview(sshButton)
 
         vncButton = NSButton(title: "VNC Display", target: self, action: #selector(vncClicked))
         vncButton.bezelStyle = .rounded
         vncButton.font = NSFont.systemFont(ofSize: 12)
-        vncButton.frame = NSRect(x: margin + 222, y: y, width: 108, height: 30)
+        vncButton.frame = NSRect(x: margin + 204, y: y, width: 96, height: 30)
         detailView.addSubview(vncButton)
 
         logsButton = NSButton(title: "VM Logs...", target: self, action: #selector(logsClicked))
         logsButton.bezelStyle = .rounded
         logsButton.font = NSFont.systemFont(ofSize: 12)
-        logsButton.frame = NSRect(x: margin + 336, y: y, width: 94, height: 30)
+        logsButton.frame = NSRect(x: margin + 306, y: y, width: 88, height: 30)
         detailView.addSubview(logsButton)
+
+        commandsButton = NSButton(title: "Commands...", target: self, action: #selector(commandsClicked))
+        commandsButton.bezelStyle = .rounded
+        commandsButton.font = NSFont.systemFont(ofSize: 12)
+        commandsButton.frame = NSRect(x: margin + 400, y: y, width: 98, height: 30)
+        detailView.addSubview(commandsButton)
 
         deleteButton = NSButton(title: "Delete...", target: self, action: #selector(deleteClicked))
         deleteButton.bezelStyle = .rounded
         deleteButton.font = NSFont.systemFont(ofSize: 12)
-        deleteButton.frame = NSRect(x: margin + 436, y: y, width: 88, height: 30)
+        deleteButton.frame = NSRect(x: margin + 504, y: y, width: 76, height: 30)
         detailView.addSubview(deleteButton)
         y += 44
 
@@ -719,6 +726,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
             startStopButton.title = "Stop VM"
             sshButton.isEnabled = true
             vncButton.isEnabled = true
+            commandsButton.isEnabled = true
         } else {
             badgeText = "○ STOPPED"
             badgeColor = CubeTokens.stoppedGray
@@ -727,6 +735,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
             startStopButton.title = "Start VM"
             sshButton.isEnabled = true
             vncButton.isEnabled = true
+            commandsButton.isEnabled = true
         }
 
         statusBadge.stringValue = badgeText
@@ -745,11 +754,11 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         ramLabel.stringValue = "\(cfg.ramMB) MB (\(memMode))"
         bootModeLabel.stringValue = cfg.bootMode.uppercased()
 
-        if let dp = cfg.diskPath {
-            diskPathLabel.stringValue = (dp as NSString).lastPathComponent
-        } else {
-            diskPathLabel.stringValue = "rootfs.img"
-        }
+        let rawDisk = cfg.diskPath ?? "rootfs.img"
+        let filename = (rawDisk as NSString).lastPathComponent
+        let fullDiskPath = rawDisk.hasPrefix("/") ? rawDisk : "\(VMManager.shared.vmsDirectory)/\(vm.name)/\(rawDisk)"
+        diskPathLabel.stringValue = formatDiskDescription(filename: filename, fullPath: fullDiskPath)
+        diskPathLabel.toolTip = fullDiskPath
 
         netModeLabel.stringValue = cfg.netMode
         ipLabel.stringValue = vm.ip ?? (isRunning ? "Acquiring DHCP..." : "Offline")
@@ -803,6 +812,59 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
             vmProcessInfoLabel.stringValue = "Stopped"
         }
         #endif
+    }
+    
+    private func formatDiskDescription(filename: String, fullPath: String) -> String {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: fullPath) else {
+            return filename
+        }
+
+        var logicalBytes: Int64 = 0
+        if let attr = try? fm.attributesOfItem(atPath: fullPath),
+           let num = attr[.size] as? NSNumber {
+            logicalBytes = num.int64Value
+        }
+
+        var physicalBytes: Int64 = 0
+        let url = URL(fileURLWithPath: fullPath)
+        if let values = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]),
+           let alloc = values.totalFileAllocatedSize {
+            physicalBytes = Int64(alloc)
+        } else if let attr = try? fm.attributesOfItem(atPath: fullPath),
+                  let num = attr[.size] as? NSNumber {
+            physicalBytes = num.int64Value
+        }
+
+        if logicalBytes > 0 {
+            let logicalStr = formatStorageBytes(logicalBytes)
+            if physicalBytes > 0 && physicalBytes < logicalBytes {
+                let physicalStr = formatStorageBytes(physicalBytes)
+                return "\(filename) — \(logicalStr) (\(physicalStr) on disk)"
+            } else {
+                return "\(filename) — \(logicalStr)"
+            }
+        }
+        return filename
+    }
+
+    private func formatStorageBytes(_ bytes: Int64) -> String {
+        let b = Double(bytes)
+        let gib = b / (1024 * 1024 * 1024)
+        if gib >= 1.0 {
+            if gib.truncatingRemainder(dividingBy: 1.0) == 0 {
+                return String(format: "%.0f GB", gib)
+            } else if gib < 10.0 {
+                return String(format: "%.1f GB", gib)
+            } else {
+                return String(format: "%.0f GB", round(gib))
+            }
+        }
+        let mib = b / (1024 * 1024)
+        if mib >= 1.0 {
+            return String(format: "%.0f MB", mib)
+        }
+        return "\(bytes) B"
     }
 
     private func updateServiceBanner() {
@@ -999,6 +1061,13 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
     @objc private func logsClicked() {
         guard let name = selectedVMName else { return }
         VMLogWindowController.show(for: name)
+    }
+
+    @objc private func commandsClicked() {
+        guard let name = selectedVMName,
+              let vm = VMManager.shared.vms.first(where: { $0.name == name }),
+              let win = self.window else { return }
+        VMCommandsSheetController.show(for: vm, on: win)
     }
 
     @objc private func deleteClicked() {

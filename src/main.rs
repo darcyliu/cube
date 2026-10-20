@@ -1437,16 +1437,26 @@ fn boot_os_kernel(
         // NorFlashDxe issues CFI commands; a plain RAM map hangs Variable services.
         {
             const EFI_VARS_GPA: u64 = 0x0400_0000;
-            let vars_path = std::path::Path::new("firmware/QEMU_VARS.fd");
-            let vars = match std::fs::read(vars_path) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!(
-                        "\x1b[1;33m[Cube Warning] Could not read firmware/QEMU_VARS.fd ({e}); using erased 64MiB\x1b[0m"
-                    );
-                    vec![0xffu8; 64 * 1024 * 1024]
+            let fw_dir = std::path::Path::new(kernel_path).parent();
+            let cand_next_to_fw = fw_dir.map(|p| p.join("QEMU_VARS.fd"));
+            let cand_rel = std::path::PathBuf::from("firmware/QEMU_VARS.fd");
+            let cand_home = std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".local/share/cube/firmware/QEMU_VARS.fd"));
+            let cand_app = std::path::PathBuf::from("/Applications/Cube.app/Contents/Resources/firmware/QEMU_VARS.fd");
+
+            let mut vars_data = None;
+            for cand in [cand_next_to_fw, Some(cand_rel), cand_home, Some(cand_app)].into_iter().flatten() {
+                if cand.is_file() {
+                    if let Ok(v) = std::fs::read(&cand) {
+                        vars_data = Some(v);
+                        break;
+                    }
                 }
-            };
+            }
+
+            let vars = vars_data.unwrap_or_else(|| {
+                vec![0xffu8; 64 * 1024 * 1024]
+            });
             let vars_len = vars.len() as u64;
             let default_store = disk_configs
                 .first()

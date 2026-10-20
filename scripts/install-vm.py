@@ -126,6 +126,14 @@ def ensure_iso(version, cache_dir, run=subprocess.run):
     filename, url = iso_location(version)
     cache_dir.mkdir(parents=True, exist_ok=True)
     destination = cache_dir / filename
+
+    legacy_file = Path.home() / "Library/Caches/vmm" / filename
+    if not destination.exists() and legacy_file.is_file():
+        try:
+            legacy_file.replace(destination)
+        except OSError:
+            destination = legacy_file
+
     # A finished disc1 image is hundreds of megabytes. A short file is a
     # failed earlier download and must not be reused.
     if destination.is_file() and destination.stat().st_size >= 100 * 1024 * 1024:
@@ -258,7 +266,7 @@ def main(argv=None):
     parser.add_argument("--iso", type=Path, help="use this disc1 ISO instead of downloading --version")
     parser.add_argument("--binary", type=Path, help="signed vmm binary (default: target/debug/cube)")
     parser.add_argument("--cache-dir", type=Path,
-                        default=Path.home() / "Library/Caches/vmm")
+                        default=Path.home() / "Library/Caches/Cube")
     parser.add_argument("--disk-gib", type=int, default=20)
     parser.add_argument("--ram", type=int, help="MiB; default 1024, or 4096 with --desktop")
     parser.add_argument("--cpus", type=int, help="default 2, or 4 with --desktop")

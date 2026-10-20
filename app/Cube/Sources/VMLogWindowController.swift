@@ -273,11 +273,25 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
 
         if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
            let content = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) {
-            rawLogContent = content
+            rawLogContent = VMLogWindowController.cleanAnsiCodes(content)
             applyFilterAndDisplay(resetPosition: resetPosition)
             let kb = Double(fileSize) / 1024.0
             statusLabel.stringValue = String(format: "%.1f KB • %@", kb, modDate.formatted(date: .omitted, time: .standard))
         }
+    }
+
+    private static let ansiRegex: NSRegularExpression? = {
+        let pattern = #"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\?[0-9a-zA-Z])|\[[0-9]{1,3}(?:;[0-9]{1,3})*[mH]|\[[0-2]?[JK]"#
+        return try? NSRegularExpression(pattern: pattern, options: [])
+    }()
+
+    static func cleanAnsiCodes(_ input: String) -> String {
+        guard let regex = ansiRegex, !input.isEmpty else { return input }
+        let range = NSRange(input.startIndex..<input.endIndex, in: input)
+        var cleaned = regex.stringByReplacingMatches(in: input, options: [], range: range, withTemplate: "")
+        cleaned = cleaned.replacingOccurrences(of: "\u{001B}", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "\u{0008}", with: "")
+        return cleaned
     }
 
     private func applyFilterAndDisplay(resetPosition: Bool = false) {

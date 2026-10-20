@@ -6,6 +6,13 @@ private class NewVMContentView: NSView {
     override var isFlipped: Bool { return true }
 }
 
+private struct OSSelectionOption {
+    let title: String
+    let osVersion: String
+    let customIsoPath: String?
+    let isCustomFilePicker: Bool
+}
+
 class NewVMWindowController: NSWindowController {
     static var shared: NewVMWindowController?
 
@@ -74,17 +81,15 @@ class NewVMWindowController: NSWindowController {
 
     private func resetUI() {
         nameField.stringValue = "freebsd-\(Int.random(in: 100...999))"
+        populateOSOptions()
         osPopUp.selectItem(at: 0)
-        isoPathField.stringValue = ""
-        isoPathField.isEnabled = false
-        browseButton.isEnabled = false
-        unattendedCheckbox.state = .on
+        osSelectionChanged()
         cpuPopUp.selectItem(at: 1) // 2 vCPUs
         ramPopUp.selectItem(at: 1) // 2048 MB
         memPreallocCheckbox?.state = .off
         diskField.stringValue = "20"
         passwordField.stringValue = "root"
-        netPopUp.selectItem(at: 0)
+        setupNetPopUp()
         sshPortField.stringValue = "\(VMManager.shared.nextAvailableSSHPort())"
         vncPortField.stringValue = "\(VMManager.shared.nextAvailableVNCPort())"
         statusLabel.stringValue = "Ready"
@@ -136,12 +141,10 @@ class NewVMWindowController: NSWindowController {
         // Box: OS Selection
         y = addRow(label: "Operating System:", in: contentView, y: y) {
             osPopUp = NSPopUpButton(frame: NSRect(x: 150, y: y - 2, width: 330, height: 26))
-            osPopUp.addItem(withTitle: "FreeBSD 14.4 (RELEASE) - Official Netboot")
-            osPopUp.addItem(withTitle: "FreeBSD 15.1 (RELEASE) - Packaged Base")
-            osPopUp.addItem(withTitle: "Custom Installer ISO...")
             osPopUp.toolTip = "Choose an official FreeBSD ARM64 release (auto-downloaded and verified) or provide a custom boot ISO."
             osPopUp.target = self
             osPopUp.action = #selector(osSelectionChanged)
+            populateOSOptions()
             return osPopUp
         }
 
@@ -257,22 +260,13 @@ class NewVMWindowController: NSWindowController {
             let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 42))
             let hasEntitlement = VMManager.shared.hasNetworkingEntitlement()
             netPopUp = NSPopUpButton(frame: NSRect(x: 0, y: 16, width: 330, height: 26), pullsDown: false)
-            if hasEntitlement {
-                netPopUp.addItem(withTitle: "Shared Proxy (vmnet-proxy)")
-                netPopUp.addItem(withTitle: "Direct vmnet NAT (vmnet) — Entitled ✓")
-                netPopUp.addItem(withTitle: "Bridged LAN (bridge) — Entitled ✓")
-                netPopUp.addItem(withTitle: "Offline / Disabled (none)")
-            } else {
-                netPopUp.addItem(withTitle: "Shared Proxy (vmnet-proxy) — Recommended")
-                netPopUp.addItem(withTitle: "Direct vmnet NAT (vmnet) — Requires Entitlement")
-                netPopUp.addItem(withTitle: "Bridged LAN (bridge) — Requires Entitlement")
-                netPopUp.addItem(withTitle: "Offline / Disabled (none)")
-            }
-            netPopUp.selectItem(at: 0)
-            netPopUp.toolTip = "Shared Proxy (vmnet-proxy) provides fast user-mode NAT with DHCP (no root/sudo privileges needed)."
+            setupNetPopUp()
             container.addSubview(netPopUp)
 
-            let hint = NSTextField(labelWithString: "💡 Shared Proxy runs in user-mode with DHCP (no root/sudo needed)")
+            let hintText = hasEntitlement
+                ? "✓ Entitlement granted: Native Apple vmnet NAT selected by default"
+                : "💡 Shared Proxy runs in user-mode with DHCP (no root/sudo needed)"
+            let hint = NSTextField(labelWithString: hintText)
             hint.font = NSFont.systemFont(ofSize: 10)
             hint.textColor = .secondaryLabelColor
             hint.frame = NSRect(x: 2, y: 0, width: 328, height: 14)
@@ -421,13 +415,107 @@ class NewVMWindowController: NSWindowController {
         return y + 30
     }
 
-    @objc private func osSelectionChanged() {
-        let isCustom = (osPopUp.indexOfSelectedItem == 2)
-        isoPathField.isEnabled = isCustom
-        browseButton.isEnabled = isCustom
-        if isCustom && isoPathField.stringValue.isEmpty {
-            browseIsoClicked()
+    private func setupNetPopUp() {
+        netPopUp.removeAllItems()
+        let hasEntitlement = VMManager.shared.hasNetworkingEntitlement()
+        
+        func addModeItem(title: String, mode: String) {
+            netPopUp.addItem(withTitle: title)
+            netPopUp.lastItem?.representedObject = mode
         }
+        
+        if hasEntitlement {
+            addModeItem(title: "Direct vmnet NAT (vmnet) — Default (Entitled ✓)", mode: "vmnet")
+            addModeItem(title: "Bridged LAN (bridge) — Entitled ✓", mode: "bridge")
+            addModeItem(title: "Offline / Disabled (none)", mode: "none")
+            addModeItem(title: "Shared Proxy (vmnet-proxy)", mode: "vmnet-proxy")
+            netPopUp.selectItem(at: 0)
+            netPopUp.toolTip = "Direct vmnet NAT (vmnet) provides native macOS Hypervisor NAT networking using Apple's vmnet framework."
+        } else {
+            addModeItem(title: "Shared Proxy (vmnet-proxy) — Default (Recommended)", mode: "vmnet-proxy")
+            addModeItem(title: "Direct vmnet NAT (vmnet) — Requires Entitlement", mode: "vmnet")
+            addModeItem(title: "Bridged LAN (bridge) — Requires Entitlement", mode: "bridge")
+            addModeItem(title: "Offline / Disabled (none)", mode: "none")
+            netPopUp.selectItem(at: 0)
+            netPopUp.toolTip = "Shared Proxy (vmnet-proxy) provides fast user-mode NAT with DHCP (no root/sudo privileges needed)."
+        }
+    }
+
+    private func populateOSOptions() {
+        osPopUp.removeAllItems()
+        let menu = NSMenu()
+        
+        let allItems = ImageCacheManager.shared.getAllImageItems()
+        let presets = ImageCacheManager.shared.presets
+        
+        // 1. Official Presets
+        for preset in presets {
+            let item = allItems.first(where: { $0.id == preset.id })
+            let isCached = item?.isCached == true
+            let tag = isCached ? " [Cached]" : " [Auto-download]"
+            let title = "\(preset.name)\(tag)"
+            
+            let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            mi.representedObject = OSSelectionOption(
+                title: title,
+                osVersion: preset.version,
+                customIsoPath: isCached ? "\(ImageCacheManager.shared.cacheDir)/\(preset.filename)" : nil,
+                isCustomFilePicker: false
+            )
+            menu.addItem(mi)
+        }
+        
+        // 2. Custom Cached Images in ~/Library/Caches/Cube
+        let customCached = allItems.filter { !$0.isPreset && $0.isCached }
+        if !customCached.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+            for img in customCached {
+                let fullPath = "\(ImageCacheManager.shared.cacheDir)/\(img.filename)"
+                let title = "\(img.title) [Cached ISO]"
+                let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                mi.representedObject = OSSelectionOption(
+                    title: title,
+                    osVersion: "custom",
+                    customIsoPath: fullPath,
+                    isCustomFilePicker: false
+                )
+                menu.addItem(mi)
+            }
+        }
+        
+        // 3. Custom ISO browse option
+        menu.addItem(NSMenuItem.separator())
+        let browseTitle = "Custom Installer ISO (Browse...)"
+        let browseMi = NSMenuItem(title: browseTitle, action: nil, keyEquivalent: "")
+        browseMi.representedObject = OSSelectionOption(
+            title: browseTitle,
+            osVersion: "custom",
+            customIsoPath: nil,
+            isCustomFilePicker: true
+        )
+        menu.addItem(browseMi)
+        
+        osPopUp.menu = menu
+    }
+
+    @objc private func osSelectionChanged() {
+        guard let opt = osPopUp.selectedItem?.representedObject as? OSSelectionOption else { return }
+        
+        isoPathField.isEnabled = opt.isCustomFilePicker
+        browseButton.isEnabled = opt.isCustomFilePicker
+        
+        if opt.isCustomFilePicker {
+            if isoPathField.stringValue.isEmpty {
+                browseIsoClicked()
+            }
+        } else if let cachedPath = opt.customIsoPath {
+            isoPathField.stringValue = cachedPath
+        } else {
+            isoPathField.stringValue = ""
+        }
+        
+        unattendedCheckbox.isEnabled = true
+        unattendedCheckbox.toolTip = "Automates disk partitioning (ZFS), root user account setup, and SSH service configuration with zero installer prompts."
     }
 
     @objc private func browseIsoClicked() {
@@ -476,32 +564,31 @@ class NewVMWindowController: NSWindowController {
             return
         }
 
-        var osVersion = "14.4"
+        guard let selectedOpt = osPopUp.selectedItem?.representedObject as? OSSelectionOption else {
+            showError("Please select a valid operating system.")
+            return
+        }
+
+        var osVersion = selectedOpt.osVersion
         var customIso: String? = nil
-        switch osPopUp.indexOfSelectedItem {
-        case 0: osVersion = "14.4"
-        case 1: osVersion = "15.1"
-        case 2:
+
+        if selectedOpt.isCustomFilePicker {
             osVersion = "custom"
             customIso = isoPathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if customIso?.isEmpty ?? true || !FileManager.default.fileExists(atPath: customIso!) {
                 showError("Please select a valid custom ISO file.")
                 return
             }
-        default: break
+        } else if let cachedPath = selectedOpt.customIsoPath, selectedOpt.osVersion == "custom" {
+            osVersion = "custom"
+            customIso = cachedPath
         }
 
         let cpus = [1, 2, 4, 8][cpuPopUp.indexOfSelectedItem]
         let rams = [1024, 2048, 4096, 8192, 16384][ramPopUp.indexOfSelectedItem]
         let diskGB = Int(diskField.stringValue) ?? 20
         let password = passwordField.stringValue.isEmpty ? "root" : passwordField.stringValue
-        let netMode: String
-        switch netPopUp.indexOfSelectedItem {
-        case 1: netMode = "vmnet"
-        case 2: netMode = "bridge"
-        case 3: netMode = "none"
-        default: netMode = "vmnet-proxy"
-        }
+        let netMode = (netPopUp.selectedItem?.representedObject as? String) ?? (VMManager.shared.hasNetworkingEntitlement() ? "vmnet" : "vmnet-proxy")
         let sshPort = Int(sshPortField.stringValue)
         let vncPort = Int(vncPortField.stringValue)
 

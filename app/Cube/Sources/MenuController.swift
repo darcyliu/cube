@@ -332,7 +332,8 @@ class MenuController: NSObject {
         
         // 1. Always prefer the signed binary inside the app bundle
         let symlinkPath = "\(binDir)/cube"
-        let devCube = "\(home)/Dev/vmm/target/debug/cube"
+        let devCube = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("target/debug/cube").path
         let cubeTarget = ServiceManager.shared.findCubeBinary() ??
             (FileManager.default.isExecutableFile(atPath: devCube) ? devCube : nil)
         
@@ -352,17 +353,9 @@ class MenuController: NSObject {
         try? FileManager.default.createDirectory(atPath: appSupport, withIntermediateDirectories: true)
         let scriptPath = "\(appSupport)/open-terminal.command"
         
-        // 3. Resolve working directory: prefer ~/Cube or $HOME; fallback to repo only when running from source
+        // 3. Resolve working directory: prefer ~/Cube (or configured vmsDirectory), fallback to $HOME
         let vmsDir = VMManager.shared.vmsDirectory
-        let devDir = "\(home)/Dev/vmm"
-        let workingDir: String
-        if !Bundle.main.bundlePath.hasPrefix("/Applications") && FileManager.default.fileExists(atPath: devDir) {
-            workingDir = devDir
-        } else if FileManager.default.fileExists(atPath: vmsDir) {
-            workingDir = vmsDir
-        } else {
-            workingDir = home
-        }
+        let workingDir = FileManager.default.fileExists(atPath: vmsDir) ? vmsDir : home
         
         let scriptContent = """
         #!/bin/bash
@@ -486,6 +479,11 @@ class MenuController: NSObject {
                 logsItem.representedObject = vm
                 logsItem.target = self
                 subMenu.addItem(logsItem)
+
+                let commandsItem = NSMenuItem(title: "View CLI Commands...", action: #selector(viewCommandsAction(_:)), keyEquivalent: "")
+                commandsItem.representedObject = vm
+                commandsItem.target = self
+                subMenu.addItem(commandsItem)
                 subMenu.addItem(NSMenuItem.separator())
 
                 if vm.isRunning {
@@ -604,5 +602,10 @@ class MenuController: NSObject {
     @objc private func openVNCAction(_ sender: NSMenuItem) {
         guard let vm = sender.representedObject as? VMInfo else { return }
         VMManager.shared.openVNC(for: vm)
+    }
+
+    @objc private func viewCommandsAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        VMCommandsSheetController.show(for: vm)
     }
 }

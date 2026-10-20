@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import Security
 import Darwin
+import CryptoKit
 
 struct VMInfo: Decodable {
     let name: String
@@ -727,20 +728,47 @@ class VMManager {
     }
 }
 
+struct DetailedVMDisk {
+    var path: String
+    var cow: Bool = false
+    var readOnly: Bool = false
+}
+
 struct DetailedVMConfig {
     var os: String?
     var cpus: Int = 2
     var ramMB: Int = 2048
     var bootMode: String = "uefi"
-    var diskPath: String?
+    var firmware: String?
+    var kernel: String?
+    var multiuser: Bool = true
+    var modules: [String] = []
+    var root: String?
+    var bootargs: String?
+    var disks: [DetailedVMDisk] = []
     var netMode: String = "vmnet-proxy"
+    var mac: String?
     var sshPort: Int?
+    var forwards: [String] = []
     var vnc: String?
+    var display: String?
+    var efiVars: String?
     var shares: [VMShareConfig] = []
+    var noReboot: Bool = false
     var memPrealloc: Bool = false
+
+    var diskPath: String? {
+        return disks.first?.path
+    }
 }
 
 extension VMInfo {
+    static func deriveMacAddress(name: String) -> String {
+        let digest = SHA256.hash(data: Data(name.utf8))
+        let bytes = Array(digest.prefix(4))
+        return String(format: "52:54:%02x:%02x:%02x:%02x", bytes[0], bytes[1], bytes[2], bytes[3])
+    }
+
     func loadConfig() -> DetailedVMConfig {
         var cfg = DetailedVMConfig()
         let configPath = self.config ?? "\(VMManager.shared.vmsDirectory)/\(self.name)/\(self.name).json"
@@ -749,17 +777,50 @@ extension VMInfo {
             if let o = json["os"] as? String { cfg.os = o }
             if let c = json["cpus"] as? Int { cfg.cpus = c }
             if let r = json["ram_mb"] as? Int { cfg.ramMB = r }
-            if let b = json["boot"] as? [String: Any], let m = b["mode"] as? String { cfg.bootMode = m }
-            if let d = json["disks"] as? [[String: Any]], let first = d.first, let p = first["path"] as? String {
-                cfg.diskPath = p
+            if let b = json["boot"] as? [String: Any] {
+                if let m = b["mode"] as? String { cfg.bootMode = m }
+                if let fw = b["firmware"] as? String { cfg.firmware = fw }
+                if let k = b["kernel"] as? String { cfg.kernel = k }
+                if let multiuser = b["multiuser"] as? Bool { cfg.multiuser = multiuser }
+                if let modules = b["modules"] as? [String] { cfg.modules = modules }
+                if let r = b["root"] as? String { cfg.root = r }
+                if let args = b["bootargs"] as? String { cfg.bootargs = args }
             }
+
+            // Disks can be [String] (simple) or [[String: Any]] (detailed)
+            if let rawDisks = json["disks"] as? [Any] {
+                cfg.disks = rawDisks.compactMap { item in
+                    if let s = item as? String {
+                        return DetailedVMDisk(path: s)
+                    } else if let dict = item as? [String: Any], let p = dict["path"] as? String {
+                        let cow = dict["cow"] as? Bool ?? false
+                        let ro = dict["read_only"] as? Bool ?? false
+                        return DetailedVMDisk(path: p, cow: cow, readOnly: ro)
+                    }
+                    return nil
+                }
+            }
+
+            // Network
             if let n = json["network"] as? [String: Any] {
                 if let m = n["mode"] as? String { cfg.netMode = m }
+                if let mc = n["mac"] as? String { cfg.mac = mc }
                 if let sp = n["ssh_port"] as? Int { cfg.sshPort = sp }
+                if let fws = n["forwards"] as? [String] { cfg.forwards = fws }
             }
-            if let v = json["vnc"] as? [String: Any], let bind = v["bind"] as? String {
-                cfg.vnc = bind
+
+            // VNC
+            if let v = json["vnc"] as? [String: Any] {
+                if let bind = v["bind"] as? String { cfg.vnc = bind }
+                if let disp = v["display"] as? String { cfg.display = disp }
             }
+
+            // EFI Vars
+            if let ev = json["efi_vars"] as? String {
+                cfg.efiVars = ev
+            }
+
+            // Shares
             if let sharesList = json["shares"] as? [[String: Any]] {
                 cfg.shares = sharesList.compactMap { s in
                     guard let tag = s["tag"] as? String, let p = s["path"] as? String else { return nil }
@@ -767,11 +828,223 @@ extension VMInfo {
                     return VMShareConfig(tag: tag, path: p, read_only: ro)
                 }
             }
+
+            // Flags
+            if let nr = json["no_reboot"] as? Bool {
+                cfg.noReboot = nr
+            }
             if let mp = json["mem_prealloc"] as? Bool {
                 cfg.memPrealloc = mp
             }
         }
         return cfg
+    }
+
+    private func resolveFirmwarePath(specified: String?, vmDir: String) -> String {
+        // 1. If explicit path in config is absolute and exists
+        if let s = specified, s.hasPrefix("/") && FileManager.default.fileExists(atPath: s) {
+            return s
+        }
+
+        // 2. If relative to VM directory
+        if let s = specified, !s.isEmpty {
+            let candidate = "\(vmDir)/\(s)"
+            if FileManager.default.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+
+        // 3. Common VM-local paths
+        let localCandidates = [
+            "\(vmDir)/firmware/QEMU_EFI.fd",
+            "\(vmDir)/QEMU_EFI.fd"
+        ]
+        for c in localCandidates {
+            if FileManager.default.fileExists(atPath: c) {
+                return c
+            }
+        }
+
+        // 4. Running App bundle Resources
+        if let res = Bundle.main.resourcePath {
+            let inBundle = "\(res)/firmware/QEMU_EFI.fd"
+            if FileManager.default.fileExists(atPath: inBundle) {
+                return inBundle
+            }
+        }
+
+        // 5. Installed /Applications/Cube.app Resources
+        let standardAppFw = "/Applications/Cube.app/Contents/Resources/firmware/QEMU_EFI.fd"
+        if FileManager.default.fileExists(atPath: standardAppFw) {
+            return standardAppFw
+        }
+
+        // 6. User share: ~/.local/share/cube/firmware/QEMU_EFI.fd
+        let home = NSHomeDirectory()
+        let userShare = "\(home)/.local/share/cube/firmware/QEMU_EFI.fd"
+        if FileManager.default.fileExists(atPath: userShare) {
+            return userShare
+        }
+
+        // 7. Check relative to cube binary location if known
+        if let cubeBin = ServiceManager.shared.findCubeBinary() {
+            var curr = URL(fileURLWithPath: cubeBin)
+            for _ in 0..<6 {
+                curr = curr.deletingLastPathComponent()
+                let candRes = curr.appendingPathComponent("Resources/firmware/QEMU_EFI.fd").path
+                if FileManager.default.fileExists(atPath: candRes) {
+                    return candRes
+                }
+                let candFw = curr.appendingPathComponent("firmware/QEMU_EFI.fd").path
+                if FileManager.default.fileExists(atPath: candFw) {
+                    return candFw
+                }
+            }
+        }
+
+        // 8. If config specified a path, make it absolute under vmDir
+        if let s = specified, !s.isEmpty {
+            return s.hasPrefix("/") ? s : "\(vmDir)/\(s)"
+        }
+
+        // Fallback to absolute path under vmDir
+        return "\(vmDir)/firmware/QEMU_EFI.fd"
+    }
+
+    private func resolveKernelPath(specified: String?, vmDir: String) -> String {
+        if let s = specified, s.hasPrefix("/") && FileManager.default.fileExists(atPath: s) {
+            return s
+        }
+
+        if let s = specified, !s.isEmpty {
+            let candidate = "\(vmDir)/\(s)"
+            if FileManager.default.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+
+        let localCandidates = [
+            "\(vmDir)/kernel",
+            "\(vmDir)/boot/kernel/kernel",
+            "\(vmDir)/boot/kernel"
+        ]
+        for c in localCandidates {
+            if FileManager.default.fileExists(atPath: c) {
+                return c
+            }
+        }
+
+        if let s = specified, !s.isEmpty {
+            return s.hasPrefix("/") ? s : "\(vmDir)/\(s)"
+        }
+        return "\(vmDir)/boot/kernel/kernel"
+    }
+
+    func generateCubeCommand() -> String {
+        let cfg = self.loadConfig()
+        var parts: [String] = ["cube"]
+
+        let configPath = self.config ?? "\(VMManager.shared.vmsDirectory)/\(self.name)/\(self.name).json"
+        let vmDir = URL(fileURLWithPath: configPath).deletingLastPathComponent().path
+        let stateDir = "\(NSHomeDirectory())/.local/state/cube/\(self.name)"
+
+        // 1. Boot mode
+        if cfg.bootMode == "uefi" {
+            let fwPath = resolveFirmwarePath(specified: cfg.firmware, vmDir: vmDir)
+            parts.append(contentsOf: ["--uefi", fwPath])
+        } else if cfg.bootMode == "freebsd" {
+            let kernelPath = resolveKernelPath(specified: cfg.kernel, vmDir: vmDir)
+            parts.append(contentsOf: ["--freebsd", kernelPath])
+            if cfg.multiuser {
+                parts.append("--multiuser")
+            }
+            if let root = cfg.root, !root.isEmpty {
+                parts.append(contentsOf: ["--root", root])
+            }
+            if let bootargs = cfg.bootargs, !bootargs.isEmpty {
+                parts.append(contentsOf: ["--bootargs", bootargs])
+            }
+        }
+
+        for module in cfg.modules {
+            let path = (module as NSString).expandingTildeInPath
+            parts.append(contentsOf: ["--module", path.hasPrefix("/") ? path : "\(vmDir)/\(path)"])
+        }
+
+        // 2. RAM & vCPUs
+        parts.append(contentsOf: ["--ram", "\(cfg.ramMB)"])
+        parts.append(contentsOf: ["--cpus", "\(cfg.cpus)"])
+
+        // 3. Disks
+        for d in cfg.disks {
+            let fullDisk = d.path.hasPrefix("/") ? d.path : "\(vmDir)/\(d.path)"
+            var arg = fullDisk
+            if d.cow {
+                arg += ",cow"
+            } else if d.readOnly {
+                arg += ",ro"
+            }
+            parts.append(contentsOf: ["--disk", arg])
+        }
+
+        // 4. Network
+        parts.append(contentsOf: ["--net", cfg.netMode])
+        if cfg.netMode != "none" {
+            let mac = cfg.mac ?? VMInfo.deriveMacAddress(name: self.name)
+            parts.append(contentsOf: ["--mac", mac])
+        }
+
+        if let port = cfg.sshPort, cfg.netMode != "none" {
+            parts.append(contentsOf: ["--ssh-port", "\(port)"])
+        }
+
+        for rule in cfg.forwards {
+            parts.append(contentsOf: ["--forward", rule])
+        }
+
+        // 5. VNC
+        if let vnc = cfg.vnc {
+            parts.append(contentsOf: ["--vnc", vnc])
+            if let disp = cfg.display {
+                parts.append(contentsOf: ["--display", disp])
+            }
+        }
+
+        // 6. Shares
+        for share in cfg.shares {
+            let flag = share.read_only ? "--share" : "--share-rw"
+            parts.append(contentsOf: [flag, share.tag, share.path])
+        }
+
+        // 7. EFI vars & serial log
+        if cfg.bootMode == "uefi" {
+            let efiPath: String
+            if let ev = cfg.efiVars, !ev.isEmpty {
+                efiPath = ev.hasPrefix("/") ? ev : "\(vmDir)/\(ev)"
+            } else {
+                efiPath = "\(stateDir)/efi-vars.fd"
+            }
+            parts.append(contentsOf: ["--efi-vars", efiPath])
+        }
+
+        let serialLog = "\(stateDir)/console.log"
+        parts.append(contentsOf: ["--serial-log", serialLog])
+
+        // 8. Flags
+        let hasAttachedIso = cfg.disks.contains(where: {
+            let p = $0.path.lowercased()
+            return p.hasSuffix(".iso") || ($0.readOnly && p.contains(".iso"))
+        })
+        if cfg.noReboot || hasAttachedIso {
+            parts.append("--no-reboot")
+        }
+
+        if cfg.memPrealloc {
+            parts.append("--mem-prealloc")
+        }
+
+        return parts.map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+            .joined(separator: " ")
     }
 }
 

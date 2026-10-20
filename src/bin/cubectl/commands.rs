@@ -1,4 +1,5 @@
 use std::fs::{self, OpenOptions};
+use std::net::ToSocketAddrs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,7 +17,7 @@ use crate::util::{
     self, canonical_path_str, create_sparse_file, default_state_root, default_vms_root, ensure_cube_entitlements,
     find_cube_binary, parse_disk_spec, require, resolve_path, write_json_atomic,
 };
-use crate::{CreateArgs, InstallArgs, StartArgs};
+use crate::{CreateArgs, InstallArgs, SshArgs, StartArgs};
 
 pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     validate_vm_name(&args.name)?;
@@ -823,6 +824,129 @@ pub fn do_start(args: StartArgs, state_root: &Path) -> Result<(), String> {
     Err(format!("VM did not start within 10s; inspect {:?}", state_dir.join("manager.log")))
 }
 
+fn ssh_identity(
+    explicit: Option<PathBuf>,
+    config: Option<&VmConfig>,
+    config_path: Option<&Path>,
+) -> Option<PathBuf> {
+    explicit.or_else(|| {
+        let identity = &config?.shutdown.as_ref()?.identity_file;
+        let base = config_path.and_then(Path::parent).unwrap_or(Path::new("."));
+        resolve_path(identity, base).ok()
+    })
+}
+
+pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
+    let (state_dir, explicit_config) = resolve_target_dir(&args.target, state_root)?;
+    let vm_name = state_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| args.target.clone());
+
+    let status = live_status(&state_dir).ok_or_else(|| {
+        format!(
+            "VM '{}' is not running. Start it first with 'cubectl start {}'",
+            vm_name, vm_name
+        )
+    })?;
+
+    // Attempt to locate the config to extract shutdown credentials / ssh_port if present
+    let config_path = explicit_config.or_else(|| find_config_for_target(&vm_name, state_root).ok());
+    let vm_config = config_path.as_ref().and_then(|cp| {
+        fs::read_to_string(&cp).ok().and_then(|c| serde_json::from_str::<VmConfig>(&c).ok())
+    });
+
+    // 1. Determine Port & Host
+    let (host, port) = if let Some(p) = args.port {
+        if p == 22 {
+            let ip = status
+                .get("ip")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && *s != "0.0.0.0");
+            (ip.unwrap_or("127.0.0.1").to_string(), 22)
+        } else {
+            ("127.0.0.1".to_string(), p)
+        }
+    } else {
+        let configured_ssh_port = status
+            .get("ssh_port")
+            .and_then(|p| p.as_u64())
+            .map(|p| p as u16)
+            .or_else(|| vm_config.as_ref().and_then(|c| c.network.as_ref()).and_then(|n| n.ssh_port));
+
+        if let Some(port) = configured_ssh_port {
+            ("127.0.0.1".to_string(), port)
+        } else if let Some(ip) = status
+            .get("ip")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "0.0.0.0")
+        {
+            (ip.to_string(), 22)
+        } else {
+            // Default port forward fallback
+            ("127.0.0.1".to_string(), 2222)
+        }
+    };
+
+    // 2. Determine User
+    let user = args.user.unwrap_or_else(|| {
+        vm_config
+            .as_ref()
+            .and_then(|c| c.shutdown.as_ref())
+            .map(|s| s.user.clone())
+            .unwrap_or_else(|| "root".to_string())
+    });
+
+    // 3. Determine Identity File
+    let identity = ssh_identity(args.identity, vm_config.as_ref(), config_path.as_deref());
+
+    // 4. Optional --wait: wait until SSH port is reachable
+    if args.wait {
+        let deadline = Instant::now() + Duration::from_secs(args.wait_timeout);
+        let mut ready = false;
+        eprintln!("[Cube] Waiting for SSH on {}:{} to become ready...", host, port);
+        while Instant::now() < deadline {
+            if let Ok(mut addrs) = (host.as_str(), port).to_socket_addrs() {
+                if let Some(addr) = addrs.next() {
+                    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
+                        ready = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if !ready {
+            return Err(format!("timed out after {}s waiting for SSH on {}:{}", args.wait_timeout, host, port));
+        }
+    }
+
+    // 5. Build and exec ssh
+    let mut ssh_cmd = Command::new("ssh");
+    ssh_cmd.args([
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-p", &port.to_string(),
+    ]);
+
+    if let Some(ref id) = identity {
+        if id.is_file() {
+            ssh_cmd.args(["-i", &id.to_string_lossy()]);
+        }
+    }
+
+    let target_dest = format!("{}@{}", user, host);
+    ssh_cmd.arg(&target_dest);
+
+    if !args.command.is_empty() {
+        ssh_cmd.args(&args.command);
+    }
+
+    let err = ssh_cmd.exec();
+    Err(format!("failed to execute ssh: {}", err))
+}
+
 pub fn do_status(target: &str, state_root: &Path) -> Result<(), String> {
     let (state_dir, _) = resolve_target_dir(target, state_root)?;
     if let Some(status) = live_status(&state_dir) {
@@ -1204,6 +1328,25 @@ pub fn find_next_available_vnc_port(state_root: &Path, vms_root: &Path) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_config_identity_is_relative_to_config_but_cli_identity_is_not() {
+        let config: VmConfig = serde_json::from_value(serde_json::json!({
+            "name": "example",
+            "boot": {"mode": "uefi"},
+            "shutdown": {"identity_file": "keys/id_ed25519", "user": "root"}
+        })).unwrap();
+        let config_path = Path::new("/tmp/vms/example/example.json");
+        assert_eq!(
+            ssh_identity(None, Some(&config), Some(config_path)),
+            Some(PathBuf::from("/tmp/vms/example/keys/id_ed25519"))
+        );
+        let override_key = PathBuf::from("my-key");
+        assert_eq!(
+            ssh_identity(Some(override_key.clone()), Some(&config), Some(config_path)),
+            Some(override_key)
+        );
+    }
 
     #[test]
     fn test_parse_vnc_port() {

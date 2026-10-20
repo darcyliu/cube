@@ -30,7 +30,7 @@ to reuse that disk as a VM later.
 ```mermaid
 flowchart TD
   svc["make vmnet-service, once, as your user"] --> iv["install-vm.py --unattended --desktop xfce or plasma"]
-  iv --> iso["Reuse or download disc1 in ~/Library/Caches/vmm"]
+  iv --> iso["Reuse or download disc1 in ~/Library/Caches/Cube"]
   iso --> dest["Create ~/VMs/name and a new ed25519 key"]
   dest --> inst["bsdinstall from the seed, --net none, then power off"]
   inst --> boot["Boot the installed disk with vmnet-proxy and SSH"]

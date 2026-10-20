@@ -11,6 +11,25 @@ private class FlippedBox: NSBox {
     override var isFlipped: Bool { return true }
 }
 
+private class ActionButton: NSButton {
+    var onClick: ((ActionButton) -> Void)?
+
+    init(title: String) {
+        super.init(frame: .zero)
+        self.title = title
+        self.target = self
+        self.action = #selector(internalAction)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func internalAction() {
+        onClick?(self)
+    }
+}
+
 struct HostNetworkInfo {
     let interface: String
     let ipv4: String?
@@ -84,6 +103,7 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         PreferenceTabItem(id: "general", title: "General", iconName: "gearshape"),
         PreferenceTabItem(id: "network", title: "Network", iconName: "network"),
         PreferenceTabItem(id: "storage", title: "Storage", iconName: "internaldrive"),
+        PreferenceTabItem(id: "images", title: "Images", iconName: "opticaldisc"),
         PreferenceTabItem(id: "ssh", title: "SSH Keys", iconName: "key"),
         PreferenceTabItem(id: "about", title: "About", iconName: "info.circle")
     ]
@@ -116,6 +136,11 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
     private var storageFreeSpaceLabel: NSTextField!
     private var storageVMCountLabel: NSTextField!
     
+    // Images Tab Controls
+    private var imagesTotalUsageLabel: NSTextField!
+    private var imagesListContainer: FlippedContainerView!
+    private var imagesScrollView: NSScrollView!
+
     // SSH Keys Tab Controls
     private var sshKeyStatusDot: NSTextField!
     private var sshKeyPathLabel: NSTextField!
@@ -196,8 +221,33 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         tabViews["general"] = buildGeneralTabView()
         tabViews["network"] = buildNetworkTabView()
         tabViews["storage"] = buildStorageTabView()
+        tabViews["images"] = buildImagesTabView()
         tabViews["ssh"] = buildSSHKeysTabView()
         tabViews["about"] = buildAboutTabView()
+
+        // Hook up background image cache updates
+        ImageCacheManager.shared.onProgressChanged = { [weak self] _, _ in
+            if self?.currentTabId == "images" {
+                self?.refreshImagesUI()
+            }
+        }
+        ImageCacheManager.shared.onCacheUpdated = { [weak self] in
+            if self?.currentTabId == "images" {
+                self?.refreshImagesUI()
+            }
+        }
+        ImageCacheManager.shared.onDownloadFinished = { [weak self] presetId, success, errorMsg in
+            if !success, let msg = errorMsg {
+                let alert = NSAlert()
+                alert.messageText = "Download Failed"
+                alert.informativeText = "Could not download image (\(presetId)):\n\(msg)"
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+            if self?.currentTabId == "images" {
+                self?.refreshImagesUI()
+            }
+        }
         
         // Select initial tab: General
         sidebarTableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
@@ -486,6 +536,111 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             cancelAction: #selector(revertStorageClicked),
             applyTitle: "Apply",
             applyAction: #selector(applyStorageClicked(_:))
+        )
+        view.addSubview(footer)
+        return view
+    }
+    
+    // MARK: - Images Tab View Builder
+    
+    private func buildImagesTabView() -> NSView {
+        let view = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: 554, height: 520))
+        let margin: CGFloat = 24
+        let contentWidth: CGFloat = 506
+        var y: CGFloat = 20
+        
+        let header = NSTextField(labelWithString: "Operating System Images & ISOs")
+        header.font = NSFont.boldSystemFont(ofSize: 15)
+        header.frame = NSRect(x: margin, y: y, width: contentWidth, height: 22)
+        view.addSubview(header)
+        y += 24
+        
+        let desc = NSTextField(wrappingLabelWithString: "Installer ISOs and disk templates are cached in ~/Library/Caches/Cube for fast, offline VM creation. Pre-download images or reclaim space.")
+        desc.font = NSFont.systemFont(ofSize: 12)
+        desc.textColor = .secondaryLabelColor
+        desc.frame = NSRect(x: margin, y: y, width: contentWidth, height: 32)
+        view.addSubview(desc)
+        y += 36
+        
+        // 1. Summary Card
+        let summaryBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 68))
+        summaryBox.boxType = .custom
+        summaryBox.cornerRadius = 6
+        summaryBox.borderWidth = 1
+        summaryBox.borderColor = .separatorColor
+        summaryBox.fillColor = NSColor.windowBackgroundColor
+        
+        let locLabel = NSTextField(labelWithString: "Cache Location: ~/Library/Caches/Cube")
+        locLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        locLabel.textColor = .secondaryLabelColor
+        locLabel.frame = NSRect(x: 12, y: 12, width: 230, height: 16)
+        summaryBox.addSubview(locLabel)
+        
+        imagesTotalUsageLabel = NSTextField(labelWithString: "Calculating cache size...")
+        imagesTotalUsageLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        imagesTotalUsageLabel.textColor = .labelColor
+        imagesTotalUsageLabel.frame = NSRect(x: 12, y: 34, width: 230, height: 20)
+        summaryBox.addSubview(imagesTotalUsageLabel)
+        
+        let openFolderBtn = NSButton(title: "Open Folder", target: self, action: #selector(revealCacheFolderClicked))
+        openFolderBtn.bezelStyle = .rounded
+        openFolderBtn.controlSize = .small
+        openFolderBtn.font = NSFont.systemFont(ofSize: 11)
+        openFolderBtn.frame = NSRect(x: contentWidth - 280, y: 22, width: 90, height: 24)
+        summaryBox.addSubview(openFolderBtn)
+        
+        let importBtn = NSButton(title: "Import ISO...", target: self, action: #selector(importLocalISOClicked))
+        importBtn.bezelStyle = .rounded
+        importBtn.controlSize = .small
+        importBtn.font = NSFont.systemFont(ofSize: 11)
+        importBtn.frame = NSRect(x: contentWidth - 186, y: 22, width: 92, height: 24)
+        summaryBox.addSubview(importBtn)
+        
+        let purgeBtn = NSButton(title: "Clear Cache", target: self, action: #selector(clearAllCacheClicked))
+        purgeBtn.bezelStyle = .rounded
+        purgeBtn.controlSize = .small
+        purgeBtn.font = NSFont.systemFont(ofSize: 11)
+        purgeBtn.frame = NSRect(x: contentWidth - 90, y: 22, width: 80, height: 24)
+        summaryBox.addSubview(purgeBtn)
+        
+        view.addSubview(summaryBox)
+        y += 76
+        
+        // 2. Catalog & Cached Images Card
+        let catalogBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 308))
+        catalogBox.boxType = .custom
+        catalogBox.cornerRadius = 6
+        catalogBox.borderWidth = 1
+        catalogBox.borderColor = .separatorColor
+        catalogBox.fillColor = NSColor.windowBackgroundColor
+        
+        let catalogTitle = NSTextField(labelWithString: "AVAILABLE & CACHED IMAGES")
+        catalogTitle.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        catalogTitle.textColor = .secondaryLabelColor
+        catalogTitle.frame = NSRect(x: 12, y: 8, width: 300, height: 16)
+        catalogBox.addSubview(catalogTitle)
+        
+        imagesScrollView = NSScrollView(frame: NSRect(x: 1, y: 28, width: contentWidth - 2, height: 278))
+        imagesScrollView.hasVerticalScroller = true
+        imagesScrollView.autohidesScrollers = true
+        imagesScrollView.borderType = .noBorder
+        imagesScrollView.drawsBackground = false
+        
+        imagesListContainer = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: contentWidth - 2, height: 278))
+        imagesScrollView.documentView = imagesListContainer
+        catalogBox.addSubview(imagesScrollView)
+        
+        view.addSubview(catalogBox)
+        
+        // 3. Footer
+        let footer = buildTabFooter(
+            width: 554,
+            y: 474,
+            note: "Downloaded ISOs are reused automatically by New Virtual Machine wizards.",
+            cancelTitle: "Open Folder",
+            cancelAction: #selector(revealCacheFolderClicked),
+            applyTitle: "Refresh",
+            applyAction: #selector(refreshImagesClicked)
         )
         view.addSubview(footer)
         return view
@@ -785,6 +940,7 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
                 case "general": iconView.contentTintColor = .systemGray
                 case "network": iconView.contentTintColor = .systemBlue
                 case "storage": iconView.contentTintColor = .systemPurple
+                case "images": iconView.contentTintColor = .systemIndigo
                 case "ssh": iconView.contentTintColor = .systemOrange
                 case "about": iconView.contentTintColor = .systemTeal
                 default: iconView.contentTintColor = .systemBlue
@@ -887,6 +1043,7 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         loadGeneralState()
         loadNetworkState()
         loadStorageState()
+        loadImagesState()
         loadSSHState()
     }
     
@@ -1389,6 +1546,283 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             guard let val = Int(octet), val >= 0 && val <= 255 else { return false }
         }
         return true
+    }
+    
+    // MARK: - Images Tab Management
+    
+    private func loadImagesState() {
+        refreshImagesUI()
+    }
+    
+    private func refreshImagesUI() {
+        guard imagesTotalUsageLabel != nil, imagesListContainer != nil, imagesScrollView != nil else { return }
+        
+        let items = ImageCacheManager.shared.getAllImageItems()
+        let totalBytes = ImageCacheManager.shared.getTotalCacheBytes()
+        let formattedTotal = ImageCacheManager.formatBytes(totalBytes)
+        let count = items.filter { $0.isCached }.count
+        imagesTotalUsageLabel.stringValue = "\(formattedTotal) used (\(count) cached file\(count == 1 ? "" : "s"))"
+        
+        for sv in imagesListContainer.subviews {
+            sv.removeFromSuperview()
+        }
+        
+        let rowHeight: CGFloat = 58
+        let totalH = max(CGFloat(items.count) * rowHeight, imagesScrollView.bounds.height)
+        imagesListContainer.frame = NSRect(x: 0, y: 0, width: imagesScrollView.contentSize.width, height: totalH)
+        
+        var ry: CGFloat = 0
+        for (idx, item) in items.enumerated() {
+            let row = buildImageRowView(item: item, frame: NSRect(x: 0, y: ry, width: imagesListContainer.bounds.width, height: rowHeight), isLast: idx == items.count - 1)
+            imagesListContainer.addSubview(row)
+            ry += rowHeight
+        }
+    }
+    
+    private func buildImageRowView(item: OSImageItem, frame: NSRect, isLast: Bool) -> NSView {
+        let row = FlippedContainerView(frame: frame)
+        
+        // Icon
+        let iconView = NSImageView(frame: NSRect(x: 12, y: 14, width: 24, height: 24))
+        let cfg = NSImage.SymbolConfiguration(pointSize: 20, weight: .regular)
+        if let img = NSImage(systemSymbolName: "opticaldisc", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
+            iconView.image = img
+            iconView.contentTintColor = item.isCached ? .systemGreen : (item.isDownloading ? .systemBlue : .secondaryLabelColor)
+        }
+        row.addSubview(iconView)
+        
+        // Title
+        let titleLabel = NSTextField(labelWithString: item.title)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.frame = NSRect(x: 46, y: 10, width: 250, height: 18)
+        row.addSubview(titleLabel)
+        
+        // Subtitle (Filename)
+        let subLabel = NSTextField(labelWithString: item.filename)
+        subLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        subLabel.textColor = .secondaryLabelColor
+        subLabel.lineBreakMode = .byTruncatingMiddle
+        subLabel.frame = NSRect(x: 46, y: 30, width: 250, height: 16)
+        subLabel.toolTip = item.filename
+        row.addSubview(subLabel)
+        
+        // Size & Status & Actions
+        let rightEdge = frame.width - 12
+        if item.isDownloading {
+            let progressIndicator = NSProgressIndicator(frame: NSRect(x: rightEdge - 175, y: 24, width: 100, height: 12))
+            progressIndicator.isIndeterminate = false
+            progressIndicator.minValue = 0.0
+            progressIndicator.maxValue = 1.0
+            progressIndicator.doubleValue = item.downloadProgress
+            row.addSubview(progressIndicator)
+            
+            let pctLabel = NSTextField(labelWithString: "\(Int(item.downloadProgress * 100))%")
+            pctLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .medium)
+            pctLabel.textColor = .systemBlue
+            pctLabel.alignment = .right
+            pctLabel.frame = NSRect(x: rightEdge - 175, y: 8, width: 100, height: 14)
+            row.addSubview(pctLabel)
+            
+            let cancelBtn = ActionButton(title: "Cancel")
+            cancelBtn.bezelStyle = .rounded
+            cancelBtn.controlSize = .small
+            cancelBtn.font = NSFont.systemFont(ofSize: 11)
+            cancelBtn.frame = NSRect(x: rightEdge - 66, y: 17, width: 66, height: 24)
+            cancelBtn.onClick = { [weak self] _ in
+                ImageCacheManager.shared.cancelDownload(presetId: item.id)
+                self?.refreshImagesUI()
+            }
+            row.addSubview(cancelBtn)
+            
+        } else if item.isCached {
+            let sizeLabel = NSTextField(labelWithString: item.sizeDisplay)
+            sizeLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            sizeLabel.textColor = .labelColor
+            sizeLabel.alignment = .right
+            sizeLabel.frame = NSRect(x: rightEdge - 215, y: 12, width: 80, height: 16)
+            row.addSubview(sizeLabel)
+            
+            let badge = NSTextField(labelWithString: "● CACHED")
+            badge.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
+            badge.textColor = .systemGreen
+            badge.alignment = .right
+            badge.frame = NSRect(x: rightEdge - 215, y: 30, width: 80, height: 14)
+            row.addSubview(badge)
+            
+            let revealBtn = ActionButton(title: "Reveal")
+            revealBtn.bezelStyle = .rounded
+            revealBtn.controlSize = .small
+            revealBtn.font = NSFont.systemFont(ofSize: 11)
+            revealBtn.frame = NSRect(x: rightEdge - 130, y: 17, width: 60, height: 24)
+            revealBtn.onClick = { _ in
+                let path = "\(ImageCacheManager.shared.cacheDir)/\(item.filename)"
+                if FileManager.default.fileExists(atPath: path) {
+                    NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
+                }
+            }
+            row.addSubview(revealBtn)
+            
+            let deleteBtn = ActionButton(title: "Delete")
+            deleteBtn.bezelStyle = .rounded
+            deleteBtn.controlSize = .small
+            deleteBtn.font = NSFont.systemFont(ofSize: 11)
+            deleteBtn.frame = NSRect(x: rightEdge - 66, y: 17, width: 62, height: 24)
+            deleteBtn.onClick = { [weak self] _ in
+                let alert = NSAlert()
+                alert.messageText = "Delete Cached Image?"
+                alert.informativeText = "Are you sure you want to delete \(item.filename) from the cache?"
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Delete")
+                alert.addButton(withTitle: "Cancel")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    _ = ImageCacheManager.shared.deleteImage(filename: item.filename)
+                    self?.refreshImagesUI()
+                }
+            }
+            row.addSubview(deleteBtn)
+            
+        } else {
+            let sizeLabel = NSTextField(labelWithString: "~\(item.fileSize == nil ? "1.15 GB" : item.sizeDisplay)")
+            sizeLabel.font = NSFont.systemFont(ofSize: 11)
+            sizeLabel.textColor = .secondaryLabelColor
+            sizeLabel.alignment = .right
+            sizeLabel.frame = NSRect(x: rightEdge - 185, y: 12, width: 85, height: 16)
+            row.addSubview(sizeLabel)
+            
+            let badge = NSTextField(labelWithString: "○ AVAILABLE")
+            badge.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
+            badge.textColor = .tertiaryLabelColor
+            badge.alignment = .right
+            badge.frame = NSRect(x: rightEdge - 185, y: 30, width: 85, height: 14)
+            row.addSubview(badge)
+            
+            let dlBtn = ActionButton(title: "Download")
+            dlBtn.bezelStyle = .rounded
+            dlBtn.controlSize = .small
+            dlBtn.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            dlBtn.frame = NSRect(x: rightEdge - 88, y: 17, width: 84, height: 24)
+            dlBtn.onClick = { [weak self] _ in
+                ImageCacheManager.shared.startDownload(presetId: item.id)
+                self?.refreshImagesUI()
+            }
+            row.addSubview(dlBtn)
+        }
+        
+        if !isLast {
+            let sep = NSBox(frame: NSRect(x: 12, y: frame.height - 1, width: frame.width - 24, height: 1))
+            sep.boxType = .separator
+            row.addSubview(sep)
+        }
+        
+        return row
+    }
+    
+    @objc private func revealCacheFolderClicked() {
+        let path = ImageCacheManager.shared.cacheDir
+        ImageCacheManager.shared.ensureCacheDirectoryExists()
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+    }
+
+    @objc private func refreshImagesClicked() {
+        refreshImagesUI()
+    }
+
+    @objc private func importLocalISOClicked() {
+        guard let win = self.window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Select OS Image or ISO to Import"
+        panel.prompt = "Import"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "iso") ?? .data,
+            UTType(filenameExtension: "img") ?? .data,
+            UTType(filenameExtension: "raw") ?? .data,
+            UTType(filenameExtension: "qcow2") ?? .data
+        ]
+        
+        panel.beginSheetModal(for: win) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                _ = try ImageCacheManager.shared.importLocalISO(from: url)
+                self?.refreshImagesUI()
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Import Failed"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+        }
+    }
+
+    @objc private func clearAllCacheClicked() {
+        let total = ImageCacheManager.shared.getTotalCacheBytes()
+        if total == 0 {
+            let alert = NSAlert()
+            alert.messageText = "Cache is Empty"
+            alert.informativeText = "There are currently no cached images in ~/Library/Caches/Cube."
+            alert.alertStyle = .informational
+            alert.runModal()
+            return
+        }
+        
+        let alert = NSAlert()
+        alert.messageText = "Clear All Cached Images?"
+        alert.informativeText = "This will permanently delete all installer ISOs and free up \(ImageCacheManager.formatBytes(total)) of disk space. You can re-download them at any time."
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Clear Cache")
+        alert.addButton(withTitle: "Cancel")
+        
+        let res = alert.runModal()
+        if res == .alertFirstButtonReturn {
+            _ = ImageCacheManager.shared.clearAllCache()
+            refreshImagesUI()
+        }
+    }
+
+    @objc private func startImageDownloadClicked(_ sender: NSButton) {
+        guard let presetId = sender.identifier?.rawValue else { return }
+        ImageCacheManager.shared.startDownload(presetId: presetId)
+        refreshImagesUI()
+    }
+
+    @objc private func cancelImageDownloadClicked(_ sender: NSButton) {
+        guard let presetId = sender.identifier?.rawValue else { return }
+        ImageCacheManager.shared.cancelDownload(presetId: presetId)
+        refreshImagesUI()
+    }
+
+    @objc private func revealImageClicked(_ sender: NSButton) {
+        guard let filename = sender.identifier?.rawValue else { return }
+        let path = "\(ImageCacheManager.shared.cacheDir)/\(filename)"
+        if FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
+        }
+    }
+
+    @objc private func deleteImageClicked(_ sender: NSButton) {
+        guard let filename = sender.identifier?.rawValue else { return }
+        let path = "\(ImageCacheManager.shared.cacheDir)/\(filename)"
+        var fileSizeStr = ""
+        if let attr = try? FileManager.default.attributesOfItem(atPath: path),
+           let num = attr[.size] as? NSNumber {
+            fileSizeStr = " (\(ImageCacheManager.formatBytes(num.int64Value)))"
+        }
+        
+        let alert = NSAlert()
+        alert.messageText = "Delete Cached Image?"
+        alert.informativeText = "Are you sure you want to delete '\(filename)'\(fileSizeStr)? It can be re-downloaded when needed."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        
+        if alert.runModal() == .alertFirstButtonReturn {
+            _ = ImageCacheManager.shared.deleteImage(filename: filename)
+            refreshImagesUI()
+        }
     }
     
     private func detectInterfaces() -> [String] {

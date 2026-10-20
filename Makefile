@@ -19,6 +19,14 @@ install-cli:
 verify:
 	python3 -B scripts/verify.py $(VERIFY_ARGS)
 
+.PHONY: test-vm-management
+test-vm-management:
+	@mkdir -p target/swift-cache
+	swiftc -module-cache-path target/swift-cache \
+		$(filter-out app/Cube/Sources/main.swift,$(wildcard app/Cube/Sources/*.swift)) \
+		app/Cube/Tests/VMManagementTests.swift -o target/vm-management-tests
+	target/vm-management-tests
+
 build:
 	cargo build
 
@@ -45,8 +53,10 @@ app: build sign
 		app/Cube/Sources/ServiceManager.swift \
 		app/Cube/Sources/SystemMetrics.swift \
 		app/Cube/Sources/VMManager.swift \
+		app/Cube/Sources/ImageCacheManager.swift \
 		app/Cube/Sources/NewVMWindowController.swift \
 		app/Cube/Sources/DashboardWindowController.swift \
+		app/Cube/Sources/VMCommandsSheetController.swift \
 		app/Cube/Sources/VMLogWindowController.swift \
 		app/Cube/Sources/MenuController.swift \
 		app/Cube/Sources/PreferencesWindowController.swift \
@@ -76,9 +86,12 @@ debug-app: build
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
 	swiftc -g -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
+		app/Cube/Sources/SystemMetrics.swift \
 		app/Cube/Sources/VMManager.swift \
+		app/Cube/Sources/ImageCacheManager.swift \
 		app/Cube/Sources/NewVMWindowController.swift \
 		app/Cube/Sources/DashboardWindowController.swift \
+		app/Cube/Sources/VMCommandsSheetController.swift \
 		app/Cube/Sources/VMLogWindowController.swift \
 		app/Cube/Sources/MenuController.swift \
 		app/Cube/Sources/PreferencesWindowController.swift \
