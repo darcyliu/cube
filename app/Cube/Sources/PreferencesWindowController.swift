@@ -7,8 +7,25 @@ private class FlippedContainerView: NSView {
     override var isFlipped: Bool { return true }
 }
 
-private class FlippedBox: NSBox {
-    override var isFlipped: Bool { return true }
+private class CardView: NSView {
+    init() {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = CubeTokens.cardCornerRadius
+        layer?.borderWidth = CubeTokens.cardBorderWidth
+        layer?.borderColor = CubeTokens.cardBorder.cgColor
+        layer?.backgroundColor = CubeTokens.cardBackground.cgColor
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func updateColors() {
+        layer?.borderColor = CubeTokens.cardBorder.cgColor
+        layer?.backgroundColor = CubeTokens.cardBackground.cgColor
+    }
 }
 
 private class ActionButton: NSButton {
@@ -16,6 +33,7 @@ private class ActionButton: NSButton {
 
     init(title: String) {
         super.init(frame: .zero)
+        self.translatesAutoresizingMaskIntoConstraints = false
         self.title = title
         self.target = self
         self.action = #selector(internalAction)
@@ -113,6 +131,13 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
     private var tabViews: [String: NSView] = [:]
     private var currentTabId: String = "general"
     
+    private var rootVisualEffect: NSVisualEffectView!
+    private var sidebarContainer: NSVisualEffectView!
+
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
     // General Tab Controls
     private var autoStartCheckbox: NSButton!
     private var launchAtLoginCheckbox: NSButton!
@@ -138,7 +163,7 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
     
     // Images Tab Controls
     private var imagesTotalUsageLabel: NSTextField!
-    private var imagesListContainer: FlippedContainerView!
+    private var imagesListContainer: NSStackView!
     private var imagesScrollView: NSScrollView!
 
     // SSH Keys Tab Controls
@@ -150,51 +175,84 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 730, height: 520),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 750, height: 540),
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "Cube Preferences — \(AppVersion.displayString)"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.minSize = NSSize(width: 750, height: 540)
         window.center()
         window.isReleasedWhenClosed = false
         
         self.init(window: window)
         setupUI()
     }
-    
+
     private func setupUI() {
         guard let window = self.window else { return }
         
-        let mainContainer = NSView(frame: window.contentView!.bounds)
-        mainContainer.autoresizingMask = [.width, .height]
-        window.contentView = mainContainer
+        rootVisualEffect = NSVisualEffectView(frame: window.contentView!.bounds)
+        rootVisualEffect.material = .underWindowBackground
+        rootVisualEffect.blendingMode = .behindWindow
+        rootVisualEffect.state = .active
+        rootVisualEffect.autoresizingMask = [.width, .height]
+        rootVisualEffect.wantsLayer = true
+        rootVisualEffect.layer?.cornerRadius = 18.0
+        rootVisualEffect.layer?.masksToBounds = true
+        rootVisualEffect.layer?.borderWidth = 1.0
+        rootVisualEffect.layer?.borderColor = CubeTokens.windowBorder.cgColor
+        window.contentView = rootVisualEffect
         
-        let sidebarWidth: CGFloat = 175
-        let totalHeight: CGFloat = mainContainer.bounds.height
-        let contentWidth = mainContainer.bounds.width - sidebarWidth - 1
+        let sidebarWidth: CGFloat = 180
         
-        // 1. Left Sidebar View
-        let sidebarContainer = NSView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: totalHeight))
-        sidebarContainer.autoresizingMask = [.height]
+        // 1. Left Sidebar View (Translucent frosted glass sidebar)
+        sidebarContainer = NSVisualEffectView()
+        sidebarContainer.translatesAutoresizingMaskIntoConstraints = false
+        sidebarContainer.material = .sidebar
+        sidebarContainer.blendingMode = .behindWindow
+        sidebarContainer.state = .active
+        rootVisualEffect.addSubview(sidebarContainer)
+
+        let headerHeight: CGFloat = 80
+
+        // Top Header - 80pt height to cleanly clear native window traffic light buttons at top-left
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: "PREFERENCES")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = CubeTokens.sectionHeaderFont
+        titleLabel.textColor = CubeTokens.secondaryText
+        header.addSubview(titleLabel)
+
+        let sepTop = NSBox()
+        sepTop.translatesAutoresizingMaskIntoConstraints = false
+        sepTop.boxType = .custom
+        sepTop.borderWidth = 0
+        sepTop.fillColor = CubeTokens.separatorColor
+        header.addSubview(sepTop)
+        sidebarContainer.addSubview(header)
         
-        let sidebarScrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: totalHeight))
-        sidebarScrollView.autoresizingMask = [.width, .height]
+        let sidebarScrollView = NSScrollView()
+        sidebarScrollView.translatesAutoresizingMaskIntoConstraints = false
         sidebarScrollView.hasVerticalScroller = false
         sidebarScrollView.borderType = .noBorder
-        sidebarScrollView.drawsBackground = true
-        sidebarScrollView.backgroundColor = NSColor.controlBackgroundColor
+        sidebarScrollView.drawsBackground = false
         
-        sidebarTableView = NSTableView(frame: sidebarScrollView.bounds)
+        sidebarTableView = NSTableView()
         sidebarTableView.headerView = nil
-        sidebarTableView.rowHeight = 34
+        sidebarTableView.rowHeight = 36
         if #available(macOS 11.0, *) {
             sidebarTableView.style = .sourceList
         } else {
             sidebarTableView.selectionHighlightStyle = .sourceList
         }
-        sidebarTableView.backgroundColor = NSColor.controlBackgroundColor
-        sidebarTableView.autoresizingMask = [.width, .height]
+        sidebarTableView.backgroundColor = .clear
         
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("PrefTabCol"))
         col.width = sidebarWidth
@@ -204,18 +262,62 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         sidebarTableView.delegate = self
         sidebarScrollView.documentView = sidebarTableView
         sidebarContainer.addSubview(sidebarScrollView)
-        mainContainer.addSubview(sidebarContainer)
         
         // 2. Vertical Divider line
-        let divider = NSBox(frame: NSRect(x: sidebarWidth, y: 0, width: 1, height: totalHeight))
-        divider.boxType = .separator
-        divider.autoresizingMask = [.height]
-        mainContainer.addSubview(divider)
+        let divider = NSBox()
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.boxType = .custom
+        divider.borderWidth = 0
+        divider.fillColor = CubeTokens.separatorColor
+        rootVisualEffect.addSubview(divider)
         
         // 3. Right Content Container (Full Height, per-tab footers)
-        contentContainerView = NSView(frame: NSRect(x: sidebarWidth + 1, y: 0, width: contentWidth, height: totalHeight))
-        contentContainerView.autoresizingMask = [.width, .height]
-        mainContainer.addSubview(contentContainerView)
+        contentContainerView = NSView()
+        contentContainerView.translatesAutoresizingMaskIntoConstraints = false
+        contentContainerView.wantsLayer = true
+        contentContainerView.layer?.backgroundColor = NSColor.clear.cgColor
+        rootVisualEffect.addSubview(contentContainerView)
+        
+        NSLayoutConstraint.activate([
+            // Sidebar constraints
+            sidebarContainer.leadingAnchor.constraint(equalTo: rootVisualEffect.leadingAnchor),
+            sidebarContainer.topAnchor.constraint(equalTo: rootVisualEffect.topAnchor),
+            sidebarContainer.bottomAnchor.constraint(equalTo: rootVisualEffect.bottomAnchor),
+            sidebarContainer.widthAnchor.constraint(equalToConstant: sidebarWidth),
+            
+            // Header inside sidebar
+            header.topAnchor.constraint(equalTo: sidebarContainer.topAnchor),
+            header.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
+            header.heightAnchor.constraint(equalToConstant: headerHeight),
+            
+            titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+            titleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+            titleLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -14),
+            
+            sepTop.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            sepTop.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            sepTop.bottomAnchor.constraint(equalTo: header.bottomAnchor),
+            sepTop.heightAnchor.constraint(equalToConstant: 1),
+            
+            // Sidebar scroll view
+            sidebarScrollView.topAnchor.constraint(equalTo: header.bottomAnchor),
+            sidebarScrollView.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
+            sidebarScrollView.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
+            sidebarScrollView.bottomAnchor.constraint(equalTo: sidebarContainer.bottomAnchor),
+            
+            // Divider
+            divider.leadingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
+            divider.topAnchor.constraint(equalTo: rootVisualEffect.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: rootVisualEffect.bottomAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            
+            // Content Container
+            contentContainerView.leadingAnchor.constraint(equalTo: divider.trailingAnchor),
+            contentContainerView.trailingAnchor.constraint(equalTo: rootVisualEffect.trailingAnchor),
+            contentContainerView.topAnchor.constraint(equalTo: rootVisualEffect.topAnchor),
+            contentContainerView.bottomAnchor.constraint(equalTo: rootVisualEffect.bottomAnchor)
+        ])
         
         // 4. Pre-build all Tab Views
         tabViews["general"] = buildGeneralTabView()
@@ -252,100 +354,86 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         // Select initial tab: General
         sidebarTableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         switchTab(id: "general")
+
+        // Accessibility Listeners
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityDisplayOptionsDidChange),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
+        updateAccessibilityPreferences()
+    }
+
+    private func createCardBox() -> CardView {
+        return CardView()
     }
     
     // MARK: - Tab Views Builders
     
     private func buildGeneralTabView() -> NSView {
-        let view = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: 554, height: 520))
-        let margin: CGFloat = 24
-        let contentWidth: CGFloat = 506
-        var y: CGFloat = 22
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         
         let header = NSTextField(labelWithString: "General & Automation")
+        header.translatesAutoresizingMaskIntoConstraints = false
         header.font = NSFont.boldSystemFont(ofSize: 15)
-        header.frame = NSRect(x: margin, y: y, width: contentWidth, height: 22)
+        header.textColor = CubeTokens.primaryText
         view.addSubview(header)
-        y += 28
         
         // Startup options card
-        let startupBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 86))
-        startupBox.boxType = .custom
-        startupBox.cornerRadius = 6
-        startupBox.borderWidth = 1
-        startupBox.borderColor = .separatorColor
-        startupBox.fillColor = NSColor.windowBackgroundColor
+        let startupBox = createCardBox()
+        view.addSubview(startupBox)
         
         autoStartCheckbox = NSButton(checkboxWithTitle: "Automatically start Cube network service on launch", target: nil, action: nil)
+        autoStartCheckbox.translatesAutoresizingMaskIntoConstraints = false
         autoStartCheckbox.font = NSFont.systemFont(ofSize: 13)
-        autoStartCheckbox.frame = NSRect(x: 14, y: 14, width: contentWidth - 28, height: 22)
         startupBox.addSubview(autoStartCheckbox)
         
         launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Launch Cube menu bar application at macOS login", target: nil, action: nil)
+        launchAtLoginCheckbox.translatesAutoresizingMaskIntoConstraints = false
         launchAtLoginCheckbox.font = NSFont.systemFont(ofSize: 13)
-        launchAtLoginCheckbox.frame = NSRect(x: 14, y: 46, width: contentWidth - 28, height: 22)
         startupBox.addSubview(launchAtLoginCheckbox)
         
-        view.addSubview(startupBox)
-        y += 98
-        
         // Preferred Terminal Card
-        let termBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 72))
-        termBox.boxType = .custom
-        termBox.cornerRadius = 6
-        termBox.borderWidth = 1
-        termBox.borderColor = .separatorColor
-        termBox.fillColor = NSColor.windowBackgroundColor
+        let termBox = createCardBox()
+        view.addSubview(termBox)
         
         let termLabel = NSTextField(labelWithString: "Preferred Terminal Application:")
+        termLabel.translatesAutoresizingMaskIntoConstraints = false
         termLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        termLabel.textColor = .secondaryLabelColor
-        termLabel.frame = NSRect(x: 12, y: 10, width: contentWidth - 24, height: 16)
+        termLabel.textColor = CubeTokens.secondaryText
         termBox.addSubview(termLabel)
         
-        terminalPopUp = NSPopUpButton(frame: NSRect(x: 10, y: 32, width: 260, height: 26), pullsDown: false)
+        terminalPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        terminalPopUp.translatesAutoresizingMaskIntoConstraints = false
         terminalPopUp.target = self
         terminalPopUp.action = #selector(terminalPopUpChanged(_:))
         termBox.addSubview(terminalPopUp)
         
         let termHint = NSTextField(wrappingLabelWithString: "Used when opening SSH terminal sessions from the dashboard and menu bar.")
+        termHint.translatesAutoresizingMaskIntoConstraints = false
         termHint.font = NSFont.systemFont(ofSize: 11)
-        termHint.textColor = .tertiaryLabelColor
-        termHint.frame = NSRect(x: 280, y: 30, width: contentWidth - 290, height: 32)
+        termHint.textColor = CubeTokens.tertiaryText
         termBox.addSubview(termHint)
-        
-        view.addSubview(termBox)
-        y += 84
         
         // Keyboard Shortcuts header
         let shortcutsHeader = NSTextField(labelWithString: "Global Keyboard Shortcuts")
+        shortcutsHeader.translatesAutoresizingMaskIntoConstraints = false
         shortcutsHeader.font = NSFont.boldSystemFont(ofSize: 13)
-        shortcutsHeader.frame = NSRect(x: margin, y: y, width: contentWidth, height: 18)
+        shortcutsHeader.textColor = CubeTokens.primaryText
         view.addSubview(shortcutsHeader)
-        y += 24
         
-        let scBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 110))
-        scBox.boxType = .custom
-        scBox.cornerRadius = 6
-        scBox.borderWidth = 1
-        scBox.borderColor = .separatorColor
-        scBox.fillColor = NSColor.windowBackgroundColor
-        
-        var scY: CGFloat = 10
-        _ = addShortcutRow(action: "Open Dashboard:", shortcut: "⌘ D", in: scBox, y: scY)
-        scY += 24
-        _ = addShortcutRow(action: "New Virtual Machine:", shortcut: "⌘ N", in: scBox, y: scY)
-        scY += 24
-        _ = addShortcutRow(action: "View Virtual Machine Logs:", shortcut: "⌘ L", in: scBox, y: scY)
-        scY += 24
-        _ = addShortcutRow(action: "Open Preferences:", shortcut: "⌘ ,", in: scBox, y: scY)
-        
+        let scBox = createCardBox()
         view.addSubview(scBox)
+        
+        let (_, r1Bottom) = addShortcutRow(action: "Open Dashboard:", shortcut: "⌘ D", in: scBox, topAnchor: scBox.topAnchor, topOffset: 12)
+        let (_, r2Bottom) = addShortcutRow(action: "New Virtual Machine:", shortcut: "⌘ N", in: scBox, topAnchor: r1Bottom, topOffset: 8)
+        let (_, r3Bottom) = addShortcutRow(action: "View Virtual Machine Logs:", shortcut: "⌘ L", in: scBox, topAnchor: r2Bottom, topOffset: 8)
+        let (_, r4Bottom) = addShortcutRow(action: "Open Preferences:", shortcut: "⌘ ,", in: scBox, topAnchor: r3Bottom, topOffset: 8)
         
         // Per-tab action footer
         let footer = buildTabFooter(
-            width: 554,
-            y: 474,
             note: "Applies to current user session.",
             cancelTitle: "Cancel",
             cancelAction: #selector(revertGeneralClicked),
@@ -353,97 +441,138 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             applyAction: #selector(applyGeneralClicked(_:))
         )
         view.addSubview(footer)
+        
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: view.topAnchor, constant: 26),
+            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            header.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            // Startup Card
+            startupBox.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
+            startupBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            startupBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            autoStartCheckbox.topAnchor.constraint(equalTo: startupBox.topAnchor, constant: 14),
+            autoStartCheckbox.leadingAnchor.constraint(equalTo: startupBox.leadingAnchor, constant: 14),
+            autoStartCheckbox.trailingAnchor.constraint(lessThanOrEqualTo: startupBox.trailingAnchor, constant: -14),
+            
+            launchAtLoginCheckbox.topAnchor.constraint(equalTo: autoStartCheckbox.bottomAnchor, constant: 10),
+            launchAtLoginCheckbox.leadingAnchor.constraint(equalTo: startupBox.leadingAnchor, constant: 14),
+            launchAtLoginCheckbox.trailingAnchor.constraint(lessThanOrEqualTo: startupBox.trailingAnchor, constant: -14),
+            launchAtLoginCheckbox.bottomAnchor.constraint(equalTo: startupBox.bottomAnchor, constant: -14),
+            
+            // Terminal Card
+            termBox.topAnchor.constraint(equalTo: startupBox.bottomAnchor, constant: 14),
+            termBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            termBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            termLabel.topAnchor.constraint(equalTo: termBox.topAnchor, constant: 12),
+            termLabel.leadingAnchor.constraint(equalTo: termBox.leadingAnchor, constant: 14),
+            termLabel.trailingAnchor.constraint(lessThanOrEqualTo: termBox.trailingAnchor, constant: -14),
+            
+            terminalPopUp.topAnchor.constraint(equalTo: termLabel.bottomAnchor, constant: 8),
+            terminalPopUp.leadingAnchor.constraint(equalTo: termBox.leadingAnchor, constant: 14),
+            terminalPopUp.widthAnchor.constraint(equalToConstant: 240),
+            terminalPopUp.bottomAnchor.constraint(equalTo: termBox.bottomAnchor, constant: -14),
+            
+            termHint.leadingAnchor.constraint(equalTo: terminalPopUp.trailingAnchor, constant: 14),
+            termHint.trailingAnchor.constraint(equalTo: termBox.trailingAnchor, constant: -14),
+            termHint.centerYAnchor.constraint(equalTo: terminalPopUp.centerYAnchor),
+            
+            // Shortcuts Header & Card
+            shortcutsHeader.topAnchor.constraint(equalTo: termBox.bottomAnchor, constant: 18),
+            shortcutsHeader.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            shortcutsHeader.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            scBox.topAnchor.constraint(equalTo: shortcutsHeader.bottomAnchor, constant: 10),
+            scBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            scBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            scBox.bottomAnchor.constraint(equalTo: r4Bottom, constant: 12),
+            
+            // Footer
+            footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 48)
+        ])
+        
         return view
     }
     
     private func buildNetworkTabView() -> NSView {
-        let view = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: 554, height: 520))
-        let margin: CGFloat = 24
-        let contentWidth: CGFloat = 506
-        var y: CGFloat = 20
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         
         let header = NSTextField(labelWithString: "Network Operation Mode")
+        header.translatesAutoresizingMaskIntoConstraints = false
         header.font = NSFont.boldSystemFont(ofSize: 15)
-        header.frame = NSRect(x: margin, y: y, width: contentWidth, height: 22)
+        header.textColor = CubeTokens.primaryText
         view.addSubview(header)
-        y += 28
         
         // Radio 1: Apple Default NAT
         radioAppleDefault = NSButton(radioButtonWithTitle: "Shared NAT — Apple Default (Recommended)", target: self, action: #selector(radioChanged))
+        radioAppleDefault.translatesAutoresizingMaskIntoConstraints = false
         radioAppleDefault.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        radioAppleDefault.frame = NSRect(x: margin, y: y, width: contentWidth, height: 20)
         view.addSubview(radioAppleDefault)
-        y += 22
         
         let appleDefaultHint = NSTextField(wrappingLabelWithString: "Uses Apple's native subnet (192.168.64.0/24). Runs 100% unprivileged without root or sudo.")
+        appleDefaultHint.translatesAutoresizingMaskIntoConstraints = false
         appleDefaultHint.font = NSFont.systemFont(ofSize: 11)
-        appleDefaultHint.textColor = .secondaryLabelColor
-        appleDefaultHint.frame = NSRect(x: margin + 20, y: y, width: contentWidth - 20, height: 28)
+        appleDefaultHint.textColor = CubeTokens.secondaryText
         view.addSubview(appleDefaultHint)
-        y += 32
         
         // Radio 2: Custom Subnet NAT
         radioCustomSubnet = NSButton(radioButtonWithTitle: "Shared NAT — Custom Subnet", target: self, action: #selector(radioChanged))
+        radioCustomSubnet.translatesAutoresizingMaskIntoConstraints = false
         radioCustomSubnet.font = NSFont.systemFont(ofSize: 13)
-        radioCustomSubnet.frame = NSRect(x: margin, y: y, width: 220, height: 20)
         view.addSubview(radioCustomSubnet)
         
-        customSubnetField = NSTextField(frame: NSRect(x: margin + 225, y: y - 1, width: 170, height: 22))
+        customSubnetField = NSTextField()
+        customSubnetField.translatesAutoresizingMaskIntoConstraints = false
         customSubnetField.placeholderString = "192.168.18.0/24"
         customSubnetField.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         view.addSubview(customSubnetField)
-        y += 22
         
         let customSubnetHint = NSTextField(wrappingLabelWithString: "Specify an RFC1918 CIDR. Requires a separately administered root service; unavailable in Cube.")
+        customSubnetHint.translatesAutoresizingMaskIntoConstraints = false
         customSubnetHint.font = NSFont.systemFont(ofSize: 11)
-        customSubnetHint.textColor = .secondaryLabelColor
-        customSubnetHint.frame = NSRect(x: margin + 20, y: y, width: contentWidth - 20, height: 28)
+        customSubnetHint.textColor = CubeTokens.secondaryText
         view.addSubview(customSubnetHint)
-        y += 32
         
         // Radio 3: Bridged LAN
         radioBridged = NSButton(radioButtonWithTitle: "Bridged LAN (Physical Interface)", target: self, action: #selector(radioChanged))
+        radioBridged.translatesAutoresizingMaskIntoConstraints = false
         radioBridged.font = NSFont.systemFont(ofSize: 13)
-        radioBridged.frame = NSRect(x: margin, y: y, width: 235, height: 20)
         view.addSubview(radioBridged)
         
-        interfacePopUp = NSPopUpButton(frame: NSRect(x: margin + 240, y: y - 2, width: 150, height: 24), pullsDown: false)
+        interfacePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        interfacePopUp.translatesAutoresizingMaskIntoConstraints = false
         for iface in detectInterfaces() {
             interfacePopUp.addItem(withTitle: iface)
         }
         view.addSubview(interfacePopUp)
-        y += 22
         
         let bridgedHint = NSTextField(wrappingLabelWithString: "Attaches guests to the physical network for external DHCP address assignment.")
+        bridgedHint.translatesAutoresizingMaskIntoConstraints = false
         bridgedHint.font = NSFont.systemFont(ofSize: 11)
-        bridgedHint.textColor = .secondaryLabelColor
-        bridgedHint.frame = NSRect(x: margin + 20, y: y, width: contentWidth - 20, height: 28)
+        bridgedHint.textColor = CubeTokens.secondaryText
         view.addSubview(bridgedHint)
-        y += 34
         
-        // Card: Diagnostics & Host Information
-        let diagBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 114))
-        diagBox.boxType = .custom
-        diagBox.cornerRadius = 6
-        diagBox.borderWidth = 1
-        diagBox.borderColor = .separatorColor
-        diagBox.fillColor = NSColor.windowBackgroundColor
-        
-        var dy: CGFloat = 10
-        hostIPv4Label = addDiagRow(label: "Host IPv4 (en0):", value: "Detecting...", in: diagBox, y: dy, copyAction: #selector(copyIPv4Clicked))
-        dy += 24
-        hostIPv6Label = addDiagRow(label: "Host IPv6:", value: "Detecting...", in: diagBox, y: dy, copyAction: #selector(copyIPv6Clicked))
-        dy += 24
-        vmGatewayLabel = addDiagRow(label: "VM Gateway:", value: "192.168.64.1", in: diagBox, y: dy, copyAction: nil)
-        dy += 24
-        socketLabel = addDiagRow(label: "Daemon Socket:", value: ServiceManager.shared.defaultSocketPath, in: diagBox, y: dy, copyAction: #selector(copySocketClicked))
-        
+        // Card: Diagnostics & Host Information (Compresto Frosted Glass)
+        let diagBox = createCardBox()
         view.addSubview(diagBox)
+        
+        let (v1, d1Bottom) = addDiagRow(label: "Host IPv4 (en0):", value: "Detecting...", in: diagBox, topAnchor: diagBox.topAnchor, topOffset: 12, copyAction: #selector(copyIPv4Clicked(_:)))
+        hostIPv4Label = v1
+        let (v2, d2Bottom) = addDiagRow(label: "Host IPv6:", value: "Detecting...", in: diagBox, topAnchor: d1Bottom, topOffset: 8, copyAction: #selector(copyIPv6Clicked(_:)))
+        hostIPv6Label = v2
+        let (v3, d3Bottom) = addDiagRow(label: "VM Gateway:", value: "192.168.64.1", in: diagBox, topAnchor: d2Bottom, topOffset: 8, copyAction: nil)
+        vmGatewayLabel = v3
+        let (v4, d4Bottom) = addDiagRow(label: "Daemon Socket:", value: ServiceManager.shared.defaultSocketPath, in: diagBox, topAnchor: d3Bottom, topOffset: 8, copyAction: #selector(copySocketClicked(_:)))
+        socketLabel = v4
         
         // Per-tab action footer
         let footer = buildTabFooter(
-            width: 554,
-            y: 474,
             note: "Requires service restart.",
             cancelTitle: "Cancel",
             cancelAction: #selector(revertNetworkClicked),
@@ -451,86 +580,122 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             applyAction: #selector(applyNetworkClicked(_:))
         )
         view.addSubview(footer)
+        
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: view.topAnchor, constant: 26),
+            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            header.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            // Radio 1
+            radioAppleDefault.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 14),
+            radioAppleDefault.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            radioAppleDefault.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            appleDefaultHint.topAnchor.constraint(equalTo: radioAppleDefault.bottomAnchor, constant: 4),
+            appleDefaultHint.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 44),
+            appleDefaultHint.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            // Radio 2
+            radioCustomSubnet.topAnchor.constraint(equalTo: appleDefaultHint.bottomAnchor, constant: 12),
+            radioCustomSubnet.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            
+            customSubnetField.leadingAnchor.constraint(equalTo: radioCustomSubnet.trailingAnchor, constant: 8),
+            customSubnetField.centerYAnchor.constraint(equalTo: radioCustomSubnet.centerYAnchor),
+            customSubnetField.widthAnchor.constraint(equalToConstant: 170),
+            customSubnetField.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            customSubnetHint.topAnchor.constraint(equalTo: radioCustomSubnet.bottomAnchor, constant: 4),
+            customSubnetHint.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 44),
+            customSubnetHint.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            // Radio 3
+            radioBridged.topAnchor.constraint(equalTo: customSubnetHint.bottomAnchor, constant: 12),
+            radioBridged.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            
+            interfacePopUp.leadingAnchor.constraint(equalTo: radioBridged.trailingAnchor, constant: 8),
+            interfacePopUp.centerYAnchor.constraint(equalTo: radioBridged.centerYAnchor),
+            interfacePopUp.widthAnchor.constraint(equalToConstant: 150),
+            interfacePopUp.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            bridgedHint.topAnchor.constraint(equalTo: radioBridged.bottomAnchor, constant: 4),
+            bridgedHint.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 44),
+            bridgedHint.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            // Diagnostics Card
+            diagBox.topAnchor.constraint(equalTo: bridgedHint.bottomAnchor, constant: 16),
+            diagBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            diagBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            diagBox.bottomAnchor.constraint(equalTo: d4Bottom, constant: 12),
+            
+            // Footer
+            footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 48)
+        ])
+        
         return view
     }
     
     private func buildStorageTabView() -> NSView {
-        let view = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: 554, height: 520))
-        let margin: CGFloat = 24
-        let contentWidth: CGFloat = 506
-        var y: CGFloat = 20
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         
         let header = NSTextField(labelWithString: "Virtual Machine Storage")
+        header.translatesAutoresizingMaskIntoConstraints = false
         header.font = NSFont.boldSystemFont(ofSize: 15)
-        header.frame = NSRect(x: margin, y: y, width: contentWidth, height: 22)
+        header.textColor = CubeTokens.primaryText
         view.addSubview(header)
-        y += 26
         
         let desc = NSTextField(wrappingLabelWithString: "Select the primary folder for storing virtual disk images (rootfs.img), hardware configs, and VM state directories. External SSDs (Thunderbolt / USB4) are fully supported.")
+        desc.translatesAutoresizingMaskIntoConstraints = false
         desc.font = NSFont.systemFont(ofSize: 12)
-        desc.textColor = .secondaryLabelColor
-        desc.frame = NSRect(x: margin, y: y, width: contentWidth, height: 36)
+        desc.textColor = CubeTokens.secondaryText
         view.addSubview(desc)
-        y += 44
         
         // Storage path card
-        let pathBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 72))
-        pathBox.boxType = .custom
-        pathBox.cornerRadius = 6
-        pathBox.borderWidth = 1
-        pathBox.borderColor = .separatorColor
-        pathBox.fillColor = NSColor.windowBackgroundColor
+        let pathBox = createCardBox()
+        view.addSubview(pathBox)
         
         let pathLabel = NSTextField(labelWithString: "Storage Directory:")
+        pathLabel.translatesAutoresizingMaskIntoConstraints = false
         pathLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        pathLabel.textColor = .secondaryLabelColor
-        pathLabel.frame = NSRect(x: 12, y: 10, width: 200, height: 16)
+        pathLabel.textColor = CubeTokens.secondaryText
         pathBox.addSubview(pathLabel)
         
-        vmsDirField = NSTextField(frame: NSRect(x: 12, y: 32, width: contentWidth - 235, height: 24))
+        vmsDirField = NSTextField()
+        vmsDirField.translatesAutoresizingMaskIntoConstraints = false
         vmsDirField.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         vmsDirField.placeholderString = "~/Cube"
         pathBox.addSubview(vmsDirField)
         
         let chooseBtn = NSButton(title: "Choose...", target: self, action: #selector(chooseVMsDirClicked))
+        chooseBtn.translatesAutoresizingMaskIntoConstraints = false
         chooseBtn.bezelStyle = .rounded
-        chooseBtn.frame = NSRect(x: contentWidth - 215, y: 30, width: 78, height: 26)
         pathBox.addSubview(chooseBtn)
         
         let revealBtn = NSButton(title: "Reveal", target: self, action: #selector(revealVMsDirClicked))
+        revealBtn.translatesAutoresizingMaskIntoConstraints = false
         revealBtn.bezelStyle = .rounded
-        revealBtn.frame = NSRect(x: contentWidth - 134, y: 30, width: 66, height: 26)
         pathBox.addSubview(revealBtn)
         
         let resetBtn = NSButton(title: "Reset", target: self, action: #selector(resetVMsDirClicked))
+        resetBtn.translatesAutoresizingMaskIntoConstraints = false
         resetBtn.bezelStyle = .rounded
-        resetBtn.frame = NSRect(x: contentWidth - 66, y: 30, width: 56, height: 26)
         pathBox.addSubview(resetBtn)
         
-        view.addSubview(pathBox)
-        y += 88
-        
         // Storage Stats card
-        let statsBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 84))
-        statsBox.boxType = .custom
-        statsBox.cornerRadius = 6
-        statsBox.borderWidth = 1
-        statsBox.borderColor = .separatorColor
-        statsBox.fillColor = NSColor.windowBackgroundColor
-        
-        var sy: CGFloat = 10
-        storageFreeSpaceLabel = addInfoRow(label: "Volume Free Space:", value: "Calculating...", in: statsBox, y: sy)
-        sy += 24
-        storageVMCountLabel = addInfoRow(label: "Configured Virtual Machines:", value: "0 VMs", in: statsBox, y: sy)
-        sy += 24
-        _ = addInfoRow(label: "Image Format:", value: "Raw Sparse Disk Image (*.raw / *.img)", in: statsBox, y: sy)
-        
+        let statsBox = createCardBox()
         view.addSubview(statsBox)
+        
+        let (s1, st1Bottom) = addInfoRow(label: "Volume Free Space:", value: "Calculating...", in: statsBox, topAnchor: statsBox.topAnchor, topOffset: 12)
+        storageFreeSpaceLabel = s1
+        let (s2, st2Bottom) = addInfoRow(label: "Configured Virtual Machines:", value: "0 VMs", in: statsBox, topAnchor: st1Bottom, topOffset: 8)
+        storageVMCountLabel = s2
+        let (_, st3Bottom) = addInfoRow(label: "Image Format:", value: "Raw Sparse Disk Image (*.raw / *.img)", in: statsBox, topAnchor: st2Bottom, topOffset: 8)
         
         // Per-tab action footer
         let footer = buildTabFooter(
-            width: 554,
-            y: 474,
             note: "VMs are loaded dynamically from this location.",
             cancelTitle: "Cancel",
             cancelAction: #selector(revertStorageClicked),
@@ -538,104 +703,138 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             applyAction: #selector(applyStorageClicked(_:))
         )
         view.addSubview(footer)
+        
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: view.topAnchor, constant: 26),
+            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            header.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            desc.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            desc.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            desc.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            // Path Box
+            pathBox.topAnchor.constraint(equalTo: desc.bottomAnchor, constant: 14),
+            pathBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            pathBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            pathLabel.topAnchor.constraint(equalTo: pathBox.topAnchor, constant: 12),
+            pathLabel.leadingAnchor.constraint(equalTo: pathBox.leadingAnchor, constant: 14),
+            pathLabel.trailingAnchor.constraint(lessThanOrEqualTo: pathBox.trailingAnchor, constant: -14),
+            
+            resetBtn.trailingAnchor.constraint(equalTo: pathBox.trailingAnchor, constant: -14),
+            resetBtn.centerYAnchor.constraint(equalTo: vmsDirField.centerYAnchor),
+            
+            revealBtn.trailingAnchor.constraint(equalTo: resetBtn.leadingAnchor, constant: -8),
+            revealBtn.centerYAnchor.constraint(equalTo: resetBtn.centerYAnchor),
+            
+            chooseBtn.trailingAnchor.constraint(equalTo: revealBtn.leadingAnchor, constant: -8),
+            chooseBtn.centerYAnchor.constraint(equalTo: revealBtn.centerYAnchor),
+            
+            vmsDirField.topAnchor.constraint(equalTo: pathLabel.bottomAnchor, constant: 8),
+            vmsDirField.leadingAnchor.constraint(equalTo: pathBox.leadingAnchor, constant: 14),
+            vmsDirField.trailingAnchor.constraint(equalTo: chooseBtn.leadingAnchor, constant: -10),
+            vmsDirField.heightAnchor.constraint(equalToConstant: 24),
+            vmsDirField.bottomAnchor.constraint(equalTo: pathBox.bottomAnchor, constant: -14),
+            
+            // Stats Box
+            statsBox.topAnchor.constraint(equalTo: pathBox.bottomAnchor, constant: 14),
+            statsBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            statsBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            statsBox.bottomAnchor.constraint(equalTo: st3Bottom, constant: 12),
+            
+            // Footer
+            footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 48)
+        ])
+        
         return view
     }
     
     // MARK: - Images Tab View Builder
     
     private func buildImagesTabView() -> NSView {
-        let view = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: 554, height: 520))
-        let margin: CGFloat = 24
-        let contentWidth: CGFloat = 506
-        var y: CGFloat = 20
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         
         let header = NSTextField(labelWithString: "Operating System Images & ISOs")
+        header.translatesAutoresizingMaskIntoConstraints = false
         header.font = NSFont.boldSystemFont(ofSize: 15)
-        header.frame = NSRect(x: margin, y: y, width: contentWidth, height: 22)
+        header.textColor = CubeTokens.primaryText
         view.addSubview(header)
-        y += 24
         
         let desc = NSTextField(wrappingLabelWithString: "Installer ISOs and disk templates are cached in ~/Library/Caches/Cube for fast, offline VM creation. Pre-download images or reclaim space.")
+        desc.translatesAutoresizingMaskIntoConstraints = false
         desc.font = NSFont.systemFont(ofSize: 12)
-        desc.textColor = .secondaryLabelColor
-        desc.frame = NSRect(x: margin, y: y, width: contentWidth, height: 32)
+        desc.textColor = CubeTokens.secondaryText
         view.addSubview(desc)
-        y += 36
         
         // 1. Summary Card
-        let summaryBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 68))
-        summaryBox.boxType = .custom
-        summaryBox.cornerRadius = 6
-        summaryBox.borderWidth = 1
-        summaryBox.borderColor = .separatorColor
-        summaryBox.fillColor = NSColor.windowBackgroundColor
+        let summaryBox = createCardBox()
+        view.addSubview(summaryBox)
         
         let locLabel = NSTextField(labelWithString: "Cache Location: ~/Library/Caches/Cube")
+        locLabel.translatesAutoresizingMaskIntoConstraints = false
         locLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        locLabel.textColor = .secondaryLabelColor
-        locLabel.frame = NSRect(x: 12, y: 12, width: 230, height: 16)
+        locLabel.textColor = CubeTokens.secondaryText
         summaryBox.addSubview(locLabel)
         
         imagesTotalUsageLabel = NSTextField(labelWithString: "Calculating cache size...")
+        imagesTotalUsageLabel.translatesAutoresizingMaskIntoConstraints = false
         imagesTotalUsageLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        imagesTotalUsageLabel.textColor = .labelColor
-        imagesTotalUsageLabel.frame = NSRect(x: 12, y: 34, width: 230, height: 20)
+        imagesTotalUsageLabel.textColor = CubeTokens.primaryText
         summaryBox.addSubview(imagesTotalUsageLabel)
         
-        let openFolderBtn = NSButton(title: "Open Folder", target: self, action: #selector(revealCacheFolderClicked))
-        openFolderBtn.bezelStyle = .rounded
-        openFolderBtn.controlSize = .small
-        openFolderBtn.font = NSFont.systemFont(ofSize: 11)
-        openFolderBtn.frame = NSRect(x: contentWidth - 280, y: 22, width: 90, height: 24)
-        summaryBox.addSubview(openFolderBtn)
-        
-        let importBtn = NSButton(title: "Import ISO...", target: self, action: #selector(importLocalISOClicked))
-        importBtn.bezelStyle = .rounded
-        importBtn.controlSize = .small
-        importBtn.font = NSFont.systemFont(ofSize: 11)
-        importBtn.frame = NSRect(x: contentWidth - 186, y: 22, width: 92, height: 24)
-        summaryBox.addSubview(importBtn)
-        
         let purgeBtn = NSButton(title: "Clear Cache", target: self, action: #selector(clearAllCacheClicked))
+        purgeBtn.translatesAutoresizingMaskIntoConstraints = false
         purgeBtn.bezelStyle = .rounded
         purgeBtn.controlSize = .small
         purgeBtn.font = NSFont.systemFont(ofSize: 11)
-        purgeBtn.frame = NSRect(x: contentWidth - 90, y: 22, width: 80, height: 24)
         summaryBox.addSubview(purgeBtn)
         
-        view.addSubview(summaryBox)
-        y += 76
+        let importBtn = NSButton(title: "Import ISO...", target: self, action: #selector(importLocalISOClicked))
+        importBtn.translatesAutoresizingMaskIntoConstraints = false
+        importBtn.bezelStyle = .rounded
+        importBtn.controlSize = .small
+        importBtn.font = NSFont.systemFont(ofSize: 11)
+        summaryBox.addSubview(importBtn)
+        
+        let openFolderBtn = NSButton(title: "Open Folder", target: self, action: #selector(revealCacheFolderClicked))
+        openFolderBtn.translatesAutoresizingMaskIntoConstraints = false
+        openFolderBtn.bezelStyle = .rounded
+        openFolderBtn.controlSize = .small
+        openFolderBtn.font = NSFont.systemFont(ofSize: 11)
+        summaryBox.addSubview(openFolderBtn)
         
         // 2. Catalog & Cached Images Card
-        let catalogBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 308))
-        catalogBox.boxType = .custom
-        catalogBox.cornerRadius = 6
-        catalogBox.borderWidth = 1
-        catalogBox.borderColor = .separatorColor
-        catalogBox.fillColor = NSColor.windowBackgroundColor
+        let catalogBox = createCardBox()
+        view.addSubview(catalogBox)
         
         let catalogTitle = NSTextField(labelWithString: "AVAILABLE & CACHED IMAGES")
-        catalogTitle.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        catalogTitle.textColor = .secondaryLabelColor
-        catalogTitle.frame = NSRect(x: 12, y: 8, width: 300, height: 16)
+        catalogTitle.translatesAutoresizingMaskIntoConstraints = false
+        catalogTitle.font = CubeTokens.sectionHeaderFont
+        catalogTitle.textColor = CubeTokens.secondaryText
         catalogBox.addSubview(catalogTitle)
         
-        imagesScrollView = NSScrollView(frame: NSRect(x: 1, y: 28, width: contentWidth - 2, height: 278))
+        imagesScrollView = NSScrollView()
+        imagesScrollView.translatesAutoresizingMaskIntoConstraints = false
         imagesScrollView.hasVerticalScroller = true
         imagesScrollView.autohidesScrollers = true
         imagesScrollView.borderType = .noBorder
         imagesScrollView.drawsBackground = false
         
-        imagesListContainer = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: contentWidth - 2, height: 278))
+        imagesListContainer = NSStackView()
+        imagesListContainer.translatesAutoresizingMaskIntoConstraints = false
+        imagesListContainer.orientation = .vertical
+        imagesListContainer.alignment = .leading
+        imagesListContainer.spacing = 0
         imagesScrollView.documentView = imagesListContainer
         catalogBox.addSubview(imagesScrollView)
         
-        view.addSubview(catalogBox)
-        
         // 3. Footer
         let footer = buildTabFooter(
-            width: 554,
-            y: 474,
             note: "Downloaded ISOs are reused automatically by New Virtual Machine wizards.",
             cancelTitle: "Open Folder",
             cancelAction: #selector(revealCacheFolderClicked),
@@ -643,251 +842,422 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             applyAction: #selector(refreshImagesClicked)
         )
         view.addSubview(footer)
+        
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: view.topAnchor, constant: 26),
+            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            header.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            desc.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            desc.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            desc.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            // Summary Card
+            summaryBox.topAnchor.constraint(equalTo: desc.bottomAnchor, constant: 14),
+            summaryBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            summaryBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            locLabel.topAnchor.constraint(equalTo: summaryBox.topAnchor, constant: 12),
+            locLabel.leadingAnchor.constraint(equalTo: summaryBox.leadingAnchor, constant: 14),
+            
+            imagesTotalUsageLabel.topAnchor.constraint(equalTo: locLabel.bottomAnchor, constant: 6),
+            imagesTotalUsageLabel.leadingAnchor.constraint(equalTo: summaryBox.leadingAnchor, constant: 14),
+            imagesTotalUsageLabel.bottomAnchor.constraint(equalTo: summaryBox.bottomAnchor, constant: -14),
+            
+            purgeBtn.trailingAnchor.constraint(equalTo: summaryBox.trailingAnchor, constant: -14),
+            purgeBtn.centerYAnchor.constraint(equalTo: summaryBox.centerYAnchor),
+            
+            importBtn.trailingAnchor.constraint(equalTo: purgeBtn.leadingAnchor, constant: -8),
+            importBtn.centerYAnchor.constraint(equalTo: summaryBox.centerYAnchor),
+            
+            openFolderBtn.trailingAnchor.constraint(equalTo: importBtn.leadingAnchor, constant: -8),
+            openFolderBtn.centerYAnchor.constraint(equalTo: summaryBox.centerYAnchor),
+            
+            // Catalog Card
+            catalogBox.topAnchor.constraint(equalTo: summaryBox.bottomAnchor, constant: 14),
+            catalogBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            catalogBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            catalogBox.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -14),
+            
+            catalogTitle.topAnchor.constraint(equalTo: catalogBox.topAnchor, constant: 10),
+            catalogTitle.leadingAnchor.constraint(equalTo: catalogBox.leadingAnchor, constant: 14),
+            catalogTitle.trailingAnchor.constraint(lessThanOrEqualTo: catalogBox.trailingAnchor, constant: -14),
+            
+            imagesScrollView.topAnchor.constraint(equalTo: catalogTitle.bottomAnchor, constant: 8),
+            imagesScrollView.leadingAnchor.constraint(equalTo: catalogBox.leadingAnchor, constant: 1),
+            imagesScrollView.trailingAnchor.constraint(equalTo: catalogBox.trailingAnchor, constant: -1),
+            imagesScrollView.bottomAnchor.constraint(equalTo: catalogBox.bottomAnchor, constant: -1),
+            
+            // List Container inside Scroll View
+            imagesListContainer.topAnchor.constraint(equalTo: imagesScrollView.contentView.topAnchor),
+            imagesListContainer.leadingAnchor.constraint(equalTo: imagesScrollView.contentView.leadingAnchor),
+            imagesListContainer.trailingAnchor.constraint(equalTo: imagesScrollView.contentView.trailingAnchor),
+            
+            // Footer
+            footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 48)
+        ])
+        
         return view
     }
     
     private func buildSSHKeysTabView() -> NSView {
-        let view = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: 554, height: 520))
-        let margin: CGFloat = 24
-        let contentWidth: CGFloat = 506
-        var y: CGFloat = 20
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         
         let header = NSTextField(labelWithString: "SSH Key Management")
+        header.translatesAutoresizingMaskIntoConstraints = false
         header.font = NSFont.boldSystemFont(ofSize: 15)
-        header.frame = NSRect(x: margin, y: y, width: contentWidth, height: 22)
+        header.textColor = CubeTokens.primaryText
         view.addSubview(header)
-        y += 26
         
         let desc = NSTextField(wrappingLabelWithString: "Cube automatically detects your public SSH keys to provision unattended root logins. You can preview, copy, or choose a custom key.")
+        desc.translatesAutoresizingMaskIntoConstraints = false
         desc.font = NSFont.systemFont(ofSize: 12)
-        desc.textColor = .secondaryLabelColor
-        desc.frame = NSRect(x: margin, y: y, width: contentWidth, height: 36)
+        desc.textColor = CubeTokens.secondaryText
         view.addSubview(desc)
-        y += 44
         
         // Detected Key Card
-        let keyBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 154))
-        keyBox.boxType = .custom
-        keyBox.cornerRadius = 6
-        keyBox.borderWidth = 1
-        keyBox.borderColor = .separatorColor
-        keyBox.fillColor = NSColor.windowBackgroundColor
+        let keyBox = createCardBox()
+        view.addSubview(keyBox)
         
         sshKeyStatusDot = NSTextField(labelWithString: "●")
+        sshKeyStatusDot.translatesAutoresizingMaskIntoConstraints = false
         sshKeyStatusDot.font = NSFont.boldSystemFont(ofSize: 12)
-        sshKeyStatusDot.frame = NSRect(x: 12, y: 10, width: 14, height: 18)
         keyBox.addSubview(sshKeyStatusDot)
         
         sshKeyPathLabel = NSTextField(labelWithString: "~/.ssh/id_ed25519.pub")
+        sshKeyPathLabel.translatesAutoresizingMaskIntoConstraints = false
         sshKeyPathLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        sshKeyPathLabel.frame = NSRect(x: 28, y: 10, width: contentWidth - 40, height: 18)
+        sshKeyPathLabel.textColor = CubeTokens.primaryText
         keyBox.addSubview(sshKeyPathLabel)
         
         sshKeyTypeLabel = NSTextField(labelWithString: "Type: ED25519 (256-bit elliptic curve)")
+        sshKeyTypeLabel.translatesAutoresizingMaskIntoConstraints = false
         sshKeyTypeLabel.font = NSFont.systemFont(ofSize: 11)
-        sshKeyTypeLabel.textColor = .secondaryLabelColor
-        sshKeyTypeLabel.frame = NSRect(x: 28, y: 30, width: contentWidth - 40, height: 16)
+        sshKeyTypeLabel.textColor = CubeTokens.secondaryText
         keyBox.addSubview(sshKeyTypeLabel)
         
         // Monospace key preview box
         sshKeyPreviewField = NSTextField(wrappingLabelWithString: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5...")
+        sshKeyPreviewField.translatesAutoresizingMaskIntoConstraints = false
         sshKeyPreviewField.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        sshKeyPreviewField.textColor = .labelColor
-        sshKeyPreviewField.frame = NSRect(x: 12, y: 52, width: contentWidth - 24, height: 55)
+        sshKeyPreviewField.textColor = CubeTokens.primaryText
         sshKeyPreviewField.isSelectable = true
         keyBox.addSubview(sshKeyPreviewField)
         
         // Buttons
         let copyKeyBtn = NSButton(title: "Copy Public Key", target: self, action: #selector(copySSHKeyClicked(_:)))
+        copyKeyBtn.translatesAutoresizingMaskIntoConstraints = false
         copyKeyBtn.bezelStyle = .rounded
+        copyKeyBtn.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+        copyKeyBtn.imagePosition = .imageLeading
+        copyKeyBtn.imageHugsTitle = true
         copyKeyBtn.font = NSFont.systemFont(ofSize: 11)
-        copyKeyBtn.frame = NSRect(x: 10, y: 116, width: 120, height: 26)
         keyBox.addSubview(copyKeyBtn)
         
         let revealKeyBtn = NSButton(title: "Reveal in Finder", target: self, action: #selector(revealSSHKeyClicked))
+        revealKeyBtn.translatesAutoresizingMaskIntoConstraints = false
         revealKeyBtn.bezelStyle = .rounded
         revealKeyBtn.font = NSFont.systemFont(ofSize: 11)
-        revealKeyBtn.frame = NSRect(x: 134, y: 116, width: 120, height: 26)
         keyBox.addSubview(revealKeyBtn)
         
         let chooseKeyBtn = NSButton(title: "Choose Other...", target: self, action: #selector(chooseSSHKeyClicked))
+        chooseKeyBtn.translatesAutoresizingMaskIntoConstraints = false
         chooseKeyBtn.bezelStyle = .rounded
         chooseKeyBtn.font = NSFont.systemFont(ofSize: 11)
-        chooseKeyBtn.frame = NSRect(x: 258, y: 116, width: 115, height: 26)
         keyBox.addSubview(chooseKeyBtn)
         
         let generateKeyBtn = NSButton(title: "Generate Key", target: self, action: #selector(generateSSHKeyClicked))
+        generateKeyBtn.translatesAutoresizingMaskIntoConstraints = false
         generateKeyBtn.bezelStyle = .rounded
         generateKeyBtn.font = NSFont.systemFont(ofSize: 11)
-        generateKeyBtn.frame = NSRect(x: 377, y: 116, width: 105, height: 26)
         keyBox.addSubview(generateKeyBtn)
         
-        view.addSubview(keyBox)
-        y += 172
-        
         // Security note
-        let noteBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 75))
-        noteBox.boxType = .custom
-        noteBox.cornerRadius = 6
-        noteBox.borderWidth = 1
-        noteBox.borderColor = .separatorColor
-        noteBox.fillColor = NSColor.windowBackgroundColor
+        let noteBox = createCardBox()
+        view.addSubview(noteBox)
         
-        let noteIcon = NSImageView(frame: NSRect(x: 12, y: 12, width: 20, height: 20))
-        let heroConfig = NSImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+        let noteIcon = NSImageView()
+        noteIcon.translatesAutoresizingMaskIntoConstraints = false
+        noteIcon.imageScaling = .scaleProportionallyDown
+        let heroConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
         if let lockImg = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: nil)?.withSymbolConfiguration(heroConfig) {
             noteIcon.image = lockImg
-            noteIcon.contentTintColor = .systemBlue
+            noteIcon.contentTintColor = CubeTokens.accent
         }
         noteBox.addSubview(noteIcon)
         
         let noteText = NSTextField(wrappingLabelWithString: "Security Assurance: Private keys are never read, stored, or transmitted by Cube. Only the public key (.pub) is placed inside /root/.ssh/authorized_keys on the virtual machine for port-forwarded SSH login.")
+        noteText.translatesAutoresizingMaskIntoConstraints = false
         noteText.font = NSFont.systemFont(ofSize: 11)
-        noteText.textColor = .secondaryLabelColor
-        noteText.frame = NSRect(x: 40, y: 10, width: contentWidth - 52, height: 55)
+        noteText.textColor = CubeTokens.secondaryText
         noteBox.addSubview(noteText)
         
-        view.addSubview(noteBox)
-        
         // Bottom information bar
-        let footer = FlippedContainerView(frame: NSRect(x: 0, y: 474, width: 554, height: 46))
-        footer.autoresizingMask = [.width, .minYMargin]
-        let sep = NSBox(frame: NSRect(x: 0, y: 0, width: 554, height: 1))
-        sep.boxType = .separator
-        sep.autoresizingMask = [.width]
-        footer.addSubview(sep)
-        
-        let footerNote = NSTextField(labelWithString: "Public key is automatically injected into new VMs during unattended install.")
-        footerNote.font = NSFont.systemFont(ofSize: 11)
-        footerNote.textColor = .secondaryLabelColor
-        footerNote.frame = NSRect(x: 24, y: 14, width: 506, height: 18)
-        footer.addSubview(footerNote)
-        
+        let footer = buildInfoFooter(note: "Public key is automatically injected into new VMs during unattended install.")
         view.addSubview(footer)
+        
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: view.topAnchor, constant: 26),
+            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            header.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            desc.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            desc.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            desc.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            // Key Box
+            keyBox.topAnchor.constraint(equalTo: desc.bottomAnchor, constant: 14),
+            keyBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            keyBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            sshKeyStatusDot.topAnchor.constraint(equalTo: keyBox.topAnchor, constant: 12),
+            sshKeyStatusDot.leadingAnchor.constraint(equalTo: keyBox.leadingAnchor, constant: 14),
+            sshKeyStatusDot.widthAnchor.constraint(equalToConstant: 14),
+            
+            sshKeyPathLabel.centerYAnchor.constraint(equalTo: sshKeyStatusDot.centerYAnchor),
+            sshKeyPathLabel.leadingAnchor.constraint(equalTo: sshKeyStatusDot.trailingAnchor, constant: 4),
+            sshKeyPathLabel.trailingAnchor.constraint(lessThanOrEqualTo: keyBox.trailingAnchor, constant: -14),
+            
+            sshKeyTypeLabel.topAnchor.constraint(equalTo: sshKeyPathLabel.bottomAnchor, constant: 4),
+            sshKeyTypeLabel.leadingAnchor.constraint(equalTo: sshKeyPathLabel.leadingAnchor),
+            sshKeyTypeLabel.trailingAnchor.constraint(lessThanOrEqualTo: keyBox.trailingAnchor, constant: -14),
+            
+            sshKeyPreviewField.topAnchor.constraint(equalTo: sshKeyTypeLabel.bottomAnchor, constant: 8),
+            sshKeyPreviewField.leadingAnchor.constraint(equalTo: keyBox.leadingAnchor, constant: 14),
+            sshKeyPreviewField.trailingAnchor.constraint(equalTo: keyBox.trailingAnchor, constant: -14),
+            
+            copyKeyBtn.topAnchor.constraint(equalTo: sshKeyPreviewField.bottomAnchor, constant: 12),
+            copyKeyBtn.leadingAnchor.constraint(equalTo: keyBox.leadingAnchor, constant: 14),
+            copyKeyBtn.bottomAnchor.constraint(equalTo: keyBox.bottomAnchor, constant: -14),
+            
+            revealKeyBtn.centerYAnchor.constraint(equalTo: copyKeyBtn.centerYAnchor),
+            revealKeyBtn.leadingAnchor.constraint(equalTo: copyKeyBtn.trailingAnchor, constant: 8),
+            
+            chooseKeyBtn.centerYAnchor.constraint(equalTo: copyKeyBtn.centerYAnchor),
+            chooseKeyBtn.leadingAnchor.constraint(equalTo: revealKeyBtn.trailingAnchor, constant: 8),
+            
+            generateKeyBtn.centerYAnchor.constraint(equalTo: copyKeyBtn.centerYAnchor),
+            generateKeyBtn.leadingAnchor.constraint(equalTo: chooseKeyBtn.trailingAnchor, constant: 8),
+            generateKeyBtn.trailingAnchor.constraint(lessThanOrEqualTo: keyBox.trailingAnchor, constant: -14),
+            
+            // Note Box - top aligned icon
+            noteBox.topAnchor.constraint(equalTo: keyBox.bottomAnchor, constant: 14),
+            noteBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            noteBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            noteIcon.topAnchor.constraint(equalTo: noteBox.topAnchor, constant: 12),
+            noteIcon.leadingAnchor.constraint(equalTo: noteBox.leadingAnchor, constant: 14),
+            noteIcon.widthAnchor.constraint(equalToConstant: 16),
+            noteIcon.heightAnchor.constraint(equalToConstant: 16),
+            
+            noteText.topAnchor.constraint(equalTo: noteBox.topAnchor, constant: 10),
+            noteText.leadingAnchor.constraint(equalTo: noteIcon.trailingAnchor, constant: 8),
+            noteText.trailingAnchor.constraint(equalTo: noteBox.trailingAnchor, constant: -14),
+            noteText.bottomAnchor.constraint(equalTo: noteBox.bottomAnchor, constant: -10),
+            
+            // Footer
+            footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 48)
+        ])
+        
         return view
     }
     
     private func buildAboutTabView() -> NSView {
-        let view = FlippedContainerView(frame: NSRect(x: 0, y: 0, width: 554, height: 520))
-        let margin: CGFloat = 24
-        let contentWidth: CGFloat = 506
-        var y: CGFloat = 20
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         
-        let iconView = NSImageView(frame: NSRect(x: margin, y: y, width: 48, height: 48))
+        let iconView = NSImageView()
+        iconView.translatesAutoresizingMaskIntoConstraints = false
         if let appIcon = NSApp.applicationIconImage {
             iconView.image = appIcon
         } else {
             let heroConfig = NSImage.SymbolConfiguration(pointSize: 36, weight: .regular)
             if let fallback = NSImage(systemSymbolName: "cube.fill", accessibilityDescription: nil)?.withSymbolConfiguration(heroConfig) {
                 iconView.image = fallback
-                iconView.contentTintColor = .systemBlue
+                iconView.contentTintColor = CubeTokens.accent
             }
         }
         view.addSubview(iconView)
         
         let appTitle = NSTextField(labelWithString: "Cube")
-        appTitle.font = NSFont.boldSystemFont(ofSize: 19)
-        appTitle.frame = NSRect(x: margin + 62, y: y + 2, width: 250, height: 24)
+        appTitle.translatesAutoresizingMaskIntoConstraints = false
+        appTitle.font = CubeTokens.heroTitleFont
+        appTitle.textColor = CubeTokens.primaryText
         view.addSubview(appTitle)
         
         let versionLabel = NSTextField(labelWithString: "Version \(AppVersion.displayString)")
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
         versionLabel.font = NSFont.systemFont(ofSize: 12)
-        versionLabel.textColor = .secondaryLabelColor
-        versionLabel.frame = NSRect(x: margin + 62, y: y + 26, width: 250, height: 18)
+        versionLabel.textColor = CubeTokens.secondaryText
         view.addSubview(versionLabel)
         
-        y += 66
-        
         // Platform Diagnostics Card
-        let statusBox = FlippedBox(frame: NSRect(x: margin, y: y, width: contentWidth, height: 110))
-        statusBox.boxType = .custom
-        statusBox.cornerRadius = 6
-        statusBox.borderWidth = 1
-        statusBox.borderColor = .separatorColor
-        statusBox.fillColor = NSColor.windowBackgroundColor
-        
-        var sy: CGFloat = 10
-        _ = addInfoRow(label: "Virtualization Engine:", value: "Apple Silicon Hypervisor.framework (ARM64)", in: statusBox, y: sy)
-        sy += 24
-        let netEntitled = VMManager.shared.hasNetworkingEntitlement() ? "Granted (com.apple.vm.networking)" : "Local Proxy Fallback (vmnet-proxy)"
-        _ = addInfoRow(label: "Network Entitlement:", value: netEntitled, in: statusBox, y: sy)
-        sy += 24
-        _ = addInfoRow(label: "CLI Utilities:", value: "cubectl (manager), cube (vmm)", in: statusBox, y: sy)
-        sy += 24
-        _ = addInfoRow(label: "Target Guest OS:", value: "FreeBSD ARM64 (RELEASE / CURRENT)", in: statusBox, y: sy)
-        
+        let statusBox = createCardBox()
         view.addSubview(statusBox)
-        y += 125
+        
+        let (_, st1) = addInfoRow(label: "Virtualization Engine:", value: "Apple Silicon Hypervisor.framework (ARM64)", in: statusBox, topAnchor: statusBox.topAnchor, topOffset: 12)
+        let netEntitled = VMManager.shared.hasNetworkingEntitlement() ? "Granted (com.apple.vm.networking)" : "Local Proxy Fallback (vmnet-proxy)"
+        let (_, st2) = addInfoRow(label: "Network Entitlement:", value: netEntitled, in: statusBox, topAnchor: st1, topOffset: 8)
+        let (_, st3) = addInfoRow(label: "CLI Utilities:", value: "cubectl (manager), cube (vmm)", in: statusBox, topAnchor: st2, topOffset: 8)
+        let (_, st4) = addInfoRow(label: "Target Guest OS:", value: "FreeBSD ARM64 (RELEASE / CURRENT)", in: statusBox, topAnchor: st3, topOffset: 8)
         
         let creditsText = NSTextField(wrappingLabelWithString: "Cube is a lightweight native macOS virtual machine manager built specifically for ARM64 guest systems, powered by Hypervisor.framework, virtio, and UEFI.")
+        creditsText.translatesAutoresizingMaskIntoConstraints = false
         creditsText.font = NSFont.systemFont(ofSize: 11)
-        creditsText.textColor = .secondaryLabelColor
-        creditsText.frame = NSRect(x: margin, y: y, width: contentWidth, height: 36)
+        creditsText.textColor = CubeTokens.secondaryText
         view.addSubview(creditsText)
         
         // Bottom footer
-        let footer = FlippedContainerView(frame: NSRect(x: 0, y: 474, width: 554, height: 46))
-        footer.autoresizingMask = [.width, .minYMargin]
-        let sep = NSBox(frame: NSRect(x: 0, y: 0, width: 554, height: 1))
-        sep.boxType = .separator
-        sep.autoresizingMask = [.width]
-        footer.addSubview(sep)
-        
-        let footerNote = NSTextField(labelWithString: "Cube Virtual Machine Manager — \(AppVersion.displayString)")
-        footerNote.font = NSFont.systemFont(ofSize: 11)
-        footerNote.textColor = .tertiaryLabelColor
-        footerNote.frame = NSRect(x: 24, y: 14, width: 506, height: 18)
-        footer.addSubview(footerNote)
-        
+        let footer = buildInfoFooter(note: "Cube Virtual Machine Manager — \(AppVersion.displayString)")
         view.addSubview(footer)
+        
+        NSLayoutConstraint.activate([
+            iconView.topAnchor.constraint(equalTo: view.topAnchor, constant: 26),
+            iconView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            iconView.widthAnchor.constraint(equalToConstant: 48),
+            iconView.heightAnchor.constraint(equalToConstant: 48),
+            
+            appTitle.topAnchor.constraint(equalTo: view.topAnchor, constant: 24),
+            appTitle.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 14),
+            appTitle.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            versionLabel.topAnchor.constraint(equalTo: appTitle.bottomAnchor, constant: 2),
+            versionLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 14),
+            versionLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            
+            // Status Card
+            statusBox.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 18),
+            statusBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            statusBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            statusBox.bottomAnchor.constraint(equalTo: st4, constant: 12),
+            
+            creditsText.topAnchor.constraint(equalTo: statusBox.bottomAnchor, constant: 16),
+            creditsText.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            creditsText.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            
+            // Footer
+            footer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 48)
+        ])
+        
         return view
     }
     
     // MARK: - Footer Builder Helper
     
     private func buildTabFooter(
-        width: CGFloat,
-        y: CGFloat,
         note: String?,
         cancelTitle: String = "Cancel",
         cancelAction: Selector?,
         applyTitle: String,
         applyAction: Selector
     ) -> NSView {
-        let footer = FlippedContainerView(frame: NSRect(x: 0, y: y, width: width, height: 46))
-        footer.autoresizingMask = [.width, .minYMargin]
+        let footer = NSView()
+        footer.translatesAutoresizingMaskIntoConstraints = false
         
-        let sep = NSBox(frame: NSRect(x: 0, y: 0, width: width, height: 1))
-        sep.boxType = .separator
-        sep.autoresizingMask = [.width]
+        let sep = NSBox()
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.boxType = .custom
+        sep.borderWidth = 0
+        sep.fillColor = CubeTokens.separatorColor
         footer.addSubview(sep)
         
         let applyBtn = NSButton(title: applyTitle, target: self, action: applyAction)
+        applyBtn.translatesAutoresizingMaskIntoConstraints = false
         applyBtn.bezelStyle = .rounded
-        let applyWidth: CGFloat = max(110, applyBtn.intrinsicContentSize.width + 24)
-        applyBtn.frame = NSRect(x: width - 24 - applyWidth, y: 8, width: applyWidth, height: 30)
         applyBtn.keyEquivalent = "\r"
         footer.addSubview(applyBtn)
         
-        var buttonsLeftX = width - 24 - applyWidth
+        var trailingForNote = applyBtn.leadingAnchor
+        var cancelBtn: NSButton? = nil
         if let cancelAction = cancelAction {
-            let cancelBtn = NSButton(title: cancelTitle, target: self, action: cancelAction)
-            cancelBtn.bezelStyle = .rounded
-            let cancelWidth: CGFloat = max(75, cancelBtn.intrinsicContentSize.width + 20)
-            buttonsLeftX = width - 24 - applyWidth - 10 - cancelWidth
-            cancelBtn.frame = NSRect(x: buttonsLeftX, y: 8, width: cancelWidth, height: 30)
-            footer.addSubview(cancelBtn)
+            let btn = NSButton(title: cancelTitle, target: self, action: cancelAction)
+            btn.translatesAutoresizingMaskIntoConstraints = false
+            btn.bezelStyle = .rounded
+            footer.addSubview(btn)
+            cancelBtn = btn
+            trailingForNote = btn.leadingAnchor
         }
         
+        var noteLabel: NSTextField? = nil
         if let note = note {
-            let noteLabel = NSTextField(labelWithString: note)
-            noteLabel.font = NSFont.systemFont(ofSize: 11)
-            noteLabel.textColor = .secondaryLabelColor
-            noteLabel.lineBreakMode = .byTruncatingTail
-            let availableWidth = max(50, buttonsLeftX - 24 - 12)
-            noteLabel.frame = NSRect(x: 24, y: 14, width: availableWidth, height: 18)
-            footer.addSubview(noteLabel)
+            let lbl = NSTextField(labelWithString: note)
+            lbl.translatesAutoresizingMaskIntoConstraints = false
+            lbl.font = NSFont.systemFont(ofSize: 11)
+            lbl.textColor = CubeTokens.secondaryText
+            lbl.lineBreakMode = .byTruncatingTail
+            footer.addSubview(lbl)
+            noteLabel = lbl
         }
+        
+        var constraints: [NSLayoutConstraint] = [
+            sep.topAnchor.constraint(equalTo: footer.topAnchor),
+            sep.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
+            sep.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            sep.heightAnchor.constraint(equalToConstant: 1),
+            
+            applyBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -24),
+            applyBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            applyBtn.heightAnchor.constraint(equalToConstant: 30)
+        ]
+        
+        if let cancelBtn = cancelBtn {
+            constraints.append(contentsOf: [
+                cancelBtn.trailingAnchor.constraint(equalTo: applyBtn.leadingAnchor, constant: -10),
+                cancelBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+                cancelBtn.heightAnchor.constraint(equalToConstant: 30)
+            ])
+        }
+        
+        if let noteLabel = noteLabel {
+            constraints.append(contentsOf: [
+                noteLabel.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 24),
+                noteLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+                noteLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingForNote, constant: -12)
+            ])
+        }
+        
+        NSLayoutConstraint.activate(constraints)
+        return footer
+    }
+    
+    private func buildInfoFooter(note: String) -> NSView {
+        let footer = NSView()
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        
+        let sep = NSBox()
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.boxType = .custom
+        sep.borderWidth = 0
+        sep.fillColor = CubeTokens.separatorColor
+        footer.addSubview(sep)
+        
+        let noteLabel = NSTextField(labelWithString: note)
+        noteLabel.translatesAutoresizingMaskIntoConstraints = false
+        noteLabel.font = NSFont.systemFont(ofSize: 11)
+        noteLabel.textColor = CubeTokens.secondaryText
+        noteLabel.lineBreakMode = .byTruncatingTail
+        footer.addSubview(noteLabel)
+        
+        NSLayoutConstraint.activate([
+            sep.topAnchor.constraint(equalTo: footer.topAnchor),
+            sep.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
+            sep.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            sep.heightAnchor.constraint(equalToConstant: 1),
+            
+            noteLabel.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 24),
+            noteLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            noteLabel.trailingAnchor.constraint(lessThanOrEqualTo: footer.trailingAnchor, constant: -24)
+        ])
         
         return footer
     }
@@ -900,9 +1270,23 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             subview.removeFromSuperview()
         }
         if let tabView = tabViews[id] {
-            tabView.frame = contentContainerView.bounds
-            tabView.autoresizingMask = [.width, .height]
+            tabView.translatesAutoresizingMaskIntoConstraints = false
             contentContainerView.addSubview(tabView)
+            NSLayoutConstraint.activate([
+                tabView.topAnchor.constraint(equalTo: contentContainerView.topAnchor),
+                tabView.bottomAnchor.constraint(equalTo: contentContainerView.bottomAnchor),
+                tabView.leadingAnchor.constraint(equalTo: contentContainerView.leadingAnchor),
+                tabView.trailingAnchor.constraint(equalTo: contentContainerView.trailingAnchor)
+            ])
+            if CubeTokens.reduceMotion {
+                tabView.alphaValue = 1.0
+            } else {
+                tabView.alphaValue = 0.0
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.12
+                    tabView.animator().alphaValue = 1.0
+                }
+            }
         }
     }
     
@@ -916,18 +1300,31 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         let cellId = NSUserInterfaceItemIdentifier("PrefSidebarCell")
         var cell = tableView.makeView(withIdentifier: cellId, owner: nil)
         if cell == nil {
-            let v = NSView(frame: NSRect(x: 0, y: 0, width: 175, height: 34))
+            let v = NSView()
             v.identifier = cellId
             
-            let iconView = NSImageView(frame: NSRect(x: 10, y: 8, width: 18, height: 18))
+            let iconView = NSImageView()
+            iconView.translatesAutoresizingMaskIntoConstraints = false
             iconView.tag = 201
             v.addSubview(iconView)
             
             let label = NSTextField(labelWithString: "")
+            label.translatesAutoresizingMaskIntoConstraints = false
             label.tag = 202
             label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-            label.frame = NSRect(x: 34, y: 7, width: 135, height: 20)
+            label.textColor = CubeTokens.primaryText
             v.addSubview(label)
+            
+            NSLayoutConstraint.activate([
+                iconView.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 12),
+                iconView.centerYAnchor.constraint(equalTo: v.centerYAnchor),
+                iconView.widthAnchor.constraint(equalToConstant: 18),
+                iconView.heightAnchor.constraint(equalToConstant: 18),
+                
+                label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+                label.centerYAnchor.constraint(equalTo: v.centerYAnchor),
+                label.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -8)
+            ])
             
             cell = v
         }
@@ -961,62 +1358,128 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
     
     // MARK: - Row Helper Builders
     
-    private func addDiagRow(label: String, value: String, in box: NSBox, y: CGFloat, copyAction: Selector?) -> NSTextField {
+    private func addDiagRow(
+        label: String,
+        value: String,
+        in card: CardView,
+        topAnchor: NSLayoutYAxisAnchor,
+        topOffset: CGFloat = 10,
+        copyAction: Selector?
+    ) -> (NSTextField, NSLayoutYAxisAnchor) {
         let lbl = NSTextField(labelWithString: label)
+        lbl.translatesAutoresizingMaskIntoConstraints = false
         lbl.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        lbl.textColor = .secondaryLabelColor
-        lbl.frame = NSRect(x: 12, y: y, width: 120, height: 18)
-        box.addSubview(lbl)
+        lbl.textColor = CubeTokens.secondaryText
+        card.addSubview(lbl)
         
         let val = NSTextField(labelWithString: value)
+        val.translatesAutoresizingMaskIntoConstraints = false
         val.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        val.textColor = .labelColor
+        val.textColor = CubeTokens.primaryText
         val.isSelectable = true
-        val.frame = NSRect(x: 135, y: y, width: copyAction != nil ? 280 : 340, height: 18)
-        box.addSubview(val)
+        card.addSubview(val)
+        
+        var trailingTarget = card.trailingAnchor
+        var trailingOffset: CGFloat = -14
         
         if let action = copyAction {
             let copyBtn = NSButton(title: "Copy", target: self, action: action)
+            copyBtn.translatesAutoresizingMaskIntoConstraints = false
             copyBtn.bezelStyle = .rounded
             copyBtn.controlSize = .small
+            copyBtn.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+            copyBtn.imagePosition = .imageLeading
+            copyBtn.imageHugsTitle = true
             copyBtn.font = NSFont.systemFont(ofSize: 10)
-            copyBtn.frame = NSRect(x: 430, y: y - 2, width: 55, height: 20)
-            box.addSubview(copyBtn)
+            card.addSubview(copyBtn)
+            
+            NSLayoutConstraint.activate([
+                copyBtn.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+                copyBtn.centerYAnchor.constraint(equalTo: lbl.centerYAnchor),
+                copyBtn.widthAnchor.constraint(equalToConstant: 70),
+                copyBtn.heightAnchor.constraint(equalToConstant: 21)
+            ])
+            trailingTarget = copyBtn.leadingAnchor
+            trailingOffset = -8
         }
         
-        return val
+        NSLayoutConstraint.activate([
+            lbl.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            lbl.topAnchor.constraint(equalTo: topAnchor, constant: topOffset),
+            lbl.widthAnchor.constraint(equalToConstant: 120),
+            
+            val.leadingAnchor.constraint(equalTo: lbl.trailingAnchor, constant: 8),
+            val.centerYAnchor.constraint(equalTo: lbl.centerYAnchor),
+            val.trailingAnchor.constraint(lessThanOrEqualTo: trailingTarget, constant: trailingOffset)
+        ])
+        
+        return (val, lbl.bottomAnchor)
     }
     
-    private func addInfoRow(label: String, value: String, in box: NSBox, y: CGFloat) -> NSTextField {
+    private func addInfoRow(
+        label: String,
+        value: String,
+        in card: CardView,
+        topAnchor: NSLayoutYAxisAnchor,
+        topOffset: CGFloat = 10
+    ) -> (NSTextField, NSLayoutYAxisAnchor) {
         let lbl = NSTextField(labelWithString: label)
+        lbl.translatesAutoresizingMaskIntoConstraints = false
         lbl.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        lbl.textColor = .secondaryLabelColor
-        lbl.frame = NSRect(x: 12, y: y, width: 175, height: 18)
-        box.addSubview(lbl)
+        lbl.textColor = CubeTokens.secondaryText
+        card.addSubview(lbl)
         
         let val = NSTextField(labelWithString: value)
+        val.translatesAutoresizingMaskIntoConstraints = false
         val.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        val.textColor = .labelColor
+        val.textColor = CubeTokens.primaryText
         val.isSelectable = true
-        val.frame = NSRect(x: 190, y: y, width: 295, height: 18)
-        box.addSubview(val)
-        return val
+        card.addSubview(val)
+        
+        NSLayoutConstraint.activate([
+            lbl.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            lbl.topAnchor.constraint(equalTo: topAnchor, constant: topOffset),
+            lbl.widthAnchor.constraint(equalToConstant: 175),
+            
+            val.leadingAnchor.constraint(equalTo: lbl.trailingAnchor, constant: 6),
+            val.centerYAnchor.constraint(equalTo: lbl.centerYAnchor),
+            val.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -14)
+        ])
+        
+        return (val, lbl.bottomAnchor)
     }
     
-    private func addShortcutRow(action: String, shortcut: String, in box: NSBox, y: CGFloat) -> NSTextField {
+    private func addShortcutRow(
+        action: String,
+        shortcut: String,
+        in card: CardView,
+        topAnchor: NSLayoutYAxisAnchor,
+        topOffset: CGFloat = 10
+    ) -> (NSTextField, NSLayoutYAxisAnchor) {
         let lbl = NSTextField(labelWithString: action)
+        lbl.translatesAutoresizingMaskIntoConstraints = false
         lbl.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        lbl.textColor = .labelColor
-        lbl.frame = NSRect(x: 14, y: y, width: 220, height: 18)
-        box.addSubview(lbl)
+        lbl.textColor = CubeTokens.primaryText
+        card.addSubview(lbl)
         
         let val = NSTextField(labelWithString: shortcut)
+        val.translatesAutoresizingMaskIntoConstraints = false
         val.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
-        val.textColor = .secondaryLabelColor
+        val.textColor = CubeTokens.secondaryText
         val.alignment = .right
-        val.frame = NSRect(x: 350, y: y, width: 120, height: 18)
-        box.addSubview(val)
-        return val
+        card.addSubview(val)
+        
+        NSLayoutConstraint.activate([
+            lbl.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            lbl.topAnchor.constraint(equalTo: topAnchor, constant: topOffset),
+            lbl.widthAnchor.constraint(equalToConstant: 220),
+            
+            val.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            val.centerYAnchor.constraint(equalTo: lbl.centerYAnchor),
+            val.leadingAnchor.constraint(greaterThanOrEqualTo: lbl.trailingAnchor, constant: 10)
+        ])
+        
+        return (val, lbl.bottomAnchor)
     }
     
     // MARK: - Lifecycle & State
@@ -1325,24 +1788,33 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         }
     }
     
-    @objc private func copyIPv4Clicked() {
+    @objc private func copyIPv4Clicked(_ sender: Any?) {
         guard !lastIPv4.isEmpty else { return }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(lastIPv4, forType: .string)
+        if let btn = sender as? NSButton {
+            CubeTokens.animateCopyFeedback(button: btn)
+        }
     }
     
-    @objc private func copyIPv6Clicked() {
+    @objc private func copyIPv6Clicked(_ sender: Any?) {
         guard !lastIPv6.isEmpty else { return }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(lastIPv6, forType: .string)
+        if let btn = sender as? NSButton {
+            CubeTokens.animateCopyFeedback(button: btn)
+        }
     }
     
-    @objc private func copySocketClicked() {
+    @objc private func copySocketClicked(_ sender: Any?) {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(ServiceManager.shared.defaultSocketPath, forType: .string)
+        if let btn = sender as? NSButton {
+            CubeTokens.animateCopyFeedback(button: btn)
+        }
     }
     
     // MARK: - Storage Tab Actions
@@ -1449,10 +1921,14 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         pb.clearContents()
         pb.setString(key.keyContent, forType: .string)
         if let btn = sender as? NSButton {
-            btn.title = "Copied!"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                btn.title = "Copy Public Key"
-            }
+            CubeTokens.animateCopyFeedback(
+                button: btn,
+                temporaryTitle: "Copied!",
+                temporaryIcon: "checkmark",
+                originalTitle: "Copy Public Key",
+                originalIcon: "doc.on.doc",
+                duration: 1.2
+            )
         }
     }
 
@@ -1563,27 +2039,25 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         let count = items.filter { $0.isCached }.count
         imagesTotalUsageLabel.stringValue = "\(formattedTotal) used (\(count) cached file\(count == 1 ? "" : "s"))"
         
-        for sv in imagesListContainer.subviews {
+        for sv in imagesListContainer.arrangedSubviews {
+            imagesListContainer.removeArrangedSubview(sv)
             sv.removeFromSuperview()
         }
         
-        let rowHeight: CGFloat = 58
-        let totalH = max(CGFloat(items.count) * rowHeight, imagesScrollView.bounds.height)
-        imagesListContainer.frame = NSRect(x: 0, y: 0, width: imagesScrollView.contentSize.width, height: totalH)
-        
-        var ry: CGFloat = 0
         for (idx, item) in items.enumerated() {
-            let row = buildImageRowView(item: item, frame: NSRect(x: 0, y: ry, width: imagesListContainer.bounds.width, height: rowHeight), isLast: idx == items.count - 1)
-            imagesListContainer.addSubview(row)
-            ry += rowHeight
+            let row = buildImageRowView(item: item, isLast: idx == items.count - 1)
+            imagesListContainer.addArrangedSubview(row)
         }
     }
     
-    private func buildImageRowView(item: OSImageItem, frame: NSRect, isLast: Bool) -> NSView {
-        let row = FlippedContainerView(frame: frame)
+    private func buildImageRowView(item: OSImageItem, isLast: Bool) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.heightAnchor.constraint(equalToConstant: 58).isActive = true
         
         // Icon
-        let iconView = NSImageView(frame: NSRect(x: 12, y: 14, width: 24, height: 24))
+        let iconView = NSImageView()
+        iconView.translatesAutoresizingMaskIntoConstraints = false
         let cfg = NSImage.SymbolConfiguration(pointSize: 20, weight: .regular)
         if let img = NSImage(systemSymbolName: "opticaldisc", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
             iconView.image = img
@@ -1593,24 +2067,36 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         
         // Title
         let titleLabel = NSTextField(labelWithString: item.title)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         titleLabel.textColor = .labelColor
-        titleLabel.frame = NSRect(x: 46, y: 10, width: 250, height: 18)
         row.addSubview(titleLabel)
         
         // Subtitle (Filename)
         let subLabel = NSTextField(labelWithString: item.filename)
+        subLabel.translatesAutoresizingMaskIntoConstraints = false
         subLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
         subLabel.textColor = .secondaryLabelColor
         subLabel.lineBreakMode = .byTruncatingMiddle
-        subLabel.frame = NSRect(x: 46, y: 30, width: 250, height: 16)
         subLabel.toolTip = item.filename
         row.addSubview(subLabel)
         
-        // Size & Status & Actions
-        let rightEdge = frame.width - 12
+        var trailingRef = row.trailingAnchor
+        var trailingPadding: CGFloat = -12
+
         if item.isDownloading {
-            let progressIndicator = NSProgressIndicator(frame: NSRect(x: rightEdge - 175, y: 24, width: 100, height: 12))
+            let cancelBtn = ActionButton(title: "Cancel")
+            cancelBtn.bezelStyle = .rounded
+            cancelBtn.controlSize = .small
+            cancelBtn.font = NSFont.systemFont(ofSize: 11)
+            cancelBtn.onClick = { [weak self] _ in
+                ImageCacheManager.shared.cancelDownload(presetId: item.id)
+                self?.refreshImagesUI()
+            }
+            row.addSubview(cancelBtn)
+
+            let progressIndicator = NSProgressIndicator()
+            progressIndicator.translatesAutoresizingMaskIntoConstraints = false
             progressIndicator.isIndeterminate = false
             progressIndicator.minValue = 0.0
             progressIndicator.maxValue = 1.0
@@ -1618,56 +2104,34 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             row.addSubview(progressIndicator)
             
             let pctLabel = NSTextField(labelWithString: "\(Int(item.downloadProgress * 100))%")
+            pctLabel.translatesAutoresizingMaskIntoConstraints = false
             pctLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .medium)
             pctLabel.textColor = .systemBlue
             pctLabel.alignment = .right
-            pctLabel.frame = NSRect(x: rightEdge - 175, y: 8, width: 100, height: 14)
             row.addSubview(pctLabel)
-            
-            let cancelBtn = ActionButton(title: "Cancel")
-            cancelBtn.bezelStyle = .rounded
-            cancelBtn.controlSize = .small
-            cancelBtn.font = NSFont.systemFont(ofSize: 11)
-            cancelBtn.frame = NSRect(x: rightEdge - 66, y: 17, width: 66, height: 24)
-            cancelBtn.onClick = { [weak self] _ in
-                ImageCacheManager.shared.cancelDownload(presetId: item.id)
-                self?.refreshImagesUI()
-            }
-            row.addSubview(cancelBtn)
-            
+
+            NSLayoutConstraint.activate([
+                cancelBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                cancelBtn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+                cancelBtn.widthAnchor.constraint(equalToConstant: 66),
+                cancelBtn.heightAnchor.constraint(equalToConstant: 24),
+
+                progressIndicator.trailingAnchor.constraint(equalTo: cancelBtn.leadingAnchor, constant: -10),
+                progressIndicator.topAnchor.constraint(equalTo: row.topAnchor, constant: 16),
+                progressIndicator.widthAnchor.constraint(equalToConstant: 100),
+                progressIndicator.heightAnchor.constraint(equalToConstant: 12),
+
+                pctLabel.trailingAnchor.constraint(equalTo: cancelBtn.leadingAnchor, constant: -10),
+                pctLabel.topAnchor.constraint(equalTo: progressIndicator.bottomAnchor, constant: 2),
+                pctLabel.widthAnchor.constraint(equalToConstant: 100)
+            ])
+            trailingRef = progressIndicator.leadingAnchor
+            trailingPadding = -8
         } else if item.isCached {
-            let sizeLabel = NSTextField(labelWithString: item.sizeDisplay)
-            sizeLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            sizeLabel.textColor = .labelColor
-            sizeLabel.alignment = .right
-            sizeLabel.frame = NSRect(x: rightEdge - 215, y: 12, width: 80, height: 16)
-            row.addSubview(sizeLabel)
-            
-            let badge = NSTextField(labelWithString: "● CACHED")
-            badge.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
-            badge.textColor = .systemGreen
-            badge.alignment = .right
-            badge.frame = NSRect(x: rightEdge - 215, y: 30, width: 80, height: 14)
-            row.addSubview(badge)
-            
-            let revealBtn = ActionButton(title: "Reveal")
-            revealBtn.bezelStyle = .rounded
-            revealBtn.controlSize = .small
-            revealBtn.font = NSFont.systemFont(ofSize: 11)
-            revealBtn.frame = NSRect(x: rightEdge - 130, y: 17, width: 60, height: 24)
-            revealBtn.onClick = { _ in
-                let path = "\(ImageCacheManager.shared.cacheDir)/\(item.filename)"
-                if FileManager.default.fileExists(atPath: path) {
-                    NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
-                }
-            }
-            row.addSubview(revealBtn)
-            
             let deleteBtn = ActionButton(title: "Delete")
             deleteBtn.bezelStyle = .rounded
             deleteBtn.controlSize = .small
             deleteBtn.font = NSFont.systemFont(ofSize: 11)
-            deleteBtn.frame = NSRect(x: rightEdge - 66, y: 17, width: 62, height: 24)
             deleteBtn.onClick = { [weak self] _ in
                 let alert = NSAlert()
                 alert.messageText = "Delete Cached Image?"
@@ -1681,40 +2145,128 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
                 }
             }
             row.addSubview(deleteBtn)
-            
-        } else {
-            let sizeLabel = NSTextField(labelWithString: "~\(item.fileSize == nil ? "1.15 GB" : item.sizeDisplay)")
-            sizeLabel.font = NSFont.systemFont(ofSize: 11)
-            sizeLabel.textColor = .secondaryLabelColor
-            sizeLabel.alignment = .right
-            sizeLabel.frame = NSRect(x: rightEdge - 185, y: 12, width: 85, height: 16)
-            row.addSubview(sizeLabel)
-            
-            let badge = NSTextField(labelWithString: "○ AVAILABLE")
+
+            let revealBtn = ActionButton(title: "Reveal")
+            revealBtn.bezelStyle = .rounded
+            revealBtn.controlSize = .small
+            revealBtn.font = NSFont.systemFont(ofSize: 11)
+            revealBtn.onClick = { _ in
+                let path = "\(ImageCacheManager.shared.cacheDir)/\(item.filename)"
+                if FileManager.default.fileExists(atPath: path) {
+                    NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
+                }
+            }
+            row.addSubview(revealBtn)
+
+            let badge = NSTextField(labelWithString: "● CACHED")
+            badge.translatesAutoresizingMaskIntoConstraints = false
             badge.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
-            badge.textColor = .tertiaryLabelColor
+            badge.textColor = .systemGreen
             badge.alignment = .right
-            badge.frame = NSRect(x: rightEdge - 185, y: 30, width: 85, height: 14)
             row.addSubview(badge)
-            
+
+            let sizeLabel = NSTextField(labelWithString: item.sizeDisplay)
+            sizeLabel.translatesAutoresizingMaskIntoConstraints = false
+            sizeLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            sizeLabel.textColor = .labelColor
+            sizeLabel.alignment = .right
+            row.addSubview(sizeLabel)
+
+            NSLayoutConstraint.activate([
+                deleteBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                deleteBtn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+                deleteBtn.widthAnchor.constraint(equalToConstant: 62),
+                deleteBtn.heightAnchor.constraint(equalToConstant: 24),
+
+                revealBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                revealBtn.trailingAnchor.constraint(equalTo: deleteBtn.leadingAnchor, constant: -6),
+                revealBtn.widthAnchor.constraint(equalToConstant: 60),
+                revealBtn.heightAnchor.constraint(equalToConstant: 24),
+
+                badge.trailingAnchor.constraint(equalTo: revealBtn.leadingAnchor, constant: -10),
+                badge.topAnchor.constraint(equalTo: row.topAnchor, constant: 14),
+                badge.widthAnchor.constraint(equalToConstant: 80),
+
+                sizeLabel.trailingAnchor.constraint(equalTo: revealBtn.leadingAnchor, constant: -10),
+                sizeLabel.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 2),
+                sizeLabel.widthAnchor.constraint(equalToConstant: 80)
+            ])
+            trailingRef = badge.leadingAnchor
+            trailingPadding = -8
+        } else {
             let dlBtn = ActionButton(title: "Download")
             dlBtn.bezelStyle = .rounded
             dlBtn.controlSize = .small
             dlBtn.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-            dlBtn.frame = NSRect(x: rightEdge - 88, y: 17, width: 84, height: 24)
             dlBtn.onClick = { [weak self] _ in
                 ImageCacheManager.shared.startDownload(presetId: item.id)
                 self?.refreshImagesUI()
             }
             row.addSubview(dlBtn)
+
+            let badge = NSTextField(labelWithString: "○ AVAILABLE")
+            badge.translatesAutoresizingMaskIntoConstraints = false
+            badge.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
+            badge.textColor = .tertiaryLabelColor
+            badge.alignment = .right
+            row.addSubview(badge)
+
+            let sizeLabel = NSTextField(labelWithString: "~\(item.fileSize == nil ? "1.15 GB" : item.sizeDisplay)")
+            sizeLabel.translatesAutoresizingMaskIntoConstraints = false
+            sizeLabel.font = NSFont.systemFont(ofSize: 11)
+            sizeLabel.textColor = .secondaryLabelColor
+            sizeLabel.alignment = .right
+            row.addSubview(sizeLabel)
+
+            NSLayoutConstraint.activate([
+                dlBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                dlBtn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+                dlBtn.widthAnchor.constraint(equalToConstant: 84),
+                dlBtn.heightAnchor.constraint(equalToConstant: 24),
+
+                badge.trailingAnchor.constraint(equalTo: dlBtn.leadingAnchor, constant: -10),
+                badge.topAnchor.constraint(equalTo: row.topAnchor, constant: 14),
+                badge.widthAnchor.constraint(equalToConstant: 85),
+
+                sizeLabel.trailingAnchor.constraint(equalTo: dlBtn.leadingAnchor, constant: -10),
+                sizeLabel.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 2),
+                sizeLabel.widthAnchor.constraint(equalToConstant: 85)
+            ])
+            trailingRef = badge.leadingAnchor
+            trailingPadding = -8
         }
-        
+
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+            iconView.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 24),
+            iconView.heightAnchor.constraint(equalToConstant: 24),
+
+            titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
+            titleLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 10),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingRef, constant: trailingPadding),
+
+            subLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
+            subLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            subLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingRef, constant: trailingPadding)
+        ])
+
         if !isLast {
-            let sep = NSBox(frame: NSRect(x: 12, y: frame.height - 1, width: frame.width - 24, height: 1))
-            sep.boxType = .separator
+            let sep = NSBox()
+            sep.translatesAutoresizingMaskIntoConstraints = false
+            sep.boxType = .custom
+            sep.borderWidth = 0
+            sep.fillColor = CubeTokens.separatorColor
             row.addSubview(sep)
+
+            NSLayoutConstraint.activate([
+                sep.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
+                sep.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+                sep.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+                sep.heightAnchor.constraint(equalToConstant: 1)
+            ])
         }
-        
+
         return row
     }
     
@@ -1840,5 +2392,42 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
             }
         }
         return names.isEmpty ? ["en0"] : names.sorted()
+    }
+
+    // MARK: - Accessibility Adaptations
+
+    @objc private func accessibilityDisplayOptionsDidChange(_ notification: Notification) {
+        updateAccessibilityPreferences()
+    }
+
+    private func updateAccessibilityPreferences() {
+        let reduceTransparency = CubeTokens.reduceTransparency
+        guard let window = self.window else { return }
+
+        window.isOpaque = reduceTransparency
+        window.backgroundColor = reduceTransparency ? .windowBackgroundColor : .clear
+
+        rootVisualEffect?.material = reduceTransparency ? .windowBackground : .underWindowBackground
+        rootVisualEffect?.blendingMode = reduceTransparency ? .withinWindow : .behindWindow
+        rootVisualEffect?.state = reduceTransparency ? .inactive : .active
+        rootVisualEffect?.layer?.borderColor = CubeTokens.windowBorder.cgColor
+
+        sidebarContainer?.material = reduceTransparency ? .windowBackground : .sidebar
+        sidebarContainer?.blendingMode = reduceTransparency ? .withinWindow : .behindWindow
+        sidebarContainer?.state = reduceTransparency ? .inactive : .active
+
+        refreshAllCardBoxes(in: window.contentView)
+        window.contentView?.needsDisplay = true
+    }
+
+    private func refreshAllCardBoxes(in view: NSView?) {
+        guard let view = view else { return }
+        if let card = view as? CardView {
+            card.updateColors()
+            card.needsDisplay = true
+        }
+        for sub in view.subviews {
+            refreshAllCardBoxes(in: sub)
+        }
     }
 }

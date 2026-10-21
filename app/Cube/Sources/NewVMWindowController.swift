@@ -6,6 +6,27 @@ private class NewVMContentView: NSView {
     override var isFlipped: Bool { return true }
 }
 
+private class NewVMCardView: NSView {
+    init() {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = CubeTokens.cardCornerRadius
+        layer?.borderWidth = CubeTokens.cardBorderWidth
+        layer?.borderColor = CubeTokens.cardBorder.cgColor
+        layer?.backgroundColor = CubeTokens.cardBackground.cgColor
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func updateColors() {
+        layer?.borderColor = CubeTokens.cardBorder.cgColor
+        layer?.backgroundColor = CubeTokens.cardBackground.cgColor
+    }
+}
+
 private struct OSSelectionOption {
     let title: String
     let osVersion: String
@@ -13,9 +34,15 @@ private struct OSSelectionOption {
     let isCustomFilePicker: Bool
 }
 
-class NewVMWindowController: NSWindowController {
+class NewVMWindowController: NSWindowController, NSWindowDelegate {
     static var shared: NewVMWindowController?
 
+    // UI Architecture
+    private var rootVisualEffect: NSVisualEffectView!
+    private var stackView: NSStackView!
+    private var logCardView: NewVMCardView!
+
+    // Form Controls
     private var nameField: NSTextField!
     private var osPopUp: NSPopUpButton!
     private var isoPathField: NSTextField!
@@ -25,8 +52,9 @@ class NewVMWindowController: NSWindowController {
     private var ramPopUp: NSPopUpButton!
     private var memPreallocCheckbox: NSButton!
     private var diskField: NSTextField!
-    private var passwordField: NSTextField!
+    private var passwordField: NSSecureTextField!
     private var netPopUp: NSPopUpButton!
+    private var netHintLabel: NSTextField!
     private var sshPortField: NSTextField!
     private var vncPortField: NSTextField!
 
@@ -36,6 +64,8 @@ class NewVMWindowController: NSWindowController {
     private var shareTagField: NSTextField!
     private var shareReadOnlyCheckbox: NSButton!
 
+    // Status / Progress / Logging
+    private var statusBarView: NSView!
     private var progressIndicator: NSProgressIndicator!
     private var statusLabel: NSTextField!
     private var logTextView: NSTextView!
@@ -44,23 +74,35 @@ class NewVMWindowController: NSWindowController {
     private var createButton: NSButton!
     private var cancelButton: NSButton!
 
+    // Storage
     private var storagePathLabel: NSTextField!
     private var customizeStorageButton: NSButton!
     private var customStorageDir: String? = nil
 
     private var isBusy = false
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 735),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 600),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "New Virtual Machine"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.minSize = NSSize(width: 500, height: 440)
         window.center()
         window.isReleasedWhenClosed = false
         super.init(window: window)
+        window.delegate = self
 
         setupUI()
     }
@@ -77,6 +119,14 @@ class NewVMWindowController: NSWindowController {
         shared?.resetUI()
         shared?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        let hasOtherWindows = PreferencesWindowController.shared.window?.isVisible == true ||
+                              DashboardWindowController.shared.window?.isVisible == true
+        if !hasOtherWindows {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     private func resetUI() {
@@ -96,7 +146,7 @@ class NewVMWindowController: NSWindowController {
         progressIndicator.stopAnimation(nil)
         progressIndicator.isHidden = true
         logTextView.string = ""
-        logScrollView.isHidden = true
+        logCardView.isHidden = true
         copyLogsButton.isHidden = true
         customStorageDir = nil
         updateStoragePathDisplay()
@@ -106,324 +156,715 @@ class NewVMWindowController: NSWindowController {
         setFormEnabled(true)
     }
 
+    // MARK: - UI Construction (Auto Layout & Translucent Frosted Glass)
+
     private func setupUI() {
         guard let window = self.window else { return }
-        let contentView = NewVMContentView(frame: window.contentView!.bounds)
-        contentView.autoresizingMask = [.width, .height]
-        window.contentView = contentView
 
-        var y: CGFloat = 20
+        // Root Liquid Translucent Glass (underWindowBackground blur behind window)
+        rootVisualEffect = NSVisualEffectView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 560, height: 740))
+        rootVisualEffect.material = .underWindowBackground
+        rootVisualEffect.blendingMode = .behindWindow
+        rootVisualEffect.state = .active
+        rootVisualEffect.autoresizingMask = [.width, .height]
+        rootVisualEffect.wantsLayer = true
+        rootVisualEffect.layer?.cornerRadius = 18.0
+        rootVisualEffect.layer?.masksToBounds = true
+        rootVisualEffect.layer?.borderWidth = 1.0
+        rootVisualEffect.layer?.borderColor = CubeTokens.windowBorder.cgColor
+        window.contentView = rootVisualEffect
 
-        // Title Header
-        let headerLabel = NSTextField(labelWithString: "Create a New Virtual Machine")
-        headerLabel.font = NSFont.boldSystemFont(ofSize: 16)
-        headerLabel.frame = NSRect(x: 24, y: y, width: 470, height: 22)
-        contentView.addSubview(headerLabel)
-        y += 30
+        // Top Header
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
+        rootVisualEffect.addSubview(header)
 
-        // Subtitle
-        let subLabel = NSTextField(labelWithString: "Configure and provision an ARM64 guest system using Cube.")
-        subLabel.textColor = .secondaryLabelColor
-        subLabel.font = NSFont.systemFont(ofSize: 12)
-        subLabel.frame = NSRect(x: 24, y: y, width: 470, height: 16)
-        contentView.addSubview(subLabel)
-        y += 28
+        let titleLabel = NSTextField(labelWithString: "Create Virtual Machine")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 16)
+        titleLabel.textColor = CubeTokens.primaryText
+        header.addSubview(titleLabel)
 
-        // Box: Machine Identity
-        y = addRow(label: "VM Name:", in: contentView, y: y) {
-            nameField = NSTextField(frame: NSRect(x: 150, y: y, width: 330, height: 22))
-            nameField.placeholderString = "e.g. freebsd-work"
-            nameField.toolTip = "Unique name identifying this virtual machine in Cube.app and cubectl CLI."
-            NotificationCenter.default.addObserver(self, selector: #selector(nameFieldChanged), name: NSControl.textDidChangeNotification, object: nameField)
-            return nameField
+        let subtitleLabel = NSTextField(labelWithString: "Configure and provision an ARM64 guest system using Cube.")
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        subtitleLabel.font = NSFont.systemFont(ofSize: 11.5)
+        subtitleLabel.textColor = CubeTokens.secondaryText
+        header.addSubview(subtitleLabel)
+
+        let sepHeader = NSBox()
+        sepHeader.translatesAutoresizingMaskIntoConstraints = false
+        sepHeader.boxType = .custom
+        sepHeader.borderWidth = 0
+        sepHeader.fillColor = CubeTokens.separatorColor
+        header.addSubview(sepHeader)
+
+        // Bottom Action & Status Bar
+        statusBarView = NSView()
+        statusBarView.translatesAutoresizingMaskIntoConstraints = false
+        statusBarView.wantsLayer = true
+        statusBarView.layer?.backgroundColor = CubeTokens.statusBarBackground.cgColor
+        rootVisualEffect.addSubview(statusBarView)
+
+        let sepBottom = NSBox()
+        sepBottom.translatesAutoresizingMaskIntoConstraints = false
+        sepBottom.boxType = .custom
+        sepBottom.borderWidth = 0
+        sepBottom.fillColor = CubeTokens.separatorColor
+        statusBarView.addSubview(sepBottom)
+
+        progressIndicator = NSProgressIndicator()
+        progressIndicator.translatesAutoresizingMaskIntoConstraints = false
+        progressIndicator.isIndeterminate = true
+        progressIndicator.style = .spinning
+        progressIndicator.controlSize = .small
+        progressIndicator.isHidden = true
+        statusBarView.addSubview(progressIndicator)
+
+        statusLabel = NSTextField(labelWithString: "Ready")
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        statusLabel.textColor = CubeTokens.secondaryText
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusBarView.addSubview(statusLabel)
+
+        copyLogsButton = NSButton(title: "Copy Logs", target: self, action: #selector(copyLogsClicked))
+        copyLogsButton.translatesAutoresizingMaskIntoConstraints = false
+        copyLogsButton.bezelStyle = .rounded
+        copyLogsButton.font = NSFont.systemFont(ofSize: 12)
+        copyLogsButton.isHidden = true
+        statusBarView.addSubview(copyLogsButton)
+
+        cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancelClicked))
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.bezelStyle = .rounded
+        cancelButton.font = NSFont.systemFont(ofSize: 12)
+        statusBarView.addSubview(cancelButton)
+
+        createButton = NSButton(title: "Create VM", target: self, action: #selector(createClicked))
+        createButton.translatesAutoresizingMaskIntoConstraints = false
+        createButton.bezelStyle = .rounded
+        createButton.keyEquivalent = "\r"
+        createButton.font = NSFont.boldSystemFont(ofSize: 12)
+        statusBarView.addSubview(createButton)
+
+        // Middle Scroll View
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.automaticallyAdjustsContentInsets = false
+        rootVisualEffect.addSubview(scrollView)
+
+        let scrollContentView = NewVMContentView()
+        scrollContentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = scrollContentView
+
+        stackView = NSStackView()
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        stackView.orientation = .vertical
+        stackView.alignment = .leading
+        stackView.distribution = .fill
+        stackView.spacing = 14
+        scrollContentView.addSubview(stackView)
+
+        NSLayoutConstraint.activate([
+            // Header Layout (height 76 clears top traffic lights)
+            header.topAnchor.constraint(equalTo: rootVisualEffect.topAnchor),
+            header.leadingAnchor.constraint(equalTo: rootVisualEffect.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: rootVisualEffect.trailingAnchor),
+            header.heightAnchor.constraint(equalToConstant: 76),
+
+            titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 20),
+            titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 26),
+            titleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -20),
+
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
+            subtitleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -20),
+
+            sepHeader.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            sepHeader.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            sepHeader.bottomAnchor.constraint(equalTo: header.bottomAnchor),
+            sepHeader.heightAnchor.constraint(equalToConstant: 1),
+
+            // Status Bar Layout
+            statusBarView.leadingAnchor.constraint(equalTo: rootVisualEffect.leadingAnchor),
+            statusBarView.trailingAnchor.constraint(equalTo: rootVisualEffect.trailingAnchor),
+            statusBarView.bottomAnchor.constraint(equalTo: rootVisualEffect.bottomAnchor),
+            statusBarView.heightAnchor.constraint(equalToConstant: 52),
+
+            sepBottom.topAnchor.constraint(equalTo: statusBarView.topAnchor),
+            sepBottom.leadingAnchor.constraint(equalTo: statusBarView.leadingAnchor),
+            sepBottom.trailingAnchor.constraint(equalTo: statusBarView.trailingAnchor),
+            sepBottom.heightAnchor.constraint(equalToConstant: 1),
+
+            progressIndicator.leadingAnchor.constraint(equalTo: statusBarView.leadingAnchor, constant: 18),
+            progressIndicator.centerYAnchor.constraint(equalTo: statusBarView.centerYAnchor),
+            progressIndicator.widthAnchor.constraint(equalToConstant: 16),
+            progressIndicator.heightAnchor.constraint(equalToConstant: 16),
+
+            statusLabel.leadingAnchor.constraint(equalTo: progressIndicator.trailingAnchor, constant: 8),
+            statusLabel.centerYAnchor.constraint(equalTo: statusBarView.centerYAnchor),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: copyLogsButton.leadingAnchor, constant: -12),
+
+            createButton.trailingAnchor.constraint(equalTo: statusBarView.trailingAnchor, constant: -18),
+            createButton.centerYAnchor.constraint(equalTo: statusBarView.centerYAnchor),
+            createButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
+
+            cancelButton.trailingAnchor.constraint(equalTo: createButton.leadingAnchor, constant: -8),
+            cancelButton.centerYAnchor.constraint(equalTo: statusBarView.centerYAnchor),
+
+            copyLogsButton.trailingAnchor.constraint(equalTo: cancelButton.leadingAnchor, constant: -8),
+            copyLogsButton.centerYAnchor.constraint(equalTo: statusBarView.centerYAnchor),
+
+            // Scroll View Layout
+            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: rootVisualEffect.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: rootVisualEffect.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: statusBarView.topAnchor),
+
+            scrollContentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            scrollContentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            scrollContentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            scrollContentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+
+            stackView.topAnchor.constraint(equalTo: scrollContentView.topAnchor, constant: 14),
+            stackView.leadingAnchor.constraint(equalTo: scrollContentView.leadingAnchor, constant: 18),
+            stackView.trailingAnchor.constraint(equalTo: scrollContentView.trailingAnchor, constant: -18),
+            stackView.bottomAnchor.constraint(equalTo: scrollContentView.bottomAnchor, constant: -18)
+        ])
+
+        // Build Cards
+        buildIdentityCard()
+        buildHardwareCard()
+        buildNetworkCard()
+        buildSharesCard()
+        buildLogCard()
+
+        // Accessibility Listeners
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityDisplayOptionsDidChange),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
+        updateAccessibilityPreferences()
+    }
+
+    // MARK: - Card Construction Helpers
+
+    private func addCardHeader(title: String, to card: NSView) -> NSLayoutYAxisAnchor {
+        let label = NSTextField(labelWithString: title.uppercased())
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = CubeTokens.sectionHeaderFont
+        label.textColor = CubeTokens.secondaryText
+        card.addSubview(label)
+
+        let sep = NSBox()
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.boxType = .custom
+        sep.borderWidth = 0
+        sep.fillColor = CubeTokens.separatorColor
+        card.addSubview(sep)
+
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            label.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            label.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+
+            sep.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 8),
+            sep.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            sep.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            sep.heightAnchor.constraint(equalToConstant: 1)
+        ])
+
+        return sep.bottomAnchor
+    }
+
+    private func addFormRow(label: String, control: NSView, in card: NSView, topAnchor: NSLayoutYAxisAnchor, topOffset: CGFloat = 10, height: CGFloat? = nil) -> NSLayoutYAxisAnchor {
+        let labelField = NSTextField(labelWithString: label)
+        labelField.translatesAutoresizingMaskIntoConstraints = false
+        labelField.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        labelField.textColor = CubeTokens.secondaryText
+        labelField.alignment = .right
+        card.addSubview(labelField)
+
+        control.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(control)
+
+        var constraints = [
+            labelField.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            labelField.widthAnchor.constraint(equalToConstant: 120),
+            labelField.firstBaselineAnchor.constraint(equalTo: control.firstBaselineAnchor),
+
+            control.leadingAnchor.constraint(equalTo: labelField.trailingAnchor, constant: 12),
+            control.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            control.topAnchor.constraint(equalTo: topAnchor, constant: topOffset)
+        ]
+        if let h = height {
+            constraints.append(control.heightAnchor.constraint(equalToConstant: h))
         }
+        NSLayoutConstraint.activate(constraints)
+        return control.bottomAnchor
+    }
 
-        // Box: OS Selection
-        y = addRow(label: "Operating System:", in: contentView, y: y) {
-            osPopUp = NSPopUpButton(frame: NSRect(x: 150, y: y - 2, width: 330, height: 26))
-            osPopUp.toolTip = "Choose an official FreeBSD ARM64 release (auto-downloaded and verified) or provide a custom boot ISO."
-            osPopUp.target = self
-            osPopUp.action = #selector(osSelectionChanged)
-            populateOSOptions()
-            return osPopUp
-        }
+    // MARK: - Section 1: Machine Identity & OS
 
-        // Custom ISO Path
-        let isoRow = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 24))
-        isoPathField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+    private func buildIdentityCard() {
+        let card = NewVMCardView()
+        stackView.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stackView.widthAnchor).isActive = true
+
+        var lastAnchor = addCardHeader(title: "Machine Identity & OS", to: card)
+
+        // VM Name
+        nameField = NSTextField()
+        nameField.font = NSFont.systemFont(ofSize: 12)
+        nameField.placeholderString = "e.g. freebsd-work"
+        nameField.toolTip = "Unique name identifying this virtual machine in Cube.app and cubectl CLI."
+        NotificationCenter.default.addObserver(self, selector: #selector(nameFieldChanged), name: NSControl.textDidChangeNotification, object: nameField)
+        lastAnchor = addFormRow(label: "VM Name:", control: nameField, in: card, topAnchor: lastAnchor, height: 22)
+
+        // Operating System
+        osPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        osPopUp.font = NSFont.systemFont(ofSize: 12)
+        osPopUp.toolTip = "Choose an official FreeBSD ARM64 release (auto-downloaded and verified) or provide a custom boot ISO."
+        osPopUp.target = self
+        osPopUp.action = #selector(osSelectionChanged)
+        populateOSOptions()
+        lastAnchor = addFormRow(label: "Operating System:", control: osPopUp, in: card, topAnchor: lastAnchor, height: 24)
+
+        // Custom ISO Path Row
+        let isoRow = NSView()
+        isoRow.translatesAutoresizingMaskIntoConstraints = false
+
+        isoPathField = NSTextField()
+        isoPathField.translatesAutoresizingMaskIntoConstraints = false
+        isoPathField.font = NSFont.systemFont(ofSize: 11)
         isoPathField.placeholderString = "Select an .iso image"
         isoPathField.toolTip = "Path to a local bootable installer ISO image on your Mac."
         isoPathField.isEnabled = false
         isoRow.addSubview(isoPathField)
 
         browseButton = NSButton(title: "Browse...", target: self, action: #selector(browseIsoClicked))
-        browseButton.frame = NSRect(x: 246, y: -2, width: 84, height: 26)
+        browseButton.translatesAutoresizingMaskIntoConstraints = false
+        browseButton.bezelStyle = .rounded
+        browseButton.font = NSFont.systemFont(ofSize: 11)
         browseButton.isEnabled = false
         isoRow.addSubview(browseButton)
-        contentView.addSubview(isoRow)
-        y += 30
 
-        // Unattended checkbox
+        NSLayoutConstraint.activate([
+            isoPathField.leadingAnchor.constraint(equalTo: isoRow.leadingAnchor),
+            isoPathField.centerYAnchor.constraint(equalTo: isoRow.centerYAnchor),
+            isoPathField.heightAnchor.constraint(equalToConstant: 22),
+
+            browseButton.leadingAnchor.constraint(equalTo: isoPathField.trailingAnchor, constant: 8),
+            browseButton.trailingAnchor.constraint(equalTo: isoRow.trailingAnchor),
+            browseButton.centerYAnchor.constraint(equalTo: isoRow.centerYAnchor),
+            browseButton.widthAnchor.constraint(equalToConstant: 80)
+        ])
+        lastAnchor = addFormRow(label: "Custom ISO:", control: isoRow, in: card, topAnchor: lastAnchor, height: 24)
+
+        // Unattended checkbox & hint
+        let unattendedContainer = NSView()
+        unattendedContainer.translatesAutoresizingMaskIntoConstraints = false
+
         unattendedCheckbox = NSButton(checkboxWithTitle: "Run Automated Unattended Installation (Zero Prompts)", target: nil, action: nil)
+        unattendedCheckbox.translatesAutoresizingMaskIntoConstraints = false
         unattendedCheckbox.state = .on
+        unattendedCheckbox.font = NSFont.systemFont(ofSize: 12)
         unattendedCheckbox.toolTip = "Automates disk partitioning (ZFS), root user account setup, and SSH service configuration with zero installer prompts."
-        unattendedCheckbox.frame = NSRect(x: 150, y: y, width: 340, height: 18)
-        contentView.addSubview(unattendedCheckbox)
-        y += 20
+        unattendedContainer.addSubview(unattendedCheckbox)
 
         let unattendedHint = NSTextField(labelWithString: "💡 Auto-provisions ZFS root filesystem, accounts, and SSH automatically.")
+        unattendedHint.translatesAutoresizingMaskIntoConstraints = false
         unattendedHint.font = NSFont.systemFont(ofSize: 10.5)
-        unattendedHint.textColor = .secondaryLabelColor
-        unattendedHint.frame = NSRect(x: 170, y: y, width: 320, height: 14)
-        contentView.addSubview(unattendedHint)
-        y += 20
+        unattendedHint.textColor = CubeTokens.secondaryText
+        unattendedContainer.addSubview(unattendedHint)
 
-        // Separator
-        let sep1 = NSBox(frame: NSRect(x: 24, y: y, width: 472, height: 1))
-        sep1.boxType = .separator
-        contentView.addSubview(sep1)
-        y += 14
+        NSLayoutConstraint.activate([
+            unattendedCheckbox.topAnchor.constraint(equalTo: unattendedContainer.topAnchor),
+            unattendedCheckbox.leadingAnchor.constraint(equalTo: unattendedContainer.leadingAnchor),
+            unattendedCheckbox.trailingAnchor.constraint(equalTo: unattendedContainer.trailingAnchor),
 
-        // Hardware: vCPUs
-        y = addRow(label: "Virtual CPUs:", in: contentView, y: y) {
-            cpuPopUp = NSPopUpButton(frame: NSRect(x: 150, y: y - 2, width: 140, height: 26))
-            cpuPopUp.addItems(withTitles: ["1 Core", "2 Cores", "4 Cores", "8 Cores"])
-            cpuPopUp.selectItem(at: 1)
-            cpuPopUp.toolTip = "Number of virtual CPU cores allocated to the guest VM (1 to 8 cores)."
-            return cpuPopUp
-        }
+            unattendedHint.topAnchor.constraint(equalTo: unattendedCheckbox.bottomAnchor, constant: 4),
+            unattendedHint.leadingAnchor.constraint(equalTo: unattendedCheckbox.leadingAnchor, constant: 18),
+            unattendedHint.trailingAnchor.constraint(equalTo: unattendedContainer.trailingAnchor),
+            unattendedHint.bottomAnchor.constraint(equalTo: unattendedContainer.bottomAnchor)
+        ])
 
-        // Hardware: RAM
-        y = addRow(label: "Memory (RAM):", in: contentView, y: y) {
-            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 26))
-            ramPopUp = NSPopUpButton(frame: NSRect(x: 0, y: -2, width: 140, height: 26))
-            ramPopUp.addItems(withTitles: ["1024 MB (1 GB)", "2048 MB (2 GB)", "4096 MB (4 GB)", "8192 MB (8 GB)", "16384 MB (16 GB)"])
-            ramPopUp.selectItem(at: 1)
-            ramPopUp.toolTip = "Guest physical memory size. By default, host memory is allocated on-demand as guest pages are used."
-            container.addSubview(ramPopUp)
+        let unattendedLabel = NSTextField(labelWithString: "Automation:")
+        unattendedLabel.translatesAutoresizingMaskIntoConstraints = false
+        unattendedLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        unattendedLabel.textColor = CubeTokens.secondaryText
+        unattendedLabel.alignment = .right
+        card.addSubview(unattendedLabel)
+        card.addSubview(unattendedContainer)
 
-            memPreallocCheckbox = NSButton(checkboxWithTitle: "Pre-allocate RAM", target: nil, action: nil)
-            memPreallocCheckbox.font = NSFont.systemFont(ofSize: 11)
-            memPreallocCheckbox.toolTip = "Pre-faults all RAM upfront on launch (disables lazy on-demand paging)"
-            memPreallocCheckbox.frame = NSRect(x: 150, y: 0, width: 180, height: 22)
-            container.addSubview(memPreallocCheckbox)
-            return container
-        }
+        NSLayoutConstraint.activate([
+            unattendedLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            unattendedLabel.widthAnchor.constraint(equalToConstant: 120),
+            unattendedLabel.topAnchor.constraint(equalTo: lastAnchor, constant: 12),
 
-        // Hardware: Disk Size
-        y = addRow(label: "Virtual Disk Size:", in: contentView, y: y) {
-            let container = NSView(frame: NSRect(x: 150, y: y, width: 180, height: 22))
-            diskField = NSTextField(frame: NSRect(x: 0, y: 0, width: 80, height: 22))
-            diskField.stringValue = "20"
-            diskField.toolTip = "Virtual disk capacity in GB. Disks are created as sparse files, only consuming disk space as data is written."
-            let gbLabel = NSTextField(labelWithString: "GB (sparse ZFS)")
-            gbLabel.toolTip = "Allocated sparsely; only written blocks take up actual storage on your Mac drive."
-            gbLabel.frame = NSRect(x: 85, y: 2, width: 95, height: 18)
-            container.addSubview(diskField)
-            container.addSubview(gbLabel)
-            return container
-        }
+            unattendedContainer.leadingAnchor.constraint(equalTo: unattendedLabel.trailingAnchor, constant: 12),
+            unattendedContainer.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            unattendedContainer.topAnchor.constraint(equalTo: unattendedLabel.topAnchor),
+            unattendedContainer.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+        ])
+    }
 
-        // Hardware: Storage Location
-        y = addRow(label: "Storage Location:", in: contentView, y: y) {
-            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 24))
-            storagePathLabel = NSTextField(labelWithString: "")
-            storagePathLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-            storagePathLabel.lineBreakMode = .byTruncatingMiddle
-            storagePathLabel.frame = NSRect(x: 0, y: 2, width: 235, height: 18)
-            container.addSubview(storagePathLabel)
+    // MARK: - Section 2: Hardware Configuration
 
-            customizeStorageButton = NSButton(title: "Customize...", target: self, action: #selector(customizeStorageClicked))
-            customizeStorageButton.bezelStyle = .rounded
-            customizeStorageButton.font = NSFont.systemFont(ofSize: 11)
-            customizeStorageButton.frame = NSRect(x: 238, y: -2, width: 92, height: 26)
-            container.addSubview(customizeStorageButton)
-            return container
-        }
+    private func buildHardwareCard() {
+        let card = NewVMCardView()
+        stackView.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stackView.widthAnchor).isActive = true
 
-        // Separator
-        let sep2 = NSBox(frame: NSRect(x: 24, y: y, width: 472, height: 1))
-        sep2.boxType = .separator
-        contentView.addSubview(sep2)
-        y += 14
+        var lastAnchor = addCardHeader(title: "Hardware Configuration", to: card)
 
-        // Networking: Root Password
-        y = addRow(label: "Root Password:", in: contentView, y: y) {
-            passwordField = NSSecureTextField(frame: NSRect(x: 150, y: y, width: 180, height: 22))
-            passwordField.stringValue = "root"
-            passwordField.toolTip = "Root password for guest console login and SSH connections (default: root)."
-            return passwordField
-        }
+        // Virtual CPUs
+        cpuPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        cpuPopUp.font = NSFont.systemFont(ofSize: 12)
+        cpuPopUp.addItems(withTitles: ["1 Core", "2 Cores", "4 Cores", "8 Cores"])
+        cpuPopUp.selectItem(at: 1)
+        cpuPopUp.toolTip = "Number of virtual CPU cores allocated to the guest VM (1 to 8 cores)."
+        lastAnchor = addFormRow(label: "Virtual CPUs:", control: cpuPopUp, in: card, topAnchor: lastAnchor, height: 24)
 
-        // Network Mode Row
-        y = addRow(label: "Network Mode:", in: contentView, y: y) {
-            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 42))
-            let hasEntitlement = VMManager.shared.hasNetworkingEntitlement()
-            netPopUp = NSPopUpButton(frame: NSRect(x: 0, y: 16, width: 330, height: 26), pullsDown: false)
-            setupNetPopUp()
-            container.addSubview(netPopUp)
+        // Memory (RAM) + Preallocate checkbox
+        let ramRow = NSView()
+        ramRow.translatesAutoresizingMaskIntoConstraints = false
 
-            let hintText = hasEntitlement
-                ? "✓ Entitlement granted: Native Apple vmnet NAT selected by default"
-                : "💡 Shared Proxy runs in user-mode with DHCP (no root/sudo needed)"
-            let hint = NSTextField(labelWithString: hintText)
-            hint.font = NSFont.systemFont(ofSize: 10)
-            hint.textColor = .secondaryLabelColor
-            hint.frame = NSRect(x: 2, y: 0, width: 328, height: 14)
-            container.addSubview(hint)
-            return container
-        }
-        y += 12
+        ramPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        ramPopUp.translatesAutoresizingMaskIntoConstraints = false
+        ramPopUp.font = NSFont.systemFont(ofSize: 12)
+        ramPopUp.addItems(withTitles: ["1024 MB (1 GB)", "2048 MB (2 GB)", "4096 MB (4 GB)", "8192 MB (8 GB)", "16384 MB (16 GB)"])
+        ramPopUp.selectItem(at: 1)
+        ramPopUp.toolTip = "Guest physical memory size. By default, host memory is allocated on-demand as guest pages are used."
+        ramRow.addSubview(ramPopUp)
 
-        // Ports Row
-        y = addRow(label: "Network Ports:", in: contentView, y: y) {
-            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 22))
-            let sshLabel = NSTextField(labelWithString: "SSH:")
-            sshLabel.frame = NSRect(x: 0, y: 2, width: 35, height: 18)
-            sshPortField = NSTextField(frame: NSRect(x: 36, y: 0, width: 65, height: 22))
-            sshPortField.stringValue = "\(VMManager.shared.nextAvailableSSHPort())"
-            sshPortField.toolTip = "Host port forwarded to guest SSH (port 22). Connect with: ssh root@127.0.0.1 -p <port>"
+        memPreallocCheckbox = NSButton(checkboxWithTitle: "Pre-allocate RAM", target: nil, action: nil)
+        memPreallocCheckbox.translatesAutoresizingMaskIntoConstraints = false
+        memPreallocCheckbox.font = NSFont.systemFont(ofSize: 11)
+        memPreallocCheckbox.toolTip = "Pre-faults all RAM upfront on launch (disables lazy on-demand paging)"
+        ramRow.addSubview(memPreallocCheckbox)
 
-            let vncLabel = NSTextField(labelWithString: "VNC:")
-            vncLabel.frame = NSRect(x: 125, y: 2, width: 35, height: 18)
-            vncPortField = NSTextField(frame: NSRect(x: 162, y: 0, width: 65, height: 22))
-            vncPortField.stringValue = "\(VMManager.shared.nextAvailableVNCPort())"
-            vncPortField.toolTip = "Host port for VNC graphical display console (port 5900+). Connect with: open vnc://127.0.0.1:<port>"
+        NSLayoutConstraint.activate([
+            ramPopUp.leadingAnchor.constraint(equalTo: ramRow.leadingAnchor),
+            ramPopUp.centerYAnchor.constraint(equalTo: ramRow.centerYAnchor),
+            ramPopUp.widthAnchor.constraint(equalToConstant: 140),
 
-            container.addSubview(sshLabel)
-            container.addSubview(sshPortField)
-            container.addSubview(vncLabel)
-            container.addSubview(vncPortField)
-            return container
-        }
+            memPreallocCheckbox.leadingAnchor.constraint(equalTo: ramPopUp.trailingAnchor, constant: 14),
+            memPreallocCheckbox.trailingAnchor.constraint(lessThanOrEqualTo: ramRow.trailingAnchor),
+            memPreallocCheckbox.centerYAnchor.constraint(equalTo: ramRow.centerYAnchor)
+        ])
+        lastAnchor = addFormRow(label: "Memory (RAM):", control: ramRow, in: card, topAnchor: lastAnchor, height: 24)
 
-        // Separator
-        let sep3 = NSBox(frame: NSRect(x: 24, y: y, width: 472, height: 1))
-        sep3.boxType = .separator
-        contentView.addSubview(sep3)
-        y += 14
+        // Virtual Disk Size
+        let diskRow = NSView()
+        diskRow.translatesAutoresizingMaskIntoConstraints = false
 
-        // Shared Folder Row
-        y = addRow(label: "Shared Folder:", in: contentView, y: y) {
-            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 26))
-            sharePathField = NSTextField(frame: NSRect(x: 0, y: 2, width: 232, height: 22))
-            sharePathField.placeholderString = "Optional host folder (e.g. ~/Dev)"
-            sharePathField.font = NSFont.systemFont(ofSize: 11)
-            sharePathField.isEditable = false
-            sharePathField.toolTip = "Mac directory shared into guest via VirtIO-9P. Mount inside guest: mount -t p9fs <tag> /mnt/host"
+        diskField = NSTextField()
+        diskField.translatesAutoresizingMaskIntoConstraints = false
+        diskField.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        diskField.stringValue = "20"
+        diskField.alignment = .right
+        diskField.toolTip = "Virtual disk capacity in GB. Disks are created as sparse files, only consuming disk space as data is written."
+        diskRow.addSubview(diskField)
 
-            shareBrowseButton = NSButton(title: "Choose...", target: self, action: #selector(chooseSharedFolderClicked))
-            shareBrowseButton.bezelStyle = .rounded
-            shareBrowseButton.font = NSFont.systemFont(ofSize: 11)
-            shareBrowseButton.frame = NSRect(x: 238, y: -2, width: 92, height: 26)
+        let gbLabel = NSTextField(labelWithString: "GB (sparse ZFS disk image)")
+        gbLabel.translatesAutoresizingMaskIntoConstraints = false
+        gbLabel.font = NSFont.systemFont(ofSize: 11)
+        gbLabel.textColor = CubeTokens.secondaryText
+        diskRow.addSubview(gbLabel)
 
-            container.addSubview(sharePathField)
-            container.addSubview(shareBrowseButton)
-            return container
-        }
+        NSLayoutConstraint.activate([
+            diskField.leadingAnchor.constraint(equalTo: diskRow.leadingAnchor),
+            diskField.centerYAnchor.constraint(equalTo: diskRow.centerYAnchor),
+            diskField.widthAnchor.constraint(equalToConstant: 64),
+            diskField.heightAnchor.constraint(equalToConstant: 22),
 
-        // Share Options Row
-        y = addRow(label: "Share Options:", in: contentView, y: y) {
-            let container = NSView(frame: NSRect(x: 150, y: y, width: 330, height: 38))
-            let tagLabel = NSTextField(labelWithString: "Tag:")
-            tagLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            tagLabel.frame = NSRect(x: 0, y: 18, width: 28, height: 18)
+            gbLabel.leadingAnchor.constraint(equalTo: diskField.trailingAnchor, constant: 8),
+            gbLabel.trailingAnchor.constraint(lessThanOrEqualTo: diskRow.trailingAnchor),
+            gbLabel.centerYAnchor.constraint(equalTo: diskRow.centerYAnchor)
+        ])
+        lastAnchor = addFormRow(label: "Virtual Disk Size:", control: diskRow, in: card, topAnchor: lastAnchor, height: 24)
 
-            shareTagField = NSTextField(frame: NSRect(x: 30, y: 16, width: 105, height: 22))
-            shareTagField.stringValue = "shared"
-            shareTagField.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-            shareTagField.toolTip = "VirtIO-9P mount tag used as the source in the guest mount command."
+        // Storage Location
+        let storageRow = NSView()
+        storageRow.translatesAutoresizingMaskIntoConstraints = false
 
-            shareReadOnlyCheckbox = NSButton(checkboxWithTitle: "Read-Only", target: nil, action: nil)
-            shareReadOnlyCheckbox.font = NSFont.systemFont(ofSize: 11)
-            shareReadOnlyCheckbox.frame = NSRect(x: 145, y: 18, width: 95, height: 18)
-            shareReadOnlyCheckbox.toolTip = "When checked, the guest VM cannot modify or write files to this host directory."
+        storagePathLabel = NSTextField(labelWithString: "")
+        storagePathLabel.translatesAutoresizingMaskIntoConstraints = false
+        storagePathLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        storagePathLabel.lineBreakMode = .byTruncatingMiddle
+        storageRow.addSubview(storagePathLabel)
 
-            let clearBtn = NSButton(title: "Clear", target: self, action: #selector(clearSharedFolderClicked))
-            clearBtn.bezelStyle = .rounded
-            clearBtn.font = NSFont.systemFont(ofSize: 10)
-            clearBtn.frame = NSRect(x: 245, y: 14, width: 60, height: 24)
+        customizeStorageButton = NSButton(title: "Customize...", target: self, action: #selector(customizeStorageClicked))
+        customizeStorageButton.translatesAutoresizingMaskIntoConstraints = false
+        customizeStorageButton.bezelStyle = .rounded
+        customizeStorageButton.font = NSFont.systemFont(ofSize: 11)
+        storageRow.addSubview(customizeStorageButton)
 
-            let hint = NSTextField(labelWithString: "💡 Mount inside guest: mount -t p9fs <tag> /mnt/host")
-            hint.font = NSFont.systemFont(ofSize: 10)
-            hint.textColor = .secondaryLabelColor
-            hint.frame = NSRect(x: 0, y: 0, width: 330, height: 14)
+        NSLayoutConstraint.activate([
+            storagePathLabel.leadingAnchor.constraint(equalTo: storageRow.leadingAnchor),
+            storagePathLabel.centerYAnchor.constraint(equalTo: storageRow.centerYAnchor),
 
-            container.addSubview(tagLabel)
-            container.addSubview(shareTagField)
-            container.addSubview(shareReadOnlyCheckbox)
-            container.addSubview(clearBtn)
-            container.addSubview(hint)
-            return container
-        }
-        y += 10
+            customizeStorageButton.leadingAnchor.constraint(equalTo: storagePathLabel.trailingAnchor, constant: 8),
+            customizeStorageButton.trailingAnchor.constraint(equalTo: storageRow.trailingAnchor),
+            customizeStorageButton.centerYAnchor.constraint(equalTo: storageRow.centerYAnchor),
+            customizeStorageButton.widthAnchor.constraint(equalToConstant: 88)
+        ])
+        lastAnchor = addFormRow(label: "Storage Location:", control: storageRow, in: card, topAnchor: lastAnchor, height: 24)
 
-        y += 10
-
-        // Live Log output view
-        logScrollView = NSScrollView(frame: NSRect(x: 24, y: y, width: 472, height: 75))
-        logScrollView.hasVerticalScroller = true
-        logScrollView.borderType = .bezelBorder
-        logScrollView.isHidden = true
-        logTextView = NSTextView(frame: logScrollView.contentView.bounds)
-        logTextView.isEditable = false
-        logTextView.font = NSFont.userFixedPitchFont(ofSize: 10)
-        logScrollView.documentView = logTextView
-        contentView.addSubview(logScrollView)
-
-        // Progress bar and status label
-        progressIndicator = NSProgressIndicator(frame: NSRect(x: 24, y: y + 80, width: 180, height: 16))
-        progressIndicator.isIndeterminate = true
-        progressIndicator.style = .bar
-        progressIndicator.isHidden = true
-        contentView.addSubview(progressIndicator)
-
-        statusLabel = NSTextField(labelWithString: "Ready")
-        statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.frame = NSRect(x: 24, y: y + 98, width: 180, height: 16)
-        contentView.addSubview(statusLabel)
-
-        // Action Buttons
-        copyLogsButton = NSButton(title: "Copy Logs", target: self, action: #selector(copyLogsClicked))
-        copyLogsButton.bezelStyle = .rounded
-        copyLogsButton.frame = NSRect(x: 215, y: y + 85, width: 95, height: 28)
-        copyLogsButton.isHidden = true
-        contentView.addSubview(copyLogsButton)
-
-        cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancelClicked))
-        cancelButton.frame = NSRect(x: 315, y: y + 85, width: 85, height: 28)
-        contentView.addSubview(cancelButton)
-
-        createButton = NSButton(title: "Create VM", target: self, action: #selector(createClicked))
-        createButton.bezelStyle = .rounded
-        createButton.keyEquivalent = "\r"
-        createButton.frame = NSRect(x: 405, y: y + 85, width: 95, height: 28)
-        contentView.addSubview(createButton)
-
+        card.bottomAnchor.constraint(equalTo: lastAnchor, constant: 14).isActive = true
         updateStoragePathDisplay()
     }
 
-    private func addRow(label text: String, in view: NSView, y: CGFloat, controlFactory: () -> NSView) -> CGFloat {
-        let label = NSTextField(labelWithString: text)
-        label.alignment = .right
-        label.frame = NSRect(x: 20, y: y + 2, width: 120, height: 18)
-        view.addSubview(label)
+    // MARK: - Section 3: Networking & Security
 
-        let control = controlFactory()
-        view.addSubview(control)
-        return y + 30
+    private func buildNetworkCard() {
+        let card = NewVMCardView()
+        stackView.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stackView.widthAnchor).isActive = true
+
+        var lastAnchor = addCardHeader(title: "Networking & Security", to: card)
+
+        // Root Password
+        passwordField = NSSecureTextField()
+        passwordField.font = NSFont.systemFont(ofSize: 12)
+        passwordField.stringValue = "root"
+        passwordField.toolTip = "Root password for guest console login and SSH connections (default: root)."
+        lastAnchor = addFormRow(label: "Root Password:", control: passwordField, in: card, topAnchor: lastAnchor, height: 22)
+
+        // Network Mode
+        let netContainer = NSView()
+        netContainer.translatesAutoresizingMaskIntoConstraints = false
+
+        netPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        netPopUp.translatesAutoresizingMaskIntoConstraints = false
+        netPopUp.font = NSFont.systemFont(ofSize: 12)
+        netContainer.addSubview(netPopUp)
+
+        netHintLabel = NSTextField(labelWithString: "")
+        netHintLabel.translatesAutoresizingMaskIntoConstraints = false
+        netHintLabel.font = NSFont.systemFont(ofSize: 10)
+        netHintLabel.textColor = CubeTokens.secondaryText
+        netContainer.addSubview(netHintLabel)
+
+        setupNetPopUp()
+
+        NSLayoutConstraint.activate([
+            netPopUp.topAnchor.constraint(equalTo: netContainer.topAnchor),
+            netPopUp.leadingAnchor.constraint(equalTo: netContainer.leadingAnchor),
+            netPopUp.trailingAnchor.constraint(equalTo: netContainer.trailingAnchor),
+            netPopUp.heightAnchor.constraint(equalToConstant: 24),
+
+            netHintLabel.topAnchor.constraint(equalTo: netPopUp.bottomAnchor, constant: 4),
+            netHintLabel.leadingAnchor.constraint(equalTo: netContainer.leadingAnchor, constant: 2),
+            netHintLabel.trailingAnchor.constraint(equalTo: netContainer.trailingAnchor),
+            netHintLabel.bottomAnchor.constraint(equalTo: netContainer.bottomAnchor)
+        ])
+        lastAnchor = addFormRow(label: "Network Mode:", control: netContainer, in: card, topAnchor: lastAnchor)
+
+        // Forwarded Ports Row (SSH and VNC)
+        let portsRow = NSView()
+        portsRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let sshLabel = NSTextField(labelWithString: "SSH:")
+        sshLabel.translatesAutoresizingMaskIntoConstraints = false
+        sshLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        sshLabel.textColor = CubeTokens.secondaryText
+        portsRow.addSubview(sshLabel)
+
+        sshPortField = NSTextField()
+        sshPortField.translatesAutoresizingMaskIntoConstraints = false
+        sshPortField.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+        sshPortField.stringValue = "\(VMManager.shared.nextAvailableSSHPort())"
+        sshPortField.toolTip = "Host port forwarded to guest SSH (port 22). Connect with: ssh root@127.0.0.1 -p <port>"
+        portsRow.addSubview(sshPortField)
+
+        let vncLabel = NSTextField(labelWithString: "VNC:")
+        vncLabel.translatesAutoresizingMaskIntoConstraints = false
+        vncLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        vncLabel.textColor = CubeTokens.secondaryText
+        portsRow.addSubview(vncLabel)
+
+        vncPortField = NSTextField()
+        vncPortField.translatesAutoresizingMaskIntoConstraints = false
+        vncPortField.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+        vncPortField.stringValue = "\(VMManager.shared.nextAvailableVNCPort())"
+        vncPortField.toolTip = "Host port for VNC graphical display console (port 5900+). Connect with: open vnc://127.0.0.1:<port>"
+        portsRow.addSubview(vncPortField)
+
+        NSLayoutConstraint.activate([
+            sshLabel.leadingAnchor.constraint(equalTo: portsRow.leadingAnchor),
+            sshLabel.centerYAnchor.constraint(equalTo: portsRow.centerYAnchor),
+
+            sshPortField.leadingAnchor.constraint(equalTo: sshLabel.trailingAnchor, constant: 6),
+            sshPortField.centerYAnchor.constraint(equalTo: portsRow.centerYAnchor),
+            sshPortField.widthAnchor.constraint(equalToConstant: 64),
+            sshPortField.heightAnchor.constraint(equalToConstant: 22),
+
+            vncLabel.leadingAnchor.constraint(equalTo: sshPortField.trailingAnchor, constant: 20),
+            vncLabel.centerYAnchor.constraint(equalTo: portsRow.centerYAnchor),
+
+            vncPortField.leadingAnchor.constraint(equalTo: vncLabel.trailingAnchor, constant: 6),
+            vncPortField.centerYAnchor.constraint(equalTo: portsRow.centerYAnchor),
+            vncPortField.widthAnchor.constraint(equalToConstant: 64),
+            vncPortField.heightAnchor.constraint(equalToConstant: 22),
+            vncPortField.trailingAnchor.constraint(lessThanOrEqualTo: portsRow.trailingAnchor)
+        ])
+        lastAnchor = addFormRow(label: "Network Ports:", control: portsRow, in: card, topAnchor: lastAnchor, height: 24)
+
+        card.bottomAnchor.constraint(equalTo: lastAnchor, constant: 14).isActive = true
     }
+
+    // MARK: - Section 4: VirtIO-9P Shared Folder
+
+    private func buildSharesCard() {
+        let card = NewVMCardView()
+        stackView.addArrangedSubview(card)
+        card.widthAnchor.constraint(equalTo: stackView.widthAnchor).isActive = true
+
+        var lastAnchor = addCardHeader(title: "Shared Folder (VirtIO-9P)", to: card)
+
+        // Host Path Row
+        let sharePathRow = NSView()
+        sharePathRow.translatesAutoresizingMaskIntoConstraints = false
+
+        sharePathField = NSTextField()
+        sharePathField.translatesAutoresizingMaskIntoConstraints = false
+        sharePathField.font = NSFont.systemFont(ofSize: 11)
+        sharePathField.placeholderString = "Optional host directory (e.g. ~/Dev)"
+        sharePathField.isEditable = false
+        sharePathField.toolTip = "Mac directory shared into guest via VirtIO-9P. Mount inside guest: mount -t p9fs <tag> /mnt/host"
+        sharePathRow.addSubview(sharePathField)
+
+        shareBrowseButton = NSButton(title: "Choose...", target: self, action: #selector(chooseSharedFolderClicked))
+        shareBrowseButton.translatesAutoresizingMaskIntoConstraints = false
+        shareBrowseButton.bezelStyle = .rounded
+        shareBrowseButton.font = NSFont.systemFont(ofSize: 11)
+        sharePathRow.addSubview(shareBrowseButton)
+
+        NSLayoutConstraint.activate([
+            sharePathField.leadingAnchor.constraint(equalTo: sharePathRow.leadingAnchor),
+            sharePathField.centerYAnchor.constraint(equalTo: sharePathRow.centerYAnchor),
+            sharePathField.heightAnchor.constraint(equalToConstant: 22),
+
+            shareBrowseButton.leadingAnchor.constraint(equalTo: sharePathField.trailingAnchor, constant: 8),
+            shareBrowseButton.trailingAnchor.constraint(equalTo: sharePathRow.trailingAnchor),
+            shareBrowseButton.centerYAnchor.constraint(equalTo: sharePathRow.centerYAnchor),
+            shareBrowseButton.widthAnchor.constraint(equalToConstant: 80)
+        ])
+        lastAnchor = addFormRow(label: "Host Directory:", control: sharePathRow, in: card, topAnchor: lastAnchor, height: 24)
+
+        // Options Row (Tag, Read-only, Clear)
+        let shareOptionsRow = NSView()
+        shareOptionsRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let tagLabel = NSTextField(labelWithString: "Tag:")
+        tagLabel.translatesAutoresizingMaskIntoConstraints = false
+        tagLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        tagLabel.textColor = CubeTokens.secondaryText
+        shareOptionsRow.addSubview(tagLabel)
+
+        shareTagField = NSTextField()
+        shareTagField.translatesAutoresizingMaskIntoConstraints = false
+        shareTagField.stringValue = "shared"
+        shareTagField.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        shareTagField.toolTip = "VirtIO-9P mount tag used as the source in the guest mount command."
+        shareOptionsRow.addSubview(shareTagField)
+
+        shareReadOnlyCheckbox = NSButton(checkboxWithTitle: "Read-Only", target: nil, action: nil)
+        shareReadOnlyCheckbox.translatesAutoresizingMaskIntoConstraints = false
+        shareReadOnlyCheckbox.font = NSFont.systemFont(ofSize: 11)
+        shareReadOnlyCheckbox.toolTip = "When checked, the guest VM cannot modify or write files to this host directory."
+        shareOptionsRow.addSubview(shareReadOnlyCheckbox)
+
+        let clearBtn = NSButton(title: "Clear", target: self, action: #selector(clearSharedFolderClicked))
+        clearBtn.translatesAutoresizingMaskIntoConstraints = false
+        clearBtn.bezelStyle = .rounded
+        clearBtn.font = NSFont.systemFont(ofSize: 11)
+        shareOptionsRow.addSubview(clearBtn)
+
+        NSLayoutConstraint.activate([
+            tagLabel.leadingAnchor.constraint(equalTo: shareOptionsRow.leadingAnchor),
+            tagLabel.centerYAnchor.constraint(equalTo: shareOptionsRow.centerYAnchor),
+
+            shareTagField.leadingAnchor.constraint(equalTo: tagLabel.trailingAnchor, constant: 6),
+            shareTagField.centerYAnchor.constraint(equalTo: shareOptionsRow.centerYAnchor),
+            shareTagField.widthAnchor.constraint(equalToConstant: 85),
+            shareTagField.heightAnchor.constraint(equalToConstant: 22),
+
+            shareReadOnlyCheckbox.leadingAnchor.constraint(equalTo: shareTagField.trailingAnchor, constant: 14),
+            shareReadOnlyCheckbox.centerYAnchor.constraint(equalTo: shareOptionsRow.centerYAnchor),
+
+            clearBtn.trailingAnchor.constraint(equalTo: shareOptionsRow.trailingAnchor),
+            clearBtn.centerYAnchor.constraint(equalTo: shareOptionsRow.centerYAnchor),
+            clearBtn.widthAnchor.constraint(equalToConstant: 60)
+        ])
+        lastAnchor = addFormRow(label: "Share Options:", control: shareOptionsRow, in: card, topAnchor: lastAnchor, height: 24)
+
+        // Mount hint
+        let shareHint = NSTextField(labelWithString: "💡 Mount inside guest: mount -t p9fs <tag> /mnt/host")
+        shareHint.translatesAutoresizingMaskIntoConstraints = false
+        shareHint.font = NSFont.systemFont(ofSize: 10.5)
+        shareHint.textColor = CubeTokens.secondaryText
+        card.addSubview(shareHint)
+
+        NSLayoutConstraint.activate([
+            shareHint.topAnchor.constraint(equalTo: lastAnchor, constant: 6),
+            shareHint.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 146),
+            shareHint.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            shareHint.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+        ])
+    }
+
+    // MARK: - Section 5: Live Creation Logs
+
+    private func buildLogCard() {
+        logCardView = NewVMCardView()
+        stackView.addArrangedSubview(logCardView)
+        logCardView.widthAnchor.constraint(equalTo: stackView.widthAnchor).isActive = true
+
+        let headerAnchor = addCardHeader(title: "Provisioning Logs", to: logCardView)
+
+        logScrollView = NSScrollView()
+        logScrollView.translatesAutoresizingMaskIntoConstraints = false
+        logScrollView.hasVerticalScroller = true
+        logScrollView.borderType = .noBorder
+        logScrollView.drawsBackground = false
+        logCardView.addSubview(logScrollView)
+
+        logTextView = NSTextView()
+        logTextView.isEditable = false
+        logTextView.backgroundColor = .clear
+        logTextView.font = NSFont.userFixedPitchFont(ofSize: 10)
+        logScrollView.documentView = logTextView
+
+        NSLayoutConstraint.activate([
+            logScrollView.topAnchor.constraint(equalTo: headerAnchor, constant: 8),
+            logScrollView.leadingAnchor.constraint(equalTo: logCardView.leadingAnchor, constant: 14),
+            logScrollView.trailingAnchor.constraint(equalTo: logCardView.trailingAnchor, constant: -14),
+            logScrollView.heightAnchor.constraint(equalToConstant: 110),
+            logScrollView.bottomAnchor.constraint(equalTo: logCardView.bottomAnchor, constant: -14)
+        ])
+
+        logCardView.isHidden = true
+    }
+
+    // MARK: - Popups & Options
 
     private func setupNetPopUp() {
         netPopUp.removeAllItems()
         let hasEntitlement = VMManager.shared.hasNetworkingEntitlement()
-        
+
         func addModeItem(title: String, mode: String) {
             netPopUp.addItem(withTitle: title)
             netPopUp.lastItem?.representedObject = mode
         }
-        
+
         if hasEntitlement {
             addModeItem(title: "Direct vmnet NAT (vmnet) — Default (Entitled ✓)", mode: "vmnet")
             addModeItem(title: "Bridged LAN (bridge) — Entitled ✓", mode: "bridge")
@@ -431,6 +872,7 @@ class NewVMWindowController: NSWindowController {
             addModeItem(title: "Shared Proxy (vmnet-proxy)", mode: "vmnet-proxy")
             netPopUp.selectItem(at: 0)
             netPopUp.toolTip = "Direct vmnet NAT (vmnet) provides native macOS Hypervisor NAT networking using Apple's vmnet framework."
+            netHintLabel?.stringValue = "✓ Entitlement granted: Native Apple vmnet NAT selected by default"
         } else {
             addModeItem(title: "Shared Proxy (vmnet-proxy) — Default (Recommended)", mode: "vmnet-proxy")
             addModeItem(title: "Direct vmnet NAT (vmnet) — Requires Entitlement", mode: "vmnet")
@@ -438,23 +880,24 @@ class NewVMWindowController: NSWindowController {
             addModeItem(title: "Offline / Disabled (none)", mode: "none")
             netPopUp.selectItem(at: 0)
             netPopUp.toolTip = "Shared Proxy (vmnet-proxy) provides fast user-mode NAT with DHCP (no root/sudo privileges needed)."
+            netHintLabel?.stringValue = "💡 Shared Proxy runs in user-mode with DHCP (no root/sudo needed)"
         }
     }
 
     private func populateOSOptions() {
         osPopUp.removeAllItems()
         let menu = NSMenu()
-        
+
         let allItems = ImageCacheManager.shared.getAllImageItems()
         let presets = ImageCacheManager.shared.presets
-        
+
         // 1. Official Presets
         for preset in presets {
             let item = allItems.first(where: { $0.id == preset.id })
             let isCached = item?.isCached == true
             let tag = isCached ? " [Cached]" : " [Auto-download]"
             let title = "\(preset.name)\(tag)"
-            
+
             let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             mi.representedObject = OSSelectionOption(
                 title: title,
@@ -464,7 +907,7 @@ class NewVMWindowController: NSWindowController {
             )
             menu.addItem(mi)
         }
-        
+
         // 2. Custom Cached Images in ~/Library/Caches/Cube
         let customCached = allItems.filter { !$0.isPreset && $0.isCached }
         if !customCached.isEmpty {
@@ -482,7 +925,7 @@ class NewVMWindowController: NSWindowController {
                 menu.addItem(mi)
             }
         }
-        
+
         // 3. Custom ISO browse option
         menu.addItem(NSMenuItem.separator())
         let browseTitle = "Custom Installer ISO (Browse...)"
@@ -494,16 +937,16 @@ class NewVMWindowController: NSWindowController {
             isCustomFilePicker: true
         )
         menu.addItem(browseMi)
-        
+
         osPopUp.menu = menu
     }
 
     @objc private func osSelectionChanged() {
         guard let opt = osPopUp.selectedItem?.representedObject as? OSSelectionOption else { return }
-        
+
         isoPathField.isEnabled = opt.isCustomFilePicker
         browseButton.isEnabled = opt.isCustomFilePicker
-        
+
         if opt.isCustomFilePicker {
             if isoPathField.stringValue.isEmpty {
                 browseIsoClicked()
@@ -513,7 +956,7 @@ class NewVMWindowController: NSWindowController {
         } else {
             isoPathField.stringValue = ""
         }
-        
+
         unattendedCheckbox.isEnabled = true
         unattendedCheckbox.toolTip = "Automates disk partitioning (ZFS), root user account setup, and SSH service configuration with zero installer prompts."
     }
@@ -618,7 +1061,7 @@ class NewVMWindowController: NSWindowController {
 
         isBusy = true
         setFormEnabled(false)
-        logScrollView.isHidden = false
+        logCardView.isHidden = false
         copyLogsButton.isHidden = false
         progressIndicator.isHidden = false
         progressIndicator.startAnimation(nil)
@@ -644,6 +1087,7 @@ class NewVMWindowController: NSWindowController {
 
             if success {
                 self.statusLabel.stringValue = "Created successfully!"
+                DashboardWindowController.shared.selectVM(name: name)
                 let alert = NSAlert()
                 alert.messageText = "Virtual Machine Ready"
                 alert.informativeText = "VM '\(name)' was created successfully. Would you like to start it now?"
@@ -753,12 +1197,12 @@ class NewVMWindowController: NSWindowController {
         if let custom = customStorageDir {
             let short = custom.replacingOccurrences(of: NSHomeDirectory(), with: "~")
             storagePathLabel?.stringValue = "\(short)/\(vmName)"
-            storagePathLabel?.textColor = .labelColor
+            storagePathLabel?.textColor = CubeTokens.primaryText
             customizeStorageButton?.title = "Reset"
         } else {
             let base = VMManager.shared.vmsDirectory.replacingOccurrences(of: NSHomeDirectory(), with: "~")
             storagePathLabel?.stringValue = "\(base)/\(vmName)"
-            storagePathLabel?.textColor = .secondaryLabelColor
+            storagePathLabel?.textColor = CubeTokens.secondaryText
             customizeStorageButton?.title = "Customize..."
         }
     }
@@ -784,6 +1228,40 @@ class NewVMWindowController: NSWindowController {
         if panel.runModal() == .OK, let url = panel.url {
             customStorageDir = url.path
             updateStoragePathDisplay()
+        }
+    }
+
+    // MARK: - Accessibility Adaptations
+
+    @objc private func accessibilityDisplayOptionsDidChange(_ notification: Notification) {
+        updateAccessibilityPreferences()
+    }
+
+    private func updateAccessibilityPreferences() {
+        let reduceTransparency = CubeTokens.reduceTransparency
+        guard let window = self.window else { return }
+
+        window.isOpaque = reduceTransparency
+        window.backgroundColor = reduceTransparency ? .windowBackgroundColor : .clear
+
+        rootVisualEffect.material = reduceTransparency ? .windowBackground : .underWindowBackground
+        rootVisualEffect.blendingMode = reduceTransparency ? .withinWindow : .behindWindow
+        rootVisualEffect.state = reduceTransparency ? .inactive : .active
+        rootVisualEffect.layer?.borderColor = CubeTokens.windowBorder.cgColor
+
+        statusBarView.layer?.backgroundColor = CubeTokens.statusBarBackground.cgColor
+
+        refreshCardLayers(in: window.contentView)
+        window.contentView?.needsDisplay = true
+    }
+
+    private func refreshCardLayers(in view: NSView?) {
+        guard let view = view else { return }
+        if let card = view as? NewVMCardView {
+            card.updateColors()
+        }
+        for sub in view.subviews {
+            refreshCardLayers(in: sub)
         }
     }
 }

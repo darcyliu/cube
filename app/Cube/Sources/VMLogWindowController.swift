@@ -4,6 +4,8 @@ import AppKit
 class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchFieldDelegate {
     static let shared = VMLogWindowController()
 
+    private var rootVisualEffect: NSVisualEffectView!
+    private var headerView: NSView!
     private var vmPicker: NSPopUpButton!
     private var logTypeSegment: NSSegmentedControl!
     private var searchField: NSSearchField!
@@ -40,15 +42,19 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
         }
     }
 
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 840, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 880, height: 580),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Cube VM Logs"
-        window.minSize = NSSize(width: 680, height: 400)
+        window.minSize = NSSize(width: 700, height: 420)
         window.center()
         window.isReleasedWhenClosed = false
 
@@ -78,30 +84,44 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
 
     func windowWillClose(_ notification: Notification) {
         stopTimer()
+        let hasOtherWindows = PreferencesWindowController.shared.window?.isVisible == true ||
+                              DashboardWindowController.shared.window?.isVisible == true ||
+                              (NewVMWindowController.shared?.window?.isVisible == true)
+        if !hasOtherWindows {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
-    // MARK: - UI Layout
+    // MARK: - UI Construction (Auto Layout & Frosted Glass)
 
     private func setupUI() {
-        guard let contentView = window?.contentView else { return }
+        guard let window = self.window else { return }
 
-        // 1. Header Toolbar View (Height: 74)
-        let headerView = NSView(frame: NSRect(x: 0, y: contentView.bounds.height - 74, width: contentView.bounds.width, height: 74))
-        headerView.autoresizingMask = [.width, .minYMargin]
+        // Root Liquid Translucent Glass (underWindowBackground blur behind window)
+        rootVisualEffect = NSVisualEffectView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 880, height: 580))
+        rootVisualEffect.material = .underWindowBackground
+        rootVisualEffect.blendingMode = .behindWindow
+        rootVisualEffect.state = .active
+        rootVisualEffect.autoresizingMask = [.width, .height]
+        rootVisualEffect.wantsLayer = true
+        window.contentView = rootVisualEffect
+
+        // 1. Header Toolbar View (Height: 78pt, traffic light clearance)
+        headerView = NSView()
+        headerView.translatesAutoresizingMaskIntoConstraints = false
         headerView.wantsLayer = true
-        headerView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-
-        let row1Y: CGFloat = 40
-        let row2Y: CGFloat = 8
+        headerView.layer?.backgroundColor = CubeTokens.statusBarBackground.cgColor
+        rootVisualEffect.addSubview(headerView)
 
         // Row 1: VM Selector Label & PopUp
         let vmLabel = NSTextField(labelWithString: "Virtual Machine:")
-        vmLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        vmLabel.textColor = .secondaryLabelColor
-        vmLabel.frame = NSRect(x: 16, y: row1Y + 2, width: 100, height: 18)
+        vmLabel.translatesAutoresizingMaskIntoConstraints = false
+        vmLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        vmLabel.textColor = CubeTokens.secondaryText
         headerView.addSubview(vmLabel)
 
-        vmPicker = NSPopUpButton(frame: NSRect(x: 120, y: row1Y - 2, width: 180, height: 24), pullsDown: false)
+        vmPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+        vmPicker.translatesAutoresizingMaskIntoConstraints = false
         vmPicker.target = self
         vmPicker.action = #selector(vmPickerChanged)
         vmPicker.font = NSFont.systemFont(ofSize: 12)
@@ -109,101 +129,172 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
 
         // Log Type Segmented Control
         logTypeSegment = NSSegmentedControl(labels: ["Console", "VMM", "Manager"], trackingMode: .selectOne, target: self, action: #selector(logTypeChanged))
+        logTypeSegment.translatesAutoresizingMaskIntoConstraints = false
         logTypeSegment.selectedSegment = 0
         logTypeSegment.segmentStyle = .texturedRounded
         logTypeSegment.font = NSFont.systemFont(ofSize: 11)
-        logTypeSegment.frame = NSRect(x: 312, y: row1Y - 1, width: 200, height: 24)
         headerView.addSubview(logTypeSegment)
 
         // Action Buttons (Copy, Finder, Clear)
         let finderBtn = NSButton(title: "Finder", target: self, action: #selector(revealInFinderClicked))
+        finderBtn.translatesAutoresizingMaskIntoConstraints = false
         finderBtn.bezelStyle = .rounded
         finderBtn.controlSize = .small
         finderBtn.font = NSFont.systemFont(ofSize: 11)
-        finderBtn.frame = NSRect(x: headerView.bounds.width - 76, y: row1Y - 1, width: 64, height: 22)
-        finderBtn.autoresizingMask = [.minXMargin]
         headerView.addSubview(finderBtn)
 
         let clearBtn = NSButton(title: "Clear View", target: self, action: #selector(clearViewClicked))
+        clearBtn.translatesAutoresizingMaskIntoConstraints = false
         clearBtn.bezelStyle = .rounded
         clearBtn.controlSize = .small
         clearBtn.font = NSFont.systemFont(ofSize: 11)
-        clearBtn.frame = NSRect(x: headerView.bounds.width - 162, y: row1Y - 1, width: 82, height: 22)
-        clearBtn.autoresizingMask = [.minXMargin]
         headerView.addSubview(clearBtn)
 
         let copyBtn = NSButton(title: "Copy", target: self, action: #selector(copyClicked(_:)))
+        copyBtn.translatesAutoresizingMaskIntoConstraints = false
         copyBtn.bezelStyle = .rounded
         copyBtn.controlSize = .small
         copyBtn.font = NSFont.systemFont(ofSize: 11)
-        copyBtn.frame = NSRect(x: headerView.bounds.width - 228, y: row1Y - 1, width: 62, height: 22)
-        copyBtn.autoresizingMask = [.minXMargin]
         headerView.addSubview(copyBtn)
 
-        // Row 2: Search Bar, Auto-scroll & Wrap Toggles
-        searchField = NSSearchField(frame: NSRect(x: 16, y: row2Y, width: 284, height: 22))
+        // Row 2: Search Bar, Auto-scroll & Wrap Toggles, Status Label
+        searchField = NSSearchField()
+        searchField.translatesAutoresizingMaskIntoConstraints = false
         searchField.placeholderString = "Filter log output..."
         searchField.delegate = self
         searchField.font = NSFont.systemFont(ofSize: 11)
         headerView.addSubview(searchField)
 
         autoScrollCheckbox = NSButton(checkboxWithTitle: "Auto-scroll to Bottom", target: self, action: #selector(autoScrollToggled))
+        autoScrollCheckbox.translatesAutoresizingMaskIntoConstraints = false
         autoScrollCheckbox.state = .on
         autoScrollCheckbox.font = NSFont.systemFont(ofSize: 11)
-        autoScrollCheckbox.frame = NSRect(x: 312, y: row2Y + 2, width: 160, height: 18)
         headerView.addSubview(autoScrollCheckbox)
 
         wrapLinesCheckbox = NSButton(checkboxWithTitle: "Wrap Lines", target: self, action: #selector(wrapLinesToggled))
+        wrapLinesCheckbox.translatesAutoresizingMaskIntoConstraints = false
         wrapLinesCheckbox.state = .on
         wrapLinesCheckbox.font = NSFont.systemFont(ofSize: 11)
-        wrapLinesCheckbox.frame = NSRect(x: 480, y: row2Y + 2, width: 100, height: 18)
         headerView.addSubview(wrapLinesCheckbox)
 
         statusLabel = NSTextField(labelWithString: "")
-        statusLabel.font = NSFont.systemFont(ofSize: 10)
-        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        statusLabel.textColor = CubeTokens.secondaryText
         statusLabel.alignment = .right
-        statusLabel.frame = NSRect(x: headerView.bounds.width - 230, y: row2Y + 2, width: 216, height: 16)
-        statusLabel.autoresizingMask = [.minXMargin]
         headerView.addSubview(statusLabel)
 
         // Hairline separator below header
-        let sep = NSBox(frame: NSRect(x: 0, y: 0, width: headerView.bounds.width, height: 1))
-        sep.boxType = .separator
-        sep.autoresizingMask = [.width]
+        let sep = NSBox()
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.boxType = .custom
+        sep.borderWidth = 0
+        sep.fillColor = CubeTokens.separatorColor
         headerView.addSubview(sep)
 
-        contentView.addSubview(headerView)
-
-        // 2. Log Text View (Dark Terminal Style)
-        let logContainerHeight = contentView.bounds.height - 74
-        scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: contentView.bounds.width, height: logContainerHeight))
-        scrollView.autoresizingMask = [.width, .height]
+        // 2. Log Text View (Terminal Dark Obsidian Style)
+        scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
+        rootVisualEffect.addSubview(scrollView)
 
-        let contentSize = scrollView.contentSize
-        textView = NSTextView(frame: NSRect(origin: .zero, size: contentSize))
-        textView.minSize = NSSize(width: 0.0, height: contentSize.height)
+        textView = NSTextView()
+        textView.minSize = NSSize(width: 0.0, height: 0.0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = true
+        textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.textContainer?.containerSize = NSSize(width: contentSize.width, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = true
 
         // Terminal Aesthetic
-        textView.backgroundColor = NSColor(calibratedRed: 0.10, green: 0.10, blue: 0.12, alpha: 1.0)
-        textView.textColor = NSColor(calibratedRed: 0.90, green: 0.92, blue: 0.94, alpha: 1.0)
+        textView.backgroundColor = NSColor(calibratedRed: 0.08, green: 0.09, blue: 0.11, alpha: 0.88)
+        textView.textColor = NSColor(calibratedRed: 0.90, green: 0.93, blue: 0.96, alpha: 1.0)
         textView.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
         textView.isEditable = false
         textView.isSelectable = true
-        textView.textContainerInset = NSSize(width: 12, height: 10)
+        textView.textContainerInset = NSSize(width: 14, height: 12)
 
         scrollView.documentView = textView
-        contentView.addSubview(scrollView)
+
+        // Auto Layout Constraints
+        NSLayoutConstraint.activate([
+            // Header view pinned to top
+            headerView.topAnchor.constraint(equalTo: rootVisualEffect.topAnchor),
+            headerView.leadingAnchor.constraint(equalTo: rootVisualEffect.leadingAnchor),
+            headerView.trailingAnchor.constraint(equalTo: rootVisualEffect.trailingAnchor),
+            headerView.heightAnchor.constraint(equalToConstant: 78),
+
+            // Row 1 constraints (Y = 16 from top of headerView, clearing window buttons)
+            vmLabel.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 18),
+            vmLabel.topAnchor.constraint(equalTo: headerView.topAnchor, constant: 14),
+            vmLabel.centerYAnchor.constraint(equalTo: vmPicker.centerYAnchor),
+
+            vmPicker.leadingAnchor.constraint(equalTo: vmLabel.trailingAnchor, constant: 8),
+            vmPicker.widthAnchor.constraint(equalToConstant: 170),
+            vmPicker.heightAnchor.constraint(equalToConstant: 24),
+
+            logTypeSegment.leadingAnchor.constraint(equalTo: vmPicker.trailingAnchor, constant: 12),
+            logTypeSegment.centerYAnchor.constraint(equalTo: vmPicker.centerYAnchor),
+            logTypeSegment.widthAnchor.constraint(equalToConstant: 200),
+            logTypeSegment.heightAnchor.constraint(equalToConstant: 22),
+
+            finderBtn.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -18),
+            finderBtn.centerYAnchor.constraint(equalTo: vmPicker.centerYAnchor),
+            finderBtn.widthAnchor.constraint(equalToConstant: 64),
+
+            clearBtn.trailingAnchor.constraint(equalTo: finderBtn.leadingAnchor, constant: -6),
+            clearBtn.centerYAnchor.constraint(equalTo: vmPicker.centerYAnchor),
+            clearBtn.widthAnchor.constraint(equalToConstant: 82),
+
+            copyBtn.trailingAnchor.constraint(equalTo: clearBtn.leadingAnchor, constant: -6),
+            copyBtn.centerYAnchor.constraint(equalTo: vmPicker.centerYAnchor),
+            copyBtn.widthAnchor.constraint(equalToConstant: 62),
+            copyBtn.leadingAnchor.constraint(greaterThanOrEqualTo: logTypeSegment.trailingAnchor, constant: 10),
+
+            // Row 2 constraints (Y = 46 from top of headerView)
+            searchField.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 18),
+            searchField.topAnchor.constraint(equalTo: headerView.topAnchor, constant: 46),
+            searchField.widthAnchor.constraint(equalToConstant: 240),
+            searchField.heightAnchor.constraint(equalToConstant: 22),
+
+            autoScrollCheckbox.leadingAnchor.constraint(equalTo: searchField.trailingAnchor, constant: 14),
+            autoScrollCheckbox.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+
+            wrapLinesCheckbox.leadingAnchor.constraint(equalTo: autoScrollCheckbox.trailingAnchor, constant: 12),
+            wrapLinesCheckbox.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+
+            statusLabel.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -18),
+            statusLabel.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: wrapLinesCheckbox.trailingAnchor, constant: 10),
+
+            // Separator pinned to bottom of header
+            sep.leadingAnchor.constraint(equalTo: headerView.leadingAnchor),
+            sep.trailingAnchor.constraint(equalTo: headerView.trailingAnchor),
+            sep.bottomAnchor.constraint(equalTo: headerView.bottomAnchor),
+            sep.heightAnchor.constraint(equalToConstant: 1),
+
+            // Scroll View pinned below header to bottom of root
+            scrollView.topAnchor.constraint(equalTo: headerView.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: rootVisualEffect.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: rootVisualEffect.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: rootVisualEffect.bottomAnchor)
+        ])
+
+        // Auto Layout must size the viewport before initializing the document width.
+        rootVisualEffect.layoutSubtreeIfNeeded()
+        wrapLinesToggled()
+
+        // Accessibility Listeners
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityDisplayOptionsDidChange),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
+        updateAccessibilityPreferences()
     }
 
     // MARK: - VM Selection & Log Loading
@@ -357,8 +448,11 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
 
     @objc private func wrapLinesToggled() {
         let shouldWrap = (wrapLinesCheckbox.state == .on)
+        textView.isHorizontallyResizable = !shouldWrap
+        textView.autoresizingMask = shouldWrap ? [.width] : []
         textView.textContainer?.widthTracksTextView = shouldWrap
         if shouldWrap {
+            textView.setFrameSize(NSSize(width: scrollView.contentSize.width, height: textView.frame.height))
             textView.textContainer?.containerSize = NSSize(width: scrollView.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
         } else {
             textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -371,10 +465,7 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
         pb.setString(textView.string, forType: .string)
 
         if let btn = sender as? NSButton {
-            btn.title = "Copied!"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                btn.title = "Copy"
-            }
+            CubeTokens.animateCopyFeedback(button: btn)
         }
     }
 
@@ -392,5 +483,26 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
         } else {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: dir)
         }
+    }
+
+    // MARK: - Accessibility Adaptations
+
+    @objc private func accessibilityDisplayOptionsDidChange(_ notification: Notification) {
+        updateAccessibilityPreferences()
+    }
+
+    private func updateAccessibilityPreferences() {
+        let reduceTransparency = CubeTokens.reduceTransparency
+        guard let window = self.window else { return }
+
+        window.isOpaque = true
+        window.backgroundColor = .windowBackgroundColor
+
+        rootVisualEffect.material = reduceTransparency ? .windowBackground : .underWindowBackground
+        rootVisualEffect.blendingMode = reduceTransparency ? .withinWindow : .behindWindow
+        rootVisualEffect.state = reduceTransparency ? .inactive : .active
+
+        headerView.layer?.backgroundColor = CubeTokens.statusBarBackground.cgColor
+        window.contentView?.needsDisplay = true
     }
 }

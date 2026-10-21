@@ -1043,8 +1043,19 @@ extension VMInfo {
             parts.append("--mem-prealloc")
         }
 
-        return parts.map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        return parts.map { $0.shellEscaped }
             .joined(separator: " ")
+    }
+}
+
+private let safeShellCharacterSet = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-/:,=+@%")
+
+extension String {
+    var shellEscaped: String {
+        if !self.isEmpty && self.unicodeScalars.allSatisfy({ safeShellCharacterSet.contains($0) }) {
+            return self
+        }
+        return "'" + self.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 
