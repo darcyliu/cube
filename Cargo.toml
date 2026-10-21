@@ -2,6 +2,23 @@
 name = "cube"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85.0"
+description = "Lightweight macOS ARM64 Hypervisor.framework Virtual Machine Monitor and CLI manager"
+readme = "README.md"
+homepage = "https://github.com/darcyliu/cube"
+repository = "https://github.com/darcyliu/cube"
+license = "Apache-2.0"
+keywords = ["hypervisor", "vmm", "virtualization", "apple-silicon", "arm64"]
+categories = ["virtualization", "command-line-utilities", "os"]
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE*",
+    "/build.rs",
+    "/entitlements.plist",
+    "/src/**/*",
+    "/guest/**/*",
+]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }

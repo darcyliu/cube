@@ -4,8 +4,15 @@ all: build sign
 
 install: install-cli
 
-CUBE_BIN := target/debug/cube
-CUBECTL_BIN := target/debug/cubectl
+ifeq ($(DIST),1)
+  CARGO_FLAGS ?= --release
+  CUBE_BIN    := target/release/cube
+  CUBECTL_BIN := target/release/cubectl
+else
+  CARGO_FLAGS ?=
+  CUBE_BIN    := target/debug/cube
+  CUBECTL_BIN := target/debug/cubectl
+endif
 CUBE_APP ?= dist/Cube.app
 CUBE_DMG ?= dist/Cube.dmg
 VOL_NAME ?= Cube
@@ -48,7 +55,7 @@ test-dashboard-layout:
 	target/dashboard-layout-tests
 
 build:
-	cargo build
+	cargo build --locked $(CARGO_FLAGS)
 
 sign:
 	codesign --entitlements entitlements.plist --force -s - $(CUBE_BIN)
@@ -67,7 +74,8 @@ sign-networking: build
 		CUBE_BIN="$(CUBE_BIN)" ./scripts/sign-networking.sh
 
 # Native macOS Menu Bar app to host vmnet-service / vmnet-service-bridge
-app: build sign
+app:
+	DIST=$(DIST) $(MAKE) build sign
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
 	swiftc -O -target $(MACOS_TARGET) -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
@@ -102,7 +110,8 @@ app: build sign
 	fi
 
 # Build debug version with debug symbols (-g) and get-task-allow for lldb
-debug-app: build
+debug-app:
+	$(MAKE) build
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
 	swiftc -g -target $(MACOS_TARGET) -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
@@ -138,6 +147,7 @@ DIST_PROFILE ?= $(wildcard Cube_Dist.provisionprofile)
 dmg:
 	PROFILE="$(or $(PROFILE),$(DIST_PROFILE))" DIST=1 $(MAKE) app
 	IDENTITY="$(IDENTITY)" NOTARY_PROFILE="$(NOTARY_PROFILE)" ./scripts/create-dmg.sh "$(CUBE_APP)" "$(CUBE_DMG)" "$(VOL_NAME)"
+
 
 run-cube: cube
 	open "$(CUBE_APP)"
@@ -213,8 +223,7 @@ debian-cloud: all
 	./scripts/debian-cloud.sh
 
 release:
-	cargo build --release
-	codesign --entitlements entitlements.plist --force -s - target/release/cube
+	DIST=1 $(MAKE) build sign
 
 
 

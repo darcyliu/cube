@@ -1,6 +1,6 @@
 # Cube: macOS ARM64 Hypervisor.framework VMM
 
-A lightweight, zero-external-dependency Virtual Machine Monitor (VMM) and menu bar companion written in **Rust** and **Swift** using Apple's native **`Hypervisor.framework`** on Apple Silicon (ARM64).
+A lightweight Virtual Machine Monitor (VMM) and menu bar companion written in **Rust** and **Swift** using Apple's native **`Hypervisor.framework`** on Apple Silicon (ARM64).
 
 It supports booting both custom baremetal ARM64 payloads at EL1 and full operating system kernels like **FreeBSD 14-RELEASE**.
 
@@ -264,3 +264,8 @@ vmm/
             ├── block.rs     # VirtIO block device (virtio-blk) implementation
             └── net.rs       # VirtIO network device (virtio-net) with macOS vmnet backend
 ```
+
+## License
+
+Cube is licensed under the [Apache License, Version 2.0](LICENSE).
+Third-party dependencies and bundled firmware retain their respective upstream licenses.
