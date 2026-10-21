@@ -6,5 +6,9 @@
 	<true/>
 	<key>com.apple.vm.networking</key>
 	<true/>
+	<key>com.apple.application-identifier</key>
+	<string>ZV8TTD4Z45.net.neuralengine.cube</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>ZV8TTD4Z45</string>
 </dict>
 </plist>

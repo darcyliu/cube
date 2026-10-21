@@ -66,7 +66,12 @@ echo "[sign-cube] Using cube binary: $CUBE_SRC"
 # 3. Locate provisioning profile if not set
 # Prefer Development profile for local execution over Distribution
 if [[ -z "$PROFILE" ]]; then
-  for candidate in "Cube_Dev.provisionprofile" "Cube_Dist.provisionprofile" "$ROOT"/*.provisionprofile; do
+  if [[ "${IDENTITY:-}" == *"Developer ID"* ]] || [[ "${DIST:-}" == "1" ]]; then
+    CANDIDATES=("Cube_Dist.provisionprofile")
+  else
+    CANDIDATES=("Cube_Dev.provisionprofile" "Cube_Dist.provisionprofile" "$ROOT"/*.provisionprofile)
+  fi
+  for candidate in "${CANDIDATES[@]}"; do
     if [[ -f "$candidate" ]]; then
       PROFILE="$candidate"
       echo "[sign-cube] Auto-detected provisioning profile: $PROFILE"
@@ -79,80 +84,17 @@ if [[ -z "$PROFILE" || ! -f "$PROFILE" ]]; then
   die "Set PROFILE=/path/to/YourProfile.provisionprofile (file not found)"
 fi
 
-# 4. Detect signing identity that matches the selected profile
-if [[ -z "$IDENTITY" ]]; then
-  # Match certificates embedded in the profile with valid Keychain signing identities
-  DETECTED="$(python3 -c "
-import plistlib, hashlib, subprocess, re, sys
-
-profile_path = '$PROFILE'
-try:
-    with open(profile_path, 'rb') as f:
-        d = f.read()
-    s = d.find(b'<?xml')
-    e = d.find(b'</plist>')
-    p = plistlib.loads(d[s:e+8])
-    prof_hashes = [hashlib.sha1(c).hexdigest().upper() for c in p.get('DeveloperCertificates', [])]
-except Exception as ex:
-    prof_hashes = []
-
-proc = subprocess.run(['security', 'find-identity', '-v', '-p', 'codesigning'], capture_output=True, text=True)
-matched = None
-
-# First priority: identity whose SHA1 matches a certificate embedded in the profile
-for line in proc.stdout.splitlines():
-    for sha in prof_hashes:
-        if sha in line.upper():
-            m = re.search(r'\"([^\"]+)\"', line)
-            if m:
-                matched = m.group(1)
-                break
-    if matched:
-        break
-
-# Second priority: Development or Developer ID identity matching TEAM_ID (never Apple Distribution for local run)
-if not matched:
-    for line in proc.stdout.splitlines():
-        if '$TEAM_ID' in line and 'Apple Distribution' not in line:
-            m = re.search(r'\"([^\"]+)\"', line)
-            if m:
-                matched = m.group(1)
-                break
-
-if matched:
-    print(matched)
-" 2>/dev/null || true)"
-
-  if [[ -n "$DETECTED" ]]; then
-    IDENTITY="$DETECTED"
-    echo "[sign-cube] Auto-detected matching signing identity: $IDENTITY"
-  else
-    echo "[sign-cube] Available codesigning identities in keychain:"
-    security find-identity -v -p codesigning || true
-    die "Could not find a matching signing identity for profile $PROFILE. Set IDENTITY=\"Apple Development: ...\""
-  fi
+# Require an exact certificate match, including when IDENTITY is explicitly set.
+# Keep the array nonempty: macOS Bash 3.2 treats an empty array as unset
+# when expanding it under `set -u`.
+VALIDATION_ARGS=(--profile "$PROFILE" --bundle-id "$BUNDLE_ID" --team-id "$TEAM_ID"
+  --identity "$IDENTITY" --entitlements "$ENTITLEMENTS"
+  --entitlements entitlements.networking.plist)
+if [[ "${DIST:-}" == "1" || "$IDENTITY" == *"Developer ID Application:"* ]]; then
+  VALIDATION_ARGS+=(--distribution)
 fi
-
-# 5. Sanity-check profile contents (extract XML)
-echo "[sign-cube] Validating provisioning profile: $PROFILE..."
-PROF_XML="$(python3 -c "
-with open('$PROFILE', 'rb') as f:
-    d = f.read()
-s = d.find(b'<?xml')
-e = d.find(b'</plist>')
-if s != -1 and e != -1:
-    print(d[s:e+8].decode('utf-8', errors='ignore'))
-" 2>/dev/null || true)"
-
-if [[ -n "$PROF_XML" ]]; then
-  if ! echo "$PROF_XML" | grep -q 'com.apple.vm.networking'; then
-    echo "[sign-cube] WARNING: Profile does NOT contain 'com.apple.vm.networking'!" >&2
-    echo "[sign-cube]          Unprivileged vmnet will fail launch constraints unless granted by Apple." >&2
-  fi
-  if ! echo "$PROF_XML" | grep -q "$BUNDLE_ID"; then
-    echo "[sign-cube] WARNING: Profile does not seem to mention BUNDLE_ID=$BUNDLE_ID" >&2
-  fi
-fi
+IDENTITY="$(python3 "$ROOT/scripts/validate-signing.py" "${VALIDATION_ARGS[@]}")"
+echo "[sign-cube] Validated signing certificate: $IDENTITY"
 
 # 6. Embed provisioning profile
 echo "[sign-cube] Embedding provisioning profile into $APP_DIR/Contents/embedded.provisionprofile..."
@@ -241,7 +183,7 @@ codesign --force \
 
 # 10. Comprehensive Verification
 echo "[sign-cube] Verifying bundle signatures..."
-codesign --verify --verbose=2 "$APP_DIR"
+codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 codesign --verify --verbose=2 "$APP_DIR/Contents/MacOS/cube"
 
 # Ensure TeamID is attached (not ad-hoc)

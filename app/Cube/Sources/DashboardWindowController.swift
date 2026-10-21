@@ -389,7 +389,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         sidebarView.blendingMode = .behindWindow
         sidebarView.state = .active
         setupSidebar()
-        splitView.addSubview(sidebarView)
+        splitView.addArrangedSubview(sidebarView)
 
         // Detail Container (Transparent so frosted wallpaper shines through)
         detailContainerView = NSView()
@@ -397,10 +397,12 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
         detailContainerView.wantsLayer = true
         detailContainerView.layer?.backgroundColor = NSColor.clear.cgColor
         setupDetailArea()
-        splitView.addSubview(detailContainerView)
+        splitView.addArrangedSubview(detailContainerView)
 
-        let sidebarWidthConstraint = sidebarView.widthAnchor.constraint(equalToConstant: 240)
-        sidebarWidthConstraint.priority = NSLayoutConstraint.Priority(499)
+        // Preserve the sidebar width while the detail pane absorbs window resizing.
+        // Keep these below the divider-dragging priority so users can resize panes.
+        splitView.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
+        splitView.setHoldingPriority(NSLayoutConstraint.Priority(250), forSubviewAt: 1)
 
         NSLayoutConstraint.activate([
             // Status bar pinned to bottom
@@ -418,11 +420,14 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
             // Sidebar & Detail sizing rules
             sidebarView.widthAnchor.constraint(greaterThanOrEqualToConstant: 200),
             sidebarView.widthAnchor.constraint(lessThanOrEqualToConstant: 340),
-            sidebarWidthConstraint,
             detailContainerView.widthAnchor.constraint(greaterThanOrEqualToConstant: 500)
         ])
 
+        // The split view starts with a zero frame. Resolve its bounds before
+        // positioning the divider, otherwise initial pane sizing is OS-dependent.
+        rootVisualEffect.layoutSubtreeIfNeeded()
         splitView.setPosition(240, ofDividerAt: 0)
+        rootVisualEffect.layoutSubtreeIfNeeded()
 
         // Accessibility Listeners
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -1563,18 +1568,6 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
 
     func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
         return false
-    }
-
-    func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
-        return 200
-    }
-
-    func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
-        return 340
-    }
-
-    func splitView(_ splitView: NSSplitView, shouldAdjustSizeOfSubview view: NSView) -> Bool {
-        return view !== sidebarView
     }
 
     // MARK: - Actions

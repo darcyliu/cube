@@ -1,4 +1,4 @@
-.PHONY: all build sign sign-networking run freebsd freebsd-zfs freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify alpine debian debian-cloud app cube run-cube debug-app sign-cube-networking debug-run-cube install install-cli
+.PHONY: all build sign sign-networking run freebsd freebsd-zfs freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify alpine debian debian-cloud app cube run-cube debug-app sign-cube-networking debug-run-cube install install-cli dmg
 
 all: build sign
 
@@ -7,6 +7,9 @@ install: install-cli
 CUBE_BIN := target/debug/cube
 CUBECTL_BIN := target/debug/cubectl
 CUBE_APP ?= dist/Cube.app
+CUBE_DMG ?= dist/Cube.dmg
+VOL_NAME ?= Cube
+NOTARY_PROFILE ?= Cube-Profile
 
 install-cli:
 	@mkdir -p $(HOME)/.local/bin
@@ -26,13 +29,23 @@ verify-cube:
 verify-cubectl:
 	python3 -B scripts/verify.py --component cubectl $(VERIFY_ARGS)
 
+MACOS_TARGET ?= arm64-apple-macos15.0
+
 .PHONY: test-vm-management
 test-vm-management:
 	@mkdir -p target/swift-cache
-	swiftc -module-cache-path target/swift-cache \
+	swiftc -target $(MACOS_TARGET) -module-cache-path target/swift-cache \
 		$(filter-out app/Cube/Sources/main.swift,$(wildcard app/Cube/Sources/*.swift)) \
 		app/Cube/Tests/VMManagementTests.swift -o target/vm-management-tests
 	target/vm-management-tests
+
+.PHONY: test-dashboard-layout
+test-dashboard-layout:
+	@mkdir -p target/swift-cache
+	swiftc -target $(MACOS_TARGET) -module-cache-path target/swift-cache \
+		$(filter-out app/Cube/Sources/main.swift,$(wildcard app/Cube/Sources/*.swift)) \
+		app/Cube/Tests/DashboardLayoutTests.swift -o target/dashboard-layout-tests
+	target/dashboard-layout-tests
 
 build:
 	cargo build
@@ -56,7 +69,7 @@ sign-networking: build
 # Native macOS Menu Bar app to host vmnet-service / vmnet-service-bridge
 app: build sign
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
-	swiftc -O -module-cache-path target/swift-cache \
+	swiftc -O -target $(MACOS_TARGET) -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
 		app/Cube/Sources/SystemMetrics.swift \
 		app/Cube/Sources/VMManager.swift \
@@ -76,12 +89,12 @@ app: build sign
 	cp app/Cube/Resources/AppIcon.icns "$(CUBE_APP)"/Contents/Resources/AppIcon.icns
 	[ -f app/Cube/Resources/Credits.rtf ] && cp app/Cube/Resources/Credits.rtf "$(CUBE_APP)"/Contents/Resources/Credits.rtf || true
 	./scripts/embed-cube-helper.sh "$(CUBE_BIN)" "$(CUBE_APP)"
-	@if [ -n "$$PROFILE" ] || ls *.provisionprofile >/dev/null 2>&1; then \
+	@if [ "$(DIST)" = "1" ] || [ -n "$(PROFILE)" ] || ls *.provisionprofile >/dev/null 2>&1; then \
 		echo "[Cube] Provisioning profile detected, signing with Developer identity & com.apple.vm.networking..."; \
-		IDENTITY="$(IDENTITY)" PROFILE="$(PROFILE)" BUNDLE_ID="$(BUNDLE_ID)" TEAM_ID="$(TEAM_ID)" \
+		IDENTITY="$(IDENTITY)" PROFILE="$(PROFILE)" BUNDLE_ID="$(BUNDLE_ID)" TEAM_ID="$(TEAM_ID)" DIST="$(DIST)" \
 			CUBE_BIN="$(CUBE_BIN)" APP_DIR="$(CUBE_APP)" ./scripts/sign-cube-networking.sh || { \
-				echo "[Cube] Developer signing failed, falling back to ad-hoc signature..."; \
-				codesign --force --deep --sign - --entitlements app/Cube/Resources/Cube.entitlements "$(CUBE_APP)"; \
+				echo "[Cube] Profile signing failed; refusing to build an app without VM Networking. See the signing error above." >&2; \
+				exit 1; \
 			}; \
 	else \
 		codesign --force --deep --sign - --entitlements app/Cube/Resources/Cube.entitlements "$(CUBE_APP)"; \
@@ -91,7 +104,7 @@ app: build sign
 # Build debug version with debug symbols (-g) and get-task-allow for lldb
 debug-app: build
 	@mkdir -p "$(CUBE_APP)"/Contents/MacOS "$(CUBE_APP)"/Contents/Resources target/swift-cache
-	swiftc -g -module-cache-path target/swift-cache \
+	swiftc -g -target $(MACOS_TARGET) -module-cache-path target/swift-cache \
 		app/Cube/Sources/ServiceManager.swift \
 		app/Cube/Sources/SystemMetrics.swift \
 		app/Cube/Sources/VMManager.swift \
@@ -118,6 +131,13 @@ sign-cube-networking: app
 	CUBE_BIN="$(CUBE_BIN)" APP_DIR="$(CUBE_APP)" ./scripts/sign-cube-networking.sh
 
 cube: app
+
+DIST_PROFILE ?= $(wildcard Cube_Dist.provisionprofile)
+
+# Package a standalone drag-and-drop disk image (DMG) for distribution
+dmg:
+	PROFILE="$(or $(PROFILE),$(DIST_PROFILE))" DIST=1 $(MAKE) app
+	IDENTITY="$(IDENTITY)" NOTARY_PROFILE="$(NOTARY_PROFILE)" ./scripts/create-dmg.sh "$(CUBE_APP)" "$(CUBE_DMG)" "$(VOL_NAME)"
 
 run-cube: cube
 	open "$(CUBE_APP)"

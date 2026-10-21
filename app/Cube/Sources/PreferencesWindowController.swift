@@ -7,6 +7,10 @@ private class FlippedContainerView: NSView {
     override var isFlipped: Bool { return true }
 }
 
+private class FlippedClipView: NSClipView {
+    override var isFlipped: Bool { return true }
+}
+
 private class CardView: NSView {
     init() {
         super.init(frame: .zero)
@@ -824,6 +828,10 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         imagesScrollView.autohidesScrollers = true
         imagesScrollView.borderType = .noBorder
         imagesScrollView.drawsBackground = false
+        
+        let clipView = FlippedClipView()
+        clipView.drawsBackground = false
+        imagesScrollView.contentView = clipView
         
         imagesListContainer = NSStackView()
         imagesListContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -2047,6 +2055,7 @@ class PreferencesWindowController: NSWindowController, NSTableViewDataSource, NS
         for (idx, item) in items.enumerated() {
             let row = buildImageRowView(item: item, isLast: idx == items.count - 1)
             imagesListContainer.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: imagesListContainer.widthAnchor).isActive = true
         }
     }
     

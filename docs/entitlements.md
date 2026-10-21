@@ -85,3 +85,29 @@ You should see both entitlements as `true`. Then `make freebsd-zfs-uefi …
 - `--net vmnet|vmnet-proxy|bridge[:iface]|mock|none` CLI — [networking.md](networking.md)
 - Full-suite network modes — [verification.md](verification.md)
 - UEFI ZFS boot — [freebsd_zfs_runbook.md](freebsd_zfs_runbook.md)
+
+## DMG distribution signing
+
+`make dmg` requires a **Developer ID Application** certificate and a Developer ID
+provisioning profile granting VM Networking. By default it uses
+`Cube_Dist.provisionprofile`. The certificate must be one of the exact
+`DeveloperCertificates` embedded in that profile; sharing a Team ID is not enough.
+The signing script validates both entitlement files, expiration, profile type,
+and certificate membership. Distribution signing failures stop the build instead
+of falling back to ad-hoc signing. The packaging script also validates the actual
+signatures and embedded profiles in both Cube.app and its cube.app helper.
+
+If the error says “No matching signing identity authorized by profile”, regenerate
+the Developer ID profile in the Apple Developer account with the installed
+Developer ID Application certificate selected, then replace
+`Cube_Dist.provisionprofile`. Alternatively, install the certificate and private key
+already authorized by the profile. Do not substitute an Apple Distribution or
+Mac App Store profile.
+
+```sh
+security find-identity -v -p codesigning
+make dmg PROFILE=/path/to/updated.provisionprofile
+```
+
+Apple documents the certificate/profile relationship in
+[TN3125](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles).
