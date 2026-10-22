@@ -9,6 +9,7 @@ pub mod gpa;
 pub mod gpt;
 pub mod memory;
 pub mod msr;
+pub mod shared_fs;
 pub mod terminal;
 pub mod vmnet_proto;
 pub mod vmnet_service;

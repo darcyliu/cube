@@ -1,5 +1,6 @@
 //! Non-transitional virtio-pci 1.0 transport. No MSI-X and no virtio-mmio
-//! register file. INTx is active-low. Block is one queue; net is RX then TX.
+//! register file. INTx is active-low. Block is one queue, 9p is one queue,
+//! and net is RX then TX.
 
 use std::thread::JoinHandle;
 
@@ -32,15 +33,45 @@ const ISR_OFF: u64 = 0x2000;
 const DEVCFG_OFF: u64 = 0x3000;
 const DEVCFG_LEN: u64 = 32;
 
+pub struct PciIdent {
+    pub device_id: u16,
+    pub subsystem_id: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub config_len: u32,
+}
+
+/// One virtio function that shares the block/9p register file. Net stays on
+/// its own path because TX returns a batch the vCPU sends after dropping PCI.
+pub trait VirtioPciDev: Send {
+    fn pci_ident(&self) -> PciIdent;
+    fn queue(&self) -> &VirtQueue;
+    fn queue_mut(&mut self) -> &mut VirtQueue;
+    fn set_queue_ready(&mut self, ready: bool);
+    fn device_feature_word(&self, select: u32) -> u32;
+    fn driver_feature_word(&self, select: u32) -> u32;
+    fn set_driver_feature_word(&mut self, select: u32, word: u32);
+    fn status(&self) -> u32;
+    fn set_status(&mut self, status: u32);
+    fn read_config(&self, offset: usize, size: usize) -> u64;
+    /// Returns whether the guest should see a queue interrupt (ISR bit 0).
+    fn process_queue(&mut self) -> bool;
+    /// ISR bit 1. Cleared when observed so a later read does not re-raise.
+    fn consume_config_isr(&mut self) -> bool {
+        false
+    }
+}
+
 enum Dev {
     Block(VirtioBlock),
     Net(VirtioNet),
+    P9(Box<dyn VirtioPciDev>),
 }
 
 impl Dev {
     fn num_queues(&self) -> u16 {
         match self {
-            Dev::Block(_) => 1,
+            Dev::Block(_) | Dev::P9(_) => 1,
             Dev::Net(_) => 2,
         }
     }
@@ -49,6 +80,7 @@ impl Dev {
         match self {
             Dev::Block(dev) => dev.device_feature_word(select),
             Dev::Net(dev) => dev.device_feature_word(select),
+            Dev::P9(dev) => dev.device_feature_word(select),
         }
     }
 
@@ -56,6 +88,7 @@ impl Dev {
         match self {
             Dev::Block(dev) => dev.driver_feature_word(select),
             Dev::Net(dev) => dev.driver_feature_word(select),
+            Dev::P9(dev) => dev.driver_feature_word(select),
         }
     }
 
@@ -63,6 +96,7 @@ impl Dev {
         match self {
             Dev::Block(dev) => dev.set_driver_feature_word(select, word),
             Dev::Net(dev) => dev.set_driver_feature_word(select, word),
+            Dev::P9(dev) => dev.set_driver_feature_word(select, word),
         }
     }
 
@@ -76,6 +110,7 @@ impl Dev {
         match self {
             Dev::Block(dev) => dev.status(),
             Dev::Net(dev) => dev.status(),
+            Dev::P9(dev) => dev.status(),
         }
     }
 
@@ -83,6 +118,7 @@ impl Dev {
         match self {
             Dev::Block(dev) => dev.set_status(status),
             Dev::Net(dev) => dev.set_status(status),
+            Dev::P9(dev) => dev.set_status(status),
         }
     }
 
@@ -90,12 +126,14 @@ impl Dev {
         match self {
             Dev::Block(dev) => dev.read_config(offset, size),
             Dev::Net(dev) => dev.read_config(offset, size),
+            Dev::P9(dev) => dev.read_config(offset, size),
         }
     }
 
     fn queue(&self, sel: u16) -> Option<VirtQueue> {
         match self {
             Dev::Block(dev) if sel == 0 => Some(dev.queue),
+            Dev::P9(dev) if sel == 0 => Some(*dev.queue()),
             Dev::Net(dev) => dev.queue(sel),
             _ => None,
         }
@@ -104,6 +142,7 @@ impl Dev {
     fn update_queue(&mut self, sel: u16, update: impl FnOnce(&mut VirtQueue)) {
         match self {
             Dev::Block(dev) if sel == 0 => update(&mut dev.queue),
+            Dev::P9(dev) if sel == 0 => update(dev.queue_mut()),
             Dev::Net(dev) => dev.update_queue(sel, update),
             _ => {}
         }
@@ -113,6 +152,7 @@ impl Dev {
         let ready = byte & 1 == 1;
         match self {
             Dev::Block(dev) if sel == 0 => dev.queue.ready = ready,
+            Dev::P9(dev) if sel == 0 => dev.set_queue_ready(ready),
             Dev::Net(dev) => dev.set_ready_low(sel, ready),
             _ => {}
         }
@@ -127,14 +167,22 @@ impl Dev {
     fn notify(&mut self, queue: u16) -> (bool, Option<TxSubmit>) {
         match self {
             Dev::Block(dev) => (queue == 0 && dev.process_queue(), None),
+            Dev::P9(dev) => (queue == 0 && dev.process_queue(), None),
             Dev::Net(dev) => dev.notify(queue),
         }
     }
 
     fn take_irq_pending(&self) -> bool {
         match self {
-            Dev::Block(_) => false,
+            Dev::Block(_) | Dev::P9(_) => false,
             Dev::Net(dev) => dev.take_irq_pending(),
+        }
+    }
+
+    fn consume_config_isr(&mut self) -> bool {
+        match self {
+            Dev::P9(dev) => dev.consume_config_isr(),
+            Dev::Block(_) | Dev::Net(_) => false,
         }
     }
 }
@@ -151,17 +199,53 @@ pub(crate) struct VirtioPciTransport {
     interrupt_line: u8,
     cache_line: u8,
     latency: u8,
+    config_len: u64,
     template: [u8; 256],
     dev: Dev,
 }
 
 impl VirtioPciTransport {
     pub(crate) fn new(dev: u8, gsi: u32, bar: u32, block: VirtioBlock) -> Self {
-        Self::build(dev, gsi, bar, 0x1042, 0x01, 2, Dev::Block(block))
+        Self::build(
+            dev,
+            gsi,
+            bar,
+            0x1042,
+            0x01,
+            0x00,
+            2,
+            DEVCFG_LEN as u32,
+            Dev::Block(block),
+        )
     }
 
     pub(crate) fn new_net(dev: u8, gsi: u32, bar: u32, net: VirtioNet) -> Self {
-        Self::build(dev, gsi, bar, 0x1041, 0x02, 1, Dev::Net(net))
+        Self::build(
+            dev,
+            gsi,
+            bar,
+            0x1041,
+            0x02,
+            0x00,
+            1,
+            DEVCFG_LEN as u32,
+            Dev::Net(net),
+        )
+    }
+
+    pub(crate) fn new_p9(dev: u8, gsi: u32, bar: u32, device: Box<dyn VirtioPciDev>) -> Self {
+        let ident = device.pci_ident();
+        Self::build(
+            dev,
+            gsi,
+            bar,
+            ident.device_id,
+            ident.class,
+            ident.subclass,
+            ident.subsystem_id,
+            ident.config_len,
+            Dev::P9(device),
+        )
     }
 
     fn build(
@@ -170,7 +254,9 @@ impl VirtioPciTransport {
         bar: u32,
         device_id: u16,
         class: u8,
+        subclass: u8,
         subsystem: u16,
+        config_len: u32,
         backend: Dev,
     ) -> Self {
         Self {
@@ -185,7 +271,8 @@ impl VirtioPciTransport {
             interrupt_line: 0,
             cache_line: 0,
             latency: 0,
-            template: config_template(device_id, class, subsystem),
+            config_len: u64::from(config_len),
+            template: config_template(device_id, class, subclass, subsystem, config_len),
             dev: backend,
         }
     }
@@ -263,7 +350,7 @@ impl VirtioPciTransport {
             let isr = u64::from(self.isr);
             self.isr = 0;
             isr
-        } else if fits(offset, size, DEVCFG_OFF, DEVCFG_LEN) {
+        } else if fits(offset, size, DEVCFG_OFF, self.config_len) {
             self.dev.read_config((offset - DEVCFG_OFF) as usize, size)
         } else {
             0
@@ -300,6 +387,9 @@ impl VirtioPciTransport {
         if self.dev.take_irq_pending() {
             self.isr |= 1;
         }
+        if self.dev.consume_config_isr() {
+            self.isr |= 2;
+        }
         (self.irq_delta(before), tx)
     }
 
@@ -330,7 +420,7 @@ impl VirtioPciTransport {
     pub(crate) fn take_worker(&mut self) -> Option<JoinHandle<()>> {
         match &mut self.dev {
             Dev::Net(net) => net.take_worker(),
-            Dev::Block(_) => None,
+            Dev::Block(_) | Dev::P9(_) => None,
         }
     }
 
@@ -504,12 +594,19 @@ fn poke_u64(reg: &mut u64, off: usize, byte: u8) {
     *reg = u64::from_le_bytes(raw);
 }
 
-fn config_template(device_id: u16, class: u8, subsystem: u16) -> [u8; 256] {
+fn config_template(
+    device_id: u16,
+    class: u8,
+    subclass: u8,
+    subsystem: u16,
+    config_len: u32,
+) -> [u8; 256] {
     let mut cfg = [0u8; 256];
     cfg[0..2].copy_from_slice(&0x1AF4u16.to_le_bytes());
     cfg[2..4].copy_from_slice(&device_id.to_le_bytes());
     cfg[0x06] = 0x10; // capabilities list
     cfg[0x08] = 1; // revision
+    cfg[0x0a] = subclass;
     cfg[0x0b] = class;
     cfg[0x2c..0x2e].copy_from_slice(&0x1AF4u16.to_le_bytes());
     cfg[0x2e..0x30].copy_from_slice(&subsystem.to_le_bytes());
@@ -526,7 +623,7 @@ fn config_template(device_id: u16, class: u8, subsystem: u16) -> [u8; 256] {
         16,
         4,
         DEVCFG_OFF as u32,
-        DEVCFG_LEN as u32,
+        config_len,
         None,
     );
     cfg

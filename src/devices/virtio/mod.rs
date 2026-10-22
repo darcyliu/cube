@@ -4,6 +4,7 @@
 
 pub mod block;
 pub mod net;
+pub mod p9;
 pub mod transport;
 
 // VirtIO MMIO Register Offsets (Modern, Version 2)

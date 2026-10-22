@@ -1,4 +1,4 @@
-//! PCI CAM at ports `0xCF8`/`0xCFC`, the PIIX4 PM block, virtio-blk, and virtio-net.
+//! PCI CAM at ports `0xCF8`/`0xCFC`, the PIIX4 PM block, virtio-blk, virtio-net, and virtio-9p.
 //! No ECAM and no MCFG. Host-bridge and PIIX BARs do not decode.
 //! Virtio BAR0 does, inside the 32-bit PCI hole.
 
@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use super::virtio::block::VirtioBlock;
 use super::virtio::net::{NetIrqHook, TxSubmit, VirtioNet};
-use super::virtio::transport::{NET_BAR, PCI_HOLE_START, VIRTIO_BAR_SIZE, VirtioPciTransport};
+use super::virtio::transport::{
+    NET_BAR, PCI_HOLE_START, VIRTIO_BAR_SIZE, VirtioPciDev, VirtioPciTransport,
+};
 
 pub use super::virtio::transport::PciIrq;
 
@@ -70,6 +72,7 @@ pub struct PciHost {
     clock: Instant,
     blks: Vec<VirtioPciTransport>,
     net: Option<VirtioPciTransport>,
+    p9: Option<VirtioPciTransport>,
     pending_irqs: Vec<PciIrq>,
     pending_tx: Option<TxSubmit>,
 }
@@ -100,6 +103,7 @@ impl PciHost {
             clock: Instant::now(),
             blks: Vec::new(),
             net: None,
+            p9: None,
             pending_irqs: Vec::new(),
             pending_tx: None,
         }
@@ -109,6 +113,9 @@ impl PciHost {
     /// so `00:03.0` stays free for net. Extra-disk GSIs start at 19: 17 is
     /// net and 18 is 9p. At most six disks (GSI 23).
     pub fn add_block(&mut self, block: VirtioBlock) -> Result<(), String> {
+        if self.p9.is_some() {
+            return Err("virtio-blk must be added before the shared folder".into());
+        }
         let index = self.blks.len();
         let (dev, gsi) = virtio_blk_bdf(index)?;
         let bar = (PCI_HOLE_START as u32)
@@ -124,6 +131,20 @@ impl PciHost {
             return Err("virtio-net is already attached".into());
         }
         self.net = Some(VirtioPciTransport::new_net(3, 17, NET_BAR, net));
+        Ok(())
+    }
+
+    /// One 9p function after the disks. GSI 18. `00:03.0` stays free for net.
+    pub fn add_p9(&mut self, p9: impl VirtioPciDev + 'static) -> Result<(), String> {
+        if self.p9.is_some() {
+            return Err("only one shared folder is supported".into());
+        }
+        let disks = self.blks.len();
+        let (dev, gsi) = virtio_9p_bdf(disks)?;
+        let bar = (PCI_HOLE_START as u32)
+            .wrapping_add((disks as u32).wrapping_mul(VIRTIO_BAR_SIZE as u32));
+        self.p9 = Some(VirtioPciTransport::new_p9(dev, gsi, bar, Box::new(p9)));
+        eprintln!("[VMM] 9P PCI 00:{dev:02x}.0 GSI {gsi}");
         Ok(())
     }
 
@@ -157,6 +178,9 @@ impl PciHost {
         if let Some(net) = &self.net {
             entries.push(net.prt());
         }
+        if let Some(p9) = &self.p9 {
+            entries.push(p9.prt());
+        }
         entries
     }
 
@@ -164,6 +188,9 @@ impl PciHost {
         let mut gsis: Vec<_> = self.blks.iter().map(VirtioPciTransport::gsi).collect();
         if let Some(net) = &self.net {
             gsis.push(net.gsi());
+        }
+        if let Some(p9) = &self.p9 {
+            gsis.push(p9.gsi());
         }
         gsis
     }
@@ -182,6 +209,7 @@ impl PciHost {
         let (value, irqs) = match hit {
             Hit::Blk(index) => self.blks[index].bar_read(offset, size),
             Hit::Net => self.net.as_mut().unwrap().bar_read(offset, size),
+            Hit::P9 => self.p9.as_mut().unwrap().bar_read(offset, size),
         };
         self.pending_irqs.extend(irqs);
         Some(value)
@@ -194,6 +222,7 @@ impl PciHost {
         let (irqs, tx) = match hit {
             Hit::Blk(index) => self.blks[index].bar_write(offset, data, size),
             Hit::Net => self.net.as_mut().unwrap().bar_write(offset, data, size),
+            Hit::P9 => self.p9.as_mut().unwrap().bar_write(offset, data, size),
         };
         self.pending_irqs.extend(irqs);
         self.pending_tx = tx;
@@ -214,6 +243,11 @@ impl PciHost {
             && let Some(offset) = bar_window(net.mapped_base(), gpa, len)
         {
             return Some((Hit::Net, offset));
+        }
+        if let Some(p9) = &self.p9
+            && let Some(offset) = bar_window(p9.mapped_base(), gpa, len)
+        {
+            return Some((Hit::P9, offset));
         }
         None
     }
@@ -293,6 +327,7 @@ impl PciHost {
             return match hit {
                 Hit::Blk(index) => self.blks[index].cfg_read(off, size),
                 Hit::Net => self.net.as_ref().unwrap().cfg_read(off, size),
+                Hit::P9 => self.p9.as_ref().unwrap().cfg_read(off, size),
             };
         }
         let Some(slot) = self.slot() else {
@@ -313,6 +348,7 @@ impl PciHost {
             let irqs = match hit {
                 Hit::Blk(index) => self.blks[index].cfg_write(off, data, size),
                 Hit::Net => self.net.as_mut().unwrap().cfg_write(off, data, size),
+                Hit::P9 => self.p9.as_mut().unwrap().cfg_write(off, data, size),
             };
             self.pending_irqs.extend(irqs);
             return;
@@ -341,6 +377,9 @@ impl PciHost {
         }
         if self.net.as_ref().is_some_and(|net| net.dev() == dev) {
             return Some(Hit::Net);
+        }
+        if self.p9.as_ref().is_some_and(|p9| p9.dev() == dev) {
+            return Some(Hit::P9);
         }
         self.blks
             .iter()
@@ -465,6 +504,7 @@ fn write_bytes(raw: &mut [u8], off: usize, data: u64, size: usize) {
 enum Hit {
     Blk(usize),
     Net,
+    P9,
 }
 
 fn bar_window(base: Option<u64>, gpa: u64, len: u64) -> Option<u64> {
@@ -486,6 +526,20 @@ fn virtio_blk_bdf(index: usize) -> Result<(u8, u32), String> {
         return Ok((2, 16));
     }
     Ok((3 + index as u8, 18 + index as u32))
+}
+
+fn virtio_9p_bdf(disk_count: usize) -> Result<(u8, u32), String> {
+    // After every disk function. Dev 3 stays free for net, so zero disks still
+    // land on 00:04.0 rather than the blk or net slot. GSI is fixed at 18.
+    if disk_count > 6 {
+        return Err("too many virtio-blk devices".into());
+    }
+    let dev = if disk_count == 0 {
+        4
+    } else {
+        3 + disk_count as u8
+    };
+    Ok((dev, 18))
 }
 
 fn poke(reg: &mut u16, off: usize, byte: u8) {

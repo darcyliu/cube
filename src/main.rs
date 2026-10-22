@@ -15,8 +15,15 @@ use std::process;
 use vmm::cli::{self, Boot};
 
 fn main() {
-    enforce_host_gate();
     let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).is_some_and(|arg| arg == "--internal-9p-worker") {
+        if let Err(error) = vmm::shared_fs::worker(&raw) {
+            eprintln!("[9P helper] {error}");
+            process::exit(1);
+        }
+        return;
+    }
+    enforce_host_gate();
     if raw.get(1).is_some_and(|arg| arg == "--vmnet-service") {
         if let Err(error) = vmm::vmnet_service::run(&raw) {
             eprintln!("[vmnet] {error}");
@@ -44,6 +51,7 @@ fn main() {
                     run.disks,
                     run.net,
                     run.forwards,
+                    run.share,
                 ),
                 Boot::Uefi(path) => vm::run_uefi(
                     path,
@@ -54,6 +62,7 @@ fn main() {
                     run.net,
                     run.forwards,
                     run.efi_vars,
+                    run.share,
                 ),
             };
             let mut failed = false;

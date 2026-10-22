@@ -20,9 +20,11 @@ use vmm::devices::pit::Pit;
 use vmm::devices::serial::{ConsoleHooks, HostConsole, Ns16550};
 use vmm::devices::virtio::block::VirtioBlock;
 use vmm::devices::virtio::net::{VirtioNet, net_learns_dhcp};
+use vmm::devices::virtio::p9::P9Core;
 use vmm::forward::{self, ForwardRule, PortForward};
 use vmm::gpa::{self, GuestSpace};
 use vmm::memory::GuestMemory;
+use vmm::shared_fs::{Backend, ShareConfig};
 use vmm::terminal::{self, TerminalGuard};
 use vmm::x86::{self, GUEST_RAM_BYTES, PAYLOAD_GPA};
 
@@ -48,8 +50,11 @@ pub fn run_payload(
     disks: Vec<DiskSpec>,
     net: NetConfig,
     forwards: Vec<ForwardRule>,
+    share: Option<ShareConfig>,
 ) -> Vec<VcpuDone> {
-    match run_payload_inner(path, serial_log, cpus, ram_mb, disks, net, forwards) {
+    match run_payload_inner(
+        path, serial_log, cpus, ram_mb, disks, net, forwards, share,
+    ) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
     }
@@ -64,6 +69,7 @@ pub fn run_uefi(
     net: NetConfig,
     forwards: Vec<ForwardRule>,
     efi_vars: Option<PathBuf>,
+    share: Option<ShareConfig>,
 ) -> Vec<VcpuDone> {
     match run_uefi_inner(
         firmware,
@@ -74,6 +80,7 @@ pub fn run_uefi(
         net,
         forwards,
         efi_vars,
+        share,
     ) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
@@ -96,6 +103,7 @@ fn run_payload_inner(
     disks: Vec<DiskSpec>,
     net: NetConfig,
     forwards: Vec<ForwardRule>,
+    share: Option<ShareConfig>,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let bytes = load_payload(path)?;
@@ -113,10 +121,11 @@ fn run_payload_inner(
         return Err("payload does not fit in guest RAM".into());
     }
     mem.write(entry, &bytes)?;
-    // A missing image, forward bind, or NIC must not call hv_vm_create.
+    // A missing image, forward bind, NIC, or share must not call hv_vm_create.
     let blocks = load_blocks(&mem, &disks)?;
     let (nic, _forwards) = attach_net(&mem, &net, &forwards)?;
-    let pci = assemble_pci(blocks, nic, false)?;
+    let share = open_share(&mem, share)?;
+    let pci = assemble_pci(blocks, nic, share, false)?;
     let gsis = pci.as_ref().map(PciHost::virtio_gsis).unwrap_or_default();
 
     let _vm = create_vm(&mem)?;
@@ -149,6 +158,7 @@ fn run_uefi_inner(
     net: NetConfig,
     forwards: Vec<ForwardRule>,
     efi_vars: Option<PathBuf>,
+    share: Option<ShareConfig>,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let code_bytes =
@@ -180,10 +190,11 @@ fn run_uefi_inner(
     let ram_bytes = cli::ram_bytes(ram_mb.unwrap_or(cli::DEFAULT_RAM_MB))?;
     let ram = Arc::new(GuestMemory::allocate(0, ram_bytes)?);
     let code = Arc::new(GuestMemory::from_buffer(gpa::CODE_FLASH_BASE, &code_bytes)?);
-    // A missing image, forward bind, or NIC must not call hv_vm_create.
+    // A missing image, forward bind, NIC, or share must not call hv_vm_create.
     let blocks = load_blocks(&ram, &disks)?;
     let (nic, _forwards) = attach_net(&ram, &net, &forwards)?;
-    let pci = assemble_pci(blocks, nic, true)?.expect("UEFI always has a PCI host");
+    let share = open_share(&ram, share)?;
+    let pci = assemble_pci(blocks, nic, share, true)?.expect("UEFI always has a PCI host");
     let gsis = pci.virtio_gsis();
     let tables = vmm::acpi::build_with_prt(cpus, ram_bytes as u64, &pci.prt());
     let cfg = FwCfg::from_files(
@@ -285,12 +296,23 @@ fn attach_net(
     Ok((Some(nic), running))
 }
 
+fn open_share(
+    mem: &Arc<GuestMemory>,
+    share: Option<ShareConfig>,
+) -> Result<Option<P9Core<Backend>>, String> {
+    match share {
+        Some(config) => Ok(Some(P9Core::open(&config, Arc::clone(mem))?)),
+        None => Ok(None),
+    }
+}
+
 fn assemble_pci(
     blocks: Vec<VirtioBlock>,
     net: Option<VirtioNet>,
+    share: Option<P9Core<Backend>>,
     always: bool,
 ) -> Result<Option<PciHost>, String> {
-    if !always && blocks.is_empty() && net.is_none() {
+    if !always && blocks.is_empty() && net.is_none() && share.is_none() {
         return Ok(None);
     }
     let mut pci = PciHost::new();
@@ -299,6 +321,9 @@ fn assemble_pci(
     }
     if let Some(net) = net {
         pci.add_net(net)?;
+    }
+    if let Some(p9) = share {
+        pci.add_p9(p9)?;
     }
     Ok(Some(pci))
 }

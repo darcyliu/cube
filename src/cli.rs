@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::forward::ForwardRule;
+use crate::shared_fs::ShareConfig;
 
 pub const DEFAULT_RAM_MB: u32 = 1024;
 pub const MIN_RAM_MB: u32 = 128;
@@ -58,6 +59,7 @@ pub struct Run {
     pub efi_vars: Option<PathBuf>,
     pub net: NetConfig,
     pub forwards: Vec<ForwardRule>,
+    pub share: Option<ShareConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +124,8 @@ Options:
   --forward RULE               TCP HOST_IP:PORT=GUEST_IP:PORT
   --ssh-port PORT              localhost PORT to the guest DHCP address port 22
   --efi-vars PATH              variable store (default <first writable disk>.vars.fd, otherwise efi-vars.fd)
+  --share TAG PATH             one read-only virtio-9p folder
+  --share-rw TAG PATH          one read-write virtio-9p folder
   --serial-log, --console-log PATH
   -h, --help                   print this help and exit 1
 
@@ -143,6 +147,7 @@ pub fn parse(args: &[String]) -> Cli {
     let mut disks = Vec::new();
     let mut global_cow = false;
     let mut efi_vars = None;
+    let mut share = None;
     let mut net_mode: Option<String> = None;
     let mut vmnet_socket: Option<PathBuf> = None;
     let mut mac = None;
@@ -227,6 +232,22 @@ pub fn parse(args: &[String]) -> Cli {
                     return Cli::Error("--efi-vars needs a path".into());
                 };
                 efi_vars = Some(PathBuf::from(path));
+            }
+            "--share" | "--share-rw" => {
+                if share.is_some() {
+                    return Cli::Error("only one shared folder is supported".into());
+                }
+                let read_only = args[i] == "--share";
+                let Some(tag) = value_at(args, &mut i) else {
+                    return Cli::Error("--share/--share-rw requires TAG PATH".into());
+                };
+                let Some(path) = value_at(args, &mut i) else {
+                    return Cli::Error("--share/--share-rw requires TAG PATH".into());
+                };
+                match ShareConfig::new(tag, path, read_only) {
+                    Ok(config) => share = Some(config),
+                    Err(message) => return Cli::Error(message),
+                }
             }
             "--serial-log" | "--console-log" => {
                 let Some(path) = value_at(args, &mut i) else {
@@ -331,6 +352,7 @@ pub fn parse(args: &[String]) -> Cli {
         efi_vars,
         net,
         forwards,
+        share,
     })
 }
 
@@ -445,6 +467,8 @@ mod tests {
             "--uefi",
             "--firmware",
             "--efi-vars",
+            "--share",
+            "--share-rw",
             "--serial-log",
             "--console-log",
         ] {
@@ -463,7 +487,6 @@ mod tests {
             "--freebsd",
             "--kernel",
             "--multiuser",
-            "--share",
             "--vnc",
             "--gui",
         ] {
@@ -480,7 +503,6 @@ mod tests {
             "--freebsd",
             "--kernel",
             "--multiuser",
-            "--share",
             "--vnc",
             "--gui",
             "--memory",
@@ -495,6 +517,16 @@ mod tests {
         assert!(cow.disks[1].cow && !cow.disks[1].read_only);
         assert_eq!(cow.disks[1].path, PathBuf::from("disk.img"));
         assert!(run(&["--uefi", "-d", "disk.img,cow"]).disks[0].cow);
+        assert!(error(&["--uefi", "--share"]).contains("TAG PATH"));
+        let ro = run(&["--uefi", "--share", "work", "."]);
+        assert_eq!(ro.share.as_ref().map(|share| share.tag.as_str()), Some("work"));
+        assert!(ro.share.unwrap().read_only);
+        let rw = run(&["--uefi", "--share-rw", "work", "."]);
+        assert!(!rw.share.unwrap().read_only);
+        assert!(
+            error(&["--uefi", "--share", "work", ".", "--share-rw", "other", "."])
+                .contains("only one")
+        );
     }
 
     #[test]
