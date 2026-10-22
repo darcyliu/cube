@@ -1,4 +1,4 @@
-.PHONY: all build sign sign-networking test release clean fetch-uefi vmnet-service vmnet-service-bridge
+.PHONY: all build sign sign-networking test release clean fetch-uefi fetch-iso verify vmnet-service vmnet-service-bridge
 
 all: build sign
 
@@ -36,6 +36,13 @@ fetch-uefi:
 		rm -f firmware/OVMF_VARS.fd; \
 		exit 1; \
 	fi
+
+# FreeBSD 14.4-RELEASE amd64 disc1. The ISO is gitignored.
+fetch-iso:
+	sh scripts/fetch-iso.sh
+
+verify:
+	python3 -B scripts/verify.py $(VERIFY_ARGS)
 
 sign:
 	codesign --entitlements entitlements.plist --force -s - $(VMM_BIN)

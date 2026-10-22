@@ -9,6 +9,7 @@ guest/*.bin
 *.cow
 *.vars.fd
 *.iso
+*.iso.partial
 /.iso-boot
 /target_root
 

@@ -32,12 +32,17 @@ Run the VMM as root so vmnet shared-mode can start:
 
 ```sh
 make all
-sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img
+sudo ./target/debug/vmm \
+  --uefi firmware/OVMF_CODE.fd \
+  --disk freebsd-installed.img \
+  --cpus 2 \
+  --ram 1024 \
+  --net vmnet
 ```
 
-That target also installs a small PF NAT anchor (`com.apple/vmm`) so the guest
-subnet `192.168.18.0/24` can reach the internet via your default interface.
-See [networking.md](networking.md).
+In-process `--net vmnet` installs a small PF NAT anchor (`com.apple/vmm`) so
+the guest subnet `192.168.18.0/24` can reach the internet via your default
+interface. See [networking.md](networking.md).
 
 If you start without sudo and `--net vmnet` fails, the VMM exits with an error.
 Re-run under sudo (or with an authorized networking signature). For offline
@@ -59,10 +64,10 @@ make vmnet-service
 process, so they need root for the same reason, and they do not install PF NAT.
 `--net vmnet-proxy` only talks to the socket. Do not sudo a proxy guest: the
 service rejects uid 0. A second guest needs its own `--mac`.
-`scripts/verify.py --suite full` covers the proxy. In-process vmnet is
-`sudo python3 scripts/verify.py --suite full --sudo --keep-root`, and
-in-process bridge is `--bridge en0 --keep-root` on that same command. See
-[verification.md](verification.md).
+`python3 -B scripts/verify.py --suite full` boots the FreeBSD amd64 installer
+with `--net vmnet-proxy`. Run it as your user. In-process vmnet and bridge are
+the `sudo ./target/debug/vmm ... --net vmnet` and `--net bridge:en0` commands
+above, not extra suite flags. See [verification.md](verification.md).
 
 ## Optional: Developer ID + vm.networking
 
@@ -77,11 +82,11 @@ If you obtain the restricted capability:
 codesign -d --entitlements - --xml "$VMM_BIN" | plutil -p -
 ```
 
-You should see both entitlements as `true`. Then `make freebsd-zfs-uefi …
---net vmnet` can work without sudo.
+You should see both entitlements as `true`. Then
+`./target/debug/vmm --uefi firmware/OVMF_CODE.fd --disk freebsd-installed.img --cpus 2 --net vmnet`
+can work without sudo.
 
 ## Related
 
 - `--net vmnet|vmnet-proxy|bridge[:iface]|mock|none` CLI — [networking.md](networking.md)
-- Full-suite network modes — [verification.md](verification.md)
-- UEFI ZFS boot — [freebsd_zfs_runbook.md](freebsd_zfs_runbook.md)
+- Installer smoke — [freebsd_amd64.md](freebsd_amd64.md) and [verification.md](verification.md)

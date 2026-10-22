@@ -12,8 +12,12 @@ or `--net none` to omit the NIC.
 
 ```sh
 make all
-# UEFI + ZFS disk with a real NIC:
-sudo make sudo-freebsd-zfs-uefi DISK=freebsd-installed.img
+sudo ./target/debug/vmm \
+  --uefi firmware/OVMF_CODE.fd \
+  --disk freebsd-installed.img \
+  --cpus 2 \
+  --ram 1024 \
+  --net vmnet
 ```
 
 **Unprivileged VMM, privileged vmnet service:**
@@ -55,8 +59,8 @@ completed on en0 and printed `bridged interface up`. Guests still take
 addresses from the LAN DHCP server.
 
 `--net bridge` remains the in-process root path and does not use this service.
-`scripts/verify.py --suite full --bridge en0` runs the real-network guest
-checks on that path. See [verification.md](verification.md).
+The installer smoke is `python3 -B scripts/verify.py --suite full` and uses
+`--net vmnet-proxy`, not bridge. See [verification.md](verification.md).
 
 Inside FreeBSD (multi-user usually gets DHCP automatically):
 
@@ -69,8 +73,8 @@ ping -c 2 1.1.1.1
 ```
 
 Guest traffic uses the vmnet shared subnet (documented below as
-`192.168.18.0/24`). The `sudo-*` Makefile targets also install a PF NAT anchor
-so that subnet can reach the internet.
+`192.168.18.0/24`). In-process `--net vmnet` installs a PF NAT anchor so that
+subnet can reach the internet.
 
 **Bridged (LAN DHCP, no host PF NAT):**
 ```sh
@@ -79,11 +83,17 @@ sudo ./target/debug/vmm ... --net bridge:en0    # explicit iface
 ```
 Guest gets an address from your LAN router. Creating the interface still needs
 root, or `com.apple.vm.networking` on the binary. Bridge only removes the PF
-NAT step. The ad-hoc signature does not carry that entitlement, so the
-regression run stays root with
-`sudo python3 -B scripts/verify.py --suite full --bridge en0 --keep-root`
-and a free LAN address. Stop `make vmnet-service` first. See
-[verification.md](verification.md).
+NAT step. The ad-hoc signature does not carry that entitlement, so bridge stays:
+
+```sh
+sudo ./target/debug/vmm \
+  --uefi firmware/OVMF_CODE.fd \
+  --disk freebsd-installed.img \
+  --cpus 2 \
+  --net bridge:en0
+```
+
+Stop `make vmnet-service` first. See [verification.md](verification.md).
 
 **Force mock** (no sudo, no external routing): `--net mock`  
 **Disable NIC:** `--net none`
@@ -95,8 +105,12 @@ Codesigning details: [entitlements.md](entitlements.md).
 Use a repeatable rule with numeric host and guest addresses:
 
 ```sh
-sudo ./target/debug/vmm --freebsd boot/kernel/kernel --disk freebsd-installed.img \
-  --multiuser --net vmnet --forward 127.0.0.1:2222=192.168.18.7:22 \
+sudo ./target/debug/vmm \
+  --uefi firmware/OVMF_CODE.fd \
+  --disk freebsd-installed.img \
+  --cpus 2 \
+  --net vmnet \
+  --forward 127.0.0.1:2222=192.168.18.7:22 \
   --forward 127.0.0.1:8080=192.168.18.7:80
 ssh -p 2222 root@127.0.0.1
 ```
@@ -122,25 +136,16 @@ forwards through the host's routing table, not UDP forwarding or a NAT backend.
 Regression checks:
 
 ```sh
-cargo test
-python3 scripts/check_network.py target/debug/vmm
-# Choose an unused address on your actual vmnet subnet for the guest check:
-python3 scripts/check_network.py target/debug/vmm \
-  --kernel .iso-boot/boot/kernel/kernel \
-  --iso FreeBSD-14.4-RELEASE-arm64-aarch64-disc1.iso \
-  --guest-cidr 192.168.18.77/24 --host-ip 192.168.18.1
+cargo +1.89.0 test --lib --offline
+python3 -B scripts/verify.py --suite quick
+python3 -B scripts/verify.py --suite full
 ```
 
-The guest check uses a temporary SSH key and RAM-backed guest scratch files,
-without a writable disk. It checks host connectivity and forwards SSH to guest
-port 22222. It starts `--net vmnet-proxy`. Run `make vmnet-service` as your
-user first, and do not sudo this script: the service rejects uid 0. Pass
-`--sudo` to re-run the guest check as root with in-process `--net vmnet` and
-the VMM's host PF/NAT setup. Pass `--net bridge:en0` to re-run it as root on
-the in-process bridge; pick the guest address from the LAN. The basic CLI
-checks and TCP unit tests require permission to open local sockets, but do not
-require sudo. The full suite wraps these three modes; see
-[verification.md](verification.md).
+The full suite boots the FreeBSD 14.4 amd64 disc1 ISO with `--net vmnet-proxy`.
+Run `make vmnet-service` as your user first, and do not sudo the suite: the
+service rejects uid 0. It does not fall back to `--net none`. TCP unit tests
+do not require sudo. See [verification.md](verification.md) and
+[freebsd_amd64.md](freebsd_amd64.md).
 
 ---
 
@@ -264,27 +269,17 @@ fetch --no-verify-peer -o - https://www.freebsd.org | head -n 15
 
 To avoid manual `pfctl` commands, shell mounts, and manual route additions in future runs, the following improvements can be implemented:
 
-### Improvement 1: Automated macOS PF NAT Setup in `Makefile`
-Integrate PF rule setup directly into the `sudo-freebsd-net` target. When the user starts the VM with `sudo make sudo-freebsd-net`, the Makefile automatically:
-1. Detects the active upstream network interface (e.g. `en0`).
-2. Configures `sysctl net.inet.ip.forwarding=1`.
-3. Populates the `com.apple/vmm` PF anchor.
-4. Cleans up the anchor when the VMM terminates.
+### Improvement 1: macOS PF NAT
 
-```makefile
-NET_IF ?= $(shell route get default 2>/dev/null | awk '/interface:/{print $$2}')
+In-process `--net vmnet` installs the PF anchor. The command is:
 
-sudo-freebsd-net: build
-	@echo "[*] Setting up macOS PF NAT forwarding on $(NET_IF)..."
-	@sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null
-	@printf 'nat on $(NET_IF) from 192.168.18.0/24 to any -> ($(NET_IF))\npass in quick on bridge100 all\npass out quick on $(NET_IF) all\n' | sudo pfctl -a "com.apple/vmm" -f - 2>/dev/null || true
-	@sudo ./target/release/vmm \
-		--kernel boot/kernel/kernel \
-		--initrd boot/kernel/kernel \
-		--disk mini-memstick.img \
-		--cmdline "boot_single=YES vfs.root.mountfrom=ufs:/dev/vtbd0p2" \
-		--cpus 1 --mem 1024 \
-		--net vmnet
+```sh
+sudo ./target/debug/vmm \
+  --uefi firmware/OVMF_CODE.fd \
+  --disk freebsd-installed.img \
+  --cpus 2 \
+  --ram 1024 \
+  --net vmnet
 ```
 
 ### Improvement 2: Automated In-Guest Network Bootstrap
