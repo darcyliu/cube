@@ -109,10 +109,14 @@ pub const VMCS_CTRL_EXC_BITMAP: u32 = 0x4004;
 pub const VMCS_CTRL_CR3_COUNT: u32 = 0x400a;
 pub const VMCS_CTRL_VMEXIT_CONTROLS: u32 = 0x400c;
 pub const VMCS_CTRL_VMENTRY_CONTROLS: u32 = 0x4012;
+pub const VMCS_CTRL_VMENTRY_IRQ_INFO: u32 = 0x4016;
+pub const VMCS_CTRL_VMENTRY_EXC_ERROR: u32 = 0x4018;
 pub const VMCS_CTRL_TPR_THRESHOLD: u32 = 0x401c;
 pub const VMCS_CTRL_CPU_BASED2: u32 = 0x401e;
 pub const VMCS_RO_INSTR_ERROR: u32 = 0x4400;
 pub const VMCS_RO_EXIT_REASON: u32 = 0x4402;
+pub const VMCS_RO_IDT_VECTOR_INFO: u32 = 0x4408;
+pub const VMCS_RO_IDT_VECTOR_ERROR: u32 = 0x440a;
 pub const VMCS_RO_VMEXIT_INSTR_LEN: u32 = 0x440c;
 pub const VMCS_GUEST_ES: u32 = 0x0800;
 pub const VMCS_GUEST_CS: u32 = 0x0802;
@@ -169,6 +173,7 @@ pub const VMCS_GUEST_DEBUG_EXC: u32 = 0x6822;
 
 pub const PIN_BASED_INTR: u64 = 1 << 0;
 pub const PIN_BASED_NMI: u64 = 1 << 3;
+pub const CPU_BASED_IRQ_WND: u64 = 1 << 2;
 pub const CPU_BASED_HLT: u64 = 1 << 7;
 pub const CPU_BASED_MWAIT: u64 = 1 << 10;
 pub const CPU_BASED_RDPMC: u64 = 1 << 11;
@@ -194,9 +199,11 @@ pub const VMENTRY_LOAD_EFER: u64 = 1 << 15;
 
 pub const VMX_REASON_IRQ: u16 = 1;
 pub const VMX_REASON_TRIPLE_FAULT: u16 = 2;
+pub const VMX_REASON_IRQ_WND: u16 = 7;
 pub const VMX_REASON_CPUID: u16 = 10;
 pub const VMX_REASON_HLT: u16 = 12;
 pub const VMX_REASON_IO: u16 = 30;
+pub const VMX_REASON_APIC_ACCESS: u16 = 44;
 pub const VMX_REASON_VMENTRY_GUEST: u16 = 33;
 pub const VMX_REASON_EPT_VIOLATION: u16 = 48;
 pub const VMX_REASON_EPT_MISCONFIG: u16 = 49;
@@ -204,6 +211,9 @@ pub const VMX_REASON_VMX_TIMER: u16 = 52;
 
 pub const ACTIVITY_ACTIVE: u64 = 0;
 pub const ACTIVITY_HLT: u64 = 1;
+
+/// External interrupt, valid. Type 0 is bits 10:8 clear.
+pub const IRQ_INFO_VALID: u64 = 1 << 31;
 
 pub const IA32_PAT: u32 = 0x277;
 pub const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
@@ -269,6 +279,5 @@ unsafe extern "C" {
     pub fn hv_vmx_vcpu_read_vmcs(vcpu: hv_vcpuid_t, field: u32, value: *mut u64) -> hv_return_t;
     pub fn hv_vmx_vcpu_write_vmcs(vcpu: hv_vcpuid_t, field: u32, value: u64) -> hv_return_t;
     pub fn hv_vmx_read_capability(field: hv_vmx_capability_t, value: *mut u64) -> hv_return_t;
-    /// Present on 10.15. Not used until the APIC is emulated.
     pub fn hv_vmx_vcpu_set_apic_address(vcpu: hv_vcpuid_t, gpa: hv_gpaddr_t) -> hv_return_t;
 }

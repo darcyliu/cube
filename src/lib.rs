@@ -1,6 +1,8 @@
 pub mod cow;
+pub mod decode;
 pub mod devices;
 pub mod forward;
+pub mod gpa;
 pub mod gpt;
 pub mod memory;
 pub mod terminal;

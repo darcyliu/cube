@@ -167,10 +167,15 @@ impl Regs {
     }
 }
 
+pub type IrqNotify = Arc<dyn Fn(bool) + Send + Sync>;
+
 pub struct Ns16550 {
     regs: Mutex<Regs>,
     log: Mutex<Option<File>>,
     hooks: ConsoleHooks,
+    /// Last level reported to the I/O APIC. `None` until the first update.
+    irq_level: Mutex<Option<bool>>,
+    irq_notify: Mutex<Option<IrqNotify>>,
 }
 
 impl Ns16550 {
@@ -190,16 +195,34 @@ impl Ns16550 {
             regs: Mutex::new(Regs::new()),
             log: Mutex::new(log),
             hooks,
+            irq_level: Mutex::new(None),
+            irq_notify: Mutex::new(None),
         })
     }
 
+    /// GSI 4 is level-high while IER enables the receiver and RX is non-empty.
+    /// FIFO trigger thresholds are not modeled; one queued byte is enough.
+    pub fn set_irq_notify(&self, notify: IrqNotify) {
+        *self.irq_notify.lock().unwrap() = Some(notify);
+        self.update_irq();
+    }
+
+    pub fn gsi4_asserted(&self) -> bool {
+        let regs = self.regs.lock().unwrap();
+        regs.ier & 1 != 0 && !regs.rx.is_empty()
+    }
+
     pub fn read_port(&self, offset: u16, size: usize) -> u64 {
-        let mut regs = self.regs.lock().unwrap();
-        let mut value = 0u64;
-        for i in 0..size {
-            let byte = regs.read_reg(offset + i as u16);
-            value |= (byte as u64) << (8 * i);
-        }
+        let value = {
+            let mut regs = self.regs.lock().unwrap();
+            let mut value = 0u64;
+            for i in 0..size {
+                let byte = regs.read_reg(offset + i as u16);
+                value |= (byte as u64) << (8 * i);
+            }
+            value
+        };
+        self.update_irq();
         value
     }
 
@@ -218,6 +241,21 @@ impl Ns16550 {
         }
         if n > 0 {
             self.emit_tx(&tx[..n]);
+        }
+        self.update_irq();
+    }
+
+    fn update_irq(&self) {
+        let asserted = self.gsi4_asserted();
+        let mut prev = self.irq_level.lock().unwrap();
+        if *prev == Some(asserted) {
+            return;
+        }
+        *prev = Some(asserted);
+        drop(prev);
+        let notify = self.irq_notify.lock().unwrap().clone();
+        if let Some(notify) = notify {
+            notify(asserted);
         }
     }
 
@@ -248,6 +286,7 @@ impl Ns16550 {
             let byte = if b == b'\r' { b'\n' } else { b };
             self.regs.lock().unwrap().push_rx(byte);
         }
+        self.update_irq();
         (self.hooks.on_kick)();
     }
 
@@ -362,7 +401,8 @@ fn inject_loop(uart: Arc<Ns16550>, path: PathBuf, active: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn uart() -> Ns16550 {
         Ns16550::new(None, ConsoleHooks::default()).unwrap()
@@ -434,5 +474,23 @@ mod tests {
         uart.push_host_bytes(&[0x1d]);
         assert!(shut.load(Ordering::Relaxed));
         assert_eq!(uart.read_port(5, 1) & 1, 0);
+    }
+
+    #[test]
+    fn gsi4_is_level_while_ier_and_rx() {
+        let uart = uart();
+        let line = Arc::new(AtomicBool::new(false));
+        let seen = line.clone();
+        uart.set_irq_notify(Arc::new(move |high| seen.store(high, Ordering::Relaxed)));
+        assert!(!uart.gsi4_asserted());
+        uart.push_host_bytes(b"Z");
+        assert!(!uart.gsi4_asserted());
+        assert!(!line.load(Ordering::Relaxed));
+        uart.write_port(1, 0x01, 1);
+        assert!(uart.gsi4_asserted());
+        assert!(line.load(Ordering::Relaxed));
+        assert_eq!(uart.read_port(0, 1), b'Z' as u64);
+        assert!(!uart.gsi4_asserted());
+        assert!(!line.load(Ordering::Relaxed));
     }
 }

@@ -1,7 +1,12 @@
 //! MMIO / port I/O buses and devices that do not call the hypervisor.
 
+pub mod debugcon;
 pub mod fw_cfg;
+pub mod ioapic;
+pub mod lapic;
 pub mod pflash;
+pub mod pic;
+pub mod pit;
 pub mod serial;
 pub mod virtio;
 

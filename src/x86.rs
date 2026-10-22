@@ -1,5 +1,7 @@
 //! Guest paging and CR shadow helper. No Hypervisor.framework calls.
 
+use crate::devices::ioapic::IOAPIC_MMIO;
+use crate::devices::lapic::LAPIC_MMIO;
 use crate::memory::GuestMemory;
 
 /// 64 MiB identity map at GPA 0, entered at [`PAYLOAD_GPA`].
@@ -88,7 +90,34 @@ pub fn install_identity_map(mem: &GuestMemory) -> Result<u64, String> {
             mem.write_u64(pt + (j as u64) * 8, gpa | PAGE_FLAGS)?;
         }
     }
+    // A not-present guest translation is #PF. EPT never sees the LAPIC or I/O APIC.
+    let mut extra = tables_end;
+    map_identity_page(mem, IOAPIC_MMIO, &mut extra)?;
+    map_identity_page(mem, LAPIC_MMIO, &mut extra)?;
+    if extra > PAYLOAD_GPA || extra > STACK_GPA || extra > ram {
+        return Err("MMIO page tables overlap the payload, stack, or end of RAM".into());
+    }
     Ok(PML4_GPA)
+}
+
+fn map_identity_page(mem: &GuestMemory, gpa: u64, extra: &mut u64) -> Result<(), String> {
+    if gpa & 0xfff != 0 {
+        return Err(format!("MMIO page {gpa:#x} is not 4 KiB aligned"));
+    }
+    let pdpt = ensure_table(mem, PDPT_GPA + ((gpa >> 30) & 0x1ff) * 8, extra)?;
+    let pt = ensure_table(mem, pdpt + ((gpa >> 21) & 0x1ff) * 8, extra)?;
+    mem.write_u64(pt + ((gpa >> 12) & 0x1ff) * 8, gpa | PAGE_FLAGS)
+}
+
+fn ensure_table(mem: &GuestMemory, entry_gpa: u64, extra: &mut u64) -> Result<u64, String> {
+    let entry = mem.read_u64(entry_gpa)?;
+    if entry & PTE_PRESENT != 0 {
+        return Ok(entry & 0x000f_ffff_ffff_f000);
+    }
+    let page = *extra;
+    *extra += 0x1000;
+    mem.write_u64(entry_gpa, page | TABLE_FLAGS)?;
+    Ok(page)
 }
 
 pub fn write_gdt_tss(mem: &GuestMemory) -> Result<(), String> {
@@ -195,6 +224,8 @@ mod tests {
         ] {
             assert_eq!(translate_4k(&mem, cr3, va).unwrap(), va);
         }
+        assert_eq!(translate_4k(&mem, cr3, IOAPIC_MMIO).unwrap(), IOAPIC_MMIO);
+        assert_eq!(translate_4k(&mem, cr3, LAPIC_MMIO).unwrap(), LAPIC_MMIO);
         assert!(translate_4k(&mem, cr3, GUEST_RAM_BYTES as u64).is_err());
         let leaf = mem.read_u64(PT_GPA).unwrap();
         assert_eq!(leaf & PAGE_FLAGS, PAGE_FLAGS);

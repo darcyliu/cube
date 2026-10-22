@@ -5,6 +5,7 @@
 compile_error!("vmm-intel builds only for x86_64-apple-darwin");
 
 mod hypervisor;
+mod machine;
 mod vcpu;
 mod vm;
 
@@ -22,13 +23,23 @@ fn main() {
             eprintln!("{message}");
             process::exit(1);
         }
-        Cli::Payload { path, serial_log } => {
-            let done = vm::run_payload(path, serial_log);
-            if let Some(ns) = done.exec_ns {
-                eprintln!("[VMM] vCPU exec time: {ns} ns");
+        Cli::Payload {
+            path,
+            serial_log,
+            cpus,
+        } => {
+            let dones = vm::run_payload(path, serial_log, cpus);
+            let mut failed = false;
+            for done in dones {
+                if let Some(ns) = done.exec_ns {
+                    eprintln!("[VMM] vCPU {} exec time: {ns} ns", done.index);
+                }
+                if let Some(error) = done.error {
+                    eprintln!("{error}");
+                    failed = true;
+                }
             }
-            if let Some(error) = done.error {
-                eprintln!("{error}");
+            if failed {
                 process::exit(1);
             }
         }
@@ -41,6 +52,7 @@ enum Cli {
     Payload {
         path: Option<PathBuf>,
         serial_log: Option<PathBuf>,
+        cpus: u32,
     },
 }
 
@@ -51,10 +63,27 @@ fn parse_args() -> Cli {
     }
     let mut payload: Option<Option<PathBuf>> = None;
     let mut serial_log = None;
+    let mut cpus = 1u32;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => return Cli::Help,
+            "--cpus" | "-c" => {
+                let Some(text) = args.get(i + 1) else {
+                    return Cli::Error("--cpus needs a count".into());
+                };
+                if text.starts_with('-') {
+                    return Cli::Error("--cpus needs a count".into());
+                }
+                let Ok(n) = text.parse::<u32>() else {
+                    return Cli::Error("--cpus needs a count".into());
+                };
+                if !(1..=16).contains(&n) {
+                    return Cli::Error("--cpus must be from 1 to 16".into());
+                }
+                cpus = n;
+                i += 1;
+            }
             "--payload" => {
                 let path = args
                     .get(i + 1)
@@ -80,7 +109,11 @@ fn parse_args() -> Cli {
         i += 1;
     }
     match payload {
-        Some(path) => Cli::Payload { path, serial_log },
+        Some(path) => Cli::Payload {
+            path,
+            serial_log,
+            cpus,
+        },
         None => Cli::Error("no boot path; pass --payload".into()),
     }
 }
@@ -94,7 +127,9 @@ This fork does not run on Apple Silicon and must not be merged back into the
 AArch64 VMM.
 
 Usage:
-  vmm --payload [PATH]   Long-mode guest. PATH defaults to the built-in COM1 banner.
+  vmm --payload [PATH] [--cpus N]
+                         Long-mode guest. PATH defaults to the built-in COM1 banner.
+                         --cpus / -c is 1..=16 (default 1). vCPU 0 is the BSP.
 
 With no arguments, vmm prints this help and exits 1."
     );
