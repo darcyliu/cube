@@ -172,7 +172,8 @@ impl VirtioPciTransport {
         let mut cfg = self.template;
         cfg[0x04..0x06].copy_from_slice(&self.command.to_le_bytes());
         let mut status = 0x0010u16;
-        if !self.electrical_high() {
+        // Interrupt Disable masks the pin only. Status bit 3 stays with the ISR.
+        if self.isr != 0 {
             status |= 1 << 3;
         }
         cfg[0x06..0x08].copy_from_slice(&status.to_le_bytes());

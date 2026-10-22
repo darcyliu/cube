@@ -86,8 +86,8 @@ impl PciHost {
     }
 
     /// First function is `00:02.0` (GSI 16). Later disks start at `00:04.0`
-    /// so `00:03.0` stays free for a net function. At most seven: GSI 23 is
-    /// the last I/O APIC pin.
+    /// so `00:03.0` stays free for net. Extra-disk GSIs start at 19: 17 is
+    /// net and 18 is 9p. At most six disks (GSI 23).
     pub fn add_block(&mut self, block: VirtioBlock) -> Result<(), String> {
         let index = self.blks.len();
         let (dev, gsi) = virtio_blk_bdf(index)?;
@@ -378,14 +378,14 @@ fn write_bytes(raw: &mut [u8], off: usize, data: u64, size: usize) {
 }
 
 fn virtio_blk_bdf(index: usize) -> Result<(u8, u32), String> {
-    // 00:03.0 / GSI 17 is reserved for virtio-net. Extra disks use 18+.
-    if index >= 7 {
+    // 00:03.0 / GSI 17 is virtio-net. GSI 18 is 9p. Extra disks are 19..=23.
+    if index >= 6 {
         return Err("too many virtio-blk devices".into());
     }
     if index == 0 {
         return Ok((2, 16));
     }
-    Ok((3 + index as u8, 17 + index as u32))
+    Ok((3 + index as u8, 18 + index as u32))
 }
 
 fn poke(reg: &mut u16, off: usize, byte: u8) {
@@ -442,9 +442,10 @@ mod tests {
     #[test]
     fn virtio_blk_bdfs_skip_the_net_slot() {
         assert_eq!(virtio_blk_bdf(0).unwrap(), (2, 16));
-        assert_eq!(virtio_blk_bdf(1).unwrap(), (4, 18));
-        assert_eq!(virtio_blk_bdf(2).unwrap(), (5, 19));
-        assert!(virtio_blk_bdf(7).is_err());
+        assert_eq!(virtio_blk_bdf(1).unwrap(), (4, 19));
+        assert_eq!(virtio_blk_bdf(2).unwrap(), (5, 20));
+        assert_eq!(virtio_blk_bdf(5).unwrap(), (8, 23));
+        assert!(virtio_blk_bdf(6).is_err());
     }
 
     #[test]
