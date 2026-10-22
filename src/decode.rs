@@ -9,6 +9,36 @@ pub struct RegOp {
     pub high_byte: bool,
 }
 
+impl RegOp {
+    /// AH/CH/DH/BH are the high bytes of RAX/RCX/RDX/RBX, not RSP/RBP/RSI/RDI.
+    pub fn gpr_index(self) -> u8 {
+        if self.high_byte {
+            self.index - 4
+        } else {
+            self.index
+        }
+    }
+}
+
+pub fn reg_bits(full: u64, reg: RegOp) -> u64 {
+    let value = if reg.high_byte { full >> 8 } else { full };
+    value & width_mask(reg.width)
+}
+
+pub fn merge_reg(old: u64, reg: RegOp, value: u64) -> u64 {
+    if reg.width == 4 {
+        value & 0xffff_ffff
+    } else if reg.width == 8 {
+        value
+    } else if reg.high_byte {
+        (old & !0xff00) | ((value & 0xff) << 8)
+    } else if reg.width == 1 {
+        (old & !0xff) | (value & 0xff)
+    } else {
+        (old & !0xffff) | (value & 0xffff)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreSrc {
     Reg(RegOp),
@@ -82,7 +112,7 @@ pub struct DecodedMmio {
     pub op: MmioOp,
 }
 
-pub fn decode_mmio(bytes: &[u8]) -> Result<DecodedMmio, String> {
+pub fn decode_mmio(bytes: &[u8], addr16: bool) -> Result<DecodedMmio, String> {
     let mut i = 0;
     let mut operand_16 = false;
     let mut addr_override = false;
@@ -117,6 +147,15 @@ pub fn decode_mmio(bytes: &[u8]) -> Result<DecodedMmio, String> {
     i += 1;
     let rex_w = rex & 0x8 != 0;
     let rex_r = rex & 0x4 != 0;
+
+    // 16-bit ModRM uses disp16 where this decoder reads an immediate. Reject it.
+    let string_op = matches!(
+        opcode,
+        0xA4 | 0xA5 | 0xA6 | 0xA7 | 0xAA | 0xAB | 0xAC | 0xAD | 0xAE | 0xAF
+    );
+    if addr16 && !addr_override && !string_op {
+        return Err("16-bit address size is not an MMIO operand".into());
+    }
 
     if opcode == 0x0F {
         if i >= bytes.len() {
@@ -561,7 +600,7 @@ mod tests {
     #[test]
     fn decodes_mov_eax_indirect() {
         // mov %eax, (%rdx)
-        let store = decode_mmio(&[0x89, 0x02]).unwrap();
+        let store = decode_mmio(&[0x89, 0x02], false).unwrap();
         assert_eq!(store.len, 2);
         assert_eq!(
             store.op,
@@ -574,7 +613,7 @@ mod tests {
             }
         );
         // mov (%rdx), %eax
-        let load = decode_mmio(&[0x8B, 0x02]).unwrap();
+        let load = decode_mmio(&[0x8B, 0x02], false).unwrap();
         assert_eq!(
             load.op,
             MmioOp::Load {
@@ -586,7 +625,7 @@ mod tests {
             }
         );
         // mov $imm32, (%rdx)
-        let imm = decode_mmio(&[0xC7, 0x02, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        let imm = decode_mmio(&[0xC7, 0x02, 0x78, 0x56, 0x34, 0x12], false).unwrap();
         assert_eq!(imm.len, 6);
         assert_eq!(
             imm.op,
@@ -602,7 +641,7 @@ mod tests {
     #[test]
     fn decodes_fv_header_compares_without_a_store() {
         // cmp byte [rdi+0x37], 2
-        let rev = decode_mmio(&[0x80, 0x7F, 0x37, 0x02]).unwrap();
+        let rev = decode_mmio(&[0x80, 0x7F, 0x37, 0x02], false).unwrap();
         assert_eq!(rev.len, 4);
         assert_eq!(
             rev.op,
@@ -615,7 +654,7 @@ mod tests {
             }
         );
         // cmp dword [rdi+0x28], '_FVH'
-        let sig = decode_mmio(&[0x81, 0x7F, 0x28, 0x5F, 0x46, 0x56, 0x48]).unwrap();
+        let sig = decode_mmio(&[0x81, 0x7F, 0x28, 0x5F, 0x46, 0x56, 0x48], false).unwrap();
         assert_eq!(sig.len, 7);
         assert_eq!(
             sig.op,
@@ -628,7 +667,7 @@ mod tests {
             }
         );
         // add dword [rdi], -1  (0x83 sign-extends)
-        let add = decode_mmio(&[0x83, 0x07, 0xFF]).unwrap();
+        let add = decode_mmio(&[0x83, 0x07, 0xFF], false).unwrap();
         assert_eq!(
             add.op,
             MmioOp::Alu {
@@ -640,7 +679,7 @@ mod tests {
             }
         );
         // movzx r13d, word [rdi+0x30]
-        let zx = decode_mmio(&[0x44, 0x0F, 0xB7, 0x6F, 0x30]).unwrap();
+        let zx = decode_mmio(&[0x44, 0x0F, 0xB7, 0x6F, 0x30], false).unwrap();
         assert_eq!(zx.len, 5);
         assert_eq!(
             zx.op,
@@ -683,7 +722,7 @@ mod tests {
 
     #[test]
     fn decodes_rep_movsq_and_steps_the_index() {
-        let op = decode_mmio(&[0xF3, 0x48, 0xA5]).unwrap();
+        let op = decode_mmio(&[0xF3, 0x48, 0xA5], false).unwrap();
         assert_eq!(op.len, 3);
         assert_eq!(
             op.op,
@@ -699,5 +738,47 @@ mod tests {
         assert_eq!(string_step(0, 8, false, u64::MAX), 8);
         assert_eq!(string_step(8, 8, true, u64::MAX), 0);
         assert_eq!(string_step(0, 8, true, u64::MAX), 0u64.wrapping_sub(8));
+    }
+
+    #[test]
+    fn ah_is_the_high_byte_of_rax() {
+        // mov ah, [rdi]
+        let load = decode_mmio(&[0x8A, 0x27], false).unwrap();
+        let MmioOp::Load { dest } = load.op else {
+            panic!("load");
+        };
+        assert!(dest.high_byte);
+        assert_eq!(dest.index, 4);
+        assert_eq!(dest.gpr_index(), 0);
+        let merged = merge_reg(0x1111_2222_3333_4455, dest, 0xAB);
+        assert_eq!(merged, 0x1111_2222_3333_AB55);
+        assert_eq!(reg_bits(merged, dest), 0xAB);
+        // mov [rdi], ah
+        let store = decode_mmio(&[0x88, 0x27], false).unwrap();
+        let MmioOp::Store {
+            src: StoreSrc::Reg(reg),
+        } = store.op
+        else {
+            panic!("store");
+        };
+        assert!(reg.high_byte);
+        assert_eq!(reg.gpr_index(), 0);
+        assert_eq!(reg_bits(0xAB00, reg), 0xAB);
+    }
+
+    #[test]
+    fn sixteen_bit_address_does_not_store_the_displacement() {
+        // mov byte [disp16], imm8. The imm is 0xAB, not the disp low byte.
+        assert!(decode_mmio(&[0xC6, 0x06, 0x34, 0x12, 0xAB], true).is_err());
+        let wide = decode_mmio(&[0x67, 0xC6, 0x06, 0xAB], true).unwrap();
+        assert_eq!(
+            wide.op,
+            MmioOp::Store {
+                src: StoreSrc::Imm {
+                    value: 0xAB,
+                    width: 1,
+                },
+            }
+        );
     }
 }

@@ -1207,13 +1207,14 @@ fn handle_ept(
         }
         return Ok(());
     }
-    // HVF installs a new mapping on the first fault. A later write to code is ROM.
+    // HVF installs a new mapping on the first fault. A write into code is ROM,
+    // but a read-modify-write still has to update flags and registers.
     if machine.space.code_window_contains(gpa, 1) {
+        if qual & 2 != 0 {
+            return emulate_mmio(id, machine, cpu, gpa);
+        }
         let rip = read_reg(id, HV_X86_RIP)?;
         if *ept_retry == Some((gpa, rip)) {
-            if qual & 2 != 0 {
-                return advance_rip(id);
-            }
             return Err(format!("code flash fault at {gpa:#x} qual={qual:#x}"));
         }
         *ept_retry = Some((gpa, rip));
@@ -1228,7 +1229,8 @@ fn handle_ept(
 
 fn emulate_mmio(id: hv_vcpuid_t, machine: &Machine, cpu: usize, gpa: u64) -> Result<(), String> {
     let bytes = fetch_insn(id, &machine.space)?;
-    let decoded = decode::decode_mmio(&bytes).map_err(|e| {
+    let addr16 = address_bits(id, false)? == 16;
+    let decoded = decode::decode_mmio(&bytes, addr16).map_err(|e| {
         format!(
             "MMIO at {gpa:#x} bytes {}: {e}; {}",
             hex_bytes(&bytes),
@@ -1246,7 +1248,7 @@ fn emulate_mmio(id: hv_vcpuid_t, machine: &Machine, cpu: usize, gpa: u64) -> Res
             if !machine.firmware && dest.width != 4 {
                 return Err(format!("MMIO read width {} at {gpa:#x}", dest.width));
             }
-            let value = machine.mmio_read(cpu, gpa, dest.width as usize)?;
+            let value = guest_read(machine, cpu, gpa, dest.width as usize)?;
             write_partial(id, dest, value)?;
         }
         MmioOp::Store { src } => {
@@ -1264,7 +1266,7 @@ fn emulate_mmio(id: hv_vcpuid_t, machine: &Machine, cpu: usize, gpa: u64) -> Res
                     (value, width)
                 }
             };
-            machine.mmio_write(cpu, gpa, value, width as usize)?;
+            guest_write(machine, cpu, gpa, value, width as usize)?;
         }
         MmioOp::Alu {
             digit,
@@ -1282,14 +1284,14 @@ fn emulate_mmio(id: hv_vcpuid_t, machine: &Machine, cpu: usize, gpa: u64) -> Res
                     return Err("ALU immediate has no register destination".into());
                 };
                 let left = read_partial(id, reg)?;
-                let right = machine.mmio_read(cpu, gpa, width as usize)?;
+                let right = guest_read(machine, cpu, gpa, width as usize)?;
                 let (result, new_flags) = decode::apply_alu(digit, width, left, right, flags);
                 if write {
                     write_partial(id, reg, result)?;
                 }
                 new_flags
             } else {
-                let left = machine.mmio_read(cpu, gpa, width as usize)?;
+                let left = guest_read(machine, cpu, gpa, width as usize)?;
                 let right = match rhs {
                     AluRhs::Imm(value) => value,
                     AluRhs::Reg(reg) => read_partial(id, reg)?,
@@ -1297,7 +1299,7 @@ fn emulate_mmio(id: hv_vcpuid_t, machine: &Machine, cpu: usize, gpa: u64) -> Res
                 let (result, new_flags) = decode::apply_alu(digit, width, left, right, flags);
                 // CMP and TEST must not write the firmware volume.
                 if write {
-                    machine.mmio_write(cpu, gpa, result, width as usize)?;
+                    guest_write(machine, cpu, gpa, result, width as usize)?;
                 }
                 new_flags
             };
@@ -1312,7 +1314,7 @@ fn emulate_mmio(id: hv_vcpuid_t, machine: &Machine, cpu: usize, gpa: u64) -> Res
             if !machine.firmware && src_width != 4 {
                 return Err(format!("MMIO extend width {src_width} at {gpa:#x}"));
             }
-            let value = machine.mmio_read(cpu, gpa, src_width as usize)?;
+            let value = guest_read(machine, cpu, gpa, src_width as usize)?;
             let extended = decode::extend_bits(value, src_width, dest.width, sign);
             write_partial(id, dest, extended)?;
         }
@@ -1515,27 +1517,41 @@ fn write_phys(
     machine.mmio_write(cpu, gpa, value, size)
 }
 
+fn guest_read(machine: &Machine, cpu: usize, gpa: u64, size: usize) -> Result<u64, String> {
+    if machine.space.code_window_contains(gpa, size) {
+        let mut buf = [0u8; 8];
+        machine.space.read_gpa(gpa, &mut buf[..size])?;
+        let mut value = 0u64;
+        for (i, byte) in buf[..size].iter().enumerate() {
+            value |= u64::from(*byte) << (8 * i);
+        }
+        return Ok(value);
+    }
+    machine.mmio_read(cpu, gpa, size)
+}
+
+fn guest_write(
+    machine: &Machine,
+    cpu: usize,
+    gpa: u64,
+    value: u64,
+    size: usize,
+) -> Result<(), String> {
+    if machine.space.code_window_contains(gpa, size) {
+        return Ok(());
+    }
+    machine.mmio_write(cpu, gpa, value, size)
+}
+
 fn read_partial(id: hv_vcpuid_t, reg: RegOp) -> Result<u64, String> {
-    let full = read_reg(id, hv_gpr(reg.index)?)?;
-    let value = if reg.high_byte { full >> 8 } else { full };
-    Ok(value & width_mask(reg.width))
+    let full = read_reg(id, hv_gpr(reg.gpr_index())?)?;
+    Ok(decode::reg_bits(full, reg))
 }
 
 fn write_partial(id: hv_vcpuid_t, reg: RegOp, value: u64) -> Result<(), String> {
-    let gpr = hv_gpr(reg.index)?;
+    let gpr = hv_gpr(reg.gpr_index())?;
     let old = read_reg(id, gpr)?;
-    let new = if reg.width == 4 {
-        value & 0xffff_ffff
-    } else if reg.width == 8 {
-        value
-    } else if reg.high_byte {
-        (old & !0xff00) | ((value & 0xff) << 8)
-    } else if reg.width == 1 {
-        (old & !0xff) | (value & 0xff)
-    } else {
-        (old & !0xffff) | (value & 0xffff)
-    };
-    wreg(id, gpr, new)
+    wreg(id, gpr, decode::merge_reg(old, reg, value))
 }
 
 fn width_mask(width: u8) -> u64 {
@@ -1665,53 +1681,31 @@ fn handle_string_io(
     qual: u64,
     size: usize,
 ) -> Result<(), String> {
-    let bytes = fetch_insn(id, &machine.space)?;
-    let mut addr_override = false;
-    let mut rep = false;
-    let mut seg_base_field = VMCS_GUEST_DS_BASE;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            0x67 => addr_override = true,
-            0xF2 | 0xF3 => rep = true,
-            0x26 => seg_base_field = VMCS_GUEST_ES_BASE,
-            0x2E => seg_base_field = VMCS_GUEST_CS_BASE,
-            0x36 => seg_base_field = VMCS_GUEST_SS_BASE,
-            0x3E => seg_base_field = VMCS_GUEST_DS_BASE,
-            0x64 => seg_base_field = VMCS_GUEST_FS_BASE,
-            0x65 => seg_base_field = VMCS_GUEST_GS_BASE,
-            0x66 | 0xF0 | 0x40..=0x4F => {}
-            _ => break,
-        }
-        i += 1;
-    }
     let is_in = qual & (1 << 3) != 0;
-    if is_in {
-        seg_base_field = VMCS_GUEST_ES_BASE;
-    }
-    let addr_bits = address_bits(id, addr_override)?;
+    let rep = qual & (1 << 5) != 0;
+    let addr_bits = address_bits(id, false)?;
     let mask = match addr_bits {
         16 => 0xffff,
         32 => 0xffff_ffff,
         _ => u64::MAX,
     };
     let index_reg = if is_in { HV_X86_RDI } else { HV_X86_RSI };
-    let mut count = if rep {
-        read_reg(id, HV_X86_RCX)? & mask
-    } else {
-        1
-    };
+    let mut rcx = read_reg(id, HV_X86_RCX)?;
+    let mut count = if rep { rcx & mask } else { 1 };
     if count > (1 << 20) {
         return Err(format!("string I/O count {count:#x} at {}", dump_guest(id)));
     }
     let df = read_reg(id, HV_X86_RFLAGS)? & (1 << 10) != 0;
-    let step = if df {
-        0u64.wrapping_sub(size as u64)
-    } else {
-        size as u64
-    };
+    // INS is ES:RDI. OUTS is DS:RSI.
+    let seg_base = read_vmcs(
+        id,
+        if is_in {
+            VMCS_GUEST_ES_BASE
+        } else {
+            VMCS_GUEST_DS_BASE
+        },
+    )?;
     let port = ((qual >> 16) & 0xffff) as u16;
-    let seg_base = read_vmcs(id, seg_base_field)?;
     let mut index = read_reg(id, index_reg)?;
     while count > 0 {
         let linear = seg_base.wrapping_add(index & mask);
@@ -1722,16 +1716,16 @@ fn handle_string_io(
             let value = read_guest_bytes(id, &machine.space, linear, size)?;
             machine.pio_write(port, value, size)?;
         }
-        let new_low = (index & mask).wrapping_add(step) & mask;
-        index = (index & !mask) | new_low;
+        index = decode::string_step(index, size as u8, df, mask);
         if rep {
-            let rcx = read_reg(id, HV_X86_RCX)?;
-            let new_rcx = (rcx & !mask) | ((rcx.wrapping_sub(1)) & mask);
-            wreg(id, HV_X86_RCX, new_rcx)?;
+            rcx = (rcx & !mask) | (rcx.wrapping_sub(1) & mask);
         }
         count -= 1;
     }
     wreg(id, index_reg, index)?;
+    if rep {
+        wreg(id, HV_X86_RCX, rcx)?;
+    }
     advance_rip(id)
 }
 
@@ -2106,4 +2100,47 @@ struct MachTimebaseInfo {
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    use vmm::devices::lapic::Lapic;
+    use vmm::devices::{MmioBus, PioBus};
+    use vmm::gpa::GuestSpace;
+    use vmm::memory::GuestMemory;
+
+    use super::Kick;
+    use crate::machine::Machine;
+
+    #[test]
+    fn cf9_wakes_ap_waiting_for_sipi() {
+        let ram = Arc::new(GuestMemory::allocate(0, 4096).unwrap());
+        let ap = Arc::new(Kick::ap());
+        let machine = Machine::new(
+            GuestSpace::new(ram, None),
+            PioBus::new(),
+            MmioBus::new(),
+            Some(vmm::devices::pci::PciHost::new()),
+            None,
+            true,
+            vec![Mutex::new(Lapic::new(0)), Mutex::new(Lapic::new(1))],
+            vec![Arc::new(Kick::bsp()), Arc::clone(&ap)],
+        );
+        let parked = Arc::clone(&ap);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(parked.wait_for_sipi());
+        });
+        thread::sleep(Duration::from_millis(50));
+        machine.pio_write(0xCF9, 0x06, 1).unwrap();
+        let stopped = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("AP still in wait_for_sipi");
+        assert_eq!(stopped, None);
+        assert!(vmm::terminal::reboot_requested());
+    }
 }

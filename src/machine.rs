@@ -96,6 +96,7 @@ impl Machine {
                 if self.i8042.as_ref().is_some_and(|kbd| kbd.take_reboot()) {
                     host_log(format_args!("[VMM] 8042 reset"));
                     vmm::terminal::request_reboot();
+                    self.stop_cpus();
                 }
                 Ok(())
             }
@@ -112,11 +113,12 @@ impl Machine {
             PciAction::None => {}
             PciAction::Shutdown => {
                 host_log(format_args!("[VMM] PM1 shutdown"));
-                vmm::terminal::request_shutdown();
+                self.stop_cpus();
             }
             PciAction::Reboot => {
                 host_log(format_args!("[VMM] port 0xCF9 reset"));
                 vmm::terminal::request_reboot();
+                self.stop_cpus();
             }
         }
     }
