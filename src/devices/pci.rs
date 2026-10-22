@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use super::virtio::block::VirtioBlock;
-use super::virtio::net::{NetIrqHook, VirtioNet};
+use super::virtio::net::{NetIrqHook, TxSubmit, VirtioNet};
 use super::virtio::transport::{NET_BAR, PCI_HOLE_START, VIRTIO_BAR_SIZE, VirtioPciTransport};
 
 pub use super::virtio::transport::PciIrq;
@@ -57,6 +57,7 @@ pub struct PciHost {
     blks: Vec<VirtioPciTransport>,
     net: Option<VirtioPciTransport>,
     pending_irqs: Vec<PciIrq>,
+    pending_tx: Option<TxSubmit>,
 }
 
 impl PciHost {
@@ -86,6 +87,7 @@ impl PciHost {
             blks: Vec::new(),
             net: None,
             pending_irqs: Vec::new(),
+            pending_tx: None,
         }
     }
 
@@ -156,6 +158,11 @@ impl PciHost {
         std::mem::take(&mut self.pending_irqs)
     }
 
+    /// TX frames collected under this lock. The caller sends them after dropping it.
+    pub(crate) fn take_tx(&mut self) -> Option<TxSubmit> {
+        self.pending_tx.take()
+    }
+
     pub fn mmio_read(&mut self, gpa: u64, size: usize) -> Option<u64> {
         let (hit, offset) = self.bar_hit(gpa, size)?;
         let (value, irqs) = match hit {
@@ -170,11 +177,12 @@ impl PciHost {
         let Some((hit, offset)) = self.bar_hit(gpa, size) else {
             return false;
         };
-        let irqs = match hit {
+        let (irqs, tx) = match hit {
             Hit::Blk(index) => self.blks[index].bar_write(offset, data, size),
             Hit::Net => self.net.as_mut().unwrap().bar_write(offset, data, size),
         };
         self.pending_irqs.extend(irqs);
+        self.pending_tx = tx;
         true
     }
 
@@ -762,6 +770,9 @@ mod tests {
         let _ = pci.take_intx();
 
         assert!(pci.mmio_write(bar + 0x1000, 1, 2));
+        if let Some(tx) = pci.take_tx() {
+            tx.send();
+        }
         assert_eq!(
             sent.lock().unwrap().as_slice(),
             &[&[0x11, 0x22, 0x33, 0x44][..]]

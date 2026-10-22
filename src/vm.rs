@@ -404,6 +404,7 @@ fn boot_cpus(
                 for handle in handles {
                     let _ = handle.join();
                 }
+                machine.join_net_worker();
                 return Err(format!("spawn vCPU thread: {e}"));
             }
         }
@@ -424,6 +425,9 @@ fn boot_cpus(
         }
     }
     console.stop();
+    // Join while this Arc is still held, so Machine::drop cannot run on the
+    // RX thread that the hook upgrades.
+    machine.join_net_worker();
     Ok(dones)
 }
 

@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 
 use super::VirtQueue;
 use super::block::VirtioBlock;
-use super::net::{NetIrqHook, VirtioNet};
+use super::net::{NetIrqHook, TxSubmit, VirtioNet};
 
 /// Electrical level of an INTx pin. PCI INTx is active-low, so `high == false`
 /// is the asserted state the I/O APIC delivers when the pin is programmed low.
@@ -101,15 +101,10 @@ impl Dev {
         }
     }
 
-    fn poke_queue_size(&mut self, sel: u16, byte_off: usize, byte: u8) {
+    fn update_queue(&mut self, sel: u16, update: impl FnOnce(&mut VirtQueue)) {
         match self {
-            Dev::Block(dev) if sel == 0 => {
-                let mut raw = (dev.queue.size as u16).to_le_bytes();
-                raw[byte_off] = byte;
-                let size = u32::from(u16::from_le_bytes(raw));
-                dev.queue.size = size.min(dev.queue.max_size);
-            }
-            Dev::Net(dev) => dev.poke_queue_size(sel, byte_off, byte),
+            Dev::Block(dev) if sel == 0 => update(&mut dev.queue),
+            Dev::Net(dev) => dev.update_queue(sel, update),
             _ => {}
         }
     }
@@ -123,40 +118,15 @@ impl Dev {
         }
     }
 
-    fn poke_queue_desc(&mut self, sel: u16, byte_off: usize, byte: u8) {
-        self.poke_queue_addr(sel, byte_off, byte, Addr::Desc);
-    }
-
-    fn poke_queue_avail(&mut self, sel: u16, byte_off: usize, byte: u8) {
-        self.poke_queue_addr(sel, byte_off, byte, Addr::Avail);
-    }
-
-    fn poke_queue_used(&mut self, sel: u16, byte_off: usize, byte: u8) {
-        self.poke_queue_addr(sel, byte_off, byte, Addr::Used);
-    }
-
-    fn poke_queue_addr(&mut self, sel: u16, byte_off: usize, byte: u8, which: Addr) {
-        match self {
-            Dev::Block(dev) if sel == 0 => {
-                let slot = match which {
-                    Addr::Desc => &mut dev.queue.desc_table,
-                    Addr::Avail => &mut dev.queue.avail_ring,
-                    Addr::Used => &mut dev.queue.used_ring,
-                };
-                poke_u64(slot, byte_off, byte);
-            }
-            Dev::Net(dev) => match which {
-                Addr::Desc => dev.poke_queue_desc(sel, byte_off, byte),
-                Addr::Avail => dev.poke_queue_avail(sel, byte_off, byte),
-                Addr::Used => dev.poke_queue_used(sel, byte_off, byte),
-            },
-            _ => {}
+    fn set_bus_master(&self, enabled: bool) {
+        if let Dev::Net(dev) = self {
+            dev.set_bus_master(enabled);
         }
     }
 
-    fn notify(&mut self, queue: u16) -> bool {
+    fn notify(&mut self, queue: u16) -> (bool, Option<TxSubmit>) {
         match self {
-            Dev::Block(dev) => queue == 0 && dev.process_queue(),
+            Dev::Block(dev) => (queue == 0 && dev.process_queue(), None),
             Dev::Net(dev) => dev.notify(queue),
         }
     }
@@ -167,13 +137,6 @@ impl Dev {
             Dev::Net(dev) => dev.take_irq_pending(),
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum Addr {
-    Desc,
-    Avail,
-    Used,
 }
 
 pub(crate) struct VirtioPciTransport {
@@ -286,6 +249,9 @@ impl VirtioPciTransport {
                 _ => {}
             }
         }
+        // Publish before any later queue walk. The RX thread reads this
+        // without taking PciHost.
+        self.publish_bus_master();
         self.irq_delta(before)
     }
 
@@ -305,14 +271,27 @@ impl VirtioPciTransport {
         (value, self.irq_delta(before))
     }
 
-    pub(crate) fn bar_write(&mut self, offset: u64, data: u64, size: usize) -> Vec<PciIrq> {
+    pub(crate) fn bar_write(
+        &mut self,
+        offset: u64,
+        data: u64,
+        size: usize,
+    ) -> (Vec<PciIrq>, Option<TxSubmit>) {
+        // Ready and notify both lock the queue. The bus-master flag has to
+        // move first so the RX thread observes the new command bit.
+        self.publish_bus_master();
         let before = self.electrical_high();
+        let mut tx = None;
         if fits(offset, size, 0, COMMON_LEN) {
             self.write_common(offset as usize, data, size);
         } else if offset == NOTIFY_OFF && matches!(size, 1 | 2 | 4) {
             // Bus-master clear: drop the notify and do not touch guest memory.
-            if self.command & CMD_MASTER != 0 && self.dev.notify(data as u16) {
-                self.isr |= 1;
+            if self.command & CMD_MASTER != 0 {
+                let (raise, batch) = self.dev.notify(data as u16);
+                if raise {
+                    self.isr |= 1;
+                }
+                tx = batch;
             }
         }
         // QUEUE_READY can publish RX buffers without a notify. Fold that into
@@ -321,7 +300,11 @@ impl VirtioPciTransport {
         if self.dev.take_irq_pending() {
             self.isr |= 1;
         }
-        self.irq_delta(before)
+        (self.irq_delta(before), tx)
+    }
+
+    fn publish_bus_master(&self) {
+        self.dev.set_bus_master(self.command & CMD_MASTER != 0);
     }
 
     pub(crate) fn set_irq_hook(&self, hook: NetIrqHook) {
@@ -449,19 +432,33 @@ impl VirtioPciTransport {
                 .poke_driver_feature(self.drv_feat_sel, offset - 0x0c, byte),
             0x14 => self.set_status_byte(byte),
             0x16..=0x17 => poke_u16(&mut self.queue_sel, offset - 0x16, byte),
-            0x18..=0x19 => self
-                .dev
-                .poke_queue_size(self.queue_sel, offset - 0x18, byte),
+            0x18..=0x19 => {
+                let sel = self.queue_sel;
+                self.dev.update_queue(sel, |queue| {
+                    let mut size = queue.size as u16;
+                    poke_u16(&mut size, offset - 0x18, byte);
+                    queue.size = u32::from(size).min(queue.max_size);
+                });
+            }
             0x1c => self.dev.set_ready_low(self.queue_sel, byte),
-            0x20..=0x27 => self
-                .dev
-                .poke_queue_desc(self.queue_sel, offset - 0x20, byte),
-            0x28..=0x2f => self
-                .dev
-                .poke_queue_avail(self.queue_sel, offset - 0x28, byte),
-            0x30..=0x37 => self
-                .dev
-                .poke_queue_used(self.queue_sel, offset - 0x30, byte),
+            0x20..=0x27 => {
+                let sel = self.queue_sel;
+                self.dev.update_queue(sel, |queue| {
+                    poke_u64(&mut queue.desc_table, offset - 0x20, byte);
+                });
+            }
+            0x28..=0x2f => {
+                let sel = self.queue_sel;
+                self.dev.update_queue(sel, |queue| {
+                    poke_u64(&mut queue.avail_ring, offset - 0x28, byte);
+                });
+            }
+            0x30..=0x37 => {
+                let sel = self.queue_sel;
+                self.dev.update_queue(sel, |queue| {
+                    poke_u64(&mut queue.used_ring, offset - 0x30, byte);
+                });
+            }
             _ => {}
         }
     }

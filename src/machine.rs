@@ -1,6 +1,7 @@
 //! Shared devices for every vCPU. Hypervisor calls stay in `vcpu`.
 
 use std::sync::{Arc, Mutex, Weak};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use vmm::devices::i8042::I8042;
@@ -164,6 +165,21 @@ impl Machine {
         self.kick_net_irq();
     }
 
+    /// Stop the RX thread while this `Arc` is still alive. `Drop` cannot do
+    /// that when the hook's upgrade is the last owner: that runs on the RX
+    /// thread and `JoinHandle::join` would wait for itself.
+    pub fn join_net_worker(&self) {
+        let worker = self.take_net_worker();
+        join_foreign_worker(worker);
+    }
+
+    fn take_net_worker(&self) -> Option<JoinHandle<()>> {
+        // Release PciHost before the caller joins. The hook locks it.
+        self.pci
+            .as_ref()
+            .and_then(|pci| pci.lock().unwrap().take_net_worker())
+    }
+
     fn kick_net_irq(&self) {
         let Some(pci) = &self.pci else {
             return;
@@ -319,12 +335,18 @@ impl Machine {
         let Some(pci) = self.pci.as_ref() else {
             return false;
         };
-        let mut pci = pci.lock().unwrap();
-        if !pci.mmio_write(gpa, value, size) {
-            return false;
+        let (irqs, tx) = {
+            let mut pci = pci.lock().unwrap();
+            if !pci.mmio_write(gpa, value, size) {
+                return false;
+            }
+            (pci.take_intx(), pci.take_tx())
+        };
+        // vmnet_write runs after PciHost is released so blk, config, and the
+        // RX hook are not stuck behind one TX notify.
+        if let Some(tx) = tx {
+            tx.send();
         }
-        let irqs = pci.take_intx();
-        drop(pci);
         self.deliver_intx(irqs);
         true
     }
@@ -403,14 +425,18 @@ impl Machine {
 
 impl Drop for Machine {
     fn drop(&mut self) {
-        // The RX hook locks PciHost. Take the thread, drop that lock, then join.
-        let worker = self
-            .pci
-            .as_ref()
-            .and_then(|pci| pci.lock().unwrap().take_net_worker());
-        if let Some(worker) = worker {
-            let _ = worker.join();
-        }
+        // boot_cpus joins first. If the hook's Arc is the last owner, Drop
+        // runs on the RX thread and joining it deadlocks.
+        let worker = self.take_net_worker();
+        join_foreign_worker(worker);
+    }
+}
+
+fn join_foreign_worker(worker: Option<JoinHandle<()>>) {
+    if let Some(worker) = worker
+        && worker.thread().id() != std::thread::current().id()
+    {
+        let _ = worker.join();
     }
 }
 

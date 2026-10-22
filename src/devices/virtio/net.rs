@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -66,8 +66,6 @@ struct NetDebugStats {
     rx_drop: AtomicU64,
     rx_nomem: AtomicU64,
     irq_raise: AtomicU64,
-    irq_ack: AtomicU64,
-    irq_defer: AtomicU64,
     tx_notify: AtomicU64,
     vmnet_err: AtomicU64,
     sock_drop: AtomicU64,
@@ -81,8 +79,6 @@ static NET_STATS: NetDebugStats = NetDebugStats {
     rx_drop: AtomicU64::new(0),
     rx_nomem: AtomicU64::new(0),
     irq_raise: AtomicU64::new(0),
-    irq_ack: AtomicU64::new(0),
-    irq_defer: AtomicU64::new(0),
     tx_notify: AtomicU64::new(0),
     vmnet_err: AtomicU64::new(0),
     sock_drop: AtomicU64::new(0),
@@ -117,7 +113,7 @@ fn write_net_stats(inner: &VirtioNetInner) {
         .read_u16(inner.tx_queue.used_ring.saturating_add(2))
         .unwrap_or(0);
     net_log(&format!(
-        "tx_pkts={} tx_bytes={} rx_pkts={} rx_bytes={} rx_drop={} rx_nomem={} irq_raise={} irq_ack={} irq_defer={} tx_notify={} vmnet_err={} sock_drop={} backlog={} irq_pending={} rx_last={} rx_avail={} rx_used={} tx_last={} tx_avail={} tx_used={} rx_ready={} tx_ready={}",
+        "tx_pkts={} tx_bytes={} rx_pkts={} rx_bytes={} rx_drop={} rx_nomem={} irq_raise={} tx_notify={} vmnet_err={} sock_drop={} backlog={} irq_pending={} rx_last={} rx_avail={} rx_used={} tx_last={} tx_avail={} tx_used={} rx_ready={} tx_ready={}",
         NET_STATS.tx_pkts.load(Ordering::Relaxed),
         NET_STATS.tx_bytes.load(Ordering::Relaxed),
         NET_STATS.rx_pkts.load(Ordering::Relaxed),
@@ -125,8 +121,6 @@ fn write_net_stats(inner: &VirtioNetInner) {
         NET_STATS.rx_drop.load(Ordering::Relaxed),
         NET_STATS.rx_nomem.load(Ordering::Relaxed),
         NET_STATS.irq_raise.load(Ordering::Relaxed),
-        NET_STATS.irq_ack.load(Ordering::Relaxed),
-        NET_STATS.irq_defer.load(Ordering::Relaxed),
         NET_STATS.tx_notify.load(Ordering::Relaxed),
         NET_STATS.vmnet_err.load(Ordering::Relaxed),
         NET_STATS.sock_drop.load(Ordering::Relaxed),
@@ -273,6 +267,33 @@ static VMNET_COMPLETION_BLOCK: BlockLiteral = BlockLiteral {
     flags: (1 << 29) | (1 << 28), // BLOCK_IS_GLOBAL
     reserved: 0,
     invoke: vmnet_completion_invoke,
+    descriptor: &BLOCK_DESCRIPTOR,
+};
+
+/// Write end of the in-process RX wake pipe. Not `vmnet_sys::EVENT_PIPE`:
+/// that one belongs to the vmnet service process.
+static VMNET_RX_EVENT_FD: AtomicI32 = AtomicI32::new(-1);
+
+unsafe extern "C" fn vmnet_rx_event_invoke(
+    _block: *mut BlockLiteral,
+    _event: u32,
+    _info: *mut c_void,
+) {
+    let fd = VMNET_RX_EVENT_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let byte = [1u8];
+    unsafe {
+        let _ = libc::write(fd, byte.as_ptr() as *const c_void, 1);
+    }
+}
+
+static VMNET_RX_EVENT_BLOCK: BlockLiteral = BlockLiteral {
+    isa: unsafe { _NSConcreteGlobalBlock.as_ptr() as *const c_void },
+    flags: (1 << 29) | (1 << 28),
+    reserved: 0,
+    invoke: vmnet_rx_event_invoke,
     descriptor: &BLOCK_DESCRIPTOR,
 };
 
@@ -833,6 +854,8 @@ pub struct VirtioNetInner {
     backend: Arc<Mutex<Box<dyn NetBackend>>>,
     rx_backlog: VecDeque<Vec<u8>>,
     irq_gate: Arc<IrqGate>,
+    /// PCI command bit 2. The transport stores this before it locks the queue.
+    bus_master: Arc<AtomicBool>,
 }
 
 fn fresh_queue() -> VirtQueue {
@@ -860,6 +883,7 @@ impl VirtioNetInner {
             backend: Arc::new(Mutex::new(backend)),
             rx_backlog: VecDeque::new(),
             irq_gate,
+            bus_master: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -922,28 +946,16 @@ impl VirtioNetInner {
         value
     }
 
-    fn poke_size(&mut self, sel: u16, byte_off: usize, byte: u8) {
-        let Some(queue) = self.queue_mut(sel) else {
-            return;
-        };
-        let mut raw = (queue.size as u16).to_le_bytes();
-        raw[byte_off] = byte;
-        let size = u32::from(u16::from_le_bytes(raw));
-        queue.size = size.min(queue.max_size);
+    fn dma_allowed(&self) -> bool {
+        self.bus_master.load(Ordering::Acquire)
     }
 
-    fn poke_addr(&mut self, sel: u16, byte_off: usize, byte: u8, which: u8) {
-        let Some(queue) = self.queue_mut(sel) else {
-            return;
-        };
-        let slot = match which {
-            0 => &mut queue.desc_table,
-            1 => &mut queue.avail_ring,
-            _ => &mut queue.used_ring,
-        };
-        let mut raw = slot.to_le_bytes();
-        raw[byte_off] = byte;
-        *slot = u64::from_le_bytes(raw);
+    fn push_backlog(&mut self, packet: &[u8]) {
+        if self.rx_backlog.len() < 64 {
+            self.rx_backlog.push_back(packet.to_vec());
+        } else {
+            NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn notify_used(&mut self, avail_ring: u64) {
@@ -958,28 +970,28 @@ impl VirtioNetInner {
 
     /// Receives an Ethernet frame from the network backend and delivers it into the guest RX queue.
     pub fn receive_packet(&mut self, packet: &[u8]) {
+        // Bus master clear: keep the frame on the host. Do not write guest RAM.
+        if !self.dma_allowed() {
+            self.push_backlog(packet);
+            return;
+        }
         self.drain_rx_backlog();
 
         if !self.rx_queue.ready || self.rx_queue.avail_ring == 0 || self.rx_queue.desc_table == 0 {
-            if self.rx_backlog.len() < 64 {
-                self.rx_backlog.push_back(packet.to_vec());
-            } else {
-                NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
-            }
+            self.push_backlog(packet);
             return;
         }
 
         if !self.rx_backlog.is_empty() || !self.deliver_to_rx_queue(packet) {
-            // Buffer in backlog if queue was full or prior backlog exists (preserve in-order delivery)
-            if self.rx_backlog.len() < 64 {
-                self.rx_backlog.push_back(packet.to_vec());
-            } else {
-                NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
-            }
+            // Queue was full, or an older frame is still waiting. Keep order.
+            self.push_backlog(packet);
         }
     }
 
     fn deliver_to_rx_queue(&mut self, packet: &[u8]) -> bool {
+        if !self.dma_allowed() {
+            return false;
+        }
         let q_size = self.rx_queue.size;
         if q_size == 0 {
             return false;
@@ -1001,25 +1013,32 @@ impl VirtioNetInner {
             + 4
             + 2 * (self.rx_queue.last_avail_idx as u64 % q_size as u64);
         let head_desc = self.mem.read_u16(ring_elem_offset).unwrap();
-        let buffers = match self
+        let chain = match self
             .rx_queue
             .descriptors(&self.mem, head_desc, false, 65536)
         {
-            Ok(d)
-                if d.iter().all(|d| d.flags & VRING_DESC_F_WRITE != 0)
-                    && d.iter().map(|d| d.len as usize).sum::<usize>()
-                        >= VIRTIO_NET_HDR_SIZE + packet.len() =>
-            {
-                d
-            }
-            _ => {
+            Ok(d) => d,
+            Err(_) => {
                 self.status |= VIRTIO_STATUS_NEEDS_RESET;
                 self.rx_queue.ready = false;
                 return false;
             }
         };
+        if chain.iter().any(|d| d.flags & VRING_DESC_F_WRITE == 0) {
+            self.status |= VIRTIO_STATUS_NEEDS_RESET;
+            self.rx_queue.ready = false;
+            return false;
+        }
+        let total: usize = chain.iter().map(|d| d.len as usize).sum();
+        if total < VIRTIO_NET_HDR_SIZE + packet.len() {
+            // The descriptor stays posted for a later frame that fits.
+            NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        let buffers = chain;
 
-        // Construct VirtIO Modern Net Header (12 bytes, all zeros for standard packet)
+        // Header is 12 bytes with VIRTIO_F_VERSION_1 and no MRG_RXBUF.
+        // num_buffers stays 0 because mergeable buffers are not offered.
         let hdr = [0u8; VIRTIO_NET_HDR_SIZE];
         let mut total_written = 0usize;
         let total_packet_bytes = hdr.len() + packet.len();
@@ -1030,6 +1049,9 @@ impl VirtioNetInner {
 
         let mut src_offset = 0;
         for desc in buffers {
+            if !self.dma_allowed() {
+                return false;
+            }
             let (buf_addr, buf_len) = (desc.addr, desc.len);
             if src_offset >= data_to_write.len() {
                 break;
@@ -1064,11 +1086,14 @@ impl VirtioNetInner {
     }
 
     fn drain_rx_backlog(&mut self) {
+        if !self.dma_allowed() {
+            return;
+        }
         if !self.rx_queue.ready || self.rx_queue.avail_ring == 0 || self.rx_queue.desc_table == 0 {
             return;
         }
         while let Some(pkt) = self.rx_backlog.pop_front() {
-            if !self.deliver_to_rx_queue(&pkt) {
+            if !self.dma_allowed() || !self.deliver_to_rx_queue(&pkt) {
                 self.rx_backlog.push_front(pkt);
                 break;
             }
@@ -1125,8 +1150,8 @@ impl VirtioNetInner {
                 offset = end;
             }
 
-            // Strip 12-byte VirtIO Net header and transmit payload after dropping
-            // the device lock, so RX/ACK MMIO is not blocked on vmnet_write.
+            // The queue mutex covers the guest rings. The payload is returned
+            // to the caller, which writes it after that mutex is released.
             if full_data.len() > VIRTIO_NET_HDR_SIZE {
                 let payload = &full_data[VIRTIO_NET_HDR_SIZE..];
                 NET_STATS.tx_pkts.fetch_add(1, Ordering::Relaxed);
@@ -1243,11 +1268,27 @@ impl NetBackend for CaptureBackend {
     }
 }
 
+/// TX payloads collected under the queue mutex. Sent after `PciHost` is dropped.
+pub(crate) struct TxSubmit {
+    backend: Arc<Mutex<Box<dyn NetBackend>>>,
+    frames: Vec<Vec<u8>>,
+}
+
+impl TxSubmit {
+    pub(crate) fn send(self) {
+        let mut backend = self.backend.lock().unwrap();
+        for frame in self.frames {
+            let _ = backend.send_packet(&frame);
+        }
+    }
+}
+
 pub struct VirtioNet {
     guest_address: crate::forward::GuestAddress,
     inner: Arc<Mutex<VirtioNetInner>>,
     running: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    bus_master: Arc<AtomicBool>,
 }
 
 impl VirtioNet {
@@ -1261,7 +1302,7 @@ impl VirtioNet {
         backend_choice: &str,
         vmnet_socket: Option<&Path>,
     ) -> Result<Self, String> {
-        let (backend, vmnet_iface, socket_rx) = match backend_choice {
+        let (backend, vmnet_rx, socket_rx) = match backend_choice {
             s if s == "bridge"
                 || s.starts_with("bridge:")
                 || s == "bridged"
@@ -1281,10 +1322,11 @@ impl VirtioNet {
                 };
                 match VmnetBackend::new_bridged(&host_if) {
                     Ok(b) => {
-                        let iface = b.interface;
+                        let iface = SendPtr(b.interface);
+                        let queue = SendPtr(b.dispatch_queue);
                         (
                             Box::new(b) as Box<dyn NetBackend>,
-                            Some(SendPtr(iface)),
+                            Some((iface, queue)),
                             None,
                         )
                     }
@@ -1316,10 +1358,11 @@ impl VirtioNet {
             }
             "vmnet" => match VmnetBackend::new() {
                 Ok(b) => {
-                    let iface = b.interface;
+                    let iface = SendPtr(b.interface);
+                    let queue = SendPtr(b.dispatch_queue);
                     (
                         Box::new(b) as Box<dyn NetBackend>,
-                        Some(SendPtr(iface)),
+                        Some((iface, queue)),
                         None,
                     )
                 }
@@ -1356,7 +1399,7 @@ impl VirtioNet {
         );
 
         let mut dev = Self::from_backend(mac, mem, backend);
-        dev.start(mac, vmnet_iface, socket_rx);
+        dev.start(mac, vmnet_rx, socket_rx);
         Ok(dev)
     }
 
@@ -1367,28 +1410,33 @@ impl VirtioNet {
         backend: Box<dyn NetBackend>,
     ) -> Self {
         let irq_gate = IrqGate::new();
+        let inner = VirtioNetInner::new(mac, mem, backend, irq_gate);
+        let bus_master = Arc::clone(&inner.bus_master);
         Self {
             guest_address: Arc::new(Mutex::new(None)),
-            inner: Arc::new(Mutex::new(VirtioNetInner::new(mac, mem, backend, irq_gate))),
+            inner: Arc::new(Mutex::new(inner)),
             running: Arc::new(AtomicBool::new(true)),
             worker: None,
+            bus_master,
         }
     }
 
     fn start(
         &mut self,
         mac: [u8; 6],
-        vmnet_iface: Option<SendPtr>,
+        vmnet_rx: Option<(SendPtr, SendPtr)>,
         socket_rx: Option<(UnixStream, usize)>,
     ) {
         let inner = Arc::clone(&self.inner);
         let running = Arc::clone(&self.running);
         let guest_address = self.guest_address.clone();
-        if let Some(iface_ptr) = vmnet_iface {
+        if let Some((iface_ptr, queue_ptr)) = vmnet_rx {
             self.worker = Some(
                 thread::Builder::new()
                     .name("vmm-vmnet-rx".into())
-                    .spawn(move || vmnet_rx_loop(iface_ptr, mac, inner, running, guest_address))
+                    .spawn(move || {
+                        vmnet_rx_loop(iface_ptr, queue_ptr, mac, inner, running, guest_address)
+                    })
                     .expect("Failed to spawn vmnet RX thread"),
             );
         } else if let Some((stream, max_frame)) = socket_rx {
@@ -1426,11 +1474,24 @@ impl VirtioNet {
     pub(crate) fn set_status(&self, status: u32) {
         let failed = {
             let mut inner = self.inner.lock().unwrap();
-            inner.status = status;
-            if status == 0 {
+            let mut next = status;
+            let became_features_ok = next & VIRTIO_STATUS_FEATURES_OK != 0
+                && inner.status & VIRTIO_STATUS_FEATURES_OK == 0;
+            if became_features_ok {
+                let driver = inner.driver_features;
+                let offered = offered_features();
+                // Non-transitional: FEATURES_OK sticks only when VERSION_1 is
+                // set and every driver bit was offered. Mask either way.
+                if driver & VIRTIO_F_VERSION_1 == 0 || driver & !offered != 0 {
+                    next &= !(VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
+                }
+                inner.driver_features = driver & offered;
+            }
+            inner.status = next;
+            if next == 0 {
                 inner.reset();
             }
-            status & VIRTIO_STATUS_FAILED != 0
+            next & VIRTIO_STATUS_FAILED != 0
         };
         if status == 0 {
             *self.guest_address.lock().unwrap() = None;
@@ -1452,55 +1513,55 @@ impl VirtioNet {
         }
     }
 
-    pub(crate) fn poke_queue_size(&self, sel: u16, byte_off: usize, byte: u8) {
-        self.inner.lock().unwrap().poke_size(sel, byte_off, byte);
+    pub(crate) fn update_queue(&self, sel: u16, update: impl FnOnce(&mut VirtQueue)) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(queue) = inner.queue_mut(sel) {
+            update(queue);
+        }
     }
 
+    /// `bus_master` was stored by the transport before this lock. Publish the
+    /// backlog only while bus master is set.
     pub(crate) fn set_ready_low(&self, sel: u16, ready: bool) {
+        let master = self.bus_master.load(Ordering::Acquire);
         let mut inner = self.inner.lock().unwrap();
         match sel {
             0 => inner.rx_queue.ready = ready,
             1 => inner.tx_queue.ready = ready,
             _ => return,
         }
-        if sel == 0 && ready {
+        if sel == 0 && ready && master {
             inner.drain_rx_backlog();
         }
     }
 
-    pub(crate) fn poke_queue_desc(&self, sel: u16, byte_off: usize, byte: u8) {
-        self.inner.lock().unwrap().poke_addr(sel, byte_off, byte, 0);
+    pub(crate) fn set_bus_master(&self, enabled: bool) {
+        self.bus_master.store(enabled, Ordering::Release);
     }
 
-    pub(crate) fn poke_queue_avail(&self, sel: u16, byte_off: usize, byte: u8) {
-        self.inner.lock().unwrap().poke_addr(sel, byte_off, byte, 1);
-    }
-
-    pub(crate) fn poke_queue_used(&self, sel: u16, byte_off: usize, byte: u8) {
-        self.inner.lock().unwrap().poke_addr(sel, byte_off, byte, 2);
-    }
-
-    /// Returns whether INTx should be raised. The caller holds `PciHost`, so
-    /// this does not invoke the RX hook.
-    pub(crate) fn notify(&self, queue: u16) -> bool {
+    /// IRQ bit plus TX frames. The caller sends the frames after it drops
+    /// `PciHost`. This does not invoke the RX hook.
+    pub(crate) fn notify(&self, queue: u16) -> (bool, Option<TxSubmit>) {
         let mut inner = self.inner.lock().unwrap();
         if queue == 0 {
             inner.drain_rx_backlog();
-            return inner.irq_gate.pending.swap(false, Ordering::AcqRel);
+            return (inner.irq_gate.pending.swap(false, Ordering::AcqRel), None);
         }
         if queue != 1 {
-            return false;
+            return (false, None);
         }
         NET_STATS.tx_notify.fetch_add(1, Ordering::Relaxed);
-        let packets = inner.process_tx();
-        let backend = Arc::clone(&inner.backend);
+        let frames = inner.process_tx();
         let pending = inner.irq_gate.pending.swap(false, Ordering::AcqRel);
-        drop(inner);
-        let mut backend = backend.lock().unwrap();
-        for packet in packets {
-            let _ = backend.send_packet(&packet);
-        }
-        pending
+        let tx = if frames.is_empty() {
+            None
+        } else {
+            Some(TxSubmit {
+                backend: Arc::clone(&inner.backend),
+                frames,
+            })
+        };
+        (pending, tx)
     }
 
     pub(crate) fn take_irq_pending(&self) -> bool {
@@ -1529,8 +1590,130 @@ impl VirtioNet {
     }
 }
 
+struct RxWake {
+    interface: *mut c_void,
+    read: i32,
+    write: i32,
+}
+
+impl Drop for RxWake {
+    fn drop(&mut self) {
+        VMNET_RX_EVENT_FD.store(-1, Ordering::Relaxed);
+        unsafe {
+            // Both NULL disables the callback (vmnet.h). Do this before close
+            // so a late block does not write a closed fd.
+            let _ = vmnet_interface_set_event_callback(
+                self.interface,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            libc::close(self.read);
+            libc::close(self.write);
+        }
+    }
+}
+
+/// `vmnet_read` has no timeout. The packets-available callback is the wake;
+/// shutdown polls this pipe instead of sitting in the read.
+fn install_rx_wake(interface: *mut c_void, queue: *mut c_void) -> Option<RxWake> {
+    if interface.is_null() || queue.is_null() {
+        return None;
+    }
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    for fd in fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return None;
+        }
+    }
+    VMNET_RX_EVENT_FD.store(fds[1], Ordering::Relaxed);
+    let rc = unsafe {
+        vmnet_interface_set_event_callback(
+            interface,
+            VMNET_INTERFACE_PACKETS_AVAILABLE,
+            queue,
+            &VMNET_RX_EVENT_BLOCK as *const BlockLiteral as *const c_void,
+        )
+    };
+    if rc == VMNET_SUCCESS {
+        Some(RxWake {
+            interface,
+            read: fds[0],
+            write: fds[1],
+        })
+    } else {
+        VMNET_RX_EVENT_FD.store(-1, Ordering::Relaxed);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        None
+    }
+}
+
+fn drain_rx_wake(fd: i32) {
+    let mut buf = [0u8; 64];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if n <= 0 {
+            break;
+        }
+    }
+}
+
+fn vmnet_pull(interface: *mut c_void, buf: &mut [u8]) -> Option<usize> {
+    let mut iov = Iovec {
+        iov_base: buf.as_mut_ptr() as *mut c_void,
+        iov_len: buf.len(),
+    };
+    let mut desc = VmPktDesc {
+        vm_pkt_size: buf.len() as u64,
+        vm_pkt_iov: &mut iov,
+        vm_pkt_iovcnt: 1,
+        vm_flags: 0,
+    };
+    let mut pktcnt: i32 = 1;
+    let ret = unsafe { vmnet_read(interface, &mut desc, &mut pktcnt) };
+    if ret == VMNET_SUCCESS && pktcnt > 0 && desc.vm_pkt_size > 0 {
+        Some((desc.vm_pkt_size as usize).min(buf.len()))
+    } else {
+        None
+    }
+}
+
+fn deliver_host_frame(
+    packet: &mut [u8],
+    mac: [u8; 6],
+    inner: &Mutex<VirtioNetInner>,
+    discovered: &crate::forward::GuestAddress,
+) {
+    if let Some(ip) = dhcp_guest_address(packet, mac) {
+        let mut address = discovered.lock().unwrap();
+        if *address != Some(ip) {
+            *address = Some(ip);
+            crate::host_log!("[VirtIO-Net] Guest DHCP address: {ip} (--ssh-port destination)");
+        }
+    }
+    patch_dhcp_response(packet);
+    let gate = {
+        let mut inner = inner.lock().unwrap();
+        inner.receive_packet(packet);
+        Arc::clone(&inner.irq_gate)
+    };
+    signal_irq(&gate);
+}
+
 fn vmnet_rx_loop(
     iface_ptr: SendPtr,
+    queue_ptr: SendPtr,
     mac: [u8; 6],
     inner: Arc<Mutex<VirtioNetInner>>,
     running: Arc<AtomicBool>,
@@ -1540,6 +1723,12 @@ fn vmnet_rx_loop(
     let mut last_stats = Instant::now();
     let _ = File::create("/tmp/vmm-net.log");
     net_log("[net] rx thread started");
+    let wake = install_rx_wake(iface_ptr.get(), queue_ptr.get());
+    if wake.is_none() {
+        eprintln!(
+            "[VirtIO-Net] vmnet packets-available callback failed; RX will not call vmnet_read"
+        );
+    }
     while running.load(Ordering::Relaxed) {
         let (backlog_full, gate) = {
             let mut inner = inner.lock().unwrap();
@@ -1560,41 +1749,40 @@ fn vmnet_rx_loop(
             thread::sleep(Duration::from_millis(1));
             continue;
         }
-
-        let mut iov = Iovec {
-            iov_base: buf.as_mut_ptr() as *mut c_void,
-            iov_len: buf.len(),
+        let Some(wake) = wake.as_ref() else {
+            thread::sleep(Duration::from_millis(50));
+            continue;
         };
-        let mut desc = VmPktDesc {
-            vm_pkt_size: buf.len() as u64,
-            vm_pkt_iov: &mut iov,
-            vm_pkt_iovcnt: 1,
-            vm_flags: 0,
+        let mut pfd = libc::pollfd {
+            fd: wake.read,
+            events: libc::POLLIN,
+            revents: 0,
         };
-        let mut pktcnt: i32 = 1;
-
-        let ret = unsafe { vmnet_read(iface_ptr.get(), &mut desc, &mut pktcnt) };
-        if ret == VMNET_SUCCESS && pktcnt > 0 && desc.vm_pkt_size > 0 {
-            let pkt_len = (desc.vm_pkt_size as usize).min(buf.len());
-            let packet = &mut buf[..pkt_len];
-            if let Some(ip) = dhcp_guest_address(packet, mac) {
-                let mut address = discovered.lock().unwrap();
-                if *address != Some(ip) {
-                    *address = Some(ip);
-                    crate::host_log!(
-                        "[VirtIO-Net] Guest DHCP address: {ip} (--ssh-port destination)"
-                    );
-                }
+        // vmnet_read has no timeout. This poll is the shutdown wake; the
+        // proxy loop keeps its own 50 ms poll.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            patch_dhcp_response(packet);
-            let gate = {
-                let mut inner = inner.lock().unwrap();
-                inner.receive_packet(packet);
-                Arc::clone(&inner.irq_gate)
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        if rc == 0 || pfd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+        drain_rx_wake(wake.read);
+        // Header: a read with no packet returns pktcnt 0. Cap the burst so
+        // `running` is checked. Do not call vmnet_stop from this thread.
+        for _ in 0..32 {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(len) = vmnet_pull(iface_ptr.get(), &mut buf) else {
+                break;
             };
-            signal_irq(&gate);
-        } else {
-            thread::sleep(Duration::from_micros(100));
+            deliver_host_frame(&mut buf[..len], mac, &inner, &discovered);
         }
     }
 }
