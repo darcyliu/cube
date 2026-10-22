@@ -1,7 +1,11 @@
-//! Non-transitional virtio-pci 1.0 transport for one block function.
-//! No MSI-X and no virtio-mmio register file. INTx is active-low.
+//! Non-transitional virtio-pci 1.0 transport. No MSI-X and no virtio-mmio
+//! register file. INTx is active-low. Block is one queue; net is RX then TX.
 
+use std::thread::JoinHandle;
+
+use super::VirtQueue;
 use super::block::VirtioBlock;
+use super::net::{NetIrqHook, VirtioNet};
 
 /// Electrical level of an INTx pin. PCI INTx is active-low, so `high == false`
 /// is the asserted state the I/O APIC delivers when the pin is programmed low.
@@ -14,6 +18,8 @@ pub struct PciIrq {
 pub(crate) const PCI_HOLE_START: u64 = 0xC000_0000;
 pub(crate) const PCI_HOLE_END: u64 = 0xFEC0_0000;
 pub(crate) const VIRTIO_BAR_SIZE: u64 = 0x4000;
+/// Clear of the six virtio-blk defaults (`hole + n * 16 KiB`).
+pub(crate) const NET_BAR: u32 = 0xC010_0000;
 
 const CMD_MEM: u16 = 1 << 1;
 const CMD_MASTER: u16 = 1 << 2;
@@ -26,8 +32,152 @@ const ISR_OFF: u64 = 0x2000;
 const DEVCFG_OFF: u64 = 0x3000;
 const DEVCFG_LEN: u64 = 32;
 
+enum Dev {
+    Block(VirtioBlock),
+    Net(VirtioNet),
+}
+
+impl Dev {
+    fn num_queues(&self) -> u16 {
+        match self {
+            Dev::Block(_) => 1,
+            Dev::Net(_) => 2,
+        }
+    }
+
+    fn device_feature_word(&self, select: u32) -> u32 {
+        match self {
+            Dev::Block(dev) => dev.device_feature_word(select),
+            Dev::Net(dev) => dev.device_feature_word(select),
+        }
+    }
+
+    fn driver_feature_word(&self, select: u32) -> u32 {
+        match self {
+            Dev::Block(dev) => dev.driver_feature_word(select),
+            Dev::Net(dev) => dev.driver_feature_word(select),
+        }
+    }
+
+    fn set_driver_feature_word(&mut self, select: u32, word: u32) {
+        match self {
+            Dev::Block(dev) => dev.set_driver_feature_word(select, word),
+            Dev::Net(dev) => dev.set_driver_feature_word(select, word),
+        }
+    }
+
+    fn poke_driver_feature(&mut self, select: u32, byte_off: usize, byte: u8) {
+        let mut word = self.driver_feature_word(select);
+        poke_u32(&mut word, byte_off, byte);
+        self.set_driver_feature_word(select, word);
+    }
+
+    fn status(&self) -> u32 {
+        match self {
+            Dev::Block(dev) => dev.status(),
+            Dev::Net(dev) => dev.status(),
+        }
+    }
+
+    fn set_status(&mut self, status: u32) {
+        match self {
+            Dev::Block(dev) => dev.set_status(status),
+            Dev::Net(dev) => dev.set_status(status),
+        }
+    }
+
+    fn read_config(&self, offset: usize, size: usize) -> u64 {
+        match self {
+            Dev::Block(dev) => dev.read_config(offset, size),
+            Dev::Net(dev) => dev.read_config(offset, size),
+        }
+    }
+
+    fn queue(&self, sel: u16) -> Option<VirtQueue> {
+        match self {
+            Dev::Block(dev) if sel == 0 => Some(dev.queue),
+            Dev::Net(dev) => dev.queue(sel),
+            _ => None,
+        }
+    }
+
+    fn poke_queue_size(&mut self, sel: u16, byte_off: usize, byte: u8) {
+        match self {
+            Dev::Block(dev) if sel == 0 => {
+                let mut raw = (dev.queue.size as u16).to_le_bytes();
+                raw[byte_off] = byte;
+                let size = u32::from(u16::from_le_bytes(raw));
+                dev.queue.size = size.min(dev.queue.max_size);
+            }
+            Dev::Net(dev) => dev.poke_queue_size(sel, byte_off, byte),
+            _ => {}
+        }
+    }
+
+    fn set_ready_low(&mut self, sel: u16, byte: u8) {
+        let ready = byte & 1 == 1;
+        match self {
+            Dev::Block(dev) if sel == 0 => dev.queue.ready = ready,
+            Dev::Net(dev) => dev.set_ready_low(sel, ready),
+            _ => {}
+        }
+    }
+
+    fn poke_queue_desc(&mut self, sel: u16, byte_off: usize, byte: u8) {
+        self.poke_queue_addr(sel, byte_off, byte, Addr::Desc);
+    }
+
+    fn poke_queue_avail(&mut self, sel: u16, byte_off: usize, byte: u8) {
+        self.poke_queue_addr(sel, byte_off, byte, Addr::Avail);
+    }
+
+    fn poke_queue_used(&mut self, sel: u16, byte_off: usize, byte: u8) {
+        self.poke_queue_addr(sel, byte_off, byte, Addr::Used);
+    }
+
+    fn poke_queue_addr(&mut self, sel: u16, byte_off: usize, byte: u8, which: Addr) {
+        match self {
+            Dev::Block(dev) if sel == 0 => {
+                let slot = match which {
+                    Addr::Desc => &mut dev.queue.desc_table,
+                    Addr::Avail => &mut dev.queue.avail_ring,
+                    Addr::Used => &mut dev.queue.used_ring,
+                };
+                poke_u64(slot, byte_off, byte);
+            }
+            Dev::Net(dev) => match which {
+                Addr::Desc => dev.poke_queue_desc(sel, byte_off, byte),
+                Addr::Avail => dev.poke_queue_avail(sel, byte_off, byte),
+                Addr::Used => dev.poke_queue_used(sel, byte_off, byte),
+            },
+            _ => {}
+        }
+    }
+
+    fn notify(&mut self, queue: u16) -> bool {
+        match self {
+            Dev::Block(dev) => queue == 0 && dev.process_queue(),
+            Dev::Net(dev) => dev.notify(queue),
+        }
+    }
+
+    fn take_irq_pending(&self) -> bool {
+        match self {
+            Dev::Block(_) => false,
+            Dev::Net(dev) => dev.take_irq_pending(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Addr {
+    Desc,
+    Avail,
+    Used,
+}
+
 pub(crate) struct VirtioPciTransport {
-    dev: u8,
+    dev_no: u8,
     gsi: u32,
     command: u16,
     bar_raw: u32,
@@ -39,13 +189,29 @@ pub(crate) struct VirtioPciTransport {
     cache_line: u8,
     latency: u8,
     template: [u8; 256],
-    block: VirtioBlock,
+    dev: Dev,
 }
 
 impl VirtioPciTransport {
     pub(crate) fn new(dev: u8, gsi: u32, bar: u32, block: VirtioBlock) -> Self {
+        Self::build(dev, gsi, bar, 0x1042, 0x01, 2, Dev::Block(block))
+    }
+
+    pub(crate) fn new_net(dev: u8, gsi: u32, bar: u32, net: VirtioNet) -> Self {
+        Self::build(dev, gsi, bar, 0x1041, 0x02, 1, Dev::Net(net))
+    }
+
+    fn build(
+        dev: u8,
+        gsi: u32,
+        bar: u32,
+        device_id: u16,
+        class: u8,
+        subsystem: u16,
+        backend: Dev,
+    ) -> Self {
         Self {
-            dev,
+            dev_no: dev,
             gsi,
             command: 0,
             bar_raw: bar,
@@ -56,13 +222,13 @@ impl VirtioPciTransport {
             interrupt_line: 0,
             cache_line: 0,
             latency: 0,
-            template: config_template(),
-            block,
+            template: config_template(device_id, class, subsystem),
+            dev: backend,
         }
     }
 
     pub(crate) fn dev(&self) -> u8 {
-        self.dev
+        self.dev_no
     }
 
     pub(crate) fn gsi(&self) -> u32 {
@@ -70,7 +236,7 @@ impl VirtioPciTransport {
     }
 
     pub(crate) fn prt(&self) -> (u32, u32) {
-        ((u32::from(self.dev) << 16), self.gsi)
+        ((u32::from(self.dev_no) << 16), self.gsi)
     }
 
     /// Memory decode is off until the guest sets the command bit. The address
@@ -132,7 +298,7 @@ impl VirtioPciTransport {
             self.isr = 0;
             isr
         } else if fits(offset, size, DEVCFG_OFF, DEVCFG_LEN) {
-            self.block.read_config((offset - DEVCFG_OFF) as usize, size)
+            self.dev.read_config((offset - DEVCFG_OFF) as usize, size)
         } else {
             0
         };
@@ -145,10 +311,56 @@ impl VirtioPciTransport {
             self.write_common(offset as usize, data, size);
         } else if offset == NOTIFY_OFF && matches!(size, 1 | 2 | 4) {
             // Bus-master clear: drop the notify and do not touch guest memory.
-            if self.command & CMD_MASTER != 0 && data as u16 == 0 && self.block.process_queue() {
+            if self.command & CMD_MASTER != 0 && self.dev.notify(data as u16) {
                 self.isr |= 1;
             }
         }
+        // QUEUE_READY can publish RX buffers without a notify. Fold that into
+        // the same ISR the vCPU path already owns, so the RX hook is not called
+        // while this lock is held.
+        if self.dev.take_irq_pending() {
+            self.isr |= 1;
+        }
+        self.irq_delta(before)
+    }
+
+    pub(crate) fn set_irq_hook(&self, hook: NetIrqHook) {
+        if let Dev::Net(net) = &self.dev {
+            net.set_irq_hook(hook);
+        }
+    }
+
+    /// RX publishes used buffers off the vCPU thread. Fold that into ISR here,
+    /// under the same lock as the guest's ISR read.
+    pub(crate) fn latch_irq(&mut self) -> Vec<PciIrq> {
+        let Dev::Net(net) = &self.dev else {
+            return Vec::new();
+        };
+        if !net.take_irq_pending() {
+            return Vec::new();
+        }
+        let before = self.electrical_high();
+        self.isr |= 1;
+        self.irq_delta(before)
+    }
+
+    pub(crate) fn take_worker(&mut self) -> Option<JoinHandle<()>> {
+        match &mut self.dev {
+            Dev::Net(net) => net.take_worker(),
+            Dev::Block(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rx(&mut self, frame: &[u8]) -> Vec<PciIrq> {
+        let Dev::Net(net) = &self.dev else {
+            return Vec::new();
+        };
+        if !net.inject_rx(frame) {
+            return Vec::new();
+        }
+        let before = self.electrical_high();
+        self.isr |= 1;
         self.irq_delta(before)
     }
 
@@ -195,29 +407,29 @@ impl VirtioPciTransport {
         raw[0..4].copy_from_slice(&self.dev_feat_sel.to_le_bytes());
         raw[4..8].copy_from_slice(
             &self
-                .block
+                .dev
                 .device_feature_word(self.dev_feat_sel)
                 .to_le_bytes(),
         );
         raw[8..12].copy_from_slice(&self.drv_feat_sel.to_le_bytes());
         raw[12..16].copy_from_slice(
             &self
-                .block
+                .dev
                 .driver_feature_word(self.drv_feat_sel)
                 .to_le_bytes(),
         );
         raw[0x10..0x12].copy_from_slice(&0xffffu16.to_le_bytes());
-        raw[0x12..0x14].copy_from_slice(&1u16.to_le_bytes());
-        raw[0x14] = self.block.status() as u8;
+        raw[0x12..0x14].copy_from_slice(&self.dev.num_queues().to_le_bytes());
+        raw[0x14] = self.dev.status() as u8;
         raw[0x16..0x18].copy_from_slice(&self.queue_sel.to_le_bytes());
         raw[0x1a..0x1c].copy_from_slice(&0xffffu16.to_le_bytes());
-        if self.queue_sel == 0 {
-            raw[0x18..0x1a].copy_from_slice(&(self.block.queue.size as u16).to_le_bytes());
-            let enable: u16 = u16::from(self.block.queue.ready);
+        if let Some(queue) = self.dev.queue(self.queue_sel) {
+            raw[0x18..0x1a].copy_from_slice(&(queue.size as u16).to_le_bytes());
+            let enable: u16 = u16::from(queue.ready);
             raw[0x1c..0x1e].copy_from_slice(&enable.to_le_bytes());
-            raw[0x20..0x28].copy_from_slice(&self.block.queue.desc_table.to_le_bytes());
-            raw[0x28..0x30].copy_from_slice(&self.block.queue.avail_ring.to_le_bytes());
-            raw[0x30..0x38].copy_from_slice(&self.block.queue.used_ring.to_le_bytes());
+            raw[0x20..0x28].copy_from_slice(&queue.desc_table.to_le_bytes());
+            raw[0x28..0x30].copy_from_slice(&queue.avail_ring.to_le_bytes());
+            raw[0x30..0x38].copy_from_slice(&queue.used_ring.to_le_bytes());
         }
         raw
     }
@@ -232,42 +444,30 @@ impl VirtioPciTransport {
         match offset {
             0x00..=0x03 => poke_u32(&mut self.dev_feat_sel, offset, byte),
             0x08..=0x0b => poke_u32(&mut self.drv_feat_sel, offset - 0x08, byte),
-            0x0c..=0x0f => {
-                let select = self.drv_feat_sel;
-                let mut word = self.block.driver_feature_word(select);
-                poke_u32(&mut word, offset - 0x0c, byte);
-                self.block.set_driver_feature_word(select, word);
-            }
+            0x0c..=0x0f => self
+                .dev
+                .poke_driver_feature(self.drv_feat_sel, offset - 0x0c, byte),
             0x14 => self.set_status_byte(byte),
             0x16..=0x17 => poke_u16(&mut self.queue_sel, offset - 0x16, byte),
-            0x18..=0x19 if self.queue_sel == 0 => {
-                let mut raw = (self.block.queue.size as u16).to_le_bytes();
-                raw[offset - 0x18] = byte;
-                let size = u32::from(u16::from_le_bytes(raw));
-                self.block.queue.size = size.min(self.block.queue.max_size);
-            }
-            0x1c if self.queue_sel == 0 => self.block.queue.ready = byte & 1 == 1,
-            0x20..=0x27 if self.queue_sel == 0 => {
-                let mut raw = self.block.queue.desc_table.to_le_bytes();
-                raw[offset - 0x20] = byte;
-                self.block.queue.desc_table = u64::from_le_bytes(raw);
-            }
-            0x28..=0x2f if self.queue_sel == 0 => {
-                let mut raw = self.block.queue.avail_ring.to_le_bytes();
-                raw[offset - 0x28] = byte;
-                self.block.queue.avail_ring = u64::from_le_bytes(raw);
-            }
-            0x30..=0x37 if self.queue_sel == 0 => {
-                let mut raw = self.block.queue.used_ring.to_le_bytes();
-                raw[offset - 0x30] = byte;
-                self.block.queue.used_ring = u64::from_le_bytes(raw);
-            }
+            0x18..=0x19 => self
+                .dev
+                .poke_queue_size(self.queue_sel, offset - 0x18, byte),
+            0x1c => self.dev.set_ready_low(self.queue_sel, byte),
+            0x20..=0x27 => self
+                .dev
+                .poke_queue_desc(self.queue_sel, offset - 0x20, byte),
+            0x28..=0x2f => self
+                .dev
+                .poke_queue_avail(self.queue_sel, offset - 0x28, byte),
+            0x30..=0x37 => self
+                .dev
+                .poke_queue_used(self.queue_sel, offset - 0x30, byte),
             _ => {}
         }
     }
 
     fn set_status_byte(&mut self, byte: u8) {
-        self.block.set_status(u32::from(byte));
+        self.dev.set_status(u32::from(byte));
         if byte == 0 {
             self.dev_feat_sel = 0;
             self.drv_feat_sel = 0;
@@ -301,15 +501,21 @@ fn poke_u16(reg: &mut u16, off: usize, byte: u8) {
     *reg = u16::from_le_bytes(raw);
 }
 
-fn config_template() -> [u8; 256] {
+fn poke_u64(reg: &mut u64, off: usize, byte: u8) {
+    let mut raw = reg.to_le_bytes();
+    raw[off] = byte;
+    *reg = u64::from_le_bytes(raw);
+}
+
+fn config_template(device_id: u16, class: u8, subsystem: u16) -> [u8; 256] {
     let mut cfg = [0u8; 256];
     cfg[0..2].copy_from_slice(&0x1AF4u16.to_le_bytes());
-    cfg[2..4].copy_from_slice(&0x1042u16.to_le_bytes());
+    cfg[2..4].copy_from_slice(&device_id.to_le_bytes());
     cfg[0x06] = 0x10; // capabilities list
     cfg[0x08] = 1; // revision
-    cfg[0x0b] = 0x01; // mass storage, subclass 0, prog-if 0
+    cfg[0x0b] = class;
     cfg[0x2c..0x2e].copy_from_slice(&0x1AF4u16.to_le_bytes());
-    cfg[0x2e..0x30].copy_from_slice(&2u16.to_le_bytes());
+    cfg[0x2e..0x30].copy_from_slice(&subsystem.to_le_bytes());
     cfg[0x34] = 0x40;
     cfg[0x3d] = 1; // INTA
     // Vendor-specific caps only. No MSI (0x05) and no MSI-X (0x11).

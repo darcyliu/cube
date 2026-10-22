@@ -14,8 +14,18 @@ use std::process;
 
 use std::os::unix::process::CommandExt;
 
+use vmm::forward::ForwardRule;
+
 fn main() {
     enforce_host_gate();
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).is_some_and(|arg| arg == "--vmnet-service") {
+        if let Err(error) = vmm::vmnet_service::run(&raw) {
+            eprintln!("[vmnet] {error}");
+            process::exit(1);
+        }
+        return;
+    }
     match parse_args() {
         Cli::Help => {
             print_help();
@@ -30,10 +40,14 @@ fn main() {
             serial_log,
             cpus,
             disks,
+            net,
+            forwards,
         } => {
             let dones = match boot {
-                Boot::Payload(path) => vm::run_payload(path, serial_log, cpus, disks),
-                Boot::Uefi(path) => vm::run_uefi(path, serial_log, cpus, disks),
+                Boot::Payload(path) => {
+                    vm::run_payload(path, serial_log, cpus, disks, net, forwards)
+                }
+                Boot::Uefi(path) => vm::run_uefi(path, serial_log, cpus, disks, net, forwards),
             };
             let mut failed = false;
             for done in dones {
@@ -79,6 +93,8 @@ enum Cli {
         serial_log: Option<PathBuf>,
         cpus: u32,
         disks: Vec<vm::DiskSpec>,
+        net: vm::NetConfig,
+        forwards: Vec<ForwardRule>,
     },
 }
 
@@ -93,6 +109,8 @@ fn parse_args() -> Cli {
     let mut cpus = 1u32;
     let mut cdrom: Option<PathBuf> = None;
     let mut disks = Vec::new();
+    let mut net = vm::NetConfig::default();
+    let mut forwards = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -174,6 +192,55 @@ fn parse_args() -> Cli {
                 serial_log = Some(PathBuf::from(path));
                 i += 1;
             }
+            "--net" | "-n" => {
+                let Some(mode) = args.get(i + 1).filter(|mode| !mode.starts_with('-')) else {
+                    return Cli::Error(
+                        "--net needs vmnet, vmnet-proxy, bridge[:interface], tap:<path>, mock, or none"
+                            .into(),
+                    );
+                };
+                net.mode = mode.clone();
+                i += 1;
+            }
+            "--vmnet-socket" => {
+                let Some(path) = args.get(i + 1).filter(|path| !path.starts_with('-')) else {
+                    return Cli::Error("--vmnet-socket needs a path".into());
+                };
+                net.socket = Some(PathBuf::from(path));
+                i += 1;
+            }
+            "--mac" => {
+                let Some(text) = args.get(i + 1).filter(|text| !text.starts_with('-')) else {
+                    return Cli::Error("--mac needs an address like 52:54:00:12:34:56".into());
+                };
+                let Some(mac) = parse_mac(text) else {
+                    return Cli::Error("--mac needs an address like 52:54:00:12:34:56".into());
+                };
+                net.mac = mac;
+                i += 1;
+            }
+            "--forward" => {
+                let Some(rule) = args.get(i + 1).filter(|rule| !rule.starts_with('-')) else {
+                    return Cli::Error("--forward needs HOST_IP:PORT=GUEST_IP:PORT".into());
+                };
+                match ForwardRule::parse(rule) {
+                    Ok(rule) => forwards.push(rule),
+                    Err(message) => return Cli::Error(message),
+                }
+                i += 1;
+            }
+            "--ssh-port" => {
+                let Some(port) = args
+                    .get(i + 1)
+                    .filter(|text| !text.starts_with('-'))
+                    .and_then(|text| text.parse::<u16>().ok())
+                    .filter(|port| *port != 0)
+                else {
+                    return Cli::Error("--ssh-port needs a nonzero port".into());
+                };
+                net.ssh_port = Some(port);
+                i += 1;
+            }
             other => return Cli::Error(format!("unknown argument {other}")),
         }
         i += 1;
@@ -195,12 +262,16 @@ fn parse_args() -> Cli {
             serial_log,
             cpus,
             disks: images,
+            net,
+            forwards,
         },
         (None, Some(path)) => Cli::Run {
             boot: Boot::Uefi(path),
             serial_log,
             cpus,
             disks: images,
+            net,
+            forwards,
         },
         (None, None) => Cli::Error("no boot path; pass --payload".into()),
     }
@@ -231,6 +302,18 @@ fn parse_disk(text: &str) -> Result<vm::DiskSpec, String> {
     })
 }
 
+fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = text.split(|c| c == ':' || c == '-').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
+}
+
 fn print_help() {
     println!(
         "\
@@ -248,6 +331,15 @@ Usage:
                          --cpus / -c is 1..=16 (default 1). vCPU 0 is the BSP.
                          --disk / -d PATH[,cow][,ro]  virtio-blk, repeatable.
                          --cdrom / --iso PATH         read-only virtio-blk, first disk.
+                         --net / -n MODE              vmnet, vmnet-proxy, bridge[:interface],
+                                                      tap:<path>, mock, or none (default none).
+                         --vmnet-socket PATH          socket for vmnet-proxy
+                                                      (default ~/Library/Application Support/vmm/vmnet.sock).
+                         --mac MAC                    default 52:54:00:12:34:56.
+                         --forward HOST:PORT=GUEST:PORT
+                                                      TCP forward, repeatable.
+                         --ssh-port PORT              localhost PORT to this guest's DHCP address:22.
+  vmm --vmnet-service [--subnet CIDR | --bridge [IFACE]]
 
 With no arguments, vmm prints this help and exits 1."
     );

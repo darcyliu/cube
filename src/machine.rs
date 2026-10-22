@@ -148,6 +148,30 @@ impl Machine {
         }));
     }
 
+    /// Install the net RX hook, then latch anything already pending. The hook
+    /// is stored while `PciHost` is locked and invoked only after that lock drops.
+    pub fn wire_net_irq(self: &Arc<Self>) {
+        let Some(pci) = &self.pci else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let hook: vmm::devices::virtio::net::NetIrqHook = Arc::new(move || {
+            if let Some(machine) = weak.upgrade() {
+                machine.kick_net_irq();
+            }
+        });
+        pci.lock().unwrap().set_net_hook(hook);
+        self.kick_net_irq();
+    }
+
+    fn kick_net_irq(&self) {
+        let Some(pci) = &self.pci else {
+            return;
+        };
+        let irqs = pci.lock().unwrap().latch_net_irq();
+        self.deliver_intx(irqs);
+    }
+
     pub fn expire_timer(&self, cpu: usize) {
         self.lapics[cpu].lock().unwrap().expire_timer();
     }
@@ -374,6 +398,19 @@ impl Machine {
         self.lapics
             .iter()
             .position(|lapic| lapic.lock().unwrap().id() == id)
+    }
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        // The RX hook locks PciHost. Take the thread, drop that lock, then join.
+        let worker = self
+            .pci
+            .as_ref()
+            .and_then(|pci| pci.lock().unwrap().take_net_worker());
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
     }
 }
 

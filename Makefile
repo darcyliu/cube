@@ -1,4 +1,4 @@
-.PHONY: all build sign sign-networking test release clean fetch-uefi
+.PHONY: all build sign sign-networking test release clean fetch-uefi vmnet-service vmnet-service-bridge
 
 all: build sign
 
@@ -39,6 +39,18 @@ fetch-uefi:
 
 sign:
 	codesign --entitlements entitlements.plist --force -s - $(VMM_BIN)
+
+# Long-running vmnet proxy. Build as your user first (`make all`), then `make vmnet-service`.
+# `sudo make vmnet-service` is refused: it would record SUDO_UID as root.
+vmnet-service:
+	@test "$$(id -u)" -ne 0 || { echo "[VMM] Run 'make vmnet-service' as your user, not 'sudo make'."; exit 1; }
+	@test -x $(VMM_BIN) || { echo "[VMM] Run 'make all' as your user first."; exit 1; }
+	sudo $(VMM_BIN) --vmnet-service $(if $(SUBNET),--subnet $(SUBNET),)
+
+vmnet-service-bridge:
+	@test "$$(id -u)" -ne 0 || { echo "[VMM] Run 'make vmnet-service-bridge' as your user, not 'sudo make'."; exit 1; }
+	@test -x $(VMM_BIN) || { echo "[VMM] Run 'make all' as your user first."; exit 1; }
+	sudo $(VMM_BIN) --vmnet-service --bridge $(IFACE)
 
 # Restricted com.apple.vm.networking — needs Apple-granted App ID + provisioning profile.
 # Example:
