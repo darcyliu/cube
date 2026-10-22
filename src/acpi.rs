@@ -1,4 +1,5 @@
-//! ACPI tables, e820, and QEMU bios-linker-loader records. No `_PRT`.
+//! ACPI tables, e820, and QEMU bios-linker-loader records.
+//! `_PRT` is emitted only for virtio functions passed to [`build_with_prt`].
 
 use crate::devices::pci::{PMBA_DEFAULT, pm_timer_port};
 
@@ -13,7 +14,12 @@ pub struct FirmwareFiles {
 }
 
 pub fn build(ncpus: u32, ram_size: u64) -> FirmwareFiles {
-    let dsdt = build_dsdt();
+    build_with_prt(ncpus, ram_size, &[])
+}
+
+/// `prt` entries are `(slot << 16 | function, gsi)` for each virtio INTA pin.
+pub fn build_with_prt(ncpus: u32, ram_size: u64, prt: &[(u32, u32)]) -> FirmwareFiles {
+    let dsdt = build_dsdt(prt);
     let madt = build_madt(ncpus);
     let mut fadt = vec![0u8; 276];
     let fadt_off = 52usize;
@@ -139,12 +145,16 @@ fn override_irq(src: u8, gsi: u32, flags: u16) -> [u8; 10] {
     e
 }
 
-fn build_dsdt() -> Vec<u8> {
+fn build_dsdt(prt: &[(u32, u32)]) -> Vec<u8> {
     let mut aml = Vec::new();
     aml.extend(name_pkg(*b"_S5_"));
     aml.extend(name_pkg(*b"_S0_"));
+    let mut pci_body = hid_crs(0x030A_D041, &pci_crs());
+    if !prt.is_empty() {
+        pci_body.extend(name_prt(prt));
+    }
     let mut body = Vec::new();
-    body.extend(device(*b"PCI0", &hid_crs(0x030A_D041, &pci_crs())));
+    body.extend(device(*b"PCI0", &pci_body));
     body.extend(device(*b"COM1", &hid_crs(0x0105_D041, &com_crs())));
     body.extend(device(*b"RTC_", &hid_crs(0x000B_D041, &rtc_crs())));
     aml.extend(scope_sb(&body));
@@ -203,6 +213,36 @@ fn dword_mem(min: u32, max: u32, len: u32) -> Vec<u8> {
     v.extend_from_slice(&max.to_le_bytes());
     v.extend_from_slice(&0u32.to_le_bytes());
     v.extend_from_slice(&len.to_le_bytes());
+    v
+}
+
+fn name_prt(entries: &[(u32, u32)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for &(addr, gsi) in entries {
+        body.extend(prt_entry(addr, gsi));
+    }
+    let mut v = vec![0x08];
+    v.extend(*b"_PRT");
+    v.extend(aml_pkg(entries.len() as u8, &body));
+    v
+}
+
+fn prt_entry(addr: u32, gsi: u32) -> Vec<u8> {
+    let mut body = vec![0x0C];
+    body.extend_from_slice(&addr.to_le_bytes());
+    body.push(0x00); // INTA
+    body.push(0x00); // GSI in the source index, not a link device
+    body.push(0x0A);
+    body.push(gsi as u8);
+    aml_pkg(4, &body)
+}
+
+fn aml_pkg(count: u8, body: &[u8]) -> Vec<u8> {
+    let mut after = vec![count];
+    after.extend_from_slice(body);
+    let mut v = vec![0x12];
+    v.extend(pkg_len(after.len()));
+    v.extend(after);
     v
 }
 
@@ -452,6 +492,28 @@ mod tests {
         }
         assert_eq!(cpus, 2);
         let _ = locals;
+
+        let with_prt = build_with_prt(1, 128 << 20, &[(2 << 16, 16)]);
+        let dsdt_prt = with_prt
+            .tables
+            .windows(4)
+            .position(|w| w == b"DSDT")
+            .unwrap();
+        let prt_len = u32::from_le_bytes(
+            with_prt.tables[dsdt_prt + 4..dsdt_prt + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(sum(&with_prt.tables[dsdt_prt..dsdt_prt + prt_len]), 0);
+        let prt_aml = &with_prt.tables[dsdt_prt + 36..dsdt_prt + prt_len];
+        let at = prt_aml.windows(4).position(|w| w == b"_PRT").unwrap();
+        assert_eq!(
+            &prt_aml[at + 4..at + 4 + 15],
+            &[
+                0x12, 0x0E, 0x01, 0x12, 0x0B, 0x04, 0x0C, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0A,
+                0x10,
+            ]
+        );
 
         assert_eq!(files.loader.len() % 128, 0);
         assert_eq!(files.loader[0], 1);

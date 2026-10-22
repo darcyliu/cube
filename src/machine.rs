@@ -8,7 +8,7 @@ use vmm::devices::ioapic::{IOAPIC_MMIO, IOAPIC_MMIO_LEN, IoApic, IoapicMsg};
 use vmm::devices::lapic::{
     DeliveryMode, LAPIC_MMIO, LAPIC_MMIO_LEN, Lapic, LapicEffect, Peer, logical_match,
 };
-use vmm::devices::pci::{PciAction, PciHost};
+use vmm::devices::pci::{PciAction, PciHost, PciIrq};
 use vmm::devices::{MmioBus, PioBus};
 use vmm::gpa::GuestSpace;
 use vmm::terminal::host_log;
@@ -87,7 +87,11 @@ impl Machine {
         if let Some(pci) = &self.pci {
             let mut pci = pci.lock().unwrap();
             if pci.try_out(port, data, size) {
-                self.apply_pci(pci.take_action());
+                let action = pci.take_action();
+                let irqs = pci.take_intx();
+                drop(pci);
+                self.deliver_intx(irqs);
+                self.apply_pci(action);
                 return Ok(());
             }
         }
@@ -123,9 +127,16 @@ impl Machine {
         }
     }
 
-    pub fn set_gsi(self: &std::sync::Arc<Self>, gsi: u32, high: bool) {
+    pub fn set_gsi(&self, gsi: u32, high: bool) {
         let msgs = self.ioapic.lock().unwrap().set_level(gsi, high);
         self.route(msgs);
+    }
+
+    /// Drop the PCI lock before the I/O APIC. `high` is the electrical level.
+    fn deliver_intx(&self, irqs: Vec<PciIrq>) {
+        for irq in irqs {
+            self.set_gsi(irq.gsi, irq.high);
+        }
     }
 
     pub fn wire_uart_irq(self: &std::sync::Arc<Self>, serial: &vmm::devices::serial::Ns16550) {
@@ -202,6 +213,9 @@ impl Machine {
         if let Ok(value) = self.mmio.lock().unwrap().read(gpa, size) {
             return Ok(value);
         }
+        if let Some(value) = self.pci_bar_read(gpa, size) {
+            return Ok(value);
+        }
         if self.firmware {
             note_unmapped_mmio(gpa);
             return Ok(match size {
@@ -225,13 +239,13 @@ impl Machine {
         }
         if !(in_range(gpa, LAPIC_MMIO, LAPIC_MMIO_LEN)
             || in_range(gpa, IOAPIC_MMIO, IOAPIC_MMIO_LEN))
-            && self.mmio.lock().unwrap().write(gpa, value, size).is_ok()
         {
-            return Ok(());
-        }
-        if !(in_range(gpa, LAPIC_MMIO, LAPIC_MMIO_LEN)
-            || in_range(gpa, IOAPIC_MMIO, IOAPIC_MMIO_LEN))
-        {
+            if self.mmio.lock().unwrap().write(gpa, value, size).is_ok() {
+                return Ok(());
+            }
+            if self.pci_bar_write(gpa, value, size) {
+                return Ok(());
+            }
             if self.firmware {
                 note_unmapped_mmio(gpa);
                 return Ok(());
@@ -265,6 +279,30 @@ impl Machine {
             return Ok(());
         }
         Err(format!("MMIO write at unmapped {gpa:#x}"))
+    }
+
+    fn pci_bar_read(&self, gpa: u64, size: usize) -> Option<u64> {
+        let pci = self.pci.as_ref()?;
+        let mut pci = pci.lock().unwrap();
+        let value = pci.mmio_read(gpa, size)?;
+        let irqs = pci.take_intx();
+        drop(pci);
+        self.deliver_intx(irqs);
+        Some(value)
+    }
+
+    fn pci_bar_write(&self, gpa: u64, value: u64, size: usize) -> bool {
+        let Some(pci) = self.pci.as_ref() else {
+            return false;
+        };
+        let mut pci = pci.lock().unwrap();
+        if !pci.mmio_write(gpa, value, size) {
+            return false;
+        }
+        let irqs = pci.take_intx();
+        drop(pci);
+        self.deliver_intx(irqs);
+        true
     }
 
     fn dispatch_icr(&self, cpu: usize, peers: &[Peer]) {

@@ -4,6 +4,7 @@
 
 pub mod block;
 pub mod net;
+pub mod transport;
 
 // VirtIO MMIO Register Offsets (Modern, Version 2)
 pub const VIRTIO_MMIO_MAGIC_VALUE: u64 = 0x000;

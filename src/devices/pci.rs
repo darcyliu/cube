@@ -1,7 +1,13 @@
-//! PCI CAM at ports `0xCF8`/`0xCFC` and the PIIX4 PM block it enables.
-//! No ECAM, no MCFG, and no BARs that decode.
+//! PCI CAM at ports `0xCF8`/`0xCFC`, the PIIX4 PM block, and virtio-blk 1.0.
+//! No ECAM and no MCFG. Host-bridge and PIIX BARs do not decode.
+//! virtio-blk BAR0 does, inside the 32-bit PCI hole.
 
 use std::time::Instant;
+
+use super::virtio::block::VirtioBlock;
+use super::virtio::transport::{PCI_HOLE_START, VIRTIO_BAR_SIZE, VirtioPciTransport};
+
+pub use super::virtio::transport::PciIrq;
 
 /// PM timer frequency, 3.579545 MHz, low 24 bits.
 pub const PM_TIMER_HZ: u64 = 3_579_545;
@@ -46,6 +52,8 @@ pub struct PciHost {
     cf9: u8,
     action: PciAction,
     clock: Instant,
+    blks: Vec<VirtioPciTransport>,
+    pending_irqs: Vec<PciIrq>,
 }
 
 impl PciHost {
@@ -72,7 +80,69 @@ impl PciHost {
             cf9: 0,
             action: PciAction::None,
             clock: Instant::now(),
+            blks: Vec::new(),
+            pending_irqs: Vec::new(),
         }
+    }
+
+    /// First function is `00:02.0` (GSI 16). Later disks start at `00:04.0`
+    /// so `00:03.0` stays free for a net function. At most seven: GSI 23 is
+    /// the last I/O APIC pin.
+    pub fn add_block(&mut self, block: VirtioBlock) -> Result<(), String> {
+        let index = self.blks.len();
+        let (dev, gsi) = virtio_blk_bdf(index)?;
+        let bar = (PCI_HOLE_START as u32)
+            .wrapping_add((index as u32).wrapping_mul(VIRTIO_BAR_SIZE as u32));
+        self.blks
+            .push(VirtioPciTransport::new(dev, gsi, bar, block));
+        Ok(())
+    }
+
+    pub fn prt(&self) -> Vec<(u32, u32)> {
+        self.blks.iter().map(VirtioPciTransport::prt).collect()
+    }
+
+    pub fn virtio_gsis(&self) -> Vec<u32> {
+        self.blks.iter().map(VirtioPciTransport::gsi).collect()
+    }
+
+    pub fn take_intx(&mut self) -> Vec<PciIrq> {
+        std::mem::take(&mut self.pending_irqs)
+    }
+
+    pub fn mmio_read(&mut self, gpa: u64, size: usize) -> Option<u64> {
+        let (index, offset) = self.bar_hit(gpa, size)?;
+        let (value, irqs) = self.blks[index].bar_read(offset, size);
+        self.pending_irqs.extend(irqs);
+        Some(value)
+    }
+
+    pub fn mmio_write(&mut self, gpa: u64, data: u64, size: usize) -> bool {
+        let Some((index, offset)) = self.bar_hit(gpa, size) else {
+            return false;
+        };
+        let irqs = self.blks[index].bar_write(offset, data, size);
+        self.pending_irqs.extend(irqs);
+        true
+    }
+
+    fn bar_hit(&self, gpa: u64, size: usize) -> Option<(usize, u64)> {
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let len = size as u64;
+        for (index, blk) in self.blks.iter().enumerate() {
+            let Some(base) = blk.mapped_base() else {
+                continue;
+            };
+            let Some(offset) = gpa.checked_sub(base) else {
+                continue;
+            };
+            if offset < VIRTIO_BAR_SIZE && len <= VIRTIO_BAR_SIZE - offset {
+                return Some((index, offset));
+            }
+        }
+        None
     }
 
     pub fn pm_timer_port(&self) -> u32 {
@@ -145,10 +215,13 @@ impl PciHost {
     }
 
     fn config_read(&self, port: u16, size: usize) -> u64 {
+        let off = ((self.address & 0xfc) as usize) + (port - 0xCFC) as usize;
+        if let Some(index) = self.addressed_blk() {
+            return self.blks[index].cfg_read(off, size);
+        }
         let Some(slot) = self.slot() else {
             return ones(size);
         };
-        let off = ((self.address & 0xfc) as usize) + (port - 0xCFC) as usize;
         read_le_bytes(&slot.cfg, off, size)
     }
 
@@ -158,6 +231,11 @@ impl PciHost {
         let dev = ((self.address >> 11) & 0x1f) as u8;
         let func = ((self.address >> 8) & 7) as u8;
         if bus != 0 {
+            return;
+        }
+        if let Some(index) = self.addressed_blk() {
+            let irqs = self.blks[index].cfg_write(off, data, size);
+            self.pending_irqs.extend(irqs);
             return;
         }
         {
@@ -173,6 +251,16 @@ impl PciHost {
             self.pmba = u32::from_le_bytes(self.pm.cfg[0x40..0x44].try_into().unwrap());
             self.pmiose = self.pm.cfg[0x80] & 1 != 0;
         }
+    }
+
+    fn addressed_blk(&self) -> Option<usize> {
+        let bus = ((self.address >> 16) & 0xff) as u8;
+        let dev = ((self.address >> 11) & 0x1f) as u8;
+        let func = ((self.address >> 8) & 7) as u8;
+        if bus != 0 || func != 0 {
+            return None;
+        }
+        self.blks.iter().position(|blk| blk.dev() == dev)
     }
 
     fn slot(&self) -> Option<&Slot> {
@@ -289,6 +377,17 @@ fn write_bytes(raw: &mut [u8], off: usize, data: u64, size: usize) {
     }
 }
 
+fn virtio_blk_bdf(index: usize) -> Result<(u8, u32), String> {
+    // 00:03.0 / GSI 17 is reserved for virtio-net. Extra disks use 18+.
+    if index >= 7 {
+        return Err("too many virtio-blk devices".into());
+    }
+    if index == 0 {
+        return Ok((2, 16));
+    }
+    Ok((3 + index as u8, 17 + index as u32))
+}
+
 fn poke(reg: &mut u16, off: usize, byte: u8) {
     let mut raw = reg.to_le_bytes();
     raw[off] = byte;
@@ -338,5 +437,156 @@ mod tests {
 
         pci.try_out(0xCF9, 0x06, 1);
         assert_eq!(pci.take_action(), PciAction::Reboot);
+    }
+
+    #[test]
+    fn virtio_blk_bdfs_skip_the_net_slot() {
+        assert_eq!(virtio_blk_bdf(0).unwrap(), (2, 16));
+        assert_eq!(virtio_blk_bdf(1).unwrap(), (4, 18));
+        assert_eq!(virtio_blk_bdf(2).unwrap(), (5, 19));
+        assert!(virtio_blk_bdf(7).is_err());
+    }
+
+    #[test]
+    fn virtio_pci_read_lands_in_guest_buffer() {
+        use std::sync::Arc;
+
+        use crate::devices::virtio::block::VirtioBlock;
+        use crate::memory::GuestMemory;
+        use crate::test_support::{TestDir, name};
+
+        let dir = TestDir::new();
+        let pattern: Vec<u8> = (0..512u16)
+            .map(|i| (i.wrapping_mul(17) + 3) as u8)
+            .collect();
+        let path = dir.file("disk", &pattern);
+        let mem = Arc::new(GuestMemory::from_buffer(0, &vec![0u8; 0x8000]).unwrap());
+        let block = VirtioBlock::from_raw(name(&path), true, 0, "vtbd0", mem.clone()).unwrap();
+        let mut pci = PciHost::new();
+        pci.add_block(block).unwrap();
+
+        assert_eq!(cfg_in(&mut pci, 0x0000, 4), 0x1237_8086);
+        assert_eq!(cfg_in(&mut pci, 0x1000, 4), 0x1042_1af4);
+        assert_eq!(cfg_in(&mut pci, 0x1008, 4), 0x0100_0001);
+        assert_eq!(cfg_in(&mut pci, 0x102c, 4), 0x0002_1af4);
+        assert_eq!((cfg_in(&mut pci, 0x103c, 4) >> 8) & 0xff, 1);
+        assert_eq!((cfg_in(&mut pci, 0x1004, 4) >> 16) & 0x10, 0x10);
+        // 00:03.0 stays empty. This host has no net function.
+        assert_eq!(cfg_in(&mut pci, 0x1800, 4), 0xffff_ffff);
+
+        let mut ptr = cfg_in(&mut pci, 0x1034, 1) as u8;
+        let mut types = Vec::new();
+        for _ in 0..8 {
+            assert_ne!(ptr, 0);
+            let hdr = cfg_in(&mut pci, 0x1000 | u32::from(ptr), 4);
+            let id = (hdr & 0xff) as u8;
+            let next = ((hdr >> 8) & 0xff) as u8;
+            let cfg_type = ((hdr >> 24) & 0xff) as u8;
+            assert_eq!(id, 0x09);
+            types.push(cfg_type);
+            if next == 0 {
+                break;
+            }
+            ptr = next;
+        }
+        assert_eq!(types, vec![1, 2, 3, 4]);
+        assert_eq!(cfg_in(&mut pci, 0x1060, 4), 0);
+
+        cfg(&mut pci, 0x1010, 0xffff_ffff, 4);
+        assert_eq!(cfg_in(&mut pci, 0x1010, 4), 0xffff_c000);
+        cfg(&mut pci, 0x1010, 0xC000_0000, 4);
+        cfg(&mut pci, 0x1004, 0x6, 2);
+
+        let low = pci.mmio_read(0xC000_0004, 4).unwrap() as u32;
+        let offered = (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 9) | (1 << 28);
+        assert_eq!(low, offered);
+        assert!(pci.mmio_write(0xC000_0000, 1, 4));
+        assert_eq!(pci.mmio_read(0xC000_0004, 4).unwrap(), 1);
+        assert!(pci.mmio_write(0xC000_0000, 0, 4));
+        assert_eq!(pci.mmio_read(0xC000_3000, 8).unwrap(), 1);
+
+        desc(&mem, 0, 0x4000, 16, 1, 1);
+        desc(&mem, 1, 0x5000, 512, 1 | 2, 2);
+        desc(&mem, 2, 0x6000, 1, 2, 0);
+        mem.write_u32(0x4000, 0).unwrap();
+        mem.write_u64(0x4008, 0).unwrap();
+        mem.write_u16(0x2002, 1).unwrap();
+        mem.write_u16(0x2004, 0).unwrap();
+        mem.write(0x6000, &[0xff]).unwrap();
+
+        let bar = 0xC000_0000u64;
+        assert!(pci.mmio_write(bar + 0x14, 0x3, 1));
+        assert!(pci.mmio_write(bar + 0x08, 0, 4));
+        assert!(pci.mmio_write(bar + 0x0c, u64::from(offered), 4));
+        assert!(pci.mmio_write(bar + 0x08, 1, 4));
+        assert!(pci.mmio_write(bar + 0x0c, 1, 4));
+        assert!(pci.mmio_write(bar + 0x14, 0xb, 1));
+        assert!(pci.mmio_write(bar + 0x16, 0, 2));
+        assert!(pci.mmio_write(bar + 0x18, 128, 2));
+        assert!(pci.mmio_write(bar + 0x20, 0x1000, 4));
+        assert!(pci.mmio_write(bar + 0x24, 0, 4));
+        assert!(pci.mmio_write(bar + 0x28, 0x2000, 4));
+        assert!(pci.mmio_write(bar + 0x2c, 0, 4));
+        assert!(pci.mmio_write(bar + 0x30, 0x3000, 4));
+        assert!(pci.mmio_write(bar + 0x34, 0, 4));
+        assert!(pci.mmio_write(bar + 0x1c, 1, 2));
+        assert!(pci.mmio_write(bar + 0x14, 0xf, 1));
+        assert_eq!(pci.mmio_read(bar + 0x18, 2).unwrap(), 128);
+        assert_eq!(pci.mmio_read(bar + 0x1c, 2).unwrap(), 1);
+        let _ = pci.take_intx();
+
+        assert!(pci.mmio_write(bar + 0x1000, 0, 2));
+        let mut got = [0u8; 512];
+        mem.read(0x5000, &mut got).unwrap();
+        assert_eq!(got.as_slice(), pattern.as_slice());
+        let mut status = [0u8; 1];
+        mem.read(0x6000, &mut status).unwrap();
+        assert_eq!(status[0], 0);
+        assert_eq!(mem.read_u16(0x3002).unwrap(), 1);
+        assert_eq!(mem.read_u32(0x3004).unwrap(), 0);
+        assert_eq!(mem.read_u32(0x3008).unwrap(), 513);
+        assert_eq!(
+            pci.take_intx(),
+            vec![PciIrq {
+                gsi: 16,
+                high: false
+            }]
+        );
+        assert_eq!(pci.mmio_read(bar + 0x2000, 1).unwrap(), 1);
+        assert_eq!(
+            pci.take_intx(),
+            vec![PciIrq {
+                gsi: 16,
+                high: true
+            }]
+        );
+        assert_eq!(pci.mmio_read(bar + 0x2000, 1).unwrap(), 0);
+        assert!(pci.take_intx().is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), pattern);
+    }
+
+    fn cfg(pci: &mut PciHost, addr: u32, data: u64, size: usize) {
+        assert!(pci.try_out(0xCF8, u64::from(0x8000_0000 | addr), 4));
+        assert!(pci.try_out(0xCFC, data, size));
+    }
+
+    fn cfg_in(pci: &mut PciHost, addr: u32, size: usize) -> u64 {
+        assert!(pci.try_out(0xCF8, u64::from(0x8000_0000 | addr), 4));
+        pci.try_in(0xCFC, size).unwrap()
+    }
+
+    fn desc(
+        mem: &crate::memory::GuestMemory,
+        idx: u64,
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let at = 0x1000 + idx * 16;
+        mem.write_u64(at, addr).unwrap();
+        mem.write_u32(at + 8, len).unwrap();
+        mem.write_u16(at + 12, flags).unwrap();
+        mem.write_u16(at + 14, next).unwrap();
     }
 }

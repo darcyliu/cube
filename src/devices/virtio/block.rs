@@ -1,4 +1,5 @@
-//! VirtIO Block Device (`virtio-blk`) implementation over Modern MMIO.
+//! VirtIO block backend: raw files, read-only images, and COW overlays.
+//! Queue walking stays in [`super::VirtQueue`]. PCI owns the transport.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -9,7 +10,6 @@ static BLK_IOS: AtomicU64 = AtomicU64::new(0);
 
 use super::*;
 use crate::cow::{self, CLUSTER_SIZE as COW_CLUSTER_SIZE, MAGIC as COW_MAGIC};
-use crate::devices::MmioDevice;
 use crate::memory::GuestMemory;
 
 // VirtIO Block Request Types
@@ -358,13 +358,9 @@ pub struct VirtioBlock {
     backend: Option<Box<dyn BlockBackend>>,
     capacity_sectors: u64,
     status: u32,
-    device_features_sel: u32,
-    driver_features_sel: u32,
     driver_features: u64,
-    queue: VirtQueue,
-    queue_sel: u32,
+    pub(crate) queue: VirtQueue,
     used_idx: u16,
-    interrupt_status: u32,
     #[allow(dead_code)]
     irq_num: u32,
     serial_id: String,
@@ -383,17 +379,13 @@ impl VirtioBlock {
             backend,
             capacity_sectors,
             status: 0,
-            device_features_sel: 0,
-            driver_features_sel: 0,
             driver_features: 0,
             queue: VirtQueue {
                 max_size: VTBLK_QUEUE_SIZE,
                 size: VTBLK_QUEUE_SIZE,
                 ..Default::default()
             },
-            queue_sel: 0,
             used_idx: 0,
-            interrupt_status: 0,
             irq_num,
             serial_id: serial_id.to_string(),
             mem,
@@ -434,14 +426,91 @@ impl VirtioBlock {
         Ok(Self::new(Some(Box::new(backend)), irq_num, serial_id, mem))
     }
 
-    fn process_queue(&mut self) {
+    pub(crate) fn status(&self) -> u32 {
+        self.status
+    }
+
+    /// A zero status is a device reset. Feature selects live in the transport.
+    pub(crate) fn set_status(&mut self, status: u32) {
+        self.status = status;
+        if status == 0 {
+            self.driver_features = 0;
+            self.queue = VirtQueue {
+                max_size: VTBLK_QUEUE_SIZE,
+                size: VTBLK_QUEUE_SIZE,
+                ..Default::default()
+            };
+            self.used_idx = 0;
+        }
+    }
+
+    pub(crate) fn device_feature_word(&self, select: u32) -> u32 {
+        let features = self.offered_features();
+        match select {
+            0 => features as u32,
+            1 => (features >> 32) as u32,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn driver_feature_word(&self, select: u32) -> u32 {
+        match select {
+            0 => self.driver_features as u32,
+            1 => (self.driver_features >> 32) as u32,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn set_driver_feature_word(&mut self, select: u32, word: u32) {
+        match select {
+            0 => self.driver_features = (self.driver_features & !0xffff_ffff) | u64::from(word),
+            1 => {
+                self.driver_features =
+                    (self.driver_features & 0xffff_ffff) | (u64::from(word) << 32)
+            }
+            _ => {}
+        }
+    }
+
+    fn offered_features(&self) -> u64 {
+        let mut features = VIRTIO_BLK_F_SIZE_MAX
+            | VIRTIO_BLK_F_SEG_MAX
+            | VIRTIO_BLK_F_BLK_SIZE
+            | VIRTIO_BLK_F_FLUSH
+            | VIRTIO_RING_F_INDIRECT_DESC
+            | VIRTIO_F_VERSION_1;
+        if self.backend.as_ref().is_some_and(|b| b.is_read_only()) {
+            features |= VIRTIO_BLK_F_RO;
+        }
+        features
+    }
+
+    /// Same layout the MMIO device exposed: capacity, size_max, seg_max, blk_size.
+    pub(crate) fn read_config(&self, offset: usize, size: usize) -> u64 {
+        let mut cfg = [0u8; 32];
+        cfg[0..8].copy_from_slice(&self.capacity_sectors.to_le_bytes());
+        cfg[8..12].copy_from_slice(&(1024u32 * 1024).to_le_bytes());
+        cfg[12..16].copy_from_slice(&VTBLK_SEG_MAX.to_le_bytes());
+        cfg[20..24].copy_from_slice(&512u32.to_le_bytes());
+        if size == 0 || offset.saturating_add(size) > cfg.len() {
+            return 0;
+        }
+        let mut value = 0u64;
+        for (i, &byte) in cfg[offset..offset + size].iter().enumerate() {
+            value |= u64::from(byte) << (i * 8);
+        }
+        value
+    }
+
+    /// Returns whether the guest should see a queue interrupt.
+    pub(crate) fn process_queue(&mut self) -> bool {
         if !self.queue.ready || self.queue.avail_ring == 0 || self.queue.desc_table == 0 {
-            return;
+            return false;
         }
 
         let q_size = self.queue.size;
         if q_size == 0 {
-            return;
+            return false;
         }
 
         // Drain the avail ring until it stops moving. Publish used.idx with a
@@ -451,7 +520,7 @@ impl VirtioBlock {
             Ok(n) => n,
             Err(_) => {
                 self.status |= VIRTIO_STATUS_NEEDS_RESET;
-                return;
+                return false;
             }
         };
         let mut processed_any = false;
@@ -502,9 +571,7 @@ impl VirtioBlock {
             }
         }
 
-        if processed_any {
-            self.interrupt_status |= 1;
-        }
+        processed_any && avail_wants_interrupt(&self.mem, self.queue.avail_ring)
     }
 
     fn handle_request(&mut self, head_desc: u16, q_size: u32) -> u32 {
@@ -651,163 +718,10 @@ impl VirtioBlock {
     }
 }
 
-impl MmioDevice for VirtioBlock {
-    fn shutdown(&mut self) -> Result<(), String> {
+impl Drop for VirtioBlock {
+    fn drop(&mut self) {
         if let Some(backend) = &mut self.backend {
-            backend.flush().map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
-    fn read(&mut self, offset: u64, size: usize) -> u64 {
-        match offset {
-            VIRTIO_MMIO_MAGIC_VALUE => VIRTIO_MMIO_MAGIC as u64,
-            VIRTIO_MMIO_VERSION => VIRTIO_MMIO_VERSION_2 as u64,
-            VIRTIO_MMIO_DEVICE_ID => VIRTIO_DEV_BLOCK as u64,
-            VIRTIO_MMIO_VENDOR_ID => VIRTIO_MMIO_VENDOR as u64,
-            VIRTIO_MMIO_DEVICE_FEATURES => {
-                let mut features = VIRTIO_BLK_F_SIZE_MAX
-                    | VIRTIO_BLK_F_SEG_MAX
-                    | VIRTIO_BLK_F_BLK_SIZE
-                    | VIRTIO_BLK_F_FLUSH
-                    | VIRTIO_RING_F_INDIRECT_DESC
-                    | VIRTIO_F_VERSION_1;
-                if let Some(ref b) = self.backend {
-                    if b.is_read_only() {
-                        features |= VIRTIO_BLK_F_RO;
-                    }
-                }
-                if self.device_features_sel == 0 {
-                    features & 0xffff_ffff
-                } else if self.device_features_sel == 1 {
-                    (features >> 32) & 0xffff_ffff
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => {
-                if self.queue_sel == 0 {
-                    self.queue.max_size as u64
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY => {
-                if self.queue_sel == 0 && self.queue.ready {
-                    1
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status as u64,
-            VIRTIO_MMIO_STATUS => self.status as u64,
-            off if off >= VIRTIO_MMIO_CONFIG => {
-                let config_offset = (off - VIRTIO_MMIO_CONFIG) as usize;
-                let mut cfg = [0u8; 32];
-                cfg[0..8].copy_from_slice(&self.capacity_sectors.to_le_bytes());
-                cfg[8..12].copy_from_slice(&(1024u32 * 1024).to_le_bytes());
-                cfg[12..16].copy_from_slice(&VTBLK_SEG_MAX.to_le_bytes());
-                cfg[20..24].copy_from_slice(&512u32.to_le_bytes());
-                if config_offset + size <= cfg.len() {
-                    let mut val = 0u64;
-                    for (i, &b) in cfg[config_offset..config_offset + size].iter().enumerate() {
-                        val |= (b as u64) << (i * 8);
-                    }
-                    val
-                } else {
-                    0
-                }
-            }
-            _ => 0,
-        }
-    }
-
-    fn write(&mut self, offset: u64, data: u64, _size: usize) {
-        match offset {
-            VIRTIO_MMIO_DEVICE_FEATURES_SEL => {
-                self.device_features_sel = data as u32;
-            }
-            VIRTIO_MMIO_DRIVER_FEATURES_SEL => {
-                self.driver_features_sel = data as u32;
-            }
-            VIRTIO_MMIO_DRIVER_FEATURES => {
-                if self.driver_features_sel == 0 {
-                    self.driver_features =
-                        (self.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
-                } else if self.driver_features_sel == 1 {
-                    self.driver_features =
-                        (self.driver_features & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_SEL => {
-                self.queue_sel = data as u32;
-            }
-            VIRTIO_MMIO_QUEUE_NUM => {
-                if self.queue_sel == 0 {
-                    self.queue.size = (data as u32).min(self.queue.max_size);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY => {
-                if self.queue_sel == 0 {
-                    self.queue.ready = (data & 1) == 1;
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.desc_table =
-                        (self.queue.desc_table & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.desc_table =
-                        (self.queue.desc_table & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DRIVER_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.avail_ring =
-                        (self.queue.avail_ring & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DRIVER_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.avail_ring =
-                        (self.queue.avail_ring & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DEVICE_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.used_ring =
-                        (self.queue.used_ring & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DEVICE_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.used_ring =
-                        (self.queue.used_ring & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                if data == 0 {
-                    self.process_queue();
-                }
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                self.interrupt_status &= !(data as u32);
-            }
-            VIRTIO_MMIO_STATUS => {
-                self.status = data as u32;
-                if data == 0 {
-                    self.queue = VirtQueue {
-                        max_size: VTBLK_QUEUE_SIZE,
-                        size: VTBLK_QUEUE_SIZE,
-                        ..Default::default()
-                    };
-                    self.used_idx = 0;
-                    self.interrupt_status = 0;
-                }
-            }
-            _ => {}
+            let _ = backend.flush();
         }
     }
 }

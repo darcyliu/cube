@@ -17,6 +17,7 @@ use vmm::devices::pflash::CfiPflash;
 use vmm::devices::pic::Pic;
 use vmm::devices::pit::Pit;
 use vmm::devices::serial::{ConsoleHooks, HostConsole, Ns16550};
+use vmm::devices::virtio::block::VirtioBlock;
 use vmm::gpa::{self, GuestSpace};
 use vmm::memory::GuestMemory;
 use vmm::terminal::{self, TerminalGuard};
@@ -25,6 +26,13 @@ use vmm::x86::{self, GUEST_RAM_BYTES, PAYLOAD_GPA, UEFI_RAM_BYTES};
 use crate::hypervisor::*;
 use crate::machine::Machine;
 use crate::vcpu::{self, Entry, Kick, VcpuDone};
+
+/// One virtio-blk image. `cow` uses `<path>.cow` and cannot be combined with `read_only`.
+pub struct DiskSpec {
+    pub path: PathBuf,
+    pub cow: bool,
+    pub read_only: bool,
+}
 
 struct VmGuard;
 
@@ -36,15 +44,25 @@ impl Drop for VmGuard {
     }
 }
 
-pub fn run_payload(path: Option<PathBuf>, serial_log: Option<PathBuf>, cpus: u32) -> Vec<VcpuDone> {
-    match run_payload_inner(path, serial_log, cpus) {
+pub fn run_payload(
+    path: Option<PathBuf>,
+    serial_log: Option<PathBuf>,
+    cpus: u32,
+    disks: Vec<DiskSpec>,
+) -> Vec<VcpuDone> {
+    match run_payload_inner(path, serial_log, cpus, disks) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
     }
 }
 
-pub fn run_uefi(firmware: PathBuf, serial_log: Option<PathBuf>, cpus: u32) -> Vec<VcpuDone> {
-    match run_uefi_inner(firmware, serial_log, cpus) {
+pub fn run_uefi(
+    firmware: PathBuf,
+    serial_log: Option<PathBuf>,
+    cpus: u32,
+    disks: Vec<DiskSpec>,
+) -> Vec<VcpuDone> {
+    match run_uefi_inner(firmware, serial_log, cpus, disks) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
     }
@@ -62,6 +80,7 @@ fn run_payload_inner(
     path: Option<PathBuf>,
     serial_log: Option<PathBuf>,
     cpus: u32,
+    disks: Vec<DiskSpec>,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let bytes = load_payload(path)?;
@@ -73,16 +92,24 @@ fn run_payload_inner(
         return Err("payload does not fit in guest RAM".into());
     }
     mem.write(entry, &bytes)?;
+    // A missing image must not call hv_vm_create.
+    let blocks = load_blocks(&mem, &disks)?;
 
     let _vm = create_vm(&mem)?;
     let slot: Arc<OnceLock<Weak<Machine>>> = Arc::new(OnceLock::new());
     let serial = open_serial(serial_log.as_deref(), &slot)?;
     let (kicks, lapics) = vcpu_parts(n);
+    let pci = if blocks.is_empty() {
+        None
+    } else {
+        Some(pci_with_blocks(blocks)?)
+    };
+    let gsis = pci.as_ref().map(PciHost::virtio_gsis).unwrap_or_default();
     let machine = Arc::new(Machine::new(
         GuestSpace::new(Arc::clone(&mem), None),
         standard_pio(serial.clone()),
         MmioBus::new(),
-        None,
+        pci,
         None,
         false,
         lapics,
@@ -90,6 +117,7 @@ fn run_payload_inner(
     ));
     let _ = slot.set(Arc::downgrade(&machine));
     machine.wire_uart_irq(&serial);
+    idle_intx(&machine, &gsis);
     boot_cpus(machine, kicks, serial, Entry::Payload { cr3 })
 }
 
@@ -97,6 +125,7 @@ fn run_uefi_inner(
     firmware: PathBuf,
     serial_log: Option<PathBuf>,
     cpus: u32,
+    disks: Vec<DiskSpec>,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let code_bytes =
@@ -126,7 +155,11 @@ fn run_uefi_inner(
 
     let ram = Arc::new(GuestMemory::allocate(0, UEFI_RAM_BYTES)?);
     let code = Arc::new(GuestMemory::from_buffer(gpa::CODE_FLASH_BASE, &code_bytes)?);
-    let tables = vmm::acpi::build(cpus, UEFI_RAM_BYTES as u64);
+    // A missing image must not call hv_vm_create.
+    let blocks = load_blocks(&ram, &disks)?;
+    let pci = pci_with_blocks(blocks)?;
+    let gsis = pci.virtio_gsis();
+    let tables = vmm::acpi::build_with_prt(cpus, UEFI_RAM_BYTES as u64, &pci.prt());
     let cfg = FwCfg::from_files(
         Arc::clone(&ram),
         &[
@@ -173,7 +206,7 @@ fn run_uefi_inner(
         GuestSpace::new(ram, Some(code)),
         pio,
         mmio,
-        Some(PciHost::new()),
+        Some(pci),
         Some(kbd),
         true,
         lapics,
@@ -181,7 +214,41 @@ fn run_uefi_inner(
     ));
     let _ = slot.set(Arc::downgrade(&machine));
     machine.wire_uart_irq(&serial);
+    idle_intx(&machine, &gsis);
     boot_cpus(machine, kicks, serial, Entry::Firmware)
+}
+
+fn load_blocks(mem: &Arc<GuestMemory>, disks: &[DiskSpec]) -> Result<Vec<VirtioBlock>, String> {
+    let mut blocks = Vec::with_capacity(disks.len());
+    for (i, disk) in disks.iter().enumerate() {
+        let serial = format!("vtbd{i}");
+        let path = disk
+            .path
+            .to_str()
+            .ok_or_else(|| format!("disk path is not utf-8: {}", disk.path.display()))?;
+        let block = if disk.cow {
+            VirtioBlock::from_cow(path, &format!("{path}.cow"), 0, &serial, Arc::clone(mem))?
+        } else {
+            VirtioBlock::from_raw(path, disk.read_only, 0, &serial, Arc::clone(mem))?
+        };
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+fn pci_with_blocks(blocks: Vec<VirtioBlock>) -> Result<PciHost, String> {
+    let mut pci = PciHost::new();
+    for block in blocks {
+        pci.add_block(block)?;
+    }
+    Ok(pci)
+}
+
+/// PCI INTx is active-low. Park each line high while the pin is still masked.
+fn idle_intx(machine: &Machine, gsis: &[u32]) {
+    for &gsi in gsis {
+        machine.set_gsi(gsi, true);
+    }
 }
 
 fn cpu_count(cpus: u32) -> Result<usize, String> {

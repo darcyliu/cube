@@ -29,10 +29,11 @@ fn main() {
             boot,
             serial_log,
             cpus,
+            disks,
         } => {
             let dones = match boot {
-                Boot::Payload(path) => vm::run_payload(path, serial_log, cpus),
-                Boot::Uefi(path) => vm::run_uefi(path, serial_log, cpus),
+                Boot::Payload(path) => vm::run_payload(path, serial_log, cpus, disks),
+                Boot::Uefi(path) => vm::run_uefi(path, serial_log, cpus, disks),
             };
             let mut failed = false;
             for done in dones {
@@ -77,6 +78,7 @@ enum Cli {
         boot: Boot,
         serial_log: Option<PathBuf>,
         cpus: u32,
+        disks: Vec<vm::DiskSpec>,
     },
 }
 
@@ -89,6 +91,8 @@ fn parse_args() -> Cli {
     let mut uefi: Option<PathBuf> = None;
     let mut serial_log = None;
     let mut cpus = 1u32;
+    let mut cdrom: Option<PathBuf> = None;
+    let mut disks = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -134,6 +138,32 @@ fn parse_args() -> Cli {
                     path.unwrap_or_else(|| "firmware/OVMF_CODE.fd".to_string()),
                 ));
             }
+            "--cdrom" | "--iso" => {
+                if cdrom.is_some() {
+                    return Cli::Error("pass only one of --cdrom and --iso".into());
+                }
+                let Some(path) = args.get(i + 1) else {
+                    return Cli::Error("--cdrom needs a path".into());
+                };
+                if path.starts_with('-') {
+                    return Cli::Error("--cdrom needs a path".into());
+                }
+                cdrom = Some(PathBuf::from(path));
+                i += 1;
+            }
+            "--disk" | "-d" => {
+                let Some(text) = args.get(i + 1) else {
+                    return Cli::Error("--disk needs a path".into());
+                };
+                if text.starts_with('-') {
+                    return Cli::Error("--disk needs a path".into());
+                }
+                match parse_disk(text) {
+                    Ok(disk) => disks.push(disk),
+                    Err(message) => return Cli::Error(message),
+                }
+                i += 1;
+            }
             "--serial-log" | "--console-log" => {
                 let Some(path) = args.get(i + 1) else {
                     return Cli::Error("--serial-log needs a path".into());
@@ -148,20 +178,57 @@ fn parse_args() -> Cli {
         }
         i += 1;
     }
+    let mut images = Vec::new();
+    if let Some(path) = cdrom {
+        // The ISO is vtbd0 even when --disk appears earlier on the command line.
+        images.push(vm::DiskSpec {
+            path,
+            cow: false,
+            read_only: true,
+        });
+    }
+    images.extend(disks);
     match (payload, uefi) {
         (Some(_), Some(_)) => Cli::Error("pass only one of --payload and --uefi/--firmware".into()),
         (Some(path), None) => Cli::Run {
             boot: Boot::Payload(path),
             serial_log,
             cpus,
+            disks: images,
         },
         (None, Some(path)) => Cli::Run {
             boot: Boot::Uefi(path),
             serial_log,
             cpus,
+            disks: images,
         },
         (None, None) => Cli::Error("no boot path; pass --payload".into()),
     }
+}
+
+fn parse_disk(text: &str) -> Result<vm::DiskSpec, String> {
+    let mut parts = text.split(',');
+    let path = parts.next().unwrap_or("");
+    if path.is_empty() {
+        return Err("--disk needs a path".into());
+    }
+    let mut cow = false;
+    let mut read_only = false;
+    for flag in parts {
+        match flag {
+            "cow" => cow = true,
+            "ro" => read_only = true,
+            _ => return Err(format!("--disk flag {flag} is not cow or ro")),
+        }
+    }
+    if cow && read_only {
+        return Err("--disk cannot combine cow and ro".into());
+    }
+    Ok(vm::DiskSpec {
+        path: PathBuf::from(path),
+        cow,
+        read_only,
+    })
 }
 
 fn print_help() {
@@ -179,6 +246,8 @@ Usage:
   vmm --firmware [PATH] [--cpus N]
                          OVMF. PATH defaults to firmware/OVMF_CODE.fd.
                          --cpus / -c is 1..=16 (default 1). vCPU 0 is the BSP.
+                         --disk / -d PATH[,cow][,ro]  virtio-blk, repeatable.
+                         --cdrom / --iso PATH         read-only virtio-blk, first disk.
 
 With no arguments, vmm prints this help and exits 1."
     );
