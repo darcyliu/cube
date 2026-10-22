@@ -113,6 +113,11 @@ pub struct DecodedMmio {
 }
 
 pub fn decode_mmio(bytes: &[u8], addr16: bool) -> Result<DecodedMmio, String> {
+    decode_mmio_bits(bytes, if addr16 { 16 } else { 32 })
+}
+
+/// `default_bits` is the address size without `0x67` (16, 32, or 64).
+pub fn decode_mmio_bits(bytes: &[u8], default_bits: u32) -> Result<DecodedMmio, String> {
     let mut i = 0;
     let mut operand_16 = false;
     let mut addr_override = false;
@@ -149,11 +154,17 @@ pub fn decode_mmio(bytes: &[u8], addr16: bool) -> Result<DecodedMmio, String> {
     let rex_r = rex & 0x4 != 0;
 
     // 16-bit ModRM uses disp16 where this decoder reads an immediate. Reject it.
+    // `0x67` flips 16 and 32. In long mode it selects 32, which shares this ModRM.
     let string_op = matches!(
         opcode,
         0xA4 | 0xA5 | 0xA6 | 0xA7 | 0xAA | 0xAB | 0xAC | 0xAD | 0xAE | 0xAF
     );
-    if addr16 && !addr_override && !string_op {
+    let effective_16 = match default_bits {
+        16 => !addr_override,
+        32 => addr_override,
+        _ => false,
+    };
+    if effective_16 && !string_op {
         return Err("16-bit address size is not an MMIO operand".into());
     }
 
@@ -558,6 +569,18 @@ pub fn extend_bits(value: u64, src_width: u8, dest_width: u8, sign: bool) -> u64
     extended & width_mask(dest_width)
 }
 
+/// `0x67` before the opcode. Other prefixes are skipped; ModRM is not decoded.
+pub fn has_addr_override(bytes: &[u8]) -> bool {
+    for &byte in bytes {
+        match byte {
+            0x67 => return true,
+            0x66 | 0xF0 | 0xF2 | 0xF3 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x40..=0x4F => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Advance a string index by one element. `mask` is the address-size mask.
 pub fn string_step(index: u64, width: u8, df: bool, mask: u64) -> u64 {
     let step = if df {
@@ -780,5 +803,20 @@ mod tests {
                 },
             }
         );
+        // 32-bit default (addr16 = false): 0x67 selects disp16, so 0x34 is not the imm.
+        assert!(decode_mmio(&[0x67, 0xC6, 0x06, 0x34, 0x12, 0xAB], false).is_err());
+        // Long mode: 0x67 is a 32-bit address. The immediate is the next byte.
+        let long = decode_mmio_bits(&[0x67, 0xC6, 0x06, 0xAB], 64).unwrap();
+        assert_eq!(
+            long.op,
+            MmioOp::Store {
+                src: StoreSrc::Imm {
+                    value: 0xAB,
+                    width: 1,
+                },
+            }
+        );
+        assert!(has_addr_override(&[0xF3, 0x67, 0x6C]));
+        assert!(!has_addr_override(&[0xF3, 0x6C]));
     }
 }

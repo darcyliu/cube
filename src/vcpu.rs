@@ -1229,8 +1229,8 @@ fn handle_ept(
 
 fn emulate_mmio(id: hv_vcpuid_t, machine: &Machine, cpu: usize, gpa: u64) -> Result<(), String> {
     let bytes = fetch_insn(id, &machine.space)?;
-    let addr16 = address_bits(id, false)? == 16;
-    let decoded = decode::decode_mmio(&bytes, addr16).map_err(|e| {
+    let default_bits = address_bits(id, false)?;
+    let decoded = decode::decode_mmio_bits(&bytes, default_bits).map_err(|e| {
         format!(
             "MMIO at {gpa:#x} bytes {}: {e}; {}",
             hex_bytes(&bytes),
@@ -1683,7 +1683,8 @@ fn handle_string_io(
 ) -> Result<(), String> {
     let is_in = qual & (1 << 3) != 0;
     let rep = qual & (1 << 5) != 0;
-    let addr_bits = address_bits(id, false)?;
+    let bytes = fetch_insn(id, &machine.space)?;
+    let addr_bits = address_bits(id, decode::has_addr_override(&bytes))?;
     let mask = match addr_bits {
         16 => 0xffff,
         32 => 0xffff_ffff,
