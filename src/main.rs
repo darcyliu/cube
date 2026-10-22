@@ -5,13 +5,84 @@
 compile_error!("vmm-intel builds only for x86_64-apple-darwin");
 
 mod hypervisor;
+mod vcpu;
+mod vm;
 
+use std::path::PathBuf;
 use std::process;
 
 fn main() {
     enforce_host_gate();
-    print_help();
-    process::exit(1);
+    match parse_args() {
+        Cli::Help => {
+            print_help();
+            process::exit(1);
+        }
+        Cli::Error(message) => {
+            eprintln!("{message}");
+            process::exit(1);
+        }
+        Cli::Payload { path, serial_log } => {
+            let done = vm::run_payload(path, serial_log);
+            if let Some(ns) = done.exec_ns {
+                eprintln!("[VMM] vCPU exec time: {ns} ns");
+            }
+            if let Some(error) = done.error {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+    }
+}
+
+enum Cli {
+    Help,
+    Error(String),
+    Payload {
+        path: Option<PathBuf>,
+        serial_log: Option<PathBuf>,
+    },
+}
+
+fn parse_args() -> Cli {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return Cli::Help;
+    }
+    let mut payload: Option<Option<PathBuf>> = None;
+    let mut serial_log = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => return Cli::Help,
+            "--payload" => {
+                let path = args
+                    .get(i + 1)
+                    .filter(|next| !next.starts_with('-'))
+                    .cloned();
+                if path.is_some() {
+                    i += 1;
+                }
+                payload = Some(path.map(PathBuf::from));
+            }
+            "--serial-log" | "--console-log" => {
+                let Some(path) = args.get(i + 1) else {
+                    return Cli::Error("--serial-log needs a path".into());
+                };
+                if path.starts_with('-') {
+                    return Cli::Error("--serial-log needs a path".into());
+                }
+                serial_log = Some(PathBuf::from(path));
+                i += 1;
+            }
+            other => return Cli::Error(format!("unknown argument {other}")),
+        }
+        i += 1;
+    }
+    match payload {
+        Some(path) => Cli::Payload { path, serial_log },
+        None => Cli::Error("no boot path; pass --payload".into()),
+    }
 }
 
 fn print_help() {
@@ -20,9 +91,10 @@ fn print_help() {
 vmm-intel: Intel-only x86_64 guest on macOS 10.15+ (Hypervisor.framework VMX).
 
 This fork does not run on Apple Silicon and must not be merged back into the
-AArch64 VMM. No guest machine is wired up yet, and hv_vm_create is not called.
+AArch64 VMM.
 
-Usage: vmm
+Usage:
+  vmm --payload [PATH]   Long-mode guest. PATH defaults to the built-in COM1 banner.
 
 With no arguments, vmm prints this help and exits 1."
     );

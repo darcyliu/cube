@@ -1,7 +1,8 @@
-//! MMIO bus and devices that do not call the hypervisor.
+//! MMIO / port I/O buses and devices that do not call the hypervisor.
 
 pub mod fw_cfg;
 pub mod pflash;
+pub mod serial;
 pub mod virtio;
 
 use std::sync::{Arc, Mutex};
@@ -132,6 +133,82 @@ impl MmioBus {
 }
 
 impl Default for MmioBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Port I/O device. `offset` is from the registered base port.
+pub trait PioDevice: Send + Sync {
+    fn pio_in(&self, offset: u16, size: usize) -> u64;
+    fn pio_out(&self, offset: u16, data: u64, size: usize);
+}
+
+struct PioEntry {
+    base: u16,
+    size: u16,
+    device: Arc<dyn PioDevice>,
+}
+
+pub struct PioBus {
+    devices: Vec<PioEntry>,
+}
+
+impl PioBus {
+    pub fn new() -> Self {
+        Self {
+            devices: Vec::new(),
+        }
+    }
+
+    pub fn register(&mut self, base: u16, size: u16, device: Arc<dyn PioDevice>) {
+        let end = base as u32 + size as u32;
+        assert!(
+            size != 0
+                && end <= 0x1_0000
+                && self.devices.iter().all(|e| {
+                    let other = e.base as u32 + e.size as u32;
+                    end <= e.base as u32 || base as u32 >= other
+                }),
+            "overlapping PIO range"
+        );
+        self.devices.push(PioEntry { base, size, device });
+    }
+
+    pub fn read(&self, port: u16, size: usize) -> Result<u64, String> {
+        self.dispatch(port, size)
+            .map(|(dev, offset)| dev.pio_in(offset, size))
+            .ok_or_else(|| format!("Unhandled PIO read at port {port:#04x} (size {size})"))
+    }
+
+    pub fn write(&self, port: u16, data: u64, size: usize) -> Result<(), String> {
+        match self.dispatch(port, size) {
+            Some((dev, offset)) => {
+                dev.pio_out(offset, data, size);
+                Ok(())
+            }
+            None => Err(format!(
+                "Unhandled PIO write at port {port:#04x} (val {data:#x}, size {size})"
+            )),
+        }
+    }
+
+    fn dispatch(&self, port: u16, size: usize) -> Option<(&Arc<dyn PioDevice>, u16)> {
+        if !matches!(size, 1 | 2 | 4) {
+            return None;
+        }
+        let end = port as usize + size;
+        for entry in &self.devices {
+            let base = entry.base as usize;
+            if port as usize >= base && end <= base + entry.size as usize {
+                return Some((&entry.device, port - entry.base));
+            }
+        }
+        None
+    }
+}
+
+impl Default for PioBus {
     fn default() -> Self {
         Self::new()
     }

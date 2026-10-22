@@ -44,6 +44,33 @@ impl GuestMemory {
         })
     }
 
+    /// Page-aligned zeroed buffer. Does not call `hv_vm_map`.
+    pub fn allocate(guest_base: u64, size: usize) -> Result<Self, String> {
+        if size == 0 || size % GUEST_PAGE_SIZE != 0 {
+            return Err("guest memory size must be a non-zero multiple of 4 KiB".into());
+        }
+        if guest_base % GUEST_PAGE_SIZE as u64 != 0 || guest_base.checked_add(size as u64).is_none()
+        {
+            return Err("guest memory base is misaligned or overflows".into());
+        }
+        let layout = Layout::from_size_align(size, GUEST_PAGE_SIZE)
+            .map_err(|_| "guest memory alignment failed".to_string())?;
+        let raw_ptr = unsafe { alloc_zeroed(layout) };
+        let ptr =
+            NonNull::new(raw_ptr).ok_or_else(|| "guest memory allocation failed".to_string())?;
+        Ok(Self {
+            ptr,
+            layout,
+            guest_base,
+            size,
+        })
+    }
+
+    /// Host pointer passed to `hv_vm_map` by the binary.
+    pub fn host_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
     pub fn guest_base(&self) -> u64 {
         self.guest_base
     }

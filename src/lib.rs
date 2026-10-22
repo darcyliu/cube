@@ -7,6 +7,7 @@ pub mod terminal;
 pub mod vmnet_proto;
 pub mod vmnet_service;
 pub mod vmnet_sys;
+pub mod x86;
 
 #[cfg(test)]
 mod test_support;
