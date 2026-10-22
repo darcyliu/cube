@@ -702,7 +702,7 @@ fn run_loop(
                 continue;
             }
             let attempt = (|| -> Result<Attempt, String> {
-                if injectable {
+                let accepted = if injectable {
                     if let Some(vector) = machine.accept_irq(cpu) {
                         if kick.abort_if_pending() {
                             machine.requeue_irq(cpu, vector);
@@ -714,11 +714,24 @@ fn run_loop(
                             VMCS_CTRL_VMENTRY_IRQ_INFO,
                             u64::from(vector) | IRQ_INFO_VALID,
                         )?;
+                        Some(vector)
                     } else {
                         wvmcs(id, VMCS_CTRL_VMENTRY_IRQ_INFO, 0)?;
+                        None
+                    }
+                } else {
+                    None
+                };
+                // `None` means a kick landed and the run was not entered.
+                match exec_guest(id, remain, timers, kick)? {
+                    Some(exit) => Ok(Attempt::Ran(exit)),
+                    None => {
+                        if let Some(vector) = accepted {
+                            machine.requeue_irq(cpu, vector);
+                        }
+                        Ok(Attempt::Aborted)
                     }
                 }
-                Ok(Attempt::Ran(exec_guest(id, remain, timers, kick)?))
             })();
             kick.end_run();
             match attempt? {
@@ -781,6 +794,10 @@ fn run_loop(
         if raw_basic == VMX_REASON_VMX_TIMER {
             // Only a deadline we armed is a LAPIC expiry. A leftover 0 is not.
             timer_exit = exit.with_deadline;
+        }
+        // A fault after forward progress is a new walk, not a stuck retry.
+        if raw_basic != VMX_REASON_EPT_VIOLATION {
+            ept_retry = None;
         }
 
         match raw_basic {
@@ -889,24 +906,29 @@ fn probe_preemption(id: hv_vcpuid_t) -> Result<Option<ExitInfo>, String> {
     Ok(Some(exit))
 }
 
+/// `None` when a kick arrived before entry. `hv_vcpu_interrupt` does not latch
+/// until this thread is inside `run` / `run_until`, so HLT would not return.
 fn exec_guest(
     id: hv_vcpuid_t,
     remain: Option<u64>,
     timers: &mut TimerJoin,
     kick: &Arc<Kick>,
-) -> Result<ExitInfo, String> {
+) -> Result<Option<ExitInfo>, String> {
     let watch = Arc::clone(&timers.watch);
     let mode = PREEMPT.load(Ordering::Acquire);
     if let Some(ns) = remain
         && mode != PREEMPT_NO
     {
         let deadline = mach_now().saturating_add(ns_to_abs(ns));
+        if kick.abort_if_pending() {
+            return Ok(None);
+        }
         let rc = unsafe { hv_vcpu_run_until(id, deadline) };
         if rc == HV_SUCCESS {
             if mode == PREEMPT_UNKNOWN {
                 PREEMPT.store(PREEMPT_OK, Ordering::Release);
             }
-            return read_exit(id, true);
+            return read_exit(id, true).map(Some);
         }
         if rc != HV_UNSUPPORTED {
             return Err(format!(
@@ -926,6 +948,9 @@ fn exec_guest(
     }
     // Do not leave a 0 from `run_until` in the preemption timer.
     wvmcs(id, VMCS_GUEST_VMX_TIMER_VALUE, u64::MAX)?;
+    if kick.abort_if_pending() {
+        return Ok(None);
+    }
     let rc = unsafe { hv_vcpu_run(id) };
     if rc != HV_SUCCESS {
         let reason = read_vmcs(id, VMCS_RO_EXIT_REASON).unwrap_or(0);
@@ -935,7 +960,7 @@ fn exec_guest(
             dump_guest(id)
         ));
     }
-    read_exit(id, remain.is_some())
+    read_exit(id, remain.is_some()).map(Some)
 }
 
 fn note_unsupported() {
@@ -987,6 +1012,7 @@ fn handle_ept(
     let ram = machine.space.ram().size() as u64;
     if gpa < ram {
         let rip = read_reg(id, HV_X86_RIP)?;
+        // Same access twice in a row: the framework did not install the page.
         if *ept_retry == Some((gpa, rip)) {
             return Err(format!(
                 "EPT fault on mapped RAM at {gpa:#x} is not MMIO; {}",
@@ -999,6 +1025,7 @@ fn handle_ept(
         }
         return Ok(());
     }
+    *ept_retry = None;
     // The code flash is not mapped. Writes are ignored; reads cannot be filled.
     if machine.space.code_window_contains(gpa, 1) && qual & 2 != 0 {
         return advance_rip(id);
