@@ -1269,7 +1269,7 @@ impl NetBackend for CaptureBackend {
 }
 
 /// TX payloads collected under the queue mutex. Sent after `PciHost` is dropped.
-pub(crate) struct TxSubmit {
+pub struct TxSubmit {
     backend: Arc<Mutex<Box<dyn NetBackend>>>,
     frames: Vec<Vec<u8>>,
 }

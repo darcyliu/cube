@@ -37,6 +37,20 @@ pub fn pm1_cnt_is_shutdown(value: u16) -> bool {
     value & (1 << 13) != 0 && (value >> 10) & 7 == 0
 }
 
+/// Apply the captured INTx delta, then `vmnet_write`. Another vCPU can
+/// deassert during the send; delivering this delta afterwards sticks an
+/// active-low pin. The caller has already dropped `PciHost`.
+pub fn deliver_intx_then_send(
+    irqs: Vec<PciIrq>,
+    tx: Option<TxSubmit>,
+    deliver: impl FnOnce(Vec<PciIrq>),
+) {
+    deliver(irqs);
+    if let Some(tx) = tx {
+        tx.send();
+    }
+}
+
 struct Slot {
     cfg: [u8; 256],
 }
@@ -159,7 +173,7 @@ impl PciHost {
     }
 
     /// TX frames collected under this lock. The caller sends them after dropping it.
-    pub(crate) fn take_tx(&mut self) -> Option<TxSubmit> {
+    pub fn take_tx(&mut self) -> Option<TxSubmit> {
         self.pending_tx.take()
     }
 
@@ -482,7 +496,121 @@ fn poke(reg: &mut u16, off: usize, byte: u8) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use crate::devices::virtio::net::{NetBackend, VirtioNet};
+    use crate::memory::GuestMemory;
+
     use super::*;
+
+    /// `send_packet` stands in for a blocking `vmnet_write`.
+    struct DuringSend {
+        hook: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    }
+
+    impl NetBackend for DuringSend {
+        fn send_packet(&mut self, _packet: &[u8]) -> Result<(), String> {
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn deassert_during_tx_send_beats_the_saved_assert() {
+        const BAR: u64 = 0xC010_0000;
+        let mem = Arc::new(GuestMemory::from_buffer(0, &vec![0u8; 0x1_0000]).unwrap());
+        let hook = Arc::new(Mutex::new(None));
+        let net = VirtioNet::from_backend(
+            [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            mem.clone(),
+            Box::new(DuringSend {
+                hook: Arc::clone(&hook),
+            }),
+        );
+        let mut pci = PciHost::new();
+        pci.add_net(net).unwrap();
+        cfg(&mut pci, 0x1810, BAR, 4);
+        cfg(&mut pci, 0x1804, 0x6, 2);
+        assert!(pci.mmio_write(BAR + 0x16, 1, 2));
+        assert!(pci.mmio_write(BAR + 0x18, 128, 2));
+        assert!(pci.mmio_write(BAR + 0x20, 0x5000, 4));
+        assert!(pci.mmio_write(BAR + 0x24, 0, 4));
+        assert!(pci.mmio_write(BAR + 0x28, 0x6000, 4));
+        assert!(pci.mmio_write(BAR + 0x2c, 0, 4));
+        assert!(pci.mmio_write(BAR + 0x30, 0x7000, 4));
+        assert!(pci.mmio_write(BAR + 0x34, 0, 4));
+        mem.write(0x8000, &[0u8; 12]).unwrap();
+        mem.write(0x800c, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+        mem.write_u64(0x5000, 0x8000).unwrap();
+        mem.write_u32(0x5008, 16).unwrap();
+        mem.write_u16(0x500c, 0).unwrap();
+        mem.write_u16(0x6002, 1).unwrap();
+        mem.write_u16(0x6004, 0).unwrap();
+        assert!(pci.mmio_write(BAR + 0x1c, 1, 2));
+        let _ = pci.take_intx();
+        let _ = pci.take_tx();
+
+        // Idle pin is high, matching `idle_intx` before the notify.
+        let pin = Arc::new(AtomicBool::new(true));
+        let pci = Arc::new(Mutex::new(pci));
+        let ran = Arc::new(AtomicBool::new(false));
+        let during_pci = Arc::clone(&pci);
+        let during_pin = Arc::clone(&pin);
+        let ran_send = Arc::clone(&ran);
+        *hook.lock().unwrap() = Some(Box::new(move || {
+            assert!(
+                !during_pin.load(Ordering::Relaxed),
+                "TX assert is delivered before vmnet_write"
+            );
+            let mut pci = during_pci.lock().unwrap();
+            let isr = pci.mmio_read(BAR + 0x2000, 1).unwrap();
+            assert_eq!(isr, 1, "other vCPU observes the pending ISR during send");
+            let irqs = pci.take_intx();
+            drop(pci);
+            assert_eq!(
+                irqs,
+                vec![PciIrq {
+                    gsi: 17,
+                    high: true
+                }]
+            );
+            for irq in irqs {
+                during_pin.store(irq.high, Ordering::Relaxed);
+            }
+            ran_send.store(true, Ordering::Relaxed);
+        }));
+
+        let (irqs, tx) = {
+            let mut pci = pci.lock().unwrap();
+            assert!(pci.mmio_write(BAR + 0x1000, 1, 2));
+            (pci.take_intx(), pci.take_tx())
+        };
+        let deliver_pin = Arc::clone(&pin);
+        deliver_intx_then_send(irqs, tx, move |irqs| {
+            assert_eq!(
+                irqs,
+                vec![PciIrq {
+                    gsi: 17,
+                    high: false
+                }]
+            );
+            for irq in irqs {
+                deliver_pin.store(irq.high, Ordering::Relaxed);
+            }
+        });
+        assert!(
+            ran.load(Ordering::Relaxed),
+            "send ran after PciHost was dropped"
+        );
+        assert!(
+            pin.load(Ordering::Relaxed),
+            "deassert during send must win over the saved assert"
+        );
+    }
 
     #[test]
     fn pm_timer_port_follows_pmba_and_iose() {

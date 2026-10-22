@@ -9,7 +9,7 @@ use vmm::devices::ioapic::{IOAPIC_MMIO, IOAPIC_MMIO_LEN, IoApic, IoapicMsg};
 use vmm::devices::lapic::{
     DeliveryMode, LAPIC_MMIO, LAPIC_MMIO_LEN, Lapic, LapicEffect, Peer, logical_match,
 };
-use vmm::devices::pci::{PciAction, PciHost, PciIrq};
+use vmm::devices::pci::{PciAction, PciHost, PciIrq, deliver_intx_then_send};
 use vmm::devices::{MmioBus, PioBus};
 use vmm::gpa::GuestSpace;
 use vmm::terminal::host_log;
@@ -342,12 +342,11 @@ impl Machine {
             }
             (pci.take_intx(), pci.take_tx())
         };
-        // vmnet_write runs after PciHost is released so blk, config, and the
-        // RX hook are not stuck behind one TX notify.
-        if let Some(tx) = tx {
-            tx.send();
-        }
-        self.deliver_intx(irqs);
+        // PciHost is already dropped, so vmnet_write does not block config,
+        // virtio-blk, or the RX hook. The helper delivers this delta before
+        // the send; applying it afterwards sticks GSI 17 active-low if another
+        // vCPU deasserts during vmnet_write. The TX bytes are already copied.
+        deliver_intx_then_send(irqs, tx, |irqs| self.deliver_intx(irqs));
         true
     }
 
