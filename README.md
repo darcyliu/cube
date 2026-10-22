@@ -193,6 +193,7 @@ and whether to add a desktop:
 
 ```sh
 python3 -B scripts/install-vm.py --version 14.4
+python3 -B scripts/install-vm.py --version 14.4 --unattended
 python3 -B scripts/install-vm.py --version 15.1 --unattended --name freebsd15
 python3 -B scripts/install-vm.py --version 15 --unattended --desktop plasma --name work
 ```
@@ -200,14 +201,18 @@ python3 -B scripts/install-vm.py --version 15 --unattended --desktop plasma --na
 `--version 15` is 15.1. 14.4 is the default. 14.5 uses the same distribution-set
 install as 14.4. 15.1 installs the packaged base system from disc1. 15.0 is
 interactive only: its scripted installer cannot use the packages on that disc.
-The VM is created under `~/Cube/<name>/`. The command prints a `cubectl` start
-line and a direct `cube` command for that disk. A desktop install needs guest
+The VM is created under `~/Cube/<name>/`. Without `--unattended`, the command
+creates an installer VM and prints the `cubectl start`, VNC, stop, and eject
+workflow needed to complete the manual installation. With `--unattended`, it
+finishes the installation before printing the `cubectl start` command. Use the
+saved `cubectl` configuration so its UEFI firmware, EFI variables, disks, ports,
+and network settings stay consistent. A desktop install needs guest
 internet for packages. Add `--skip-verify` to a desktop install to stop after
 the packages, login account, and Xorg configuration are written, and skip the
 X11 input check, reboot, and cold-start check. Installers use
 `vmnet-proxy` and the vmnet service (`make vmnet-service`); they do not use
 sudo. Pass `--sudo` to run the installer as root with in-process vmnet instead.
-The saved config, the `cubectl` line, and the direct `cube` command follow that choice.
+The saved config and `cubectl` launch follow that choice.
 
 For a disposable full installation, installed-disk SSH, and reboot/persistence
 check, see [the installation regression runbook](docs/install-regression.md).

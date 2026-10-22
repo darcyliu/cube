@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Install a FreeBSD VM: choose the release, unattended or interactive, and an optional desktop.
+"""Create or install a FreeBSD VM: choose interactive or unattended setup.
 
 Uses native cubectl to create, partition, install, and manage VM instances.
 
 Examples:
   python3 -B scripts/install-vm.py --version 14.4
+  python3 -B scripts/install-vm.py --version 14.4 --unattended
   python3 -B scripts/install-vm.py --version 15.1 --unattended --name freebsd15
   python3 -B scripts/install-vm.py --version 15 --unattended --desktop plasma --name work
   python3 -B scripts/install-vm.py --version 15 --unattended --desktop plasma --name work --skip-verify
@@ -205,24 +206,6 @@ def default_identity(home):
     return None
 
 
-def direct_start(spec, binary, sudo=False, display="1280x800"):
-    """Foreground cube command matching the saved config's boot."""
-    parts = ["sudo"] if sudo else []
-    kernel = spec.dest / "kernel"
-    if not kernel.is_file() and (spec.dest / "boot" / "kernel" / "kernel").is_file():
-        kernel = spec.dest / "boot" / "kernel" / "kernel"
-    parts += [shlex.quote(str(binary)),
-              "--freebsd", shlex.quote(str(kernel)),
-              "--multiuser",
-              "--disk", shlex.quote(str(spec.dest / "installed.img")),
-              "--ram", str(spec.ram), "--cpus", str(spec.cpus),
-              "--net", "vmnet" if sudo else "vmnet-proxy",
-              "--ssh-port", "2222"]
-    if spec.desktop:
-        parts += ["--vnc", "127.0.0.1:5901", "--display", shlex.quote(display)]
-    return " ".join(parts)
-
-
 def vm_config(spec, binary, identity=None, sudo=False):
     config = {
         "name": spec.name,
@@ -314,6 +297,23 @@ def provision_desktop(spec, cubectl, desktop_user="cube", password="cube",
         subprocess.run([str(cubectl), "shutdown", spec.name, "--timeout", "120"], check=False)
 
 
+def print_next_steps(spec):
+    print()
+    if spec.unattended:
+        label = f"FreeBSD {spec.version}" + (f" with {spec.desktop} desktop" if spec.desktop else "")
+        print(f"✓ {label} installation finished successfully!")
+        print(f"Start VM:  cubectl start {spec.name}")
+        return
+
+    print(f"✓ FreeBSD {spec.version} VM created for interactive installation.")
+    print("Complete the installation using the VNC address printed above:")
+    print(f"  1. cubectl start {spec.name}")
+    print("  2. Connect a VNC viewer and finish the FreeBSD installer.")
+    print(f"  3. cubectl stop {spec.name}")
+    print(f"  4. cubectl eject {spec.name}")
+    print(f"  5. cubectl start {spec.name}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -401,10 +401,7 @@ def main(argv=None):
                           password=desktop_pwd, display=args.display,
                           skip_verify=args.skip_verify)
 
-    print()
-    print(f"✓ {label} installation finished successfully!")
-    print(f"Start VM:  cubectl start {spec.name}")
-    print(f"Direct:    {direct_start(spec, binary, sudo=args.sudo)}")
+    print_next_steps(spec)
     return 0
 
 

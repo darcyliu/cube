@@ -1,6 +1,15 @@
 import Foundation
 import AppKit
 
+private final class DashboardSidebarScrollView: NSScrollView {
+    override func tile() {
+        super.tile()
+        guard let table = documentView as? NSTableView else { return }
+        table.setFrameSize(NSSize(width: contentView.bounds.width, height: table.frame.height))
+        table.sizeLastColumnToFit()
+    }
+}
+
 private class DashboardFlippedView: NSView {
     override var isFlipped: Bool { return true }
 }
@@ -577,28 +586,31 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
 
         let addBtn = NSButton(title: "+ New VM", target: self, action: #selector(newVMClicked))
         addBtn.translatesAutoresizingMaskIntoConstraints = false
-        addBtn.bezelStyle = .recessed
-        addBtn.isBordered = false
+        addBtn.bezelStyle = .rounded
         addBtn.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         bottomBar.addSubview(addBtn)
 
         let refreshBtn = NSButton(title: "↻ Refresh", target: self, action: #selector(refreshClicked))
         refreshBtn.translatesAutoresizingMaskIntoConstraints = false
-        refreshBtn.bezelStyle = .recessed
-        refreshBtn.isBordered = false
+        refreshBtn.bezelStyle = .rounded
         refreshBtn.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         bottomBar.addSubview(refreshBtn)
 
         sidebarView.addSubview(bottomBar)
 
         // Middle Table View
-        let scrollView = NSScrollView()
+        let scrollView = DashboardSidebarScrollView()
+        scrollView.autohidesScrollers = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.horizontalScrollElasticity = .none
         scrollView.drawsBackground = false
 
         tableView = NSTableView()
+        tableView.autoresizingMask = [.width]
         tableView.headerView = nil
+        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         tableView.backgroundColor = .clear
         tableView.rowHeight = 48
         tableView.intercellSpacing = NSSize(width: 0, height: 4)
@@ -608,6 +620,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
 
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("VMColumn"))
         col.width = 240
+        col.resizingMask = .autoresizingMask
         tableView.addTableColumn(col)
 
         tableView.dataSource = self
@@ -1535,7 +1548,7 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableVi
                 }
                 #endif
             } else {
-                subtitle.stringValue = "\(os) • Stopped"
+                subtitle.stringValue = os
             }
         }
         return cell

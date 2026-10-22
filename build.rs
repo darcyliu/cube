@@ -101,7 +101,6 @@ fn main() {
                 if let Ok(elf_bytes) = fs::read(linux_out_obj.to_str().unwrap()) {
                     if let Some(text_section) = extract_elf_text_section(&elf_bytes) {
                         let _ = fs::write(&linux_out_bin, text_section);
-                        let _ = fs::write("guest/linux_payload.bin", text_section);
                     }
                 }
             }

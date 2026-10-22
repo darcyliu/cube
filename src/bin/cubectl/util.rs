@@ -205,11 +205,15 @@ pub fn canonical_path_buf(path: &Path) -> Result<PathBuf, String> {
 pub fn control_socket_path(state_dir: &Path) -> PathBuf {
     let canonical = state_dir.canonicalize().unwrap_or_else(|_| state_dir.to_path_buf());
     let digest = &sha256_hex(canonical.to_string_lossy().as_bytes())[..24];
+    control_socket_root().join(format!("{}.sock", digest))
+}
+
+pub fn control_socket_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("CUBECTL_SOCKET_DIR") {
-        return PathBuf::from(dir).join(format!("{}.sock", digest));
+        return PathBuf::from(dir);
     }
     let uid = unsafe { libc::getuid() };
-    PathBuf::from("/tmp").join(format!("cubectl-{}", uid)).join(format!("{}.sock", digest))
+    PathBuf::from("/tmp").join(format!("cubectl-{}", uid))
 }
 
 pub fn ensure_control_root(control: &Path) -> Result<(), String> {
@@ -321,6 +325,44 @@ pub fn parse_disk_spec(spec: &str) -> Result<ParsedDiskSpec, String> {
         cow,
         read_only,
     })
+}
+
+/// Require an Apple-issued signing identity: ad-hoc signatures cannot authorize vmnet.
+pub fn has_vmnet_entitlement(binary: &Path) -> bool {
+    let Ok(verified) = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "-R", "=anchor apple generic"])
+        .arg(binary)
+        .output()
+    else { return false };
+    if !verified.status.success() {
+        return false;
+    }
+    let Ok(entitlements) = Command::new("/usr/bin/codesign")
+        .args(["-d", "--entitlements", "-", "--xml"])
+        .arg(binary)
+        .output()
+    else { return false };
+    if !entitlements.status.success() {
+        return false;
+    }
+
+    let Ok(mut parser) = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else { return false };
+    let written = parser.stdin.take()
+        .is_some_and(|mut stdin| stdin.write_all(&entitlements.stdout).is_ok());
+    let Ok(parsed) = parser.wait_with_output() else { return false };
+    if !written || !parsed.status.success() {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(&parsed.stdout)
+        .ok()
+        .and_then(|value| value.get("com.apple.vm.networking").and_then(|v| v.as_bool()))
+        == Some(true)
 }
 
 pub fn ensure_cube_entitlements(cube_path: &Path) {
@@ -553,6 +595,11 @@ pub fn resolve_freebsd_version(version: &str) -> Result<(&'static str, &'static 
     }
 }
 
+pub fn default_cache_dir() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or("HOME not set")?;
+    Ok(PathBuf::from(home).join("Library/Caches/Cube"))
+}
+
 pub fn ensure_freebsd_iso(version: &str, cache_dir: Option<&Path>) -> Result<PathBuf, String> {
     let (resolved_ver, _) = resolve_freebsd_version(version)?;
     let filename = format!("FreeBSD-{resolved_ver}-RELEASE-arm64-aarch64-disc1.iso");
@@ -564,7 +611,7 @@ pub fn ensure_freebsd_iso(version: &str, cache_dir: Option<&Path>) -> Result<Pat
         Some(d) => d.to_path_buf(),
         None => {
             let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-            let cube_cache = PathBuf::from(&home).join("Library/Caches/Cube");
+            let cube_cache = default_cache_dir()?;
             let legacy_cache = PathBuf::from(&home).join("Library/Caches/vmm");
             let legacy_file = legacy_cache.join(&filename);
             let cube_file = cube_cache.join(&filename);

@@ -3,7 +3,7 @@
 //! Started with the VM Networking entitlement, or as root then dropped to `SUDO_UID`.
 //! Guests connect with `--net vmnet-proxy`. `--net vmnet` does not use this module.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
@@ -126,14 +126,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     serve(listener, &mut port, &resolvers, user.uid, dns_scope)
 }
 
-pub fn default_socket_path() -> Result<PathBuf, String> {
-    socket_path_for(unsafe { libc::geteuid() })
-}
-
-pub fn socket_path_for(uid: u32) -> Result<PathBuf, String> {
-    let (_name, home) = lookup_user(uid)?;
-    Ok(home.join("Library/Application Support/cube/vmnet.sock"))
-}
+pub use cube::runtime_paths::default_socket_path;
+use cube::runtime_paths::lookup_user;
 
 enum ServiceNet {
     Shared,
@@ -305,27 +299,6 @@ fn invoking_user() -> Result<Invoker, String> {
     Ok(Invoker { uid, gid, home })
 }
 
-fn lookup_user(uid: u32) -> Result<(String, PathBuf), String> {
-    let pw = unsafe { libc::getpwuid(uid) };
-    if pw.is_null() {
-        return Err(format!("getpwuid({uid}) failed"));
-    }
-    let name_ptr = unsafe { (*pw).pw_name };
-    let dir_ptr = unsafe { (*pw).pw_dir };
-    if name_ptr.is_null() || dir_ptr.is_null() {
-        return Err(format!("getpwuid({uid}) returned an empty name or home"));
-    }
-    let name = unsafe { CStr::from_ptr(name_ptr) }
-        .to_string_lossy()
-        .into_owned();
-    let home = unsafe { CStr::from_ptr(dir_ptr) }
-        .to_string_lossy()
-        .into_owned();
-    if name.is_empty() || home.is_empty() {
-        return Err(format!("getpwuid({uid}) returned an empty name or home"));
-    }
-    Ok((name, PathBuf::from(home)))
-}
 
 fn check_sun_path(path: &Path) -> Result<(), String> {
     let len = path.as_os_str().len();

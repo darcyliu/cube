@@ -19,6 +19,12 @@ use crate::util::{
 };
 use crate::{CreateArgs, InstallArgs, SshArgs, StartArgs};
 
+fn create_network_mode(explicit: Option<String>, has_entitlement: impl FnOnce() -> bool) -> String {
+    explicit.unwrap_or_else(|| {
+        if has_entitlement() { "vmnet" } else { "vmnet-proxy" }.into()
+    })
+}
+
 pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     validate_vm_name(&args.name)?;
 
@@ -37,6 +43,17 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     if config_path.exists() && !args.force {
         return Err(format!("configuration file {:?} already exists; choose another name or use --force to overwrite", config_path));
     }
+
+    // Resolve UEFI firmware before downloading an ISO or preparing/installing disks.
+    let boot_mode = args.boot.to_lowercase();
+    let firmware = match boot_mode.as_str() {
+        "uefi" => {
+            let fw_path = find_default_firmware(args.firmware.as_ref(), args.binary.as_deref())?;
+            Some(canonical_path_str(&fw_path)?)
+        }
+        "freebsd" => None,
+        other => return Err(format!("unsupported boot mode '{}'; choose 'uefi' or 'freebsd'", other)),
+    };
 
     // Resolve or detect installation ISO
     let installer_iso = if let Some(ref iso) = args.iso {
@@ -152,12 +169,11 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     }
 
     // Boot configuration
-    let boot = match args.boot.to_lowercase().as_str() {
+    let boot = match boot_mode.as_str() {
         "uefi" => {
-            let fw_path = find_default_firmware(args.firmware.as_ref(), &dest_dir)?;
             BootConfig {
                 mode: "uefi".into(),
-                firmware: Some(canonical_path_str(&fw_path)?),
+                firmware,
                 kernel: None,
                 multiuser: true,
                 root: args.root,
@@ -237,17 +253,22 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         }
     }
 
+    let net_mode = create_network_mode(args.net, || {
+        find_cube_binary(args.binary.as_deref(), None, Path::new("."))
+            .is_ok_and(|binary| util::has_vmnet_entitlement(&binary))
+    });
+
     // Network configuration: smart auto-allocation if ssh_port not specified
     let allocated_ssh_port = if let Some(p) = args.ssh_port {
         if p == 0 { None } else { Some(p) }
-    } else if args.net != "none" {
+    } else if net_mode != "none" {
         Some(find_next_available_ssh_port(state_root, &vms_root, &reserved_ssh_ports))
     } else {
         None
     };
 
     let network = Some(NetworkConfig {
-        mode: args.net.clone(),
+        mode: net_mode,
         mac: args.mac,
         ssh_port: allocated_ssh_port,
         forwards: args.forwards,
@@ -1135,15 +1156,16 @@ pub fn do_list(state_root: &Path, as_json: bool) -> Result<(), String> {
     } else if list.is_empty() {
         println!("No VMs configured in {:?}", state_root);
     } else {
-        println!("{:<20} {:<10} {:<24} {:<8} {:<10}", "NAME", "STATE", "OS", "PID", "STARTED");
-        println!("{:-<20} {:-<10} {:-<24} {:-<8} {:-<10}", "", "", "", "", "");
+        println!("{:<20} {:<10} {:<24} {:<15} {:<8} {:<10}", "NAME", "STATE", "OS", "IP", "PID", "STARTED");
+        println!("{:-<20} {:-<10} {:-<24} {:-<15} {:-<8} {:-<10}", "", "", "", "", "", "");
         for item in &list {
             let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("-");
             let state = item.get("state").and_then(|s| s.as_str()).unwrap_or("-");
             let os = item.get("os").and_then(|o| o.as_str()).unwrap_or("FreeBSD");
-            let pid = item.get("pid").and_then(|p| p.as_u64()).map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-            let started = item.get("started").and_then(|s| s.as_f64()).map(|s| format!("{:.0}s ago", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64() - s)).unwrap_or_else(|| "-".into());
-            println!("{:<20} {:<10} {:<24} {:<8} {:<10}", name, state, os, pid, started);
+            let ip = item.get("ip").and_then(|ip| ip.as_str()).unwrap_or("-");
+            let pid = item.get("pid").filter(|_| state != "stopped").and_then(|p| p.as_u64()).map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+            let started = item.get("started").filter(|_| state != "stopped").and_then(|s| s.as_f64()).map(|s| format!("{:.0}s ago", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64() - s)).unwrap_or_else(|| "-".into());
+            println!("{:<20} {:<10} {:<24} {:<15} {:<8} {:<10}", name, state, os, ip, pid, started);
         }
     }
     Ok(())
@@ -1180,6 +1202,21 @@ pub fn do_config_set(key: &str, value: &str, state_root: &Path) -> Result<(), St
         }
         _ => Err(format!("unknown configuration key '{}'. Supported keys: vms-dir", key)),
     }
+}
+
+pub fn do_info(state_root: &Path) -> Result<(), String> {
+    let paths = [
+        ("vms-dir", util::default_vms_root()),
+        ("cache-dir", util::default_cache_dir()?),
+        ("state-root", state_root.to_path_buf()),
+        ("settings-file", util::settings_path(state_root)),
+        ("vmnet-socket", cube::runtime_paths::default_socket_path()?),
+        ("control-socket-dir", util::control_socket_root()),
+    ];
+    for (key, path) in paths {
+        println!("{} = {}", key, path.display());
+    }
+    Ok(())
 }
 
 pub fn do_config_list(state_root: &Path) -> Result<(), String> {
@@ -1335,6 +1372,25 @@ pub fn find_next_available_vnc_port(state_root: &Path, vms_root: &Path) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_network_default_follows_entitlement() {
+        assert_eq!(create_network_mode(None, || true), "vmnet");
+        assert_eq!(create_network_mode(None, || false), "vmnet-proxy");
+    }
+
+    #[test]
+    fn explicit_create_network_skips_entitlement_detection() {
+        use clap::Parser;
+        for mode in ["vmnet-proxy", "vmnet", "bridge", "mock", "none"] {
+            let cli = crate::Cli::try_parse_from(["cubectl", "create", "test", "--net", mode]).unwrap();
+            let crate::Commands::Create(args) = cli.command else { panic!("expected create") };
+            assert_eq!(create_network_mode(args.net, || panic!("explicit mode must take precedence")), mode);
+        }
+        let cli = crate::Cli::try_parse_from(["cubectl", "create", "test"]).unwrap();
+        let crate::Commands::Create(args) = cli.command else { panic!("expected create") };
+        assert_eq!(args.net, None);
+    }
 
     #[test]
     fn ssh_config_identity_is_relative_to_config_but_cli_identity_is_not() {

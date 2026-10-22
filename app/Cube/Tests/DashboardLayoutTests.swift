@@ -12,6 +12,7 @@ struct DashboardLayoutTests {
         precondition(split.arrangedSubviews.count == 2)
         let sidebar = split.arrangedSubviews[0]
         let detail = split.arrangedSubviews[1]
+        let sidebarScroll = sidebar.subviews.compactMap { $0 as? NSScrollView }.first!
 
         func checkLayout() {
             root.layoutSubtreeIfNeeded()
@@ -23,6 +24,10 @@ struct DashboardLayoutTests {
             precondition(abs(sidebar.frame.minX) < 1)
             precondition(abs(detail.frame.minX - sidebar.frame.maxX - split.dividerThickness) < 1)
             precondition(abs(detail.frame.maxX - split.bounds.width) < 1)
+            precondition(!sidebarScroll.hasHorizontalScroller)
+            precondition(sidebarScroll.horizontalScrollElasticity == .none)
+            precondition(sidebarScroll.documentView!.frame.width <= sidebarScroll.contentView.bounds.width + 1,
+                         "Sidebar table overflows horizontally")
         }
 
         checkLayout()
@@ -35,7 +40,7 @@ struct DashboardLayoutTests {
         // Give the detail controls enough room to exercise the full divider range.
         window.setContentSize(NSSize(width: 1200, height: 580))
         checkLayout()
-        for position in [240.0, 300.0, 340.0] {
+        for position in [210.0, 240.0, 300.0, 340.0] {
             split.setPosition(position, ofDividerAt: 0)
             checkLayout()
             precondition(abs(sidebar.frame.width - position) < 1, "Divider requested \(position), got \(sidebar.frame.width)")

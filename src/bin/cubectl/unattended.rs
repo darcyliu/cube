@@ -6,76 +6,49 @@ use std::time::{Duration, Instant};
 
 use crate::util::{canonical_path_buf, find_cube_binary, require, resolve_path};
 
-pub fn find_default_firmware(user_fw: Option<&PathBuf>, base: &Path) -> Result<PathBuf, String> {
+pub fn find_default_firmware(user_fw: Option<&PathBuf>, cube_binary: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(fw) = user_fw {
         let resolved = resolve_path(&fw.to_string_lossy(), Path::new("."))?;
         require(resolved.is_file(), format!("firmware file not found: {:?}", resolved))?;
         return canonical_path_buf(&resolved);
     }
 
-    let p1 = Path::new("firmware/QEMU_EFI.fd");
-    if p1.is_file() {
-        return canonical_path_buf(p1);
-    }
-
-    let p2 = base.join("firmware/QEMU_EFI.fd");
-    if p2.is_file() {
-        return canonical_path_buf(&p2);
-    }
-
-    // Check ancestors of current executable (e.g. target/debug/cubectl or Cube.app/Contents/MacOS/cubectl)
+    // macOS current_exe() is the path used to launch, so ~/.local/bin/cubectl stays a
+    // symlink and its parents are not the Cube.app bundle. Resolve first, then walk.
     if let Ok(current_exe) = std::env::current_exe() {
-        let mut curr = current_exe.clone();
-        for _ in 0..6 {
-            if let Some(parent) = curr.parent() {
-                let cand_res = parent.join("Resources/firmware/QEMU_EFI.fd");
-                if cand_res.is_file() {
-                    return canonical_path_buf(&cand_res);
-                }
-                let cand_fw = parent.join("firmware/QEMU_EFI.fd");
-                if cand_fw.is_file() {
-                    return canonical_path_buf(&cand_fw);
-                }
-                curr = parent.to_path_buf();
-            } else {
-                break;
+        if let Some(found) = firmware_near_binary(&current_exe) {
+            return Ok(found);
+        }
+    }
+
+    if let Ok(cube_bin) = find_cube_binary(cube_binary, None, Path::new(".")) {
+        if let Some(found) = firmware_near_binary(&cube_bin) {
+            return Ok(found);
+        }
+    }
+
+    Err("UEFI boot requires --firmware <PATH>".into())
+}
+
+/// Firmware embedded beside a `cubectl` or `cube` binary.
+///
+/// Accepts a dev build (`.../firmware/QEMU_EFI.fd`), the main app
+/// (`Cube.app/Contents/MacOS/cubectl` -> `Contents/Resources/firmware/QEMU_EFI.fd`),
+/// and the nested helper (`Contents/Helpers/cube.app/.../cube`). Symlinks are
+/// resolved before the walk so a `~/.local/bin` launcher still finds the bundle.
+fn firmware_near_binary(exe: &Path) -> Option<PathBuf> {
+    let mut curr = exe.canonicalize().ok()?;
+    for _ in 0..8 {
+        let Some(parent) = curr.parent() else { break };
+        for rel in ["Resources/firmware/QEMU_EFI.fd", "firmware/QEMU_EFI.fd"] {
+            let cand = parent.join(rel);
+            if cand.is_file() {
+                return canonical_path_buf(&cand).ok();
             }
         }
+        curr = parent.to_path_buf();
     }
-
-    // Check ancestors of cube binary
-    if let Ok(cube_bin) = find_cube_binary(None, None, base) {
-        let mut curr = cube_bin.clone();
-        for _ in 0..6 {
-            if let Some(parent) = curr.parent() {
-                let cand_res = parent.join("Resources/firmware/QEMU_EFI.fd");
-                if cand_res.is_file() {
-                    return canonical_path_buf(&cand_res);
-                }
-                let cand_fw = parent.join("firmware/QEMU_EFI.fd");
-                if cand_fw.is_file() {
-                    return canonical_path_buf(&cand_fw);
-                }
-                curr = parent.to_path_buf();
-            } else {
-                break;
-            }
-        }
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join(".local/share/cube/firmware/QEMU_EFI.fd");
-        if candidate.is_file() {
-            return canonical_path_buf(&candidate);
-        }
-    }
-
-    let app_fw = Path::new("/Applications/Cube.app/Contents/Resources/firmware/QEMU_EFI.fd");
-    if app_fw.is_file() {
-        return canonical_path_buf(app_fw);
-    }
-
-    Err("UEFI boot requires --firmware <PATH> (or firmware/QEMU_EFI.fd in current directory or cube installation)".into())
+    None
 }
 
 pub fn auto_detect_iso() -> Option<PathBuf> {
@@ -202,7 +175,6 @@ pub fn build_cidata_seed(
         "cat << 'RC' > /etc/rc.conf\n\
 hostname=\"{}\"\n\
 ifconfig_vtnet0=\"DHCP\"\n\
-defaultrouter=\"192.168.18.1\"\n\
 sshd_enable=\"YES\"\n\
 growfs_enable=\"YES\"\n\
 sendmail_enable=\"NONE\"\n\
@@ -527,9 +499,72 @@ pub fn installation_complete(log: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
     #[test]
     fn completion_requires_standalone_marker() {
         assert!(!installation_complete("# bsdinstall script /media/installerconfig && echo VMM_INSTALL_COMPLETE && poweroff\ninstallation failed"));
         assert!(installation_complete("done\r\nVMM_INSTALL_COMPLETE\r\n"));
+    }
+
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, b"fw").unwrap();
+    }
+
+    #[test]
+    fn finds_app_bundle_firmware_through_external_symlink() {
+        let root = std::env::temp_dir().join(format!(
+            "cube-fw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _guard = TempDir(root.clone());
+        let fw = root.join("Cube.app/Contents/Resources/firmware/QEMU_EFI.fd");
+        let bin = root.join("Cube.app/Contents/MacOS/cubectl");
+        touch(&fw);
+        touch(&bin);
+        let link = root.join("local-bin/cubectl");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&bin, &link).unwrap();
+
+        let found = firmware_near_binary(&link).expect("bundle firmware via symlink");
+        assert_eq!(found, fw.canonicalize().unwrap());
+
+        let direct = firmware_near_binary(&bin).expect("bundle firmware via real binary");
+        assert_eq!(direct, fw.canonicalize().unwrap());
+        assert!(!link.parent().unwrap().join("Resources/firmware/QEMU_EFI.fd").is_file());
+    }
+
+    #[test]
+    fn finds_main_bundle_firmware_from_nested_helper() {
+        let root = std::env::temp_dir().join(format!(
+            "cube-fw-helper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _guard = TempDir(root.clone());
+        let fw = root.join("Cube.app/Contents/Resources/firmware/QEMU_EFI.fd");
+        let helper = root.join("Cube.app/Contents/Helpers/cube.app/Contents/MacOS/cube");
+        touch(&fw);
+        touch(&helper);
+
+        let found = firmware_near_binary(&helper).expect("firmware from helper binary");
+        assert_eq!(found, fw.canonicalize().unwrap());
     }
 }

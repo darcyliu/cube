@@ -136,6 +136,9 @@ pub enum Commands {
         password: String,
     },
 
+    /// Show runtime directories and socket locations
+    Info,
+
     /// Manage cubectl global configuration (e.g. default VM disk storage location)
     Config {
         #[command(subcommand)]
@@ -284,7 +287,7 @@ pub struct CreateArgs {
     #[arg(long, default_value = "uefi")]
     pub boot: String,
 
-    /// UEFI firmware path (required for uefi mode unless firmware/QEMU_EFI.fd exists)
+    /// UEFI firmware path (defaults to firmware discovered relative to cubectl or cube)
     #[arg(long)]
     pub firmware: Option<PathBuf>,
 
@@ -324,9 +327,9 @@ pub struct CreateArgs {
     #[arg(long = "share-rw", num_args = 2, value_names = ["TAG", "PATH"])]
     pub shares_rw: Vec<String>,
 
-    /// Network mode ("vmnet-proxy", "vmnet", "bridge", "mock", "none")
-    #[arg(long, default_value = "vmnet-proxy")]
-    pub net: String,
+    /// Network mode (default: vmnet when cube has the networking entitlement, otherwise vmnet-proxy)
+    #[arg(long)]
+    pub net: Option<String>,
 
     /// Network MAC address (default: auto-generated from VM name)
     #[arg(long)]
@@ -465,6 +468,7 @@ fn main() {
         Commands::PatchShadow { disk, password } => {
             ext4::patch_cloud_shadow(&disk, &password)
         }
+        Commands::Info => commands::do_info(&state_root),
         Commands::Config { action } => match action {
             ConfigCommands::Get { key } => commands::do_config_get(&key, &state_root),
             ConfigCommands::Set { key, value } => commands::do_config_set(&key, &value, &state_root),

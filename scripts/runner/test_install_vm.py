@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Plan checks for the FreeBSD install front door. No download, sudo, or hypervisor."""
 import importlib.util
+import io
 import json
 import os
+from contextlib import redirect_stdout
 from unittest.mock import patch
 from pathlib import Path
 import subprocess
@@ -136,35 +138,29 @@ class PlanTests(unittest.TestCase):
             without_key = install_vm.vm_config(spec, Path("/vmm"), None)
             self.assertNotIn("shutdown", without_key)
 
-    def test_direct_start_matches_the_saved_boot(self):
-        root = Path("/tmp/vms")
-        binary = Path("/usr/local/bin/vmm")
+    def test_interactive_next_steps_do_not_claim_install_or_invent_a_kernel(self):
+        spec = install_vm.specification(version="14.4", name="box", dest_root=Path("/tmp/vms"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            install_vm.print_next_steps(spec)
+        text = output.getvalue()
+        self.assertIn("created for interactive installation", text)
+        self.assertIn("cubectl start box", text)
+        self.assertIn("cubectl eject box", text)
+        self.assertNotIn("installation finished successfully", text)
+        self.assertNotIn("--freebsd", text)
+        self.assertNotIn("/kernel", text)
+
+    def test_unattended_next_steps_use_the_saved_cubectl_configuration(self):
         spec = install_vm.specification(version="14.4", unattended=True, name="box",
-                                         dest_root=root)
-        line = install_vm.direct_start(spec, binary)
-        self.assertEqual(line.split()[0], str(binary))
-        self.assertTrue(line.split()[line.split().index("--freebsd") + 1]
-                        .endswith("/box/kernel"))
-        self.assertTrue(any(part.endswith("/box/installed.img") for part in line.split()))
-        self.assertIn("--net vmnet-proxy", line)
-        self.assertIn("--ssh-port 2222", line)
-        self.assertIn("--ram 1024", line)
-        self.assertIn("--cpus 2", line)
-        self.assertIn("--multiuser", line)
-        self.assertNotIn("--vnc", line)
-        self.assertNotIn("sudo", line)
-        elevated = install_vm.direct_start(spec, binary, sudo=True)
-        self.assertTrue(elevated.startswith("sudo "))
-        self.assertIn("--net vmnet", elevated)
-        self.assertNotIn("vmnet-proxy", elevated)
-        desktop = install_vm.specification(version="15.1", unattended=True, desktop="plasma",
-                                           name="work", dest_root=root)
-        shown = install_vm.direct_start(desktop, binary, display="1280x800")
-        self.assertIn("--vnc 127.0.0.1:5901", shown)
-        self.assertIn("--display 1280x800", shown)
-        self.assertIn("--ram 4096", shown)
-        self.assertIn("--cpus 4", shown)
-        self.assertIn("--net vmnet-proxy", shown)
+                                         dest_root=Path("/tmp/vms"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            install_vm.print_next_steps(spec)
+        text = output.getvalue()
+        self.assertIn("installation finished successfully", text)
+        self.assertIn("cubectl start box", text)
+        self.assertNotIn("--freebsd", text)
 
     def test_main_rejects_a_bad_combination_before_using_a_binary(self):
         self.assertEqual(install_vm.main(["--version", "15.0", "--unattended"]), 2)
