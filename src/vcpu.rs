@@ -1,7 +1,7 @@
 //! One vCPU. HLT sets activity state 1 and blocks in `hv_vcpu_run` (not a sleep).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use vmm::devices::PioBus;
 use vmm::terminal::host_log;
@@ -21,14 +21,13 @@ pub struct VcpuDone {
     pub error: Option<String>,
 }
 
-/// Pending flag plus `wfi_cv`. HLT itself stays inside `hv_vcpu_run`;
-/// the condvar is only for a thread that is not in that call.
+/// Pending kick flag. HLT stays inside `hv_vcpu_run`.
+/// `lock` is held across `hv_vcpu_interrupt` and across `hv_vcpu_destroy`.
 pub struct Kick {
     vcpu: AtomicU32,
     ready: AtomicBool,
     pending: AtomicBool,
     lock: Mutex<()>,
-    cv: Condvar,
 }
 
 impl Kick {
@@ -38,7 +37,6 @@ impl Kick {
             ready: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             lock: Mutex::new(()),
-            cv: Condvar::new(),
         }
     }
 
@@ -47,16 +45,19 @@ impl Kick {
         self.ready.store(true, Ordering::Release);
     }
 
-    fn disarm(&self) {
+    /// `ready` is cleared under the same mutex `signal` holds across
+    /// `hv_vcpu_interrupt`, then the vCPU id is destroyed before the guard drops.
+    fn disarm_and_destroy(&self, id: hv_vcpuid_t) {
+        let _guard = self.lock.lock().unwrap();
         self.ready.store(false, Ordering::Release);
+        unsafe {
+            let _ = hv_vcpu_destroy(id);
+        }
     }
 
     pub fn signal(&self) {
         self.pending.store(true, Ordering::Release);
-        {
-            let _guard = self.lock.lock().unwrap();
-            self.cv.notify_all();
-        }
+        let _guard = self.lock.lock().unwrap();
         if self.ready.load(Ordering::Acquire) {
             let id = self.vcpu.load(Ordering::Relaxed);
             unsafe {
@@ -96,10 +97,7 @@ pub fn run(kick: Arc<Kick>, pio: Arc<PioBus>, cr3: u64, ram_bytes: u64) -> VcpuD
             });
         }
     }
-    kick.disarm();
-    unsafe {
-        let _ = hv_vcpu_destroy(id);
-    }
+    kick.disarm_and_destroy(id);
     done
 }
 
@@ -167,11 +165,10 @@ fn write_controls(id: hv_vcpuid_t) -> Result<(), String> {
         wvmcs(id, VMCS_CTRL_TPR_THRESHOLD, 0)?;
     }
 
-    let mut entry_desired = VMENTRY_GUEST_IA32E | VMENTRY_LOAD_EFER;
-    if entry_cap >> 32 & VMENTRY_LOAD_IA32_PAT != 0 {
-        entry_desired |= VMENTRY_LOAD_IA32_PAT;
-    }
-    let entry = x86::vmx_cap_control(entry_cap, entry_desired);
+    let entry = x86::vmx_cap_control(
+        entry_cap,
+        VMENTRY_GUEST_IA32E | VMENTRY_LOAD_EFER | VMENTRY_LOAD_IA32_PAT,
+    );
     if entry & (VMENTRY_GUEST_IA32E | VMENTRY_LOAD_EFER)
         != (VMENTRY_GUEST_IA32E | VMENTRY_LOAD_EFER)
     {
@@ -185,18 +182,10 @@ fn write_controls(id: hv_vcpuid_t) -> Result<(), String> {
         wvmcs(id, VMCS_GUEST_IA32_PAT, PAT_RESET)?;
     }
 
-    let mut exit_desired = 0u64;
-    for bit in [
-        VMEXIT_SAVE_EFER,
-        VMEXIT_LOAD_EFER,
-        VMEXIT_SAVE_IA32_PAT,
-        VMEXIT_LOAD_IA32_PAT,
-    ] {
-        if exit_cap >> 32 & bit != 0 {
-            exit_desired |= bit;
-        }
-    }
-    let exitc = x86::vmx_cap_control(exit_cap, exit_desired);
+    let exitc = x86::vmx_cap_control(
+        exit_cap,
+        VMEXIT_SAVE_EFER | VMEXIT_LOAD_EFER | VMEXIT_SAVE_IA32_PAT | VMEXIT_LOAD_IA32_PAT,
+    );
     wvmcs(id, VMCS_CTRL_VMEXIT_CONTROLS, exitc)?;
 
     wvmcs(id, VMCS_CTRL_EXC_BITMAP, 0)?;

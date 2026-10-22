@@ -1,4 +1,4 @@
-//! 16550 at COM1. IRQ 4 is counted and not delivered (no APIC in this PR).
+//! 16550 at COM1.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -12,7 +12,6 @@ use std::time::Duration;
 use super::PioDevice;
 
 const RX_CAP: usize = 4096;
-const COM1_IRQ: u8 = 4;
 
 const MCR_DTR: u8 = 1 << 0;
 const MCR_RTS: u8 = 1 << 1;
@@ -20,10 +19,6 @@ const MCR_OUT1: u8 = 1 << 2;
 const MCR_OUT2: u8 = 1 << 3;
 const MCR_LOOP: u8 = 1 << 4;
 
-const MSR_DCTS: u8 = 1 << 0;
-const MSR_DDSR: u8 = 1 << 1;
-const MSR_TERI: u8 = 1 << 2;
-const MSR_DDCD: u8 = 1 << 3;
 const MSR_CTS: u8 = 1 << 4;
 const MSR_DSR: u8 = 1 << 5;
 const MSR_RI: u8 = 1 << 6;
@@ -34,9 +29,6 @@ const LSR_DR: u8 = 1 << 0;
 const LSR_OE: u8 = 1 << 1;
 const LSR_THRE: u8 = 1 << 5;
 const LSR_TEMT: u8 = 1 << 6;
-
-const IER_RX: u8 = 1 << 0;
-const IER_THRE: u8 = 1 << 1;
 
 pub struct ConsoleHooks {
     pub on_shutdown: Arc<dyn Fn() + Send + Sync>,
@@ -62,9 +54,6 @@ struct Regs {
     dll: u8,
     dlm: u8,
     lsr_oe: bool,
-    thr_pending: bool,
-    msr_delta: u8,
-    irq_pulses: u32,
 }
 
 impl Regs {
@@ -79,30 +68,11 @@ impl Regs {
             dll: 1,
             dlm: 0,
             lsr_oe: false,
-            thr_pending: true,
-            msr_delta: 0,
-            irq_pulses: 0,
         }
     }
 
     fn dlab(&self) -> bool {
         self.lcr & 0x80 != 0
-    }
-
-    fn trigger(&self) -> usize {
-        if self.fcr & 1 == 0 {
-            return 1;
-        }
-        match self.fcr & 0xc0 {
-            0x00 => 1,
-            0x40 => 4,
-            0x80 => 8,
-            _ => 14,
-        }
-    }
-
-    fn pulse(&mut self) {
-        self.irq_pulses = self.irq_pulses.wrapping_add(1);
     }
 
     fn modem_lines(&self) -> u8 {
@@ -131,40 +101,19 @@ impl Regs {
             self.lsr_oe = true;
             return;
         }
-        let was_empty = self.rx.is_empty();
         self.rx.push_back(byte);
-        if was_empty && self.ier & IER_RX != 0 {
-            self.pulse();
-        }
-    }
-
-    fn rearm_rx(&mut self) {
-        if self.ier & IER_RX != 0 && self.rx.len() >= self.trigger() {
-            self.pulse();
-        }
     }
 
     fn read_reg(&mut self, offset: u16) -> u8 {
         match offset {
             0 if self.dlab() => self.dll,
-            0 => {
-                let byte = self.rx.pop_front().unwrap_or(0);
-                self.rearm_rx();
-                byte
-            }
+            0 => self.rx.pop_front().unwrap_or(0),
             1 if self.dlab() => self.dlm,
             1 => self.ier,
             2 => {
+                // FIFO-enable bits in 7:6. Bit 0 set: no interrupt pending.
                 let fifo = if self.fcr & 1 != 0 { 0xc0 } else { 0 };
-                if self.ier & IER_RX != 0 && !self.rx.is_empty() {
-                    self.rearm_rx();
-                    fifo | 0x04
-                } else if self.ier & IER_THRE != 0 && self.thr_pending {
-                    self.thr_pending = false;
-                    fifo | 0x02
-                } else {
-                    fifo | 0x01
-                }
+                fifo | 0x01
             }
             3 => self.lcr,
             4 => self.mcr,
@@ -179,11 +128,7 @@ impl Regs {
                 }
                 v
             }
-            6 => {
-                let v = self.msr_delta | self.modem_lines();
-                self.msr_delta = 0;
-                v
-            }
+            6 => self.modem_lines(),
             7 => self.scr,
             _ => 0xff,
         }
@@ -194,7 +139,6 @@ impl Regs {
         match offset {
             0 if self.dlab() => self.dll = value,
             0 => {
-                self.thr_pending = true;
                 if self.mcr & MCR_LOOP != 0 {
                     self.push_rx(value);
                     return None;
@@ -202,15 +146,7 @@ impl Regs {
                 return Some(value);
             }
             1 if self.dlab() => self.dlm = value,
-            1 => {
-                self.ier = value & 0x0f;
-                if self.ier & IER_RX != 0 && !self.rx.is_empty() {
-                    self.pulse();
-                }
-                if self.ier & IER_THRE != 0 {
-                    self.thr_pending = true;
-                }
-            }
+            1 => self.ier = value & 0x0f,
             2 => {
                 if value & 0x02 != 0 {
                     self.rx.clear();
@@ -223,24 +159,7 @@ impl Regs {
                 }
             }
             3 => self.lcr = value,
-            4 => {
-                let old = self.modem_lines();
-                self.mcr = value & 0x1f;
-                let new = self.modem_lines();
-                let changed = old ^ new;
-                if changed & MSR_CTS != 0 {
-                    self.msr_delta |= MSR_DCTS;
-                }
-                if changed & MSR_DSR != 0 {
-                    self.msr_delta |= MSR_DDSR;
-                }
-                if changed & MSR_RI != 0 {
-                    self.msr_delta |= MSR_TERI;
-                }
-                if changed & MSR_DCD != 0 {
-                    self.msr_delta |= MSR_DDCD;
-                }
-            }
+            4 => self.mcr = value & 0x1f,
             7 => self.scr = value,
             _ => {}
         }
@@ -272,14 +191,6 @@ impl Ns16550 {
             log: Mutex::new(log),
             hooks,
         })
-    }
-
-    pub fn irq_line(&self) -> u8 {
-        COM1_IRQ
-    }
-
-    pub fn irq_pulses(&self) -> u32 {
-        self.regs.lock().unwrap().irq_pulses
     }
 
     pub fn read_port(&self, offset: u16, size: usize) -> u64 {
@@ -326,7 +237,7 @@ impl Ns16550 {
         }
     }
 
-    /// Host input policy shared with the old PL011: Ctrl-] shuts down, CR is stored as LF.
+    /// Ctrl-] requests shutdown. CR is stored as LF.
     pub fn push_host_bytes(&self, bytes: &[u8]) {
         for &b in bytes {
             if b == 0x1d {
@@ -460,16 +371,13 @@ mod tests {
     #[test]
     fn loopback_msr_follows_mcr() {
         let uart = uart();
-        assert_eq!(uart.irq_line(), COM1_IRQ);
         assert_eq!(uart.read_port(6, 1) & 0xf0, MSR_LINES as u64);
         // LOOP | OUT2 | RTS. CTS follows RTS, DCD follows OUT2.
         uart.write_port(4, (MCR_LOOP | MCR_OUT2 | MCR_RTS) as u64, 1);
-        let _ = uart.read_port(6, 1);
         let msr = uart.read_port(6, 1);
         assert_eq!(msr & 0xf0, (MSR_CTS | MSR_DCD) as u64);
 
         uart.write_port(4, (MCR_LOOP | MCR_DTR) as u64, 1);
-        let _ = uart.read_port(6, 1);
         assert_eq!(uart.read_port(6, 1) & 0xf0, MSR_DSR as u64);
 
         uart.write_port(0, b'Z' as u64, 1);
@@ -478,16 +386,20 @@ mod tests {
     }
 
     #[test]
-    fn rx_empty_to_nonempty_pulses_once_and_rearms_above_trigger() {
+    fn rx_bytes_show_in_rbr_lsr_and_iir_fifo_bits() {
         let uart = uart();
-        uart.write_port(1, IER_RX as u64, 1);
-        assert_eq!(uart.irq_pulses(), 0);
+        assert_eq!(uart.read_port(2, 1), 0x01);
+        assert_eq!(uart.read_port(5, 1) & LSR_DR as u64, 0);
+        uart.write_port(2, 0x01, 1);
+        assert_eq!(uart.read_port(2, 1), 0xc1);
         uart.push_host_bytes(b"AB");
-        assert_eq!(uart.irq_pulses(), 1);
+        assert_eq!(uart.read_port(5, 1) & LSR_DR as u64, LSR_DR as u64);
+        assert_eq!(uart.read_port(2, 1), 0xc1);
         assert_eq!(uart.read_port(0, 1), b'A' as u64);
-        assert_eq!(uart.irq_pulses(), 2);
+        assert_eq!(uart.read_port(5, 1) & LSR_DR as u64, LSR_DR as u64);
         assert_eq!(uart.read_port(0, 1), b'B' as u64);
-        assert_eq!(uart.irq_pulses(), 2);
+        assert_eq!(uart.read_port(5, 1) & LSR_DR as u64, 0);
+        assert_eq!(uart.read_port(0, 1), 0);
     }
 
     #[test]

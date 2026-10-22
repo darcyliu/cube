@@ -13,11 +13,6 @@ use vmm::x86::{self, GUEST_RAM_BYTES, PAYLOAD_GPA};
 use crate::hypervisor::*;
 use crate::vcpu::{self, Kick, VcpuDone};
 
-pub struct Finished {
-    pub exec_ns: Option<u64>,
-    pub error: Option<String>,
-}
-
 struct VmGuard;
 
 impl Drop for VmGuard {
@@ -28,17 +23,17 @@ impl Drop for VmGuard {
     }
 }
 
-pub fn run_payload(path: Option<PathBuf>, serial_log: Option<PathBuf>) -> Finished {
+pub fn run_payload(path: Option<PathBuf>, serial_log: Option<PathBuf>) -> VcpuDone {
     match run_inner(path, serial_log) {
         Ok(done) => done,
-        Err(error) => Finished {
+        Err(error) => VcpuDone {
             exec_ns: None,
             error: Some(error),
         },
     }
 }
 
-fn run_inner(path: Option<PathBuf>, serial_log: Option<PathBuf>) -> Result<Finished, String> {
+fn run_inner(path: Option<PathBuf>, serial_log: Option<PathBuf>) -> Result<VcpuDone, String> {
     let bytes = load_payload(path)?;
     let mem = GuestMemory::allocate(0, GUEST_RAM_BYTES)?;
     let cr3 = x86::install_identity_map(&mem)?;
@@ -98,10 +93,7 @@ fn run_inner(path: Option<PathBuf>, serial_log: Option<PathBuf>) -> Result<Finis
         },
     };
     console.stop();
-    Ok(Finished {
-        exec_ns: done.exec_ns,
-        error: done.error,
-    })
+    Ok(done)
 }
 
 fn load_payload(path: Option<PathBuf>) -> Result<Vec<u8>, String> {
