@@ -152,6 +152,10 @@ pub const VMCS_CTRL_CR4_MASK: u32 = 0x6002;
 pub const VMCS_CTRL_CR0_SHADOW: u32 = 0x6004;
 pub const VMCS_CTRL_CR4_SHADOW: u32 = 0x6006;
 pub const VMCS_RO_EXIT_QUALIFIC: u32 = 0x6400;
+pub const VMCS_RO_IO_RCX: u32 = 0x6402;
+pub const VMCS_RO_IO_RSI: u32 = 0x6404;
+pub const VMCS_RO_IO_RDI: u32 = 0x6406;
+pub const VMCS_RO_IO_RIP: u32 = 0x6408;
 pub const VMCS_GUEST_CR0: u32 = 0x6800;
 pub const VMCS_GUEST_CR3: u32 = 0x6802;
 pub const VMCS_GUEST_CR4: u32 = 0x6804;
@@ -199,15 +203,26 @@ pub const VMENTRY_LOAD_EFER: u64 = 1 << 15;
 
 pub const VMX_REASON_IRQ: u16 = 1;
 pub const VMX_REASON_TRIPLE_FAULT: u16 = 2;
+pub const VMX_REASON_INIT: u16 = 3;
+pub const VMX_REASON_SIPI: u16 = 4;
 pub const VMX_REASON_IRQ_WND: u16 = 7;
 pub const VMX_REASON_CPUID: u16 = 10;
 pub const VMX_REASON_HLT: u16 = 12;
+pub const VMX_REASON_INVD: u16 = 13;
+pub const VMX_REASON_RDPMC: u16 = 15;
 pub const VMX_REASON_IO: u16 = 30;
+pub const VMX_REASON_CR_ACCESS: u16 = 28;
+pub const VMX_REASON_RDMSR: u16 = 31;
+pub const VMX_REASON_WRMSR: u16 = 32;
+pub const VMX_REASON_MWAIT: u16 = 36;
+pub const VMX_REASON_MONITOR: u16 = 39;
 pub const VMX_REASON_APIC_ACCESS: u16 = 44;
 pub const VMX_REASON_VMENTRY_GUEST: u16 = 33;
 pub const VMX_REASON_EPT_VIOLATION: u16 = 48;
 pub const VMX_REASON_EPT_MISCONFIG: u16 = 49;
 pub const VMX_REASON_VMX_TIMER: u16 = 52;
+pub const VMX_REASON_WBINVD: u16 = 54;
+pub const VMX_REASON_XSETBV: u16 = 55;
 
 pub const ACTIVITY_ACTIVE: u64 = 0;
 pub const ACTIVITY_HLT: u64 = 1;
@@ -259,6 +274,7 @@ unsafe extern "C" {
         size: usize,
         flags: hv_memory_flags_t,
     ) -> hv_return_t;
+    pub fn hv_vm_protect(gpa: hv_gpaddr_t, size: usize, flags: hv_memory_flags_t) -> hv_return_t;
 
     pub fn hv_vcpu_create(vcpu: *mut hv_vcpuid_t, flags: hv_vcpu_options_t) -> hv_return_t;
     pub fn hv_vcpu_run(vcpu: hv_vcpuid_t) -> hv_return_t;

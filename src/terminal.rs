@@ -50,6 +50,7 @@ pub const SIGWINCH: i32 = 28;
 static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_PENDING: AtomicBool = AtomicBool::new(false);
+static REBOOT_PENDING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn shutdown_handler(_sig: i32) {
     SHUTDOWN_PENDING.store(true, Ordering::Relaxed);
@@ -68,6 +69,15 @@ pub fn shutdown_requested() -> bool {
 
 pub fn request_shutdown() {
     SHUTDOWN_PENDING.store(true, Ordering::Relaxed);
+}
+
+pub fn request_reboot() {
+    REBOOT_PENDING.store(true, Ordering::Relaxed);
+    request_shutdown();
+}
+
+pub fn reboot_requested() -> bool {
+    REBOOT_PENDING.load(Ordering::Relaxed)
 }
 
 extern "C" fn sigwinch_handler(_sig: i32) {

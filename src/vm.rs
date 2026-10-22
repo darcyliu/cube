@@ -1,24 +1,30 @@
-//! Map 64 MiB at GPA 0 and run the payload. vCPU 0 is the BSP.
+//! Map guest RAM at GPA 0 and run a payload or OVMF. vCPU 0 is the BSP.
 //! Extra vCPUs are created, then wait for INIT/SIPI outside `hv_vcpu_run`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 
+use vmm::devices::MmioBus;
 use vmm::devices::PioBus;
+use vmm::devices::cmos::Cmos;
 use vmm::devices::debugcon::DebugCon;
+use vmm::devices::fw_cfg::{FwCfg, FwCfgPio};
+use vmm::devices::i8042::I8042;
 use vmm::devices::lapic::Lapic;
+use vmm::devices::pci::PciHost;
+use vmm::devices::pflash::CfiPflash;
 use vmm::devices::pic::Pic;
 use vmm::devices::pit::Pit;
 use vmm::devices::serial::{ConsoleHooks, HostConsole, Ns16550};
-use vmm::gpa::GuestSpace;
+use vmm::gpa::{self, GuestSpace};
 use vmm::memory::GuestMemory;
 use vmm::terminal::{self, TerminalGuard};
-use vmm::x86::{self, GUEST_RAM_BYTES, PAYLOAD_GPA};
+use vmm::x86::{self, GUEST_RAM_BYTES, PAYLOAD_GPA, UEFI_RAM_BYTES};
 
 use crate::hypervisor::*;
 use crate::machine::Machine;
-use crate::vcpu::{self, Kick, VcpuDone};
+use crate::vcpu::{self, Entry, Kick, VcpuDone};
 
 struct VmGuard;
 
@@ -31,27 +37,35 @@ impl Drop for VmGuard {
 }
 
 pub fn run_payload(path: Option<PathBuf>, serial_log: Option<PathBuf>, cpus: u32) -> Vec<VcpuDone> {
-    match run_inner(path, serial_log, cpus) {
+    match run_payload_inner(path, serial_log, cpus) {
         Ok(done) => done,
-        Err(error) => vec![VcpuDone {
-            index: 0,
-            exec_ns: None,
-            error: Some(error),
-        }],
+        Err(error) => vec![failed(error)],
     }
 }
 
-fn run_inner(
+pub fn run_uefi(firmware: PathBuf, serial_log: Option<PathBuf>, cpus: u32) -> Vec<VcpuDone> {
+    match run_uefi_inner(firmware, serial_log, cpus) {
+        Ok(done) => done,
+        Err(error) => vec![failed(error)],
+    }
+}
+
+fn failed(error: String) -> VcpuDone {
+    VcpuDone {
+        index: 0,
+        exec_ns: None,
+        error: Some(error),
+    }
+}
+
+fn run_payload_inner(
     path: Option<PathBuf>,
     serial_log: Option<PathBuf>,
     cpus: u32,
 ) -> Result<Vec<VcpuDone>, String> {
-    if !(1..=16).contains(&cpus) {
-        return Err("--cpus must be from 1 to 16".into());
-    }
-    let n = cpus as usize;
+    let n = cpu_count(cpus)?;
     let bytes = load_payload(path)?;
-    let mem = GuestMemory::allocate(0, GUEST_RAM_BYTES)?;
+    let mem = Arc::new(GuestMemory::allocate(0, GUEST_RAM_BYTES)?);
     let cr3 = x86::install_identity_map(&mem)?;
     x86::write_gdt_tss(&mem)?;
     let entry = PAYLOAD_GPA;
@@ -60,11 +74,128 @@ fn run_inner(
     }
     mem.write(entry, &bytes)?;
 
+    let _vm = create_vm(&mem)?;
+    let slot: Arc<OnceLock<Weak<Machine>>> = Arc::new(OnceLock::new());
+    let serial = open_serial(serial_log.as_deref(), &slot)?;
+    let (kicks, lapics) = vcpu_parts(n);
+    let machine = Arc::new(Machine::new(
+        GuestSpace::new(Arc::clone(&mem), None),
+        standard_pio(serial.clone()),
+        MmioBus::new(),
+        None,
+        None,
+        false,
+        lapics,
+        kicks.clone(),
+    ));
+    let _ = slot.set(Arc::downgrade(&machine));
+    machine.wire_uart_irq(&serial);
+    boot_cpus(machine, kicks, serial, Entry::Payload { cr3 })
+}
+
+fn run_uefi_inner(
+    firmware: PathBuf,
+    serial_log: Option<PathBuf>,
+    cpus: u32,
+) -> Result<Vec<VcpuDone>, String> {
+    let n = cpu_count(cpus)?;
+    let code_bytes =
+        std::fs::read(&firmware).map_err(|e| format!("reading {}: {e}", firmware.display()))?;
+    if code_bytes.len() != gpa::CODE_FLASH_SIZE as usize {
+        return Err(format!(
+            "{} is {} bytes, want {}",
+            firmware.display(),
+            code_bytes.len(),
+            gpa::CODE_FLASH_SIZE
+        ));
+    }
+    let template_path = PathBuf::from("firmware/OVMF_VARS.fd");
+    let template = std::fs::read(&template_path)
+        .map_err(|e| format!("reading {}: {e}", template_path.display()))?;
+    if template.len() != gpa::VARS_FLASH_SIZE as usize {
+        return Err(format!(
+            "{} is {} bytes, want {}",
+            template_path.display(),
+            template.len(),
+            gpa::VARS_FLASH_SIZE
+        ));
+    }
+    let mut store = firmware.clone().into_os_string();
+    store.push(".vars.fd");
+    let flash = CfiPflash::open(Path::new(&store), template, 4096)?;
+
+    let ram = Arc::new(GuestMemory::allocate(0, UEFI_RAM_BYTES)?);
+    let code = Arc::new(GuestMemory::from_buffer(gpa::CODE_FLASH_BASE, &code_bytes)?);
+    let tables = vmm::acpi::build(cpus, UEFI_RAM_BYTES as u64);
+    let cfg = FwCfg::from_files(
+        Arc::clone(&ram),
+        &[
+            ("etc/e820", tables.e820.as_slice()),
+            ("etc/acpi/rsdp", tables.rsdp.as_slice()),
+            ("etc/acpi/tables", tables.tables.as_slice()),
+            ("etc/table-loader", tables.loader.as_slice()),
+        ],
+    );
+
+    let _vm = create_vm(&ram)?;
+    let rx = HV_MEMORY_READ | HV_MEMORY_EXEC;
+    let map_rx = unsafe { hv_vm_map(code.host_ptr().cast(), code.guest_base(), code.size(), rx) };
+    if map_rx == HV_BAD_ARGUMENT {
+        // Some 10.15 builds reject a mapping that was never writable.
+        check_hv(unsafe {
+            hv_vm_map(
+                code.host_ptr().cast(),
+                code.guest_base(),
+                code.size(),
+                rx | HV_MEMORY_WRITE,
+            )
+        })
+        .map_err(|e| format!("hv_vm_map code: {e}"))?;
+        check_hv(unsafe { hv_vm_protect(code.guest_base(), code.size(), rx) })
+            .map_err(|e| format!("hv_vm_protect code: {e}"))?;
+        eprintln!("[VMM] code flash mapped RWX then protected read|exec");
+    } else {
+        check_hv(map_rx).map_err(|e| format!("hv_vm_map code: {e}"))?;
+    }
+
+    let slot: Arc<OnceLock<Weak<Machine>>> = Arc::new(OnceLock::new());
+    let serial = open_serial(serial_log.as_deref(), &slot)?;
+    let (kicks, lapics) = vcpu_parts(n);
+    let mut pio = standard_pio(serial.clone());
+    // DMA low is a dword at 0x518, so the window runs through 0x51B.
+    pio.register(0x510, 12, Arc::new(FwCfgPio::new(cfg)));
+    pio.register(0x70, 2, Arc::new(Cmos::new(UEFI_RAM_BYTES as u64)));
+    let kbd = Arc::new(I8042::new());
+    pio.register(0x60, 5, kbd.clone());
+    let mut mmio = MmioBus::new();
+    mmio.register(gpa::VARS_FLASH_BASE, gpa::VARS_FLASH_SIZE, Box::new(flash));
+    let machine = Arc::new(Machine::new(
+        GuestSpace::new(ram, Some(code)),
+        pio,
+        mmio,
+        Some(PciHost::new()),
+        Some(kbd),
+        true,
+        lapics,
+        kicks.clone(),
+    ));
+    let _ = slot.set(Arc::downgrade(&machine));
+    machine.wire_uart_irq(&serial);
+    boot_cpus(machine, kicks, serial, Entry::Firmware)
+}
+
+fn cpu_count(cpus: u32) -> Result<usize, String> {
+    if !(1..=16).contains(&cpus) {
+        return Err("--cpus must be from 1 to 16".into());
+    }
+    Ok(cpus as usize)
+}
+
+fn create_vm(mem: &GuestMemory) -> Result<VmGuard, String> {
     check_hv(unsafe { hv_vm_create(HV_VM_DEFAULT) }).map_err(|e| {
         format!("{e} (codesign --entitlements entitlements.plist --force -s - target/debug/vmm)")
     })?;
-    // Dropped after every vCPU thread has destroyed its vCPU.
-    let _vm = VmGuard;
+    let guard = VmGuard;
     check_hv(unsafe {
         hv_vm_map(
             mem.host_ptr().cast(),
@@ -74,19 +205,27 @@ fn run_inner(
         )
     })
     .map_err(|e| format!("hv_vm_map: {e}"))?;
+    Ok(guard)
+}
 
+fn vcpu_parts(n: usize) -> (Vec<Arc<Kick>>, Vec<Mutex<Lapic>>) {
     let mut kicks = Vec::with_capacity(n);
     let mut lapics = Vec::with_capacity(n);
     for i in 0..n {
         kicks.push(Arc::new(if i == 0 { Kick::bsp() } else { Kick::ap() }));
         lapics.push(Mutex::new(Lapic::new(i as u32)));
     }
+    (kicks, lapics)
+}
 
-    let slot: Arc<OnceLock<Weak<Machine>>> = Arc::new(OnceLock::new());
-    let slot_shutdown = slot.clone();
-    let slot_kick = slot.clone();
-    let serial = Arc::new(Ns16550::new(
-        serial_log.as_deref(),
+fn open_serial(
+    serial_log: Option<&Path>,
+    slot: &Arc<OnceLock<Weak<Machine>>>,
+) -> Result<Arc<Ns16550>, String> {
+    let slot_shutdown = Arc::clone(slot);
+    let slot_kick = Arc::clone(slot);
+    Ok(Arc::new(Ns16550::new(
+        serial_log,
         ConsoleHooks {
             on_shutdown: Arc::new(move || {
                 terminal::request_shutdown();
@@ -100,34 +239,36 @@ fn run_inner(
                 }
             }),
         },
-    )?);
+    )?))
+}
+
+fn standard_pio(serial: Arc<Ns16550>) -> PioBus {
     let mut pio = PioBus::new();
-    pio.register(0x3f8, 8, serial.clone());
+    pio.register(0x3f8, 8, serial);
     pio.register(0x20, 2, Arc::new(Pic::new()));
     pio.register(0xa0, 2, Arc::new(Pic::new()));
     pio.register(0x40, 4, Arc::new(Pit::new()));
     pio.register(0x402, 1, Arc::new(DebugCon));
+    pio
+}
 
-    let machine = Arc::new(Machine::new(
-        GuestSpace::new(mem, None),
-        pio,
-        lapics,
-        kicks.clone(),
-    ));
-    let _ = slot.set(Arc::downgrade(&machine));
-    machine.wire_uart_irq(&serial);
-
+fn boot_cpus(
+    machine: Arc<Machine>,
+    kicks: Vec<Arc<Kick>>,
+    serial: Arc<Ns16550>,
+    entry: Entry,
+) -> Result<Vec<VcpuDone>, String> {
     let mut console = HostConsole::start(serial);
     let _raw = TerminalGuard::enter_raw_mode();
     terminal::install_shutdown_handlers();
 
+    let n = kicks.len();
     let mut handles = Vec::with_capacity(n);
-    for (i, kick) in kicks.iter().enumerate() {
-        let kick = Arc::clone(kick);
-        let machine_thread = machine.clone();
+    for (i, kick) in kicks.into_iter().enumerate() {
+        let machine_thread = Arc::clone(&machine);
         match thread::Builder::new()
             .name(format!("vmm-vcpu-{i}"))
-            .spawn(move || vcpu::run(i, kick, machine_thread, cr3))
+            .spawn(move || vcpu::run(i, kick, machine_thread, entry))
         {
             Ok(handle) => handles.push(handle),
             Err(e) => {

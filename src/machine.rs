@@ -1,38 +1,123 @@
 //! Shared devices for every vCPU. Hypervisor calls stay in `vcpu`.
 
-use std::sync::{Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use vmm::devices::PioBus;
+use vmm::devices::i8042::I8042;
 use vmm::devices::ioapic::{IOAPIC_MMIO, IOAPIC_MMIO_LEN, IoApic, IoapicMsg};
 use vmm::devices::lapic::{
     DeliveryMode, LAPIC_MMIO, LAPIC_MMIO_LEN, Lapic, LapicEffect, Peer, logical_match,
 };
+use vmm::devices::pci::{PciAction, PciHost};
+use vmm::devices::{MmioBus, PioBus};
 use vmm::gpa::GuestSpace;
+use vmm::terminal::host_log;
 
 use crate::vcpu::Kick;
 
 pub struct Machine {
     pub space: GuestSpace,
     pub pio: PioBus,
+    mmio: Mutex<MmioBus>,
+    pci: Option<Mutex<PciHost>>,
+    i8042: Option<Arc<I8042>>,
+    pub firmware: bool,
     ioapic: Mutex<IoApic>,
     lapics: Vec<Mutex<Lapic>>,
-    kicks: Vec<std::sync::Arc<Kick>>,
+    kicks: Vec<Arc<Kick>>,
 }
 
 impl Machine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         space: GuestSpace,
         pio: PioBus,
+        mmio: MmioBus,
+        pci: Option<PciHost>,
+        i8042: Option<Arc<I8042>>,
+        firmware: bool,
         lapics: Vec<Mutex<Lapic>>,
-        kicks: Vec<std::sync::Arc<Kick>>,
+        kicks: Vec<Arc<Kick>>,
     ) -> Self {
         Self {
             space,
             pio,
+            mmio: Mutex::new(mmio),
+            pci: pci.map(Mutex::new),
+            i8042,
+            firmware,
             ioapic: Mutex::new(IoApic::new()),
             lapics,
             kicks,
+        }
+    }
+
+    pub fn cpus(&self) -> u32 {
+        self.lapics.len() as u32
+    }
+
+    pub fn cr8_read(&self, cpu: usize) -> u64 {
+        u64::from(self.lapics[cpu].lock().unwrap().tpr() >> 4)
+    }
+
+    pub fn cr8_write(&self, cpu: usize, value: u64) {
+        self.lapics[cpu]
+            .lock()
+            .unwrap()
+            .set_tpr(((value as u32) & 0xf) << 4);
+    }
+
+    pub fn pio_read(&self, port: u16, size: usize) -> Result<u64, String> {
+        if let Some(pci) = &self.pci
+            && let Some(value) = pci.lock().unwrap().try_in(port, size)
+        {
+            return Ok(value);
+        }
+        match self.pio.read(port, size) {
+            Ok(value) => Ok(value),
+            Err(_) if self.firmware => {
+                trace_unhandled_pio(port, false, 0, size);
+                Ok(pio_ones(size))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn pio_write(&self, port: u16, data: u64, size: usize) -> Result<(), String> {
+        if let Some(pci) = &self.pci {
+            let mut pci = pci.lock().unwrap();
+            if pci.try_out(port, data, size) {
+                self.apply_pci(pci.take_action());
+                return Ok(());
+            }
+        }
+        match self.pio.write(port, data, size) {
+            Ok(()) => {
+                if self.i8042.as_ref().is_some_and(|kbd| kbd.take_reboot()) {
+                    host_log(format_args!("[VMM] 8042 reset"));
+                    vmm::terminal::request_reboot();
+                }
+                Ok(())
+            }
+            Err(_) if self.firmware => {
+                trace_unhandled_pio(port, true, data, size);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn apply_pci(&self, action: PciAction) {
+        match action {
+            PciAction::None => {}
+            PciAction::Shutdown => {
+                host_log(format_args!("[VMM] PM1 shutdown"));
+                vmm::terminal::request_shutdown();
+            }
+            PciAction::Reboot => {
+                host_log(format_args!("[VMM] port 0xCF9 reset"));
+                vmm::terminal::request_reboot();
+            }
         }
     }
 
@@ -97,7 +182,10 @@ impl Machine {
     }
 
     pub fn mmio_read(&self, cpu: usize, gpa: u64, size: usize) -> Result<u64, String> {
-        if size != 4 {
+        if (in_range(gpa, LAPIC_MMIO, LAPIC_MMIO_LEN)
+            || in_range(gpa, IOAPIC_MMIO, IOAPIC_MMIO_LEN))
+            && size != 4
+        {
             return Err(format!("MMIO read width {size} at {gpa:#x}"));
         }
         if in_range(gpa, LAPIC_MMIO, LAPIC_MMIO_LEN) {
@@ -109,14 +197,44 @@ impl Machine {
             let off = (gpa - IOAPIC_MMIO) as u32;
             return Ok(self.ioapic.lock().unwrap().read32(off) as u64);
         }
+        if let Ok(value) = self.mmio.lock().unwrap().read(gpa, size) {
+            return Ok(value);
+        }
+        if self.firmware {
+            note_unmapped_mmio(gpa);
+            return Ok(match size {
+                1 => 0xff,
+                2 => 0xffff,
+                4 => 0xffff_ffff,
+                _ => 0xffff_ffff_ffff_ffff,
+            });
+        }
         Err(format!("MMIO read at unmapped {gpa:#x}"))
     }
 
     pub fn mmio_write(&self, cpu: usize, gpa: u64, value: u64, size: usize) -> Result<(), String> {
-        if size != 4 {
+        if (in_range(gpa, LAPIC_MMIO, LAPIC_MMIO_LEN)
+            || in_range(gpa, IOAPIC_MMIO, IOAPIC_MMIO_LEN))
+            && size != 4
+        {
             return Err(format!(
                 "MMIO write width {size} at {gpa:#x} val {value:#x}"
             ));
+        }
+        if !(in_range(gpa, LAPIC_MMIO, LAPIC_MMIO_LEN)
+            || in_range(gpa, IOAPIC_MMIO, IOAPIC_MMIO_LEN))
+            && self.mmio.lock().unwrap().write(gpa, value, size).is_ok()
+        {
+            return Ok(());
+        }
+        if !(in_range(gpa, LAPIC_MMIO, LAPIC_MMIO_LEN)
+            || in_range(gpa, IOAPIC_MMIO, IOAPIC_MMIO_LEN))
+        {
+            if self.firmware {
+                note_unmapped_mmio(gpa);
+                return Ok(());
+            }
+            return Err(format!("MMIO write at unmapped {gpa:#x}"));
         }
         let value = value as u32;
         if in_range(gpa, LAPIC_MMIO, LAPIC_MMIO_LEN) {
@@ -221,6 +339,46 @@ impl Machine {
 
 fn in_range(gpa: u64, base: u64, len: u64) -> bool {
     gpa >= base && gpa < base + len
+}
+
+fn pio_ones(size: usize) -> u64 {
+    match size {
+        1 => 0xff,
+        2 => 0xffff,
+        _ => 0xffff_ffff,
+    }
+}
+
+fn trace_unhandled_pio(port: u16, write: bool, data: u64, size: usize) {
+    if std::env::var("VMM_TRACE_EXITS").ok().as_deref() != Some("1") {
+        return;
+    }
+    static SEEN: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    if seen.contains(&port) {
+        return;
+    }
+    seen.push(port);
+    if write {
+        host_log(format_args!(
+            "[VMM] unhandled PIO write {port:#04x} val {data:#x} size {size}"
+        ));
+    } else {
+        host_log(format_args!(
+            "[VMM] unhandled PIO read {port:#04x} size {size}"
+        ));
+    }
+}
+
+fn note_unmapped_mmio(gpa: u64) {
+    static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let page = gpa & !0xfff;
+    let mut seen = SEEN.lock().unwrap();
+    if seen.len() >= 32 || seen.contains(&page) {
+        return;
+    }
+    seen.push(page);
+    host_log(format_args!("[VMM] unmapped MMIO {gpa:#x}"));
 }
 
 pub fn mono_ns() -> u64 {

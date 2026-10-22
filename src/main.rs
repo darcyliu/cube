@@ -12,6 +12,8 @@ mod vm;
 use std::path::PathBuf;
 use std::process;
 
+use std::os::unix::process::CommandExt;
+
 fn main() {
     enforce_host_gate();
     match parse_args() {
@@ -23,12 +25,15 @@ fn main() {
             eprintln!("{message}");
             process::exit(1);
         }
-        Cli::Payload {
-            path,
+        Cli::Run {
+            boot,
             serial_log,
             cpus,
         } => {
-            let dones = vm::run_payload(path, serial_log, cpus);
+            let dones = match boot {
+                Boot::Payload(path) => vm::run_payload(path, serial_log, cpus),
+                Boot::Uefi(path) => vm::run_uefi(path, serial_log, cpus),
+            };
             let mut failed = false;
             for done in dones {
                 if let Some(ns) = done.exec_ns {
@@ -42,15 +47,34 @@ fn main() {
             if failed {
                 process::exit(1);
             }
+            if vmm::terminal::reboot_requested() {
+                let exe = match std::env::current_exe() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        eprintln!("re-exec: {error}");
+                        process::exit(1);
+                    }
+                };
+                let error = process::Command::new(exe)
+                    .args(std::env::args().skip(1))
+                    .exec();
+                eprintln!("re-exec failed: {error}");
+                process::exit(1);
+            }
         }
     }
+}
+
+enum Boot {
+    Payload(Option<PathBuf>),
+    Uefi(PathBuf),
 }
 
 enum Cli {
     Help,
     Error(String),
-    Payload {
-        path: Option<PathBuf>,
+    Run {
+        boot: Boot,
         serial_log: Option<PathBuf>,
         cpus: u32,
     },
@@ -62,6 +86,7 @@ fn parse_args() -> Cli {
         return Cli::Help;
     }
     let mut payload: Option<Option<PathBuf>> = None;
+    let mut uefi: Option<PathBuf> = None;
     let mut serial_log = None;
     let mut cpus = 1u32;
     let mut i = 0;
@@ -94,6 +119,21 @@ fn parse_args() -> Cli {
                 }
                 payload = Some(path.map(PathBuf::from));
             }
+            "--uefi" | "--firmware" => {
+                if uefi.is_some() {
+                    return Cli::Error("pass only one of --uefi and --firmware".into());
+                }
+                let path = args
+                    .get(i + 1)
+                    .filter(|next| !next.starts_with('-'))
+                    .cloned();
+                if path.is_some() {
+                    i += 1;
+                }
+                uefi = Some(PathBuf::from(
+                    path.unwrap_or_else(|| "firmware/OVMF_CODE.fd".to_string()),
+                ));
+            }
             "--serial-log" | "--console-log" => {
                 let Some(path) = args.get(i + 1) else {
                     return Cli::Error("--serial-log needs a path".into());
@@ -108,13 +148,19 @@ fn parse_args() -> Cli {
         }
         i += 1;
     }
-    match payload {
-        Some(path) => Cli::Payload {
-            path,
+    match (payload, uefi) {
+        (Some(_), Some(_)) => Cli::Error("pass only one of --payload and --uefi/--firmware".into()),
+        (Some(path), None) => Cli::Run {
+            boot: Boot::Payload(path),
             serial_log,
             cpus,
         },
-        None => Cli::Error("no boot path; pass --payload".into()),
+        (None, Some(path)) => Cli::Run {
+            boot: Boot::Uefi(path),
+            serial_log,
+            cpus,
+        },
+        (None, None) => Cli::Error("no boot path; pass --payload".into()),
     }
 }
 
@@ -129,6 +175,9 @@ AArch64 VMM.
 Usage:
   vmm --payload [PATH] [--cpus N]
                          Long-mode guest. PATH defaults to the built-in COM1 banner.
+  vmm --uefi [PATH] [--cpus N]
+  vmm --firmware [PATH] [--cpus N]
+                         OVMF. PATH defaults to firmware/OVMF_CODE.fd.
                          --cpus / -c is 1..=16 (default 1). vCPU 0 is the BSP.
 
 With no arguments, vmm prints this help and exits 1."

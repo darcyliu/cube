@@ -108,6 +108,14 @@ impl Lapic {
         self.id
     }
 
+    pub fn tpr(&self) -> u32 {
+        self.tpr
+    }
+
+    pub fn set_tpr(&mut self, value: u32) {
+        self.tpr = value & 0xff;
+    }
+
     pub fn ldr(&self) -> u32 {
         self.ldr
     }

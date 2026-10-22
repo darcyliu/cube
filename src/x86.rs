@@ -6,6 +6,8 @@ use crate::memory::GuestMemory;
 
 /// 64 MiB identity map at GPA 0, entered at [`PAYLOAD_GPA`].
 pub const GUEST_RAM_BYTES: usize = 64 * 1024 * 1024;
+/// OVMF RAM. No `--ram` flag; E820 and CMOS use this size.
+pub const UEFI_RAM_BYTES: usize = 128 * 1024 * 1024;
 pub const PAYLOAD_GPA: u64 = 0x10_0000;
 pub const STACK_GPA: u64 = 0x8_0000;
 pub const GDT_GPA: u64 = 0x1000;

@@ -1,10 +1,13 @@
+pub mod acpi;
 pub mod cow;
+pub mod cpuid;
 pub mod decode;
 pub mod devices;
 pub mod forward;
 pub mod gpa;
 pub mod gpt;
 pub mod memory;
+pub mod msr;
 pub mod terminal;
 pub mod vmnet_proto;
 pub mod vmnet_service;

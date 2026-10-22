@@ -2,8 +2,8 @@ use std::fs;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rustc-link-lib=framework=Hypervisor");
-    // ld drops a framework when the binary references no symbol from it.
+    // Lib tests must not link Hypervisor. The bin references hv_* and also
+    // forces the framework in, because ld drops it when a target has no hv_* use.
     println!("cargo:rustc-link-arg-bin=vmm=-Wl,-needed_framework,Hypervisor");
     println!("cargo:rerun-if-changed=guest/payload.S");
 

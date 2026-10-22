@@ -1,10 +1,10 @@
 //! fw_cfg item list, big-endian file directory, and DMA descriptor.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::memory::GuestMemory;
 
-use super::MmioDevice;
+use super::{MmioDevice, PioDevice};
 
 const FW_CFG_SIGNATURE: u16 = 0x00;
 const FW_CFG_ID: u16 = 0x01;
@@ -90,6 +90,37 @@ impl FwCfg {
             .unwrap_or(&[])
     }
 
+    /// PIO transport at `0x510`. Selector writes are native little-endian:
+    /// OVMF `IoWrite16` does not swap, and QEMU's combined I/O port does not either.
+    pub fn pio_in(&mut self, offset: u16, size: usize) -> u64 {
+        match offset {
+            0 | 1 => {
+                let mut val = 0u64;
+                for i in 0..size {
+                    val |= u64::from(self.read_data_byte()) << (8 * i);
+                }
+                val
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn pio_out(&mut self, offset: u16, data: u64, size: usize) {
+        match (offset, size) {
+            (0, 2) | (0, 4) => self.select(data as u16),
+            (4, 4) => {
+                let hi = u64::from((data as u32).swap_bytes());
+                self.dma_addr = (self.dma_addr & 0xffff_ffff) | (hi << 32);
+            }
+            (8, 4) => {
+                let lo = u64::from((data as u32).swap_bytes());
+                self.dma_addr = (self.dma_addr & 0xffff_ffff_0000_0000) | lo;
+                self.do_dma();
+            }
+            _ => {}
+        }
+    }
+
     fn select(&mut self, sel: u16) {
         self.selector = sel;
         self.offset = 0;
@@ -165,6 +196,29 @@ fn build_file_dir(items: &[FwCfgItem]) -> Vec<u8> {
     dir
 }
 
+/// Ports `0x510` through `0x51B`: selector, data, and the two DMA dwords.
+pub struct FwCfgPio {
+    inner: Mutex<FwCfg>,
+}
+
+impl FwCfgPio {
+    pub fn new(cfg: FwCfg) -> Self {
+        Self {
+            inner: Mutex::new(cfg),
+        }
+    }
+}
+
+impl PioDevice for FwCfgPio {
+    fn pio_in(&self, offset: u16, size: usize) -> u64 {
+        self.inner.lock().unwrap().pio_in(offset, size)
+    }
+
+    fn pio_out(&self, offset: u16, data: u64, size: usize) {
+        self.inner.lock().unwrap().pio_out(offset, data, size);
+    }
+}
+
 impl MmioDevice for FwCfg {
     fn read(&mut self, offset: u64, size: usize) -> u64 {
         match offset {
@@ -199,7 +253,7 @@ impl MmioDevice for FwCfg {
                 self.dma_addr = if size == 8 {
                     data.swap_bytes()
                 } else if size == 4 && offset == REG_DMA {
-                    (self.dma_addr & 0xffff_ffff) | ((data as u64).swap_bytes() << 32)
+                    (self.dma_addr & 0xffff_ffff) | (data.swap_bytes() << 32)
                 } else {
                     data.swap_bytes()
                 };
@@ -222,20 +276,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_dir_contains_fdt() {
-        let items = [FwCfgItem {
-            selector: FW_CFG_FILE_FIRST,
-            name: {
-                let mut n = [0u8; 56];
-                n[..8].copy_from_slice(b"etc/fdt\0");
-                n
-            },
-            data: vec![0xd0, 0x0d, 0xfe, 0xed],
-        }];
-        let dir = build_file_dir(&items);
-        assert_eq!(&dir[0..4], 1u32.to_be_bytes());
-        assert_eq!(&dir[4..8], 4u32.to_be_bytes());
-        assert_eq!(&dir[8..10], FW_CFG_FILE_FIRST.to_be_bytes());
-        assert_eq!(&dir[12..20], b"etc/fdt\0");
+    fn file_dir_contains_e820_and_not_fdt() {
+        let ram = Arc::new(GuestMemory::allocate(0, 0x1000).unwrap());
+        let cfg = FwCfg::from_files(ram, &[("etc/e820", &[1, 2, 3, 4])]);
+        let dir = cfg
+            .items
+            .iter()
+            .find(|i| i.selector == FW_CFG_FILE_DIR)
+            .unwrap();
+        assert!(!dir.data.windows(8).any(|w| w == b"etc/fdt\0"));
+        assert!(dir.data.windows(9).any(|w| w == b"etc/e820\0"));
+        assert_eq!(&dir.data[0..4], 1u32.to_be_bytes());
+        assert_eq!(&dir.data[4..8], 4u32.to_be_bytes());
+        assert_eq!(&dir.data[8..10], FW_CFG_FILE_FIRST.to_be_bytes());
+    }
+
+    #[test]
+    fn pio_selector_is_native_and_dma_halves_swap() {
+        let ram = Arc::new(GuestMemory::allocate(0, 0x1000).unwrap());
+        let mut cfg = FwCfg::from_files(Arc::clone(&ram), &[]);
+        cfg.pio_out(0, 0, 2);
+        assert_eq!(cfg.pio_in(1, 1), u64::from(b'Q'));
+        assert_eq!(cfg.pio_in(0, 1), u64::from(b'E'));
+        let mut rest = [0u8; 2];
+        rest[0] = cfg.pio_in(1, 1) as u8;
+        rest[1] = cfg.pio_in(1, 1) as u8;
+        assert_eq!(&rest, b"MU");
+
+        cfg.pio_out(0, 1, 2);
+        assert_eq!(cfg.pio_in(1, 1), 3);
+
+        let mut desc = [0u8; 16];
+        desc[0..4].copy_from_slice(&0x0000_0002u32.to_be_bytes());
+        desc[4..8].copy_from_slice(&4u32.to_be_bytes());
+        desc[8..16].copy_from_slice(&0x200u64.to_be_bytes());
+        ram.write(0x100, &desc).unwrap();
+        cfg.pio_out(0, 0, 2);
+        let addr = 0x100u64;
+        cfg.pio_out(4, u64::from(((addr >> 32) as u32).swap_bytes()), 4);
+        cfg.pio_out(8, u64::from((addr as u32).swap_bytes()), 4);
+        let mut got = [0u8; 4];
+        ram.read(0x200, &mut got).unwrap();
+        assert_eq!(&got, b"QEMU");
+        let mut ctl = [0u8; 4];
+        ram.read(0x100, &mut ctl).unwrap();
+        assert_eq!(ctl, [0, 0, 0, 0]);
     }
 }

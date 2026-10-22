@@ -7,9 +7,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use vmm::decode::{self, MmioOp, StoreSrc};
+use vmm::decode::{self, AluRhs, MemSeg, MmioOp, RegOp, StoreSrc, StrKind, StringOp};
 use vmm::devices::lapic::LAPIC_MMIO;
 use vmm::gpa::GuestSpace;
+use vmm::msr::{MsrBank, MsrWrite};
 use vmm::terminal::host_log;
 use vmm::x86::{
     self, CR0_LONG_MODE, CR4_LONG_MODE, CS_AR, CS_SELECTOR, DATA_AR, DATA_LIMIT, DS_SELECTOR,
@@ -21,6 +22,8 @@ use crate::hypervisor::*;
 use crate::machine::Machine;
 
 const MAX_EXITS: u64 = 100_000;
+/// OVMF polls the PM timer. Payload smokes exit through Ctrl-] well under the smaller cap.
+const MAX_EXITS_FIRMWARE: u64 = 20_000_000;
 const CR_MASK: u64 = 0xffff_ffff;
 /// ET | NE. Real mode keeps PE and PG clear; VMX still requires these.
 const CR0_REAL: u64 = (1 << 4) | (1 << 5);
@@ -32,6 +35,17 @@ const PREEMPT_UNKNOWN: i8 = 0;
 const PREEMPT_OK: i8 = 1;
 const PREEMPT_NO: i8 = -1;
 static PREEMPT: AtomicI8 = AtomicI8::new(PREEMPT_UNKNOWN);
+
+#[derive(Clone, Copy)]
+pub enum Entry {
+    Payload { cr3: u64 },
+    Firmware,
+}
+
+struct PendingExc {
+    info: u64,
+    error: Option<u64>,
+}
 
 pub struct VcpuDone {
     pub index: u32,
@@ -269,7 +283,7 @@ enum Attempt {
     Aborted,
 }
 
-pub fn run(cpu: usize, kick: Arc<Kick>, machine: Arc<Machine>, cr3: u64) -> VcpuDone {
+pub fn run(cpu: usize, kick: Arc<Kick>, machine: Arc<Machine>, entry: Entry) -> VcpuDone {
     let mut done = VcpuDone {
         index: cpu as u32,
         exec_ns: None,
@@ -284,7 +298,7 @@ pub fn run(cpu: usize, kick: Arc<Kick>, machine: Arc<Machine>, cr3: u64) -> Vcpu
     kick.arm(id);
     let watch = Arc::new(TimerWatch::new());
     let mut timers = TimerJoin::new(watch.clone());
-    if let Err(e) = setup_and_loop(cpu, id, &kick, &machine, cr3, &watch, &mut timers) {
+    if let Err(e) = setup_and_loop(cpu, id, &kick, &machine, entry, &watch, &mut timers) {
         done.error = Some(format!("vCPU {cpu}: {e}"));
         machine.stop_cpus();
     }
@@ -310,20 +324,36 @@ fn setup_and_loop(
     id: hv_vcpuid_t,
     kick: &Arc<Kick>,
     machine: &Arc<Machine>,
-    cr3: u64,
+    entry: Entry,
     watch: &Arc<TimerWatch>,
     timers: &mut TimerJoin,
 ) -> Result<(), String> {
     let cpu_based = write_controls(id)?;
-    if cpu == 0 {
-        plant_long_mode(id, cr3)?;
-    }
-    map_apic(id);
-    if cpu != 0 {
-        let Some(vector) = kick.wait_for_sipi() else {
-            return Ok(());
-        };
-        plant_real_mode(id, cr3, vector)?;
+    match entry {
+        Entry::Payload { cr3 } => {
+            if cpu == 0 {
+                plant_long_mode(id, cr3)?;
+            }
+            map_apic(id);
+            if cpu != 0 {
+                let Some(vector) = kick.wait_for_sipi() else {
+                    return Ok(());
+                };
+                plant_real_mode(id, cr3, vector)?;
+            }
+        }
+        Entry::Firmware => {
+            if cpu == 0 {
+                plant_firmware(id)?;
+            }
+            map_apic(id);
+            if cpu != 0 {
+                let Some(vector) = kick.wait_for_sipi() else {
+                    return Ok(());
+                };
+                plant_real_mode(id, 0, vector)?;
+            }
+        }
     }
     run_loop(cpu, id, kick, machine, cpu_based, watch, timers)
 }
@@ -620,6 +650,110 @@ fn enable_kernel_gs(id: hv_vcpuid_t) -> Result<(), String> {
         .map_err(|e| format!("hv_vcpu_enable_native_msr(KERNEL_GS_BASE): {e}"))
 }
 
+/// Real-mode reset at `0xFFFFFFF0`. No payload page tables.
+fn plant_firmware(id: hv_vcpuid_t) -> Result<(), String> {
+    let entry = read_vmcs(id, VMCS_CTRL_VMENTRY_CONTROLS)?;
+    wvmcs(id, VMCS_CTRL_VMENTRY_CONTROLS, entry & !VMENTRY_GUEST_IA32E)?;
+    wvmcs(id, VMCS_GUEST_IA32_EFER, 0)?;
+
+    wreg(id, HV_X86_CS, 0xF000)?;
+    wvmcs(id, VMCS_GUEST_CS, 0xF000)?;
+    wvmcs(id, VMCS_GUEST_CS_BASE, 0xFFFF_0000)?;
+    wvmcs(id, VMCS_GUEST_CS_LIMIT, REAL_LIMIT)?;
+    wvmcs(id, VMCS_GUEST_CS_AR, REAL_CODE_AR)?;
+
+    for (reg, vmcs_sel, limit, ar, seg_base) in [
+        (
+            HV_X86_SS,
+            VMCS_GUEST_SS,
+            VMCS_GUEST_SS_LIMIT,
+            VMCS_GUEST_SS_AR,
+            VMCS_GUEST_SS_BASE,
+        ),
+        (
+            HV_X86_DS,
+            VMCS_GUEST_DS,
+            VMCS_GUEST_DS_LIMIT,
+            VMCS_GUEST_DS_AR,
+            VMCS_GUEST_DS_BASE,
+        ),
+        (
+            HV_X86_ES,
+            VMCS_GUEST_ES,
+            VMCS_GUEST_ES_LIMIT,
+            VMCS_GUEST_ES_AR,
+            VMCS_GUEST_ES_BASE,
+        ),
+        (
+            HV_X86_FS,
+            VMCS_GUEST_FS,
+            VMCS_GUEST_FS_LIMIT,
+            VMCS_GUEST_FS_AR,
+            VMCS_GUEST_FS_BASE,
+        ),
+        (
+            HV_X86_GS,
+            VMCS_GUEST_GS,
+            VMCS_GUEST_GS_LIMIT,
+            VMCS_GUEST_GS_AR,
+            VMCS_GUEST_GS_BASE,
+        ),
+    ] {
+        wreg(id, reg, 0)?;
+        wvmcs(id, vmcs_sel, 0)?;
+        wvmcs(id, limit, REAL_LIMIT)?;
+        wvmcs(id, ar, REAL_DATA_AR)?;
+        wvmcs(id, seg_base, 0)?;
+    }
+
+    wreg(id, HV_X86_TR, 0)?;
+    wvmcs(id, VMCS_GUEST_TR, 0)?;
+    wvmcs(id, VMCS_GUEST_TR_BASE, 0)?;
+    wvmcs(id, VMCS_GUEST_TR_LIMIT, TR_LIMIT)?;
+    wvmcs(id, VMCS_GUEST_TR_AR, TR_AR)?;
+    wreg(id, HV_X86_LDTR, 0)?;
+    wvmcs(id, VMCS_GUEST_LDTR, 0)?;
+    wvmcs(id, VMCS_GUEST_LDTR_BASE, 0)?;
+    wvmcs(id, VMCS_GUEST_LDTR_LIMIT, 0)?;
+    wvmcs(id, VMCS_GUEST_LDTR_AR, UNUSABLE_AR)?;
+
+    wreg(id, HV_X86_GDT_BASE, 0)?;
+    wreg(id, HV_X86_GDT_LIMIT, REAL_LIMIT)?;
+    wreg(id, HV_X86_IDT_BASE, 0)?;
+    wreg(id, HV_X86_IDT_LIMIT, REAL_LIMIT)?;
+    wvmcs(id, VMCS_GUEST_GDTR_BASE, 0)?;
+    wvmcs(id, VMCS_GUEST_GDTR_LIMIT, REAL_LIMIT)?;
+    wvmcs(id, VMCS_GUEST_IDTR_BASE, 0)?;
+    wvmcs(id, VMCS_GUEST_IDTR_LIMIT, REAL_LIMIT)?;
+
+    let (cr0, cr0_shadow) = x86::publish_cr(CR0_REAL);
+    let (cr4_visible, cr4_shadow) = x86::publish_cr(0);
+    let cr4 = cr4_visible | (1 << 13);
+    wreg(id, HV_X86_CR0, cr0)?;
+    wreg(id, HV_X86_CR3, 0)?;
+    wreg(id, HV_X86_CR4, cr4)?;
+    wreg(id, HV_X86_RIP, 0xFFF0)?;
+    wreg(id, HV_X86_RSP, 0)?;
+    wreg(id, HV_X86_RFLAGS, 2)?;
+    wreg(id, HV_X86_XCR0, 1)?;
+    wreg(id, HV_X86_DR7, 0x400)?;
+    wvmcs(id, VMCS_GUEST_CR0, cr0)?;
+    wvmcs(id, VMCS_CTRL_CR0_SHADOW, cr0_shadow)?;
+    wvmcs(id, VMCS_GUEST_CR4, cr4)?;
+    wvmcs(id, VMCS_CTRL_CR4_SHADOW, cr4_shadow)?;
+    wvmcs(id, VMCS_GUEST_CR3, 0)?;
+    wvmcs(id, VMCS_GUEST_RIP, 0xFFF0)?;
+    wvmcs(id, VMCS_GUEST_RSP, 0)?;
+    wvmcs(id, VMCS_GUEST_RFLAGS, 2)?;
+    wvmcs(id, VMCS_GUEST_DR7, 0x400)?;
+    // Native KERNEL_GS_BASE before any later LMA entry.
+    enable_kernel_gs(id)?;
+    wvmcs(id, VMCS_GUEST_INTERRUPTIBILITY, 0)?;
+    wvmcs(id, VMCS_GUEST_DEBUG_EXC, 0)?;
+    wvmcs(id, VMCS_GUEST_ACTIVITY_STATE, ACTIVITY_ACTIVE)?;
+    Ok(())
+}
+
 fn run_loop(
     cpu: usize,
     id: hv_vcpuid_t,
@@ -630,14 +764,22 @@ fn run_loop(
     timers: &mut TimerJoin,
 ) -> Result<(), String> {
     let trace = std::env::var_os("VMM_TRACE_EXITS").is_some_and(|v| v == "1");
+    let max_exits = if machine.firmware {
+        MAX_EXITS_FIRMWARE
+    } else {
+        MAX_EXITS
+    };
     let mut hist = [0u64; 66];
     let mut exits = 0u64;
     let mut want_hlt = false;
     let mut logged_irq = false;
+    let mut logged_init = false;
     let mut timer_exit = false;
     let mut ept_retry: Option<(u64, u64)> = None;
     // Event that was mid-delivery when the last exit happened.
     let mut reinject: Option<u64> = None;
+    let mut inject: Option<PendingExc> = None;
+    let mut msrs = MsrBank::new(cpu as u32);
     let mut preload = None;
     if cpu == 0 {
         preload = probe_preemption(id)?;
@@ -652,7 +794,7 @@ fn run_loop(
     }
 
     loop {
-        if exits > MAX_EXITS {
+        if exits > max_exits {
             return Err(format!("stopped after {exits} VM exits"));
         }
         if vmm::terminal::shutdown_requested() && !want_hlt {
@@ -667,13 +809,22 @@ fn run_loop(
         let exit = if let Some(exit) = preload.take() {
             exit
         } else {
+            if reinject.is_some() {
+                inject = None;
+            }
+            let deliver_exc = reinject.is_none() && inject.is_some();
             let pending_irq = machine.has_deliverable(cpu);
             let (blocked, idt_busy) = irq_blocks(id)?;
-            let injectable = reinject.is_none() && pending_irq && !blocked;
+            let injectable = reinject.is_none() && !deliver_exc && pending_irq && !blocked;
             // IRQ-window exiting while halted does not run guest instructions.
-            let window = reinject.is_none() && pending_irq && !injectable && !want_hlt && !idt_busy;
+            let window = !deliver_exc
+                && reinject.is_none()
+                && pending_irq
+                && !injectable
+                && !want_hlt
+                && !idt_busy;
             set_irq_window(id, cpu_based, window)?;
-            let activity = if reinject.is_some() || !want_hlt || injectable {
+            let activity = if reinject.is_some() || deliver_exc || !want_hlt || injectable {
                 ACTIVITY_ACTIVE
             } else {
                 ACTIVITY_HLT
@@ -692,6 +843,14 @@ fn run_loop(
                     wvmcs(id, VMCS_CTRL_VMENTRY_EXC_ERROR, err)?;
                 }
                 wvmcs(id, VMCS_CTRL_VMENTRY_IRQ_INFO, info)?;
+            } else if let Some(exc) = inject.as_ref() {
+                unsafe {
+                    let _ = hv_vmx_vcpu_write_vmcs(id, VMCS_RO_IDT_VECTOR_INFO, 0);
+                }
+                if let Some(err) = exc.error {
+                    wvmcs(id, VMCS_CTRL_VMENTRY_EXC_ERROR, err)?;
+                }
+                wvmcs(id, VMCS_CTRL_VMENTRY_IRQ_INFO, exc.info)?;
             } else if !injectable {
                 wvmcs(id, VMCS_CTRL_VMENTRY_IRQ_INFO, 0)?;
             }
@@ -741,7 +900,12 @@ fn run_loop(
                     }
                     continue;
                 }
-                Attempt::Ran(exit) => exit,
+                Attempt::Ran(exit) => {
+                    if deliver_exc {
+                        inject = None;
+                    }
+                    exit
+                }
             }
         };
         exits += 1;
@@ -802,6 +966,27 @@ fn run_loop(
 
         match raw_basic {
             VMX_REASON_IO => handle_io(id, machine)?,
+            VMX_REASON_CPUID => handle_cpuid(id, cpu, machine)?,
+            VMX_REASON_RDMSR => handle_rdmsr(id, &msrs, &mut inject)?,
+            VMX_REASON_WRMSR => handle_wrmsr(id, &mut msrs, &mut inject)?,
+            VMX_REASON_CR_ACCESS => handle_cr(id, machine, cpu, &mut msrs, &mut inject)?,
+            VMX_REASON_XSETBV => handle_xsetbv(id, &mut inject)?,
+            VMX_REASON_WBINVD | VMX_REASON_INVD => advance_rip(id)?,
+            VMX_REASON_RDPMC => {
+                inject = Some(gp0());
+            }
+            VMX_REASON_MWAIT | VMX_REASON_MONITOR | 18..=27 => {
+                inject = Some(ud());
+            }
+            VMX_REASON_INIT | VMX_REASON_SIPI => {
+                if !logged_init {
+                    host_log(format_args!("[VMM] INIT/SIPI exit {raw_basic}; ignored"));
+                    logged_init = true;
+                }
+                if was_hlt {
+                    want_hlt = true;
+                }
+            }
             VMX_REASON_HLT => {
                 advance_rip(id)?;
                 // HLT has completed, so STI/MOV-SS blocking no longer applies.
@@ -829,9 +1014,6 @@ fn run_loop(
             }
             VMX_REASON_IRQ_WND => {
                 want_hlt = false;
-            }
-            VMX_REASON_CPUID => {
-                return Err(format!("CPUID exit: {}; stopping vCPU", dump_guest(id)));
             }
             VMX_REASON_APIC_ACCESS => {
                 let qual = read_vmcs(id, VMCS_RO_EXIT_QUALIFIC)?;
@@ -1025,11 +1207,22 @@ fn handle_ept(
         }
         return Ok(());
     }
-    *ept_retry = None;
-    // The code flash is not mapped. Writes are ignored; reads cannot be filled.
-    if machine.space.code_window_contains(gpa, 1) && qual & 2 != 0 {
-        return advance_rip(id);
+    // HVF installs a new mapping on the first fault. A later write to code is ROM.
+    if machine.space.code_window_contains(gpa, 1) {
+        let rip = read_reg(id, HV_X86_RIP)?;
+        if *ept_retry == Some((gpa, rip)) {
+            if qual & 2 != 0 {
+                return advance_rip(id);
+            }
+            return Err(format!("code flash fault at {gpa:#x} qual={qual:#x}"));
+        }
+        *ept_retry = Some((gpa, rip));
+        if was_hlt {
+            *want_hlt = true;
+        }
+        return Ok(());
     }
+    *ept_retry = None;
     emulate_mmio(id, machine, cpu, gpa)
 }
 
@@ -1050,31 +1243,308 @@ fn emulate_mmio(id: hv_vcpuid_t, machine: &Machine, cpu: usize, gpa: u64) -> Res
     };
     match decoded.op {
         MmioOp::Load { dest } => {
-            if dest.width != 4 {
+            if !machine.firmware && dest.width != 4 {
                 return Err(format!("MMIO read width {} at {gpa:#x}", dest.width));
             }
-            let value = machine.mmio_read(cpu, gpa, 4)?;
-            wreg(id, hv_gpr(dest.index)?, value & 0xffff_ffff)?;
+            let value = machine.mmio_read(cpu, gpa, dest.width as usize)?;
+            write_partial(id, dest, value)?;
         }
         MmioOp::Store { src } => {
-            let value = match src {
+            let (value, width) = match src {
                 StoreSrc::Reg(reg) => {
-                    if reg.width != 4 {
+                    if !machine.firmware && reg.width != 4 {
                         return Err(format!("MMIO write width {} at {gpa:#x}", reg.width));
                     }
-                    read_reg(id, hv_gpr(reg.index)?)? & 0xffff_ffff
+                    (read_partial(id, reg)?, reg.width)
                 }
                 StoreSrc::Imm { value, width } => {
-                    if width != 4 {
+                    if !machine.firmware && width != 4 {
                         return Err(format!("MMIO write width {width} at {gpa:#x}"));
                     }
-                    value
+                    (value, width)
                 }
             };
-            machine.mmio_write(cpu, gpa, value, 4)?;
+            machine.mmio_write(cpu, gpa, value, width as usize)?;
         }
+        MmioOp::Alu {
+            digit,
+            width,
+            rhs,
+            reg_dest,
+            write,
+        } => {
+            if !machine.firmware && width != 4 {
+                return Err(format!("MMIO alu width {width} at {gpa:#x}"));
+            }
+            let flags = read_vmcs(id, VMCS_GUEST_RFLAGS)?;
+            let new_flags = if reg_dest {
+                let AluRhs::Reg(reg) = rhs else {
+                    return Err("ALU immediate has no register destination".into());
+                };
+                let left = read_partial(id, reg)?;
+                let right = machine.mmio_read(cpu, gpa, width as usize)?;
+                let (result, new_flags) = decode::apply_alu(digit, width, left, right, flags);
+                if write {
+                    write_partial(id, reg, result)?;
+                }
+                new_flags
+            } else {
+                let left = machine.mmio_read(cpu, gpa, width as usize)?;
+                let right = match rhs {
+                    AluRhs::Imm(value) => value,
+                    AluRhs::Reg(reg) => read_partial(id, reg)?,
+                };
+                let (result, new_flags) = decode::apply_alu(digit, width, left, right, flags);
+                // CMP and TEST must not write the firmware volume.
+                if write {
+                    machine.mmio_write(cpu, gpa, result, width as usize)?;
+                }
+                new_flags
+            };
+            wreg(id, HV_X86_RFLAGS, new_flags)?;
+            wvmcs(id, VMCS_GUEST_RFLAGS, new_flags)?;
+        }
+        MmioOp::Extend {
+            dest,
+            src_width,
+            sign,
+        } => {
+            if !machine.firmware && src_width != 4 {
+                return Err(format!("MMIO extend width {src_width} at {gpa:#x}"));
+            }
+            let value = machine.mmio_read(cpu, gpa, src_width as usize)?;
+            let extended = decode::extend_bits(value, src_width, dest.width, sign);
+            write_partial(id, dest, extended)?;
+        }
+        MmioOp::String(op) => emulate_string_mem(id, machine, cpu, op)?,
     }
     advance_rip_by(id, len)
+}
+
+fn emulate_string_mem(
+    id: hv_vcpuid_t,
+    machine: &Machine,
+    cpu: usize,
+    op: StringOp,
+) -> Result<(), String> {
+    let addr_bits = address_bits(id, op.addr_override)?;
+    let mask = match addr_bits {
+        16 => 0xffff,
+        32 => 0xffff_ffff,
+        _ => u64::MAX,
+    };
+    let mut rcx = read_reg(id, HV_X86_RCX)?;
+    let mut count = if op.rep { rcx & mask } else { 1 };
+    if count > (1 << 20) {
+        return Err(format!(
+            "string move count {count:#x} at {}",
+            dump_guest(id)
+        ));
+    }
+    let mut flags = read_vmcs(id, VMCS_GUEST_RFLAGS)?;
+    let df = flags & (1 << 10) != 0;
+    // 64-bit code ignores DS/ES/SS bases. A stale VMCS base would miss the flash.
+    let src_base = linear_base(id, op.seg)?;
+    let es_base = linear_base(id, MemSeg::Es)?;
+    let mut rsi = read_reg(id, HV_X86_RSI)?;
+    let mut rdi = read_reg(id, HV_X86_RDI)?;
+    let mut rax = read_reg(id, HV_X86_RAX)?;
+    let compare = matches!(op.kind, StrKind::Cmps | StrKind::Scas);
+    while count > 0 {
+        let src_lin = src_base.wrapping_add(rsi & mask);
+        let dst_lin = es_base.wrapping_add(rdi & mask);
+        match op.kind {
+            StrKind::Movs => {
+                let value = read_linear(id, machine, cpu, src_lin, op.width)?;
+                write_linear(id, machine, cpu, dst_lin, value, op.width)?;
+                rsi = decode::string_step(rsi, op.width, df, mask);
+                rdi = decode::string_step(rdi, op.width, df, mask);
+            }
+            StrKind::Stos => {
+                write_linear(id, machine, cpu, dst_lin, rax, op.width)?;
+                rdi = decode::string_step(rdi, op.width, df, mask);
+            }
+            StrKind::Lods => {
+                rax = merge_low(
+                    rax,
+                    read_linear(id, machine, cpu, src_lin, op.width)?,
+                    op.width,
+                );
+                rsi = decode::string_step(rsi, op.width, df, mask);
+            }
+            StrKind::Cmps => {
+                let left = read_linear(id, machine, cpu, src_lin, op.width)?;
+                let right = read_linear(id, machine, cpu, dst_lin, op.width)?;
+                let (_, new_flags) = decode::apply_alu(7, op.width, left, right, flags);
+                flags = new_flags;
+                rsi = decode::string_step(rsi, op.width, df, mask);
+                rdi = decode::string_step(rdi, op.width, df, mask);
+            }
+            StrKind::Scas => {
+                let right = read_linear(id, machine, cpu, dst_lin, op.width)?;
+                let left = rax & width_mask(op.width);
+                let (_, new_flags) = decode::apply_alu(7, op.width, left, right, flags);
+                flags = new_flags;
+                rdi = decode::string_step(rdi, op.width, df, mask);
+            }
+        }
+        if op.rep {
+            rcx = (rcx & !mask) | (rcx.wrapping_sub(1) & mask);
+        }
+        count -= 1;
+        if op.rep && compare {
+            let zf = flags & (1 << 6) != 0;
+            if op.repne == zf {
+                break;
+            }
+        }
+    }
+    wreg(id, HV_X86_RSI, rsi)?;
+    wreg(id, HV_X86_RDI, rdi)?;
+    wreg(id, HV_X86_RCX, rcx)?;
+    if matches!(op.kind, StrKind::Lods) {
+        wreg(id, HV_X86_RAX, rax)?;
+    }
+    if compare {
+        wreg(id, HV_X86_RFLAGS, flags)?;
+        wvmcs(id, VMCS_GUEST_RFLAGS, flags)?;
+    }
+    Ok(())
+}
+
+fn linear_base(id: hv_vcpuid_t, seg: MemSeg) -> Result<u64, String> {
+    let lma = read_vmcs(id, VMCS_GUEST_IA32_EFER)? & (1 << 10) != 0;
+    let long64 = lma && read_vmcs(id, VMCS_GUEST_CS_AR)? & (1 << 13) != 0;
+    if long64 && !matches!(seg, MemSeg::Fs | MemSeg::Gs) {
+        return Ok(0);
+    }
+    read_vmcs(id, seg_field(seg))
+}
+
+fn seg_field(seg: MemSeg) -> u32 {
+    match seg {
+        MemSeg::Es => VMCS_GUEST_ES_BASE,
+        MemSeg::Cs => VMCS_GUEST_CS_BASE,
+        MemSeg::Ss => VMCS_GUEST_SS_BASE,
+        MemSeg::Ds => VMCS_GUEST_DS_BASE,
+        MemSeg::Fs => VMCS_GUEST_FS_BASE,
+        MemSeg::Gs => VMCS_GUEST_GS_BASE,
+    }
+}
+
+fn merge_low(old: u64, value: u64, width: u8) -> u64 {
+    if width == 4 {
+        value & 0xffff_ffff
+    } else if width == 8 {
+        value
+    } else {
+        let mask = width_mask(width);
+        (old & !mask) | (value & mask)
+    }
+}
+
+fn read_linear(
+    id: hv_vcpuid_t,
+    machine: &Machine,
+    cpu: usize,
+    linear: u64,
+    width: u8,
+) -> Result<u64, String> {
+    let size = width as usize;
+    if crosses_page(linear, size) {
+        let mut value = 0u64;
+        for i in 0..size {
+            value |= read_linear(id, machine, cpu, linear.wrapping_add(i as u64), 1)? << (8 * i);
+        }
+        return Ok(value);
+    }
+    let gpa = linear_gpa(id, &machine.space, linear)?;
+    read_phys(machine, cpu, gpa, size)
+}
+
+fn write_linear(
+    id: hv_vcpuid_t,
+    machine: &Machine,
+    cpu: usize,
+    linear: u64,
+    value: u64,
+    width: u8,
+) -> Result<(), String> {
+    let size = width as usize;
+    if crosses_page(linear, size) {
+        for i in 0..size {
+            let byte = (value >> (8 * i)) & 0xff;
+            write_linear(id, machine, cpu, linear.wrapping_add(i as u64), byte, 1)?;
+        }
+        return Ok(());
+    }
+    let gpa = linear_gpa(id, &machine.space, linear)?;
+    write_phys(machine, cpu, gpa, value, size)
+}
+
+fn crosses_page(linear: u64, size: usize) -> bool {
+    size > 1 && (linear & 0xfff) + size as u64 > 0x1000
+}
+
+fn read_phys(machine: &Machine, cpu: usize, gpa: u64, size: usize) -> Result<u64, String> {
+    let mut buf = [0u8; 8];
+    if machine.space.read_gpa(gpa, &mut buf[..size]).is_ok() {
+        let mut value = 0u64;
+        for (i, byte) in buf[..size].iter().enumerate() {
+            value |= u64::from(*byte) << (8 * i);
+        }
+        return Ok(value);
+    }
+    machine.mmio_read(cpu, gpa, size)
+}
+
+fn write_phys(
+    machine: &Machine,
+    cpu: usize,
+    gpa: u64,
+    value: u64,
+    size: usize,
+) -> Result<(), String> {
+    let mut buf = [0u8; 8];
+    for i in 0..size {
+        buf[i] = ((value >> (8 * i)) & 0xff) as u8;
+    }
+    if machine.space.write_gpa(gpa, &buf[..size]).is_ok() {
+        return Ok(());
+    }
+    machine.mmio_write(cpu, gpa, value, size)
+}
+
+fn read_partial(id: hv_vcpuid_t, reg: RegOp) -> Result<u64, String> {
+    let full = read_reg(id, hv_gpr(reg.index)?)?;
+    let value = if reg.high_byte { full >> 8 } else { full };
+    Ok(value & width_mask(reg.width))
+}
+
+fn write_partial(id: hv_vcpuid_t, reg: RegOp, value: u64) -> Result<(), String> {
+    let gpr = hv_gpr(reg.index)?;
+    let old = read_reg(id, gpr)?;
+    let new = if reg.width == 4 {
+        value & 0xffff_ffff
+    } else if reg.width == 8 {
+        value
+    } else if reg.high_byte {
+        (old & !0xff00) | ((value & 0xff) << 8)
+    } else if reg.width == 1 {
+        (old & !0xff) | (value & 0xff)
+    } else {
+        (old & !0xffff) | (value & 0xffff)
+    };
+    wreg(id, gpr, new)
+}
+
+fn width_mask(width: u8) -> u64 {
+    match width {
+        1 => 0xff,
+        2 => 0xffff,
+        4 => 0xffff_ffff,
+        _ => u64::MAX,
+    }
 }
 
 fn fetch_insn(id: hv_vcpuid_t, space: &GuestSpace) -> Result<Vec<u8>, String> {
@@ -1164,15 +1634,12 @@ fn handle_io(id: hv_vcpuid_t, machine: &Machine) -> Result<(), String> {
         other => return Err(format!("I/O size encoding {other}")),
     };
     if qual & (1 << 4) != 0 {
-        return Err(format!(
-            "string I/O is not implemented (qual {qual:#x}) at {}",
-            dump_guest(id)
-        ));
+        return handle_string_io(id, machine, qual, size);
     }
     let port = ((qual >> 16) & 0xffff) as u16;
     let is_in = qual & (1 << 3) != 0;
     if is_in {
-        let value = machine.pio.read(port, size)?;
+        let value = machine.pio_read(port, size)?;
         let rax = read_reg(id, HV_X86_RAX)?;
         let mask = match size {
             1 => 0xff,
@@ -1187,9 +1654,329 @@ fn handle_io(id: hv_vcpuid_t, machine: &Machine) -> Result<(), String> {
         wreg(id, HV_X86_RAX, new_rax)?;
     } else {
         let rax = read_reg(id, HV_X86_RAX)?;
-        machine.pio.write(port, rax, size)?;
+        machine.pio_write(port, rax, size)?;
     }
     advance_rip(id)
+}
+
+fn handle_string_io(
+    id: hv_vcpuid_t,
+    machine: &Machine,
+    qual: u64,
+    size: usize,
+) -> Result<(), String> {
+    let bytes = fetch_insn(id, &machine.space)?;
+    let mut addr_override = false;
+    let mut rep = false;
+    let mut seg_base_field = VMCS_GUEST_DS_BASE;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x67 => addr_override = true,
+            0xF2 | 0xF3 => rep = true,
+            0x26 => seg_base_field = VMCS_GUEST_ES_BASE,
+            0x2E => seg_base_field = VMCS_GUEST_CS_BASE,
+            0x36 => seg_base_field = VMCS_GUEST_SS_BASE,
+            0x3E => seg_base_field = VMCS_GUEST_DS_BASE,
+            0x64 => seg_base_field = VMCS_GUEST_FS_BASE,
+            0x65 => seg_base_field = VMCS_GUEST_GS_BASE,
+            0x66 | 0xF0 | 0x40..=0x4F => {}
+            _ => break,
+        }
+        i += 1;
+    }
+    let is_in = qual & (1 << 3) != 0;
+    if is_in {
+        seg_base_field = VMCS_GUEST_ES_BASE;
+    }
+    let addr_bits = address_bits(id, addr_override)?;
+    let mask = match addr_bits {
+        16 => 0xffff,
+        32 => 0xffff_ffff,
+        _ => u64::MAX,
+    };
+    let index_reg = if is_in { HV_X86_RDI } else { HV_X86_RSI };
+    let mut count = if rep {
+        read_reg(id, HV_X86_RCX)? & mask
+    } else {
+        1
+    };
+    if count > (1 << 20) {
+        return Err(format!("string I/O count {count:#x} at {}", dump_guest(id)));
+    }
+    let df = read_reg(id, HV_X86_RFLAGS)? & (1 << 10) != 0;
+    let step = if df {
+        0u64.wrapping_sub(size as u64)
+    } else {
+        size as u64
+    };
+    let port = ((qual >> 16) & 0xffff) as u16;
+    let seg_base = read_vmcs(id, seg_base_field)?;
+    let mut index = read_reg(id, index_reg)?;
+    while count > 0 {
+        let linear = seg_base.wrapping_add(index & mask);
+        if is_in {
+            let value = machine.pio_read(port, size)?;
+            write_guest_bytes(id, &machine.space, linear, value, size)?;
+        } else {
+            let value = read_guest_bytes(id, &machine.space, linear, size)?;
+            machine.pio_write(port, value, size)?;
+        }
+        let new_low = (index & mask).wrapping_add(step) & mask;
+        index = (index & !mask) | new_low;
+        if rep {
+            let rcx = read_reg(id, HV_X86_RCX)?;
+            let new_rcx = (rcx & !mask) | ((rcx.wrapping_sub(1)) & mask);
+            wreg(id, HV_X86_RCX, new_rcx)?;
+        }
+        count -= 1;
+    }
+    wreg(id, index_reg, index)?;
+    advance_rip(id)
+}
+
+fn address_bits(id: hv_vcpuid_t, addr_override: bool) -> Result<u32, String> {
+    let efer = read_vmcs(id, VMCS_GUEST_IA32_EFER)?;
+    let cr0 = read_vmcs(id, VMCS_GUEST_CR0)?;
+    let lma = efer & (1 << 10) != 0;
+    let pe = cr0 & 1 != 0;
+    let db = read_vmcs(id, VMCS_GUEST_CS_AR)? & (1 << 14) != 0;
+    Ok(if lma {
+        if addr_override { 32 } else { 64 }
+    } else if !pe || !db {
+        if addr_override { 32 } else { 16 }
+    } else if addr_override {
+        16
+    } else {
+        32
+    })
+}
+
+fn read_guest_bytes(
+    id: hv_vcpuid_t,
+    space: &GuestSpace,
+    linear: u64,
+    size: usize,
+) -> Result<u64, String> {
+    let mut value = 0u64;
+    for i in 0..size {
+        let gpa = linear_gpa(id, space, linear.wrapping_add(i as u64))?;
+        let mut buf = [0u8; 1];
+        space.read_gpa(gpa, &mut buf)?;
+        value |= u64::from(buf[0]) << (8 * i);
+    }
+    Ok(value)
+}
+
+fn write_guest_bytes(
+    id: hv_vcpuid_t,
+    space: &GuestSpace,
+    linear: u64,
+    value: u64,
+    size: usize,
+) -> Result<(), String> {
+    for i in 0..size {
+        let gpa = linear_gpa(id, space, linear.wrapping_add(i as u64))?;
+        let byte = [((value >> (8 * i)) & 0xff) as u8];
+        space.write_gpa(gpa, &byte)?;
+    }
+    Ok(())
+}
+
+fn linear_gpa(id: hv_vcpuid_t, space: &GuestSpace, linear: u64) -> Result<u64, String> {
+    let cr0 = read_vmcs(id, VMCS_GUEST_CR0)?;
+    if cr0 & (1 << 31) != 0 {
+        let cr3 = read_reg(id, HV_X86_CR3)?;
+        translate_4k(space, cr3, linear)
+    } else {
+        Ok(linear)
+    }
+}
+
+fn handle_cpuid(id: hv_vcpuid_t, cpu: usize, machine: &Machine) -> Result<(), String> {
+    let leaf = read_reg(id, HV_X86_RAX)? as u32;
+    let sub = read_reg(id, HV_X86_RCX)? as u32;
+    let cr4 = read_vmcs(id, VMCS_CTRL_CR4_SHADOW)?;
+    let regs = vmm::cpuid::cpuid(leaf, sub, cpu as u32, machine.cpus(), cr4 & (1 << 18) != 0);
+    wreg(id, HV_X86_RAX, u64::from(regs.eax))?;
+    wreg(id, HV_X86_RBX, u64::from(regs.ebx))?;
+    wreg(id, HV_X86_RCX, u64::from(regs.ecx))?;
+    wreg(id, HV_X86_RDX, u64::from(regs.edx))?;
+    advance_rip(id)
+}
+
+fn handle_rdmsr(
+    id: hv_vcpuid_t,
+    msrs: &MsrBank,
+    inject: &mut Option<PendingExc>,
+) -> Result<(), String> {
+    let index = read_reg(id, HV_X86_RCX)? as u32;
+    match msrs.rdmsr(index) {
+        Ok(value) => {
+            wreg(id, HV_X86_RAX, value & 0xffff_ffff)?;
+            wreg(id, HV_X86_RDX, value >> 32)?;
+            advance_rip(id)
+        }
+        Err(_) => {
+            log_msr(index);
+            *inject = Some(gp0());
+            Ok(())
+        }
+    }
+}
+
+fn handle_wrmsr(
+    id: hv_vcpuid_t,
+    msrs: &mut MsrBank,
+    inject: &mut Option<PendingExc>,
+) -> Result<(), String> {
+    let index = read_reg(id, HV_X86_RCX)? as u32;
+    let value = (read_reg(id, HV_X86_RDX)? << 32) | (read_reg(id, HV_X86_RAX)? & 0xffff_ffff);
+    match msrs.wrmsr(index, value) {
+        Ok(kind) => {
+            apply_msr(id, msrs, kind)?;
+            advance_rip(id)
+        }
+        Err(_) => {
+            log_msr(index);
+            *inject = Some(gp0());
+            Ok(())
+        }
+    }
+}
+
+fn apply_msr(id: hv_vcpuid_t, msrs: &mut MsrBank, kind: MsrWrite) -> Result<(), String> {
+    match kind {
+        MsrWrite::Efer => {
+            let cr0 = read_vmcs(id, VMCS_CTRL_CR0_SHADOW)?;
+            load_cr0(id, msrs, cr0)
+        }
+        MsrWrite::Pat => wvmcs(id, VMCS_GUEST_IA32_PAT, msrs.rdmsr(0x277).unwrap_or(0)),
+        MsrWrite::FsBase => wvmcs(id, VMCS_GUEST_FS_BASE, msrs.rdmsr(0xC000_0100).unwrap_or(0)),
+        MsrWrite::GsBase => wvmcs(id, VMCS_GUEST_GS_BASE, msrs.rdmsr(0xC000_0101).unwrap_or(0)),
+        MsrWrite::Stored | MsrWrite::Ignored | MsrWrite::ApicBase | MsrWrite::KernelGs => Ok(()),
+    }
+}
+
+fn handle_xsetbv(id: hv_vcpuid_t, inject: &mut Option<PendingExc>) -> Result<(), String> {
+    let index = read_reg(id, HV_X86_RCX)? as u32;
+    let value = (read_reg(id, HV_X86_RDX)? << 32) | (read_reg(id, HV_X86_RAX)? & 0xffff_ffff);
+    if !vmm::cpuid::xsetbv_allowed(index, value) {
+        *inject = Some(gp0());
+        return Ok(());
+    }
+    wreg(id, HV_X86_XCR0, value)?;
+    advance_rip(id)
+}
+
+fn handle_cr(
+    id: hv_vcpuid_t,
+    machine: &Machine,
+    cpu: usize,
+    msrs: &mut MsrBank,
+    inject: &mut Option<PendingExc>,
+) -> Result<(), String> {
+    let qual = read_vmcs(id, VMCS_RO_EXIT_QUALIFIC)?;
+    let cr = (qual & 0xf) as u8;
+    let access = (qual >> 4) & 3;
+    let gpr = ((qual >> 8) & 0xf) as u8;
+    match access {
+        0 => {
+            let value = read_reg(id, hv_gpr(gpr)?)?;
+            match cr {
+                0 => load_cr0(id, msrs, value)?,
+                4 => load_cr4(id, value)?,
+                8 => machine.cr8_write(cpu, value),
+                _ => {
+                    *inject = Some(gp0());
+                    return Ok(());
+                }
+            }
+        }
+        1 => {
+            let value = match cr {
+                0 => read_vmcs(id, VMCS_CTRL_CR0_SHADOW)?,
+                4 => read_vmcs(id, VMCS_CTRL_CR4_SHADOW)?,
+                8 => machine.cr8_read(cpu),
+                _ => {
+                    *inject = Some(gp0());
+                    return Ok(());
+                }
+            };
+            wreg(id, hv_gpr(gpr)?, value)?;
+        }
+        2 => {
+            let cr0 = read_vmcs(id, VMCS_CTRL_CR0_SHADOW)? & !(1 << 3);
+            load_cr0(id, msrs, cr0)?;
+        }
+        _ => {
+            let mut cr0 = read_vmcs(id, VMCS_CTRL_CR0_SHADOW)?;
+            let src = (qual >> 16) & 0xffff;
+            let pe = cr0 & 1;
+            cr0 = (cr0 & !0xf) | (src & 0xf) | pe;
+            load_cr0(id, msrs, cr0)?;
+        }
+    }
+    advance_rip(id)
+}
+
+fn load_cr0(id: hv_vcpuid_t, msrs: &mut MsrBank, written: u64) -> Result<(), String> {
+    let guest = (written & 0xffff_ffff) | CR0_REAL;
+    let (hw, shadow) = x86::publish_cr(guest);
+    wreg(id, HV_X86_CR0, hw)?;
+    wvmcs(id, VMCS_GUEST_CR0, hw)?;
+    wvmcs(id, VMCS_CTRL_CR0_SHADOW, shadow)?;
+    sync_ia32e(id, msrs, guest)
+}
+
+fn load_cr4(id: hv_vcpuid_t, written: u64) -> Result<(), String> {
+    let guest = (written & 0xffff_ffff) & !(1 << 13);
+    let (visible, shadow) = x86::publish_cr(guest);
+    let hw = visible | (1 << 13);
+    wreg(id, HV_X86_CR4, hw)?;
+    wvmcs(id, VMCS_GUEST_CR4, hw)?;
+    wvmcs(id, VMCS_CTRL_CR4_SHADOW, shadow)?;
+    Ok(())
+}
+
+fn sync_ia32e(id: hv_vcpuid_t, msrs: &mut MsrBank, cr0_guest: u64) -> Result<(), String> {
+    let lme = msrs.efer() & (1 << 8) != 0;
+    let pg = cr0_guest & (1 << 31) != 0;
+    msrs.set_lma(lme && pg);
+    wvmcs(id, VMCS_GUEST_IA32_EFER, msrs.efer())?;
+    let entry = read_vmcs(id, VMCS_CTRL_VMENTRY_CONTROLS)?;
+    let want = if lme && pg {
+        entry | VMENTRY_GUEST_IA32E
+    } else {
+        entry & !VMENTRY_GUEST_IA32E
+    };
+    if want != entry {
+        wvmcs(id, VMCS_CTRL_VMENTRY_CONTROLS, want)?;
+    }
+    Ok(())
+}
+
+fn gp0() -> PendingExc {
+    PendingExc {
+        info: 13 | (3 << 8) | (1 << 11) | IRQ_INFO_VALID,
+        error: Some(0),
+    }
+}
+
+fn ud() -> PendingExc {
+    PendingExc {
+        info: 6 | (3 << 8) | IRQ_INFO_VALID,
+        error: None,
+    }
+}
+
+fn log_msr(index: u32) {
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    if !seen.contains(&index) {
+        seen.push(index);
+        host_log(format_args!("[VMM] MSR {index:#x} -> #GP(0)"));
+    }
 }
 
 fn advance_rip(id: hv_vcpuid_t) -> Result<(), String> {
