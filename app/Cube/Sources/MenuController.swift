@@ -498,7 +498,7 @@ class MenuController: NSObject {
 
                     let effectiveVNC = vm.vnc ?? cfg.vnc
                     if let vnc = effectiveVNC {
-                        let vncItem = NSMenuItem(title: "Open Screen Sharing (VNC: \(vnc))", action: #selector(openVNCAction(_:)), keyEquivalent: "")
+                        let vncItem = NSMenuItem(title: "Open VNC Display (\(vnc))", action: #selector(openVNCAction(_:)), keyEquivalent: "")
                         vncItem.representedObject = vm
                         vncItem.target = self
                         subMenu.addItem(vncItem)
@@ -517,6 +517,11 @@ class MenuController: NSObject {
                     startItem.representedObject = vm
                     startItem.target = self
                     subMenu.addItem(startItem)
+
+                    let nativeItem = NSMenuItem(title: "Start with Native Display", action: #selector(startNativeVMAction(_:)), keyEquivalent: "")
+                    nativeItem.representedObject = vm
+                    nativeItem.target = self
+                    subMenu.addItem(nativeItem)
 
                     let deleteItem = NSMenuItem(title: "Delete Virtual Machine...", action: #selector(deleteVMAction(_:)), keyEquivalent: "")
                     deleteItem.representedObject = vm
@@ -553,6 +558,18 @@ class MenuController: NSObject {
     @objc private func startVMAction(_ sender: NSMenuItem) {
         guard let vm = sender.representedObject as? VMInfo else { return }
         VMManager.shared.startVM(name: vm.name) { [weak self] success, errorMsg in
+            if !success {
+                self?.showAlert(title: "Failed to Start VM", message: errorMsg ?? "Unknown error")
+            }
+            VMManager.shared.refreshVMs { [weak self] _ in
+                self?.updateVMMenu()
+            }
+        }
+    }
+
+    @objc private func startNativeVMAction(_ sender: NSMenuItem) {
+        guard let vm = sender.representedObject as? VMInfo else { return }
+        VMManager.shared.startVM(name: vm.name, displayMode: .native) { [weak self] success, errorMsg in
             if !success {
                 self?.showAlert(title: "Failed to Start VM", message: errorMsg ?? "Unknown error")
             }

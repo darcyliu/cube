@@ -101,23 +101,32 @@ def main():
             port = reservation.getsockname()[1]
         mailbox = directory / "uart"
         console = args.console_log or directory / "guest.console.log"
+        dynamic_vmnet = mode in ("vmnet", "vmnet-proxy")
+        guest_ssh_port = 22 if dynamic_vmnet else 22222
+        forward_args = (["--ssh-port", str(port)] if dynamic_vmnet else
+                        ["--forward", f"127.0.0.1:{port}={args.guest_cidr.ip}:{guest_ssh_port}"])
         vm = VM(binary, directory, "guest", ["--freebsd", args.kernel,
             "--cdrom", args.iso, "--root", "cd9660:/dev/vtbd0", "--net", mode,
-            "--cpus", 2, "--serial-log", console,
-            "--forward", f"127.0.0.1:{port}={args.guest_cidr.ip}:22222"],
+            "--cpus", 2, "--serial-log", console, *forward_args],
             env=dict(os.environ, VMM_UART_IN=str(mailbox)))
         try:
             vm.wait_for("RETURN for /bin/sh", timeout=90)
             publish(mailbox, "")
             vm.wait_for("root@", timeout=30)
-            command = " && ".join([
-                "mdmfs -s 64M md1 /tmp", "mdmfs -s 64M md2 /var",
-                "install -d -m 0755 /var/empty",
+            network_setup = ([
+                "dhclient -l /tmp/dhclient.leases vtnet0",
+                "ping -c 2 $(route -n get default | awk '/gateway:/{print $2}')",
+            ] if dynamic_vmnet else [
                 f"ifconfig vtnet0 inet {args.guest_cidr} up",
                 f"ping -c 2 {args.host_ip}",
+            ])
+            command = " && ".join([
+                "mdmfs -s 64M md1 /tmp", "mdmfs -s 64M md2 /var",
+                "install -d -m 0755 /var/empty /var/db /var/run",
+                *network_setup,
                 "ssh-keygen -q -t ed25519 -N '' -f /tmp/hostkey",
                 f"printf '%s\\n' {shlex.quote(public)} > /tmp/authorized_keys",
-                "/usr/sbin/sshd -f /dev/null -h /tmp/hostkey -p 22222 "
+                f"/usr/sbin/sshd -f /dev/null -h /tmp/hostkey -p {guest_ssh_port} "
                 "-o PidFile=/tmp/sshd.pid -o AuthorizedKeysFile=/tmp/authorized_keys "
                 "-o StrictModes=no -o PermitRootLogin=yes -o PasswordAuthentication=no -o UsePAM=no",
             ])
@@ -148,7 +157,10 @@ def main():
                     raise AssertionError(result.stderr)
                 time.sleep(1)
             vm.finish(stop=True)
-            print("PASS guest connectivity and SSH through alternate guest address/port", flush=True)
+            if dynamic_vmnet:
+                print("PASS guest DHCP connectivity and SSH forwarding", flush=True)
+            else:
+                print("PASS guest connectivity and SSH through static guest address/port", flush=True)
         except BaseException:
             if console.exists():
                 print("Guest console:\n" + console.read_text(errors="replace")[-8000:])

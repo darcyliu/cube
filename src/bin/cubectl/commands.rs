@@ -1,4 +1,5 @@
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,10 @@ use crate::util::{
 };
 use crate::{CreateArgs, InstallArgs, SshArgs, StartArgs};
 
+const FREEBSD_CUBE_HID_RC: &str = include_str!("../../../scripts/freebsd-cube-hid.rc");
+const DESKTOP_COMMON_PACKAGES: &str =
+    "xorg-minimal xf86-video-scfb xf86-input-libinput xinput xdpyinfo xdotool";
+
 fn create_network_mode(explicit: Option<String>, has_entitlement: impl FnOnce() -> bool) -> String {
     explicit.unwrap_or_else(|| {
         if has_entitlement() { "vmnet" } else { "vmnet-proxy" }.into()
@@ -27,6 +32,25 @@ fn create_network_mode(explicit: Option<String>, has_entitlement: impl FnOnce() 
 
 pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     validate_vm_name(&args.name)?;
+    let desktop = args.desktop.clone();
+    let desktop_user = args.desktop_user.clone();
+    let desktop_password = args.desktop_password.clone().unwrap_or_else(|| args.password.clone());
+    if desktop.is_some() {
+        require(args.unattended, "--desktop requires --unattended")?;
+        require(args.net.as_deref() != Some("none"), "--desktop requires guest networking")?;
+        require(args.ssh_port != Some(0), "--desktop requires an SSH forwarding port")?;
+        require(
+            !desktop_user.is_empty()
+                && desktop_user.len() <= 32
+                && desktop_user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "desktop user must be 1–32 letters, digits, underscores, or hyphens",
+        )?;
+        require(
+            !desktop_password.is_empty()
+                && !desktop_password.chars().any(|c| matches!(c, '\r' | '\n' | '\0')),
+            "desktop password must be one nonempty line",
+        )?;
+    }
 
     let dest_dir = if let Some(d) = args.dest {
         d
@@ -117,7 +141,33 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         }
     }
 
-    let (ssh_key_opt, ssh_key_desc, ssh_priv_key) = resolve_ssh_public_key(args.ssh_key.as_deref());
+    let (mut ssh_key_opt, mut ssh_key_desc, mut ssh_priv_key) =
+        resolve_ssh_public_key(args.ssh_key.as_deref());
+    if desktop.is_some() && ssh_priv_key.is_none() {
+        let private_key = dest_dir.join("id_ed25519");
+        let public_key = private_key.with_extension("pub");
+        if !private_key.is_file() || !public_key.is_file() {
+            let status = Command::new("/usr/bin/ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&private_key)
+                .status()
+                .map_err(|e| format!("cannot generate desktop provisioning SSH key: {e}"))?;
+            require(status.success(), "ssh-keygen failed for desktop provisioning")?;
+        }
+        let public = fs::read_to_string(&public_key)
+            .map_err(|e| format!("cannot read generated SSH public key: {e}"))?;
+        let generated_public = public.trim();
+        ssh_key_opt = Some(match ssh_key_opt.take() {
+            Some(existing) => format!("{}\n{}", existing.trim(), generated_public),
+            None => generated_public.to_string(),
+        });
+        let generated_desc = format!("{} (generated for this VM)", public_key.display());
+        ssh_key_desc = Some(match ssh_key_desc.take() {
+            Some(existing) => format!("{existing}; {generated_desc}"),
+            None => generated_desc,
+        });
+        ssh_priv_key = Some(private_key);
+    }
 
     // Run unattended installation if requested
     if args.unattended {
@@ -275,6 +325,8 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     });
 
     // VNC configuration: smart auto-allocation if VNC enabled/needed and not specified
+    let desktop_display = desktop.as_ref().map(|_| "1280x800".to_string());
+    let requested_display = args.display.or(desktop_display);
     let vnc = if let Some(ref bind) = args.vnc {
         let effective_bind = if bind == "auto" {
             let next_vnc = find_next_available_vnc_port(state_root, &vms_root);
@@ -284,13 +336,13 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         };
         Some(VncConfig {
             bind: effective_bind,
-            display: args.display,
+            display: requested_display,
         })
-    } else if args.display.is_some() || (installer_iso.is_some() && !args.unattended) {
+    } else if requested_display.is_some() || (installer_iso.is_some() && !args.unattended) {
         let next_vnc = find_next_available_vnc_port(state_root, &vms_root);
         Some(VncConfig {
             bind: format!("127.0.0.1:{}", next_vnc),
-            display: args.display,
+            display: requested_display,
         })
     } else {
         None
@@ -317,7 +369,7 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         None
     };
 
-    let os_desc = if let Some(ref ver) = args.version {
+    let mut os_desc = if let Some(ref ver) = args.version {
         if let Ok((resolved, _)) = util::resolve_freebsd_version(ver) {
             format!("FreeBSD {}-RELEASE", resolved)
         } else {
@@ -337,10 +389,14 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     } else {
         "FreeBSD".into()
     };
+    if let Some(ref environment) = desktop {
+        os_desc.push_str(if environment == "xfce" { " with XFCE" } else { " with KDE Plasma" });
+    }
 
     let config = VmConfig {
         name: args.name.clone(),
         os: Some(os_desc),
+        desktop: desktop.clone(),
         binary: args.binary.map(|b| b.to_string_lossy().into_owned()),
         boot,
         ram_mb: args.ram,
@@ -366,6 +422,18 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         "config": canonical_path_str(&config_path)?
     }))?;
 
+    if let Some(ref environment) = desktop {
+        let identity = ssh_priv_key.as_deref().ok_or("desktop provisioning requires an SSH private key")?;
+        provision_desktop(
+            &config.name,
+            state_root,
+            environment,
+            &desktop_user,
+            &desktop_password,
+            identity,
+        )?;
+    }
+
     if args.unattended {
         println!("✓ Successfully created and installed VM '{}'", args.name);
         println!("  Configuration: {}", config_path.display());
@@ -379,6 +447,10 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
             println!("  Network:       {} (SSH port: {})", net.mode, ssh_desc);
         }
         println!("  Credentials:   root / {}", args.password);
+        if let Some(ref environment) = desktop {
+            println!("  Desktop:       {}", environment);
+            println!("  Desktop Login: {} / {}", desktop_user, desktop_password);
+        }
         if let Some(desc) = ssh_key_desc {
             println!("  SSH Key:       {}", desc);
         }
@@ -415,7 +487,10 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
             println!("     cubectl start {}", args.name);
             if let Some(ref v) = config.vnc {
                 println!("  2. Connect to the installer GUI:");
-                println!("     open vnc://{}", v.bind);
+                println!("     brew install --cask tigervnc  # one-time setup");
+                if let Some(target) = tigervnc_address(&v.bind) {
+                    println!("     /Applications/TigerVNC.app/Contents/MacOS/vncviewer {target}");
+                }
             }
             println!("  3. When installation finishes, stop VM and eject the installer ISO:");
             println!("     cubectl stop {}", args.name);
@@ -429,6 +504,132 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn run_provisioning_command(
+    executable: &Path,
+    state_root: &Path,
+    arguments: &[String],
+    input: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let mut command = Command::new(executable);
+    command.arg("--state-root").arg(state_root).args(arguments);
+    command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
+    let mut child = command.spawn().map_err(|e| format!("cannot run desktop provisioning command: {e}"))?;
+    if let Some(value) = input {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(value.as_bytes()).map_err(|e| format!("cannot send desktop password: {e}"))?;
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return require(status.success(), format!("desktop provisioning command failed with {status}"));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("desktop provisioning command timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn provision_desktop(
+    name: &str,
+    state_root: &Path,
+    environment: &str,
+    user: &str,
+    password: &str,
+    identity: &Path,
+) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    println!("[Cube] Starting '{}' to provision the {} desktop...", name, environment);
+    run_provisioning_command(
+        &executable,
+        state_root,
+        &["start".into(), name.into()],
+        None,
+        Duration::from_secs(30),
+    )?;
+
+    let ssh = |remote: &str, input: Option<&str>, timeout: Duration, wait: bool| {
+        let mut arguments = vec![
+            "ssh".into(),
+            name.into(),
+            "--identity".into(),
+            identity.to_string_lossy().into_owned(),
+        ];
+        if wait {
+            arguments.extend(["--wait".into(), "--wait-timeout".into(), "180".into()]);
+        }
+        arguments.extend(["--".into(), remote.into()]);
+        run_provisioning_command(&executable, state_root, &arguments, input, timeout)
+    };
+
+    let packages = match environment {
+        "xfce" => format!(
+            "{DESKTOP_COMMON_PACKAGES} xfce dbus lightdm lightdm-gtk-greeter dejavu adwaita-icon-theme"
+        ),
+        "plasma" => format!("{DESKTOP_COMMON_PACKAGES} plasma6-plasma konsole dbus sddm dejavu"),
+        _ => return Err(format!("unsupported desktop environment '{environment}'")),
+    };
+
+    let provision_result = (|| {
+        println!("[Cube] Waiting for SSH and bootstrapping the package manager...");
+        ssh("env ASSUME_ALWAYS_YES=yes pkg bootstrap -f", None, Duration::from_secs(900), true)?;
+        println!("[Cube] Installing {} desktop packages; this can take a while...", environment);
+        ssh(&format!("pkg install -y {packages}"), None, Duration::from_secs(7200), false)?;
+        println!("[Cube] Creating desktop user '{}'...", user);
+        ssh(
+            &format!("pw useradd {user} -m -G video,wheel -s /bin/sh -h 0"),
+            Some(&format!("{password}\n")),
+            Duration::from_secs(120),
+            false,
+        )?;
+        let services = match environment {
+            "xfce" => "sysrc dbus_enable=YES lightdm_enable=YES && service dbus onestart && install -d /usr/local/etc/lightdm && printf '%s\\n' '[greeter]' 'theme-name=Adwaita' 'icon-theme-name=Adwaita' 'font-name=DejaVu Sans 11' > /usr/local/etc/lightdm/lightdm-gtk-greeter.conf",
+            "plasma" => "sysrc dbus_enable=YES sddm_enable=YES && service dbus onestart && install -d /usr/local/etc/sddm.conf.d && printf '%s\\n' '[General]' 'DisplayServer=x11' > /usr/local/etc/sddm.conf.d/10-cube.conf",
+            _ => unreachable!(),
+        };
+        println!("[Cube] Enabling the display manager and desktop services...");
+        ssh(services, None, Duration::from_secs(180), false)?;
+        ssh(
+            "cat > /usr/local/etc/rc.d/cube_hid && chmod 555 /usr/local/etc/rc.d/cube_hid && sysrc cube_hid_enable=YES",
+            Some(FREEBSD_CUBE_HID_RC),
+            Duration::from_secs(120),
+            false,
+        )?;
+        ssh(
+            "install -d /usr/local/etc/X11/xorg.conf.d && printf '%s\\n' 'Section \"Device\"' '  Identifier \"Card0\"' '  Driver \"scfb\"' 'EndSection' > /usr/local/etc/X11/xorg.conf.d/20-scfb.conf",
+            None,
+            Duration::from_secs(120),
+            false,
+        )
+    })();
+
+    println!("[Cube] Shutting down the desktop provisioning VM...");
+    let shutdown_result = run_provisioning_command(
+        &executable,
+        state_root,
+        &["shutdown".into(), name.into(), "--timeout".into(), "120".into()],
+        None,
+        Duration::from_secs(150),
+    );
+    if provision_result.is_err() || shutdown_result.is_err() {
+        let _ = run_provisioning_command(
+            &executable,
+            state_root,
+            &["stop".into(), name.into(), "--timeout".into(), "10".into()],
+            None,
+            Duration::from_secs(20),
+        );
+    }
+    provision_result?;
+    shutdown_result?;
+    println!("[Cube] {} desktop provisioning complete.", environment);
     Ok(())
 }
 
@@ -1250,6 +1451,24 @@ pub fn parse_vnc_port(bind: &str) -> Option<u16> {
     None
 }
 
+pub fn tigervnc_address(bind: &str) -> Option<String> {
+    let clean = bind.trim();
+    let (host, port) = if clean.starts_with('[') {
+        let closing = clean.find(']')?;
+        if clean.as_bytes().get(closing + 1) != Some(&b':') {
+            return None;
+        }
+        (&clean[..=closing], &clean[closing + 2..])
+    } else {
+        clean.rsplit_once(':')?
+    };
+    let port = port.parse::<u16>().ok()?;
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+    Some(format!("{host}::{port}"))
+}
+
 pub fn collect_used_ports(state_root: &Path, vms_root: &Path) -> (std::collections::HashSet<u16>, std::collections::HashSet<u16>) {
     let mut used_ssh = std::collections::HashSet::new();
     let mut used_vnc = std::collections::HashSet::new();
@@ -1419,6 +1638,9 @@ mod tests {
         assert_eq!(parse_vnc_port("5902"), Some(5902));
         assert_eq!(parse_vnc_port("0.0.0.0:5905"), Some(5905));
         assert_eq!(parse_vnc_port("invalid"), None);
+        assert_eq!(tigervnc_address("127.0.0.1:5901"), Some("127.0.0.1::5901".into()));
+        assert_eq!(tigervnc_address("[::1]:5901"), Some("[::1]::5901".into()));
+        assert_eq!(tigervnc_address("invalid"), None);
     }
 
     #[test]

@@ -34,6 +34,20 @@ struct VMManagementTests {
         precondition(tryData(cached) == replacement)
         precondition(tryData(source) == replacement, "Import must preserve the source")
 
+        let desktopCreate = CreateVMOptions(
+            name: "desktop", osVersion: "15.1", customIsoPath: nil,
+            isUnattended: true, desktop: "xfce", cpus: 4, ramMB: 4096,
+            diskSizeGB: 20, password: "desktop-secret", netMode: "vmnet-proxy",
+            sshPort: 2222, vncPort: 5901, destinationDir: nil,
+            sharePath: nil, shareTag: nil
+        )
+        let desktopCreateArgs = VMManager.shared.createArguments(options: desktopCreate)
+        precondition(desktopCreateArgs.contains("--unattended"))
+        precondition(desktopCreateArgs[desktopCreateArgs.firstIndex(of: "--desktop")! + 1] == "xfce")
+        precondition(desktopCreateArgs[desktopCreateArgs.firstIndex(of: "--desktop-user")! + 1] == "cube")
+        precondition(desktopCreateArgs[desktopCreateArgs.firstIndex(of: "--desktop-password")! + 1] == "desktop-secret")
+        precondition(desktopCreateArgs[desktopCreateArgs.firstIndex(of: "--display")! + 1] == "1280x800")
+
         let vmDir = dir.appendingPathComponent("VM's files with spaces")
         try fm.createDirectory(at: vmDir, withIntermediateDirectories: true)
         let configURL = vmDir.appendingPathComponent("example.json")
@@ -43,11 +57,15 @@ struct VMManagementTests {
             "mode": "freebsd", "kernel": "kernel", "modules": ["modules/zfs.ko"],
             "root": "zfs:zroot/ROOT/default", "bootargs": bootargs
         ]
+        var includeVNC = true
         func writeConfig() throws {
-            let config: [String: Any] = [
+            var config: [String: Any] = [
                 "name": "example", "boot": boot, "network": ["mode": "none"],
                 "disks": ["disk with spaces.img"]
             ]
+            if includeVNC {
+                config["vnc"] = ["bind": "127.0.0.1:5999", "display": "1440x900"]
+            }
             try JSONSerialization.data(withJSONObject: config).write(to: configURL)
         }
         try writeConfig()
@@ -64,7 +82,33 @@ struct VMManagementTests {
         precondition(value("--bootargs") == bootargs)
         precondition(value("--module") == vmDir.appendingPathComponent("modules/zfs.ko").path)
         precondition(args.contains("--multiuser"), "Default FreeBSD boot must be multiuser")
+        precondition(value("--vnc") == "127.0.0.1:5999")
         precondition(!fm.fileExists(atPath: marker.path), "Shell substitutions must remain literal")
+
+        let nativeArgs = try shellArguments(vm.generateCubeCommand(displayMode: .native))
+        precondition(!nativeArgs.contains("--vnc"), "Native command must omit VNC")
+        precondition(nativeArgs[nativeArgs.firstIndex(of: "--gui")! + 1] == "native")
+        precondition(nativeArgs[nativeArgs.firstIndex(of: "--display")! + 1] == "1440x900")
+        precondition(vm.managedStartArguments(displayMode: .native) ==
+                     ["start", "example", "--gui", "native", "--display", "1440x900"])
+        precondition(VMInfo.tigerVNCAddress(for: "127.0.0.1:5999") == "127.0.0.1::5999")
+        precondition(VMInfo.tigerVNCAddress(for: "[::1]:5999") == "[::1]::5999")
+        precondition(VMInfo.tigerVNCAddress(for: "127.0.0.1:not-a-port") == nil)
+
+        let vncArgs = try shellArguments(vm.generateCubeCommand(displayMode: .vnc))
+        precondition(!vncArgs.contains("--gui"), "VNC command must omit native GUI")
+        precondition(vncArgs[vncArgs.firstIndex(of: "--vnc")! + 1] == "127.0.0.1:5999")
+        precondition(vm.managedStartArguments(displayMode: .vnc) ==
+                     ["start", "example", "--vnc", "127.0.0.1:5999", "--display", "1440x900"])
+
+        includeVNC = false
+        try writeConfig()
+        let fallbackVNCArgs = try shellArguments(vm.generateCubeCommand(displayMode: .vnc))
+        precondition(fallbackVNCArgs[fallbackVNCArgs.firstIndex(of: "--vnc")! + 1] == "127.0.0.1:5901")
+        precondition(fallbackVNCArgs[fallbackVNCArgs.firstIndex(of: "--display")! + 1] == "1280x720")
+        precondition(vm.managedStartArguments(displayMode: .native) ==
+                     ["start", "example", "--gui", "native", "--display", "1280x720"])
+
         boot["multiuser"] = false
         try writeConfig()
         let singleUserArgs = try shellArguments(vm.generateCubeCommand())

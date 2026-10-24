@@ -1,7 +1,8 @@
 //! Minimal RFB 3.8 (VNC) server for a guest simple-framebuffer region.
 //!
-//! macOS Screen Sharing is picky with third-party servers; prefer TigerVNC
-//! Viewer (`brew install --cask tigervnc-viewer`) if Screen Sharing drops.
+//! macOS Screen Sharing requires password authentication for third-party VNC
+//! servers. Use TigerVNC (`brew install --cask tigervnc`) with this loopback-only
+//! unauthenticated server.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -181,10 +182,12 @@ pub fn spawn(
                 "[VNC] Listening on {bind} ({}x{}, stride {})",
                 fb.width, fb.height, fb.stride
             );
-            crate::host_log!("[VNC] Connect with: open vnc://{bind}");
-            crate::host_log!(
-                "[VNC] Tip: if macOS Screen Sharing drops, use TigerVNC Viewer (brew install --cask tigervnc-viewer)"
-            );
+            let viewer = match bind.ip() {
+                std::net::IpAddr::V4(ip) => format!("{ip}::{}", bind.port()),
+                std::net::IpAddr::V6(ip) => format!("[{ip}]::{}", bind.port()),
+            };
+            crate::host_log!("[VNC] TigerVNC target: {viewer}");
+            crate::host_log!("[VNC] Install on macOS: brew install --cask tigervnc");
             while !stop_thr.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
@@ -233,7 +236,7 @@ fn handle_client(
         tablet: tablet.clone(),
         usb: usb.clone(),
     };
-    // Longer timeouts for the handshake — Screen Sharing can be slow.
+    // Allow GUI clients enough time to complete their handshake.
     stream
         .set_read_timeout(Some(Duration::from_millis(250)))
         .ok();

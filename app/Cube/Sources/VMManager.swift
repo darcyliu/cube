@@ -31,6 +31,7 @@ struct CreateVMOptions {
     var osVersion: String // "14.4", "15.1", or "custom"
     var customIsoPath: String?
     var isUnattended: Bool
+    var desktop: String?
     var cpus: Int
     var ramMB: Int
     var diskSizeGB: Int
@@ -217,7 +218,14 @@ class VMManager {
     }
 
     func refreshVMs(completion: (([VMInfo]) -> Void)? = nil) {
-        guard !isRefreshing else { return }
+        guard !isRefreshing else {
+            if let completion {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    self.refreshVMs(completion: completion)
+                }
+            }
+            return
+        }
         guard let bin = findCubectlBinary() else {
             completion?(self.vms)
             return
@@ -257,12 +265,23 @@ class VMManager {
         }
     }
 
-    func startVM(name: String, completion: @escaping (Bool, String?) -> Void) {
+    func startVM(name: String, displayMode: CubeCommandDisplayMode? = nil,
+                 completion: @escaping (Bool, String?) -> Void) {
         let vm = vms.first(where: { $0.name == name })
         let netMode = getVMNetMode(vm: vm, name: name)
+        let startArguments: [String]
+        if let vm {
+            startArguments = vm.managedStartArguments(displayMode: displayMode)
+        } else if displayMode == .native {
+            startArguments = ["start", name, "--gui", "native", "--display", "1280x720"]
+        } else if displayMode == .vnc {
+            startArguments = ["start", name, "--vnc", "127.0.0.1:5901", "--display", "1280x720"]
+        } else {
+            startArguments = ["start", name]
+        }
 
         let launch = { [weak self] in
-            self?.runCubectl(["start", name]) { success, output in
+            self?.runCubectl(startArguments) { success, output in
                 self?.refreshVMs()
                 completion(success, output)
             }
@@ -348,6 +367,61 @@ class VMManager {
             return
         }
 
+        let args = createArguments(options: options)
+
+        let launch = {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: bin)
+                proc.arguments = args
+
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = pipe
+
+                pipe.fileHandleForReading.readabilityHandler = { handle in
+                    let chunk = handle.availableData
+                    if !chunk.isEmpty, let text = String(data: chunk, encoding: .utf8) {
+                        DispatchQueue.main.async {
+                            progressHandler(text)
+                        }
+                    }
+                }
+
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    pipe.fileHandleForReading.readabilityHandler = nil
+
+                    let success = (proc.terminationStatus == 0)
+                    DispatchQueue.main.async {
+                        self.refreshVMs { _ in
+                            completion(success, success ? nil : "Process exited with code \(proc.terminationStatus)")
+                        }
+                    }
+                } catch {
+                    pipe.fileHandleForReading.readabilityHandler = nil
+                    DispatchQueue.main.async {
+                        completion(false, error.localizedDescription)
+                    }
+                }
+            }
+        }
+
+        if options.desktop != nil && options.netMode == "vmnet-proxy" && !ServiceManager.shared.isRunning {
+            ServiceManager.shared.startService { success, error in
+                if success {
+                    launch()
+                } else {
+                    completion(false, error ?? "The Cube network service is required for desktop package installation.")
+                }
+            }
+        } else {
+            launch()
+        }
+    }
+
+    func createArguments(options: CreateVMOptions) -> [String] {
         var args = ["create", options.name]
 
         if let dest = options.destinationDir, !dest.isEmpty {
@@ -363,6 +437,11 @@ class VMManager {
         if options.isUnattended {
             args.append("--unattended")
             args.extend(["--password", options.password])
+        }
+        if let desktop = options.desktop {
+            args.extend(["--desktop", desktop, "--desktop-user", "cube",
+                         "--desktop-password", options.password,
+                         "--display", "1280x800"])
         }
 
         args.extend(["--cpus", String(options.cpus)])
@@ -390,42 +469,7 @@ class VMManager {
         if options.memPrealloc {
             args.append("--mem-prealloc")
         }
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: bin)
-            proc.arguments = args
-
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = pipe
-
-            pipe.fileHandleForReading.readabilityHandler = { handle in
-                let chunk = handle.availableData
-                if !chunk.isEmpty, let text = String(data: chunk, encoding: .utf8) {
-                    DispatchQueue.main.async {
-                        progressHandler(text)
-                    }
-                }
-            }
-
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                pipe.fileHandleForReading.readabilityHandler = nil
-
-                let success = (proc.terminationStatus == 0)
-                DispatchQueue.main.async {
-                    self.refreshVMs()
-                    completion(success, success ? nil : "Process exited with code \(proc.terminationStatus)")
-                }
-            } catch {
-                pipe.fileHandleForReading.readabilityHandler = nil
-                DispatchQueue.main.async {
-                    completion(false, error.localizedDescription)
-                }
-            }
-        }
+        return args
     }
 
     func updateShares(for vmName: String, shares: [VMShareConfig], completion: @escaping (Bool, String?) -> Void) {
@@ -600,7 +644,8 @@ class VMManager {
         }
 
         let cfg = vm.loadConfig()
-        guard let vnc = vm.vnc ?? cfg.vnc, let url = URL(string: "vnc://\(vnc)") else {
+        guard let vnc = vm.vnc ?? cfg.vnc,
+              let viewerAddress = VMInfo.tigerVNCAddress(for: vnc) else {
             let alert = NSAlert()
             alert.messageText = "No VNC Display"
             alert.informativeText = "Virtual Machine '\(vm.name)' does not have a VNC display configured."
@@ -608,7 +653,42 @@ class VMManager {
             alert.runModal()
             return
         }
-        NSWorkspace.shared.open(url)
+
+        let candidates = [
+            "/Applications/TigerVNC.app/Contents/MacOS/vncviewer",
+            "\(NSHomeDirectory())/Applications/TigerVNC.app/Contents/MacOS/vncviewer",
+            "/opt/homebrew/bin/vncviewer",
+            "/usr/local/bin/vncviewer"
+        ]
+        if let viewer = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: viewer)
+            process.arguments = [viewerAddress]
+            do {
+                try process.run()
+                return
+            } catch {
+                showVNCViewerAlert(vm: vm, detail: "TigerVNC could not be launched: \(error.localizedDescription)")
+                return
+            }
+        }
+
+        showVNCViewerAlert(vm: vm, detail: nil)
+    }
+
+    private func showVNCViewerAlert(vm: VMInfo, detail: String?) {
+        let alert = NSAlert()
+        alert.messageText = "Compatible VNC Viewer Required"
+        var message = "macOS Screen Sharing requires password authentication that Cube's loopback-only VNC server does not provide. Install TigerVNC, or stop '\(vm.name)' and start it with Native Display."
+        if let detail { message += "\n\n\(detail)" }
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Copy Install Command")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("brew install --cask tigervnc", forType: .string)
+        }
     }
 
     // MARK: - Smart Port Auto-Allocation
@@ -762,7 +842,30 @@ struct DetailedVMConfig {
     }
 }
 
+enum CubeCommandDisplayMode {
+    case vnc
+    case native
+}
+
 extension VMInfo {
+    static func tigerVNCAddress(for bind: String) -> String? {
+        let host: String
+        let portText: String
+        if bind.hasPrefix("[") {
+            guard let closing = bind.firstIndex(of: "]"),
+                  bind.index(after: closing) < bind.endIndex,
+                  bind[bind.index(after: closing)] == ":" else { return nil }
+            host = String(bind[...closing])
+            portText = String(bind[bind.index(closing, offsetBy: 2)...])
+        } else {
+            guard let separator = bind.lastIndex(of: ":") else { return nil }
+            host = String(bind[..<separator])
+            portText = String(bind[bind.index(after: separator)...])
+        }
+        guard !host.isEmpty, let port = Int(portText), (1...65535).contains(port) else { return nil }
+        return "\(host)::\(port)"
+    }
+
     static func deriveMacAddress(name: String) -> String {
         let digest = SHA256.hash(data: Data(name.utf8))
         let bytes = Array(digest.prefix(4))
@@ -940,7 +1043,22 @@ extension VMInfo {
         return "\(vmDir)/boot/kernel/kernel"
     }
 
-    func generateCubeCommand() -> String {
+    func managedStartArguments(displayMode: CubeCommandDisplayMode? = nil) -> [String] {
+        var arguments = ["start", name]
+        guard let displayMode else { return arguments }
+
+        let cfg = loadConfig()
+        switch displayMode {
+        case .native:
+            arguments.append(contentsOf: ["--gui", "native"])
+        case .vnc:
+            arguments.append(contentsOf: ["--vnc", cfg.vnc ?? "127.0.0.1:5901"])
+        }
+        arguments.append(contentsOf: ["--display", cfg.display ?? "1280x720"])
+        return arguments
+    }
+
+    func generateCubeCommand(displayMode: CubeCommandDisplayMode? = nil) -> String {
         let cfg = self.loadConfig()
         var parts: [String] = ["cube"]
 
@@ -1002,11 +1120,21 @@ extension VMInfo {
             parts.append(contentsOf: ["--forward", rule])
         }
 
-        // 5. VNC
-        if let vnc = cfg.vnc {
+        // 5. Graphical frontend. An explicit command-sheet choice always emits
+        // exactly one frontend; nil preserves the saved configuration behavior.
+        let display = cfg.display ?? "1280x720"
+        if let displayMode {
+            switch displayMode {
+            case .vnc:
+                parts.append(contentsOf: ["--vnc", cfg.vnc ?? "127.0.0.1:5901"])
+                parts.append(contentsOf: ["--display", display])
+            case .native:
+                parts.append(contentsOf: ["--gui", "native", "--display", display])
+            }
+        } else if let vnc = cfg.vnc {
             parts.append(contentsOf: ["--vnc", vnc])
-            if let disp = cfg.display {
-                parts.append(contentsOf: ["--display", disp])
+            if let configuredDisplay = cfg.display {
+                parts.append(contentsOf: ["--display", configuredDisplay])
             }
         }
 

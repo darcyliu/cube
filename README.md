@@ -135,7 +135,10 @@ the guest first when possible. Host SIGTERM also requests this cleanup. Guest
 PSCI reboot restarts the VM with the same command-line arguments.
 
 VNC accepts one client at a time and binds only to loopback addresses, for example
-`--vnc 127.0.0.1:5900`. For remote access, use an SSH tunnel. Disconnecting releases
+`--vnc 127.0.0.1:5900`. Use TigerVNC (`brew install --cask tigervnc`) because macOS
+Screen Sharing requires password authentication that this loopback-only server does
+not provide. Connect from Cube.app, or run the TigerVNC executable with the target
+`127.0.0.1::5900`; for remote access, use an SSH tunnel. Disconnecting releases
 held keys and pointer buttons. Rectangle updates and RGB565 clients are supported.
 
 UEFI variables persist in `<first-disk>.vars.fd`, or `<firmware>.vars.fd` when
@@ -194,6 +197,7 @@ and whether to add a desktop:
 ```sh
 python3 -B scripts/install-vm.py --version 14.4
 python3 -B scripts/install-vm.py --version 14.4 --unattended
+python3 -B scripts/install-vm.py --version 14.4 --unattended --filesystem ufs
 python3 -B scripts/install-vm.py --version 15.1 --unattended --name freebsd15
 python3 -B scripts/install-vm.py --version 15 --unattended --desktop plasma --name work
 ```
@@ -213,6 +217,9 @@ X11 input check, reboot, and cold-start check. Installers use
 `vmnet-proxy` and the vmnet service (`make vmnet-service`); they do not use
 sudo. Pass `--sudo` to run the installer as root with in-process vmnet instead.
 The saved config and `cubectl` launch follow that choice.
+Unattended installs use ZFS with UEFI by default. Pass `--filesystem ufs` to
+install UFS and save the VM with Cube's direct FreeBSD kernel boot path; the
+kernel extracted from the installation ISO is stored in the VM directory.
 
 For a disposable full installation, installed-disk SSH, and reboot/persistence
 check, see [the installation regression runbook](docs/install-regression.md).

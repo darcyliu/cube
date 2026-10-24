@@ -7,6 +7,19 @@ python3 -B scripts/install-vm.py --version 14.4 --unattended --desktop xfce --na
 python3 -B scripts/install-vm.py --version 15.1 --unattended --desktop plasma --name plasma
 ```
 
+The packaged Cube.app exposes the same basic installation path in **New Virtual
+Machine → Desktop**. Choose **XFCE** or **KDE Plasma** while automated unattended
+installation is enabled. The native CLI equivalent is:
+
+```sh
+cubectl create work --version 15.1 --unattended --desktop xfce \
+  --ram 4096 --cpus 4 --password change-me
+```
+
+This app/CLI path installs and configures the desktop and powers the VM off. The
+Python workflow below remains the deeper regression path because it additionally
+runs X11 input checks, reboot verification, and cold-start verification.
+
 Start the vmnet service once with `make vmnet-service`. The installer then
 uses `vmnet-proxy` as your user. Add `--sudo` to run `check_install.py` as
 root with in-process vmnet. Direct `check_install.py --net bridge:en0` is the
@@ -221,7 +234,7 @@ the default mode. The default native mode keeps the guest at 1024×768 and
 scales each pixel sharply to 2×2 screen pixels.
 
 New XFCE installs configure explicit font sets, icons, a readable LightDM GTK theme,
-and the boot-time `vmm_hid` tablet service automatically. If an X11 session does not
+and the boot-time `cube_hid` tablet service automatically. If an X11 session does not
 pick up the tablet on first boot, shut down and boot the VM again.
 
 The config uses SSH forwarding on port 2222 for `cubectl shutdown`, and the

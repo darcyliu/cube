@@ -57,6 +57,7 @@ DESKTOP_PACKAGES = {
 class Install:
     version: str
     base: str
+    filesystem: str
     unattended: bool
     desktop: str | None
     name: str
@@ -78,10 +79,13 @@ def resolve_version(version):
 
 
 def specification(version="14.4", unattended=False, desktop=None, name=None,
-                  dest_root=None, disk_gib=20, ram=None, cpus=None, hostname=None):
+                  dest_root=None, disk_gib=20, ram=None, cpus=None, hostname=None,
+                  filesystem="zfs"):
     version, (base, scripted, reason) = resolve_version(version)
     if desktop not in (None, "xfce", "plasma"):
         raise ValueError("desktop must be xfce or plasma")
+    if filesystem not in ("zfs", "ufs"):
+        raise ValueError("filesystem must be zfs or ufs")
     if (unattended or desktop) and not scripted:
         raise ValueError(reason)
     if desktop and not unattended:
@@ -110,7 +114,7 @@ def specification(version="14.4", unattended=False, desktop=None, name=None,
     if not unattended and version.startswith("15"):
         hint = ("FreeBSD 15 disc1 installs the base system from packages. "
                 "In bsdinstall choose Packages and the offline set, then Auto (UFS) on vtbd0.")
-    return Install(version, base, unattended, desktop, name, (root / name).resolve(),
+    return Install(version, base, filesystem, unattended, desktop, name, (root / name).resolve(),
                    disk_gib, ram, cpus, hostname, hint)
 
 
@@ -175,6 +179,12 @@ def command(spec, iso=None, binary=None, *, password="root", root_password_file=
         argv += ["--password", effective_pwd]
         argv += ["--hostname", spec.hostname]
         argv += ["--base", spec.base]
+        argv += ["--filesystem", spec.filesystem]
+        if spec.filesystem == "ufs":
+            # cubectl copies the ISO kernel into the VM directory before it
+            # builds the final configuration, so it can resolve this direct
+            # kernel boot without an explicit --kernel path.
+            argv += ["--boot", "freebsd"]
     if spec.desktop:
         argv += ["--vnc", "127.0.0.1:5901", "--display", display]
     argv += ["--disk", f"installed.img:{spec.disk_gib}G",
@@ -241,7 +251,8 @@ def write_result(spec, binary, iso, identity, source_root=REPO, sudo=False):
     install_kernel(source_root, spec.dest)
     config_path = spec.dest / f"{spec.name}.json"
     config_path.write_text(json.dumps(vm_config(spec, binary, identity, sudo), indent=2) + "\n")
-    source = {"version": spec.version, "base": spec.base, "desktop": spec.desktop,
+    source = {"version": spec.version, "base": spec.base, "filesystem": spec.filesystem,
+              "desktop": spec.desktop,
               "unattended": spec.unattended, "iso": str(iso)}
     (spec.dest / "source.json").write_text(json.dumps(source, indent=2) + "\n")
     return config_path
@@ -284,7 +295,7 @@ def provision_desktop(spec, cubectl, desktop_user="cube", password="cube",
                     "install -d /usr/local/etc/sddm.conf.d && "
                     "printf '%s\\n' '[General]' 'DisplayServer=x11' > /usr/local/etc/sddm.conf.d/10-cube.conf")
 
-        hid_rc_path = REPO / "scripts/freebsd-vmm-hid.rc"
+        hid_rc_path = REPO / "scripts/freebsd-cube-hid.rc"
         if hid_rc_path.is_file():
             run_ssh("cat > /usr/local/etc/rc.d/cube_hid && chmod 555 /usr/local/etc/rc.d/cube_hid && "
                     "sysrc cube_hid_enable=YES", input_text=hid_rc_path.read_text())
@@ -297,11 +308,17 @@ def provision_desktop(spec, cubectl, desktop_user="cube", password="cube",
         subprocess.run([str(cubectl), "shutdown", spec.name, "--timeout", "120"], check=False)
 
 
-def print_next_steps(spec):
+def print_next_steps(spec, root_password=None, desktop_user=None, desktop_password=None):
     print()
     if spec.unattended:
         label = f"FreeBSD {spec.version}" + (f" with {spec.desktop} desktop" if spec.desktop else "")
         print(f"✓ {label} installation finished successfully!")
+        print("Login credentials:")
+        print("  Root user:     root")
+        print(f"  Root password: {root_password}")
+        if spec.desktop:
+            print(f"  Desktop user:     {desktop_user}")
+            print(f"  Desktop password: {desktop_password}")
         print(f"Start VM:  cubectl start {spec.name}")
         return
 
@@ -321,6 +338,8 @@ def main(argv=None):
                         help="FreeBSD release: 14.4 (default), 14.5, 15.0, 15.1; 15 means 15.1")
     parser.add_argument("--unattended", action="store_true",
                         help="run automated installation instead of interactive installer")
+    parser.add_argument("--filesystem", choices=("zfs", "ufs"), default="zfs",
+                        help="filesystem and installed boot path: zfs uses UEFI, ufs uses direct kernel boot (default: zfs)")
     parser.add_argument("--desktop", choices=("xfce", "plasma"),
                         help="install this desktop after the base system; requires --unattended")
     parser.add_argument("--name", help="VM name and directory name (default: freebsd-14-4, or freebsd-15-1-plasma)")
@@ -346,7 +365,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         spec = specification(args.version, args.unattended, args.desktop, args.name,
-                             args.dest, args.disk_gib, args.ram, args.cpus, args.hostname)
+                             args.dest, args.disk_gib, args.ram, args.cpus, args.hostname,
+                             filesystem=args.filesystem)
         if args.password is not None and spec.desktop:
             raise ValueError("--password is for a base install; use --root-password-file for a desktop")
         if args.password is not None and args.root_password_file is not None:
@@ -401,7 +421,8 @@ def main(argv=None):
                           password=desktop_pwd, display=args.display,
                           skip_verify=args.skip_verify)
 
-    print_next_steps(spec)
+    print_next_steps(spec, root_password=password, desktop_user=args.desktop_user,
+                     desktop_password=desktop_pwd)
     return 0
 
 

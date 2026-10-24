@@ -512,7 +512,7 @@ fn run_cli(args: Vec<String>) {
                     "      --cpu-model <MODEL>  CPU model/MIDR spoofing: auto/host (default), m1, m1-pro, m1-max, m2, m2-pro, m2-max, neoverse-n2, cortex-a78, or 0x<hex>"
                 );
                 println!(
-                    "      --serial-log <PATH>  Mirror guest serial console output to specified log file"
+                    "      --serial-log <PATH>  Write guest serial console output to specified log file"
                 );
                 println!(
                     "  -d, --disk <PATH>[,cow][,ro] Attach disk image (can be specified multiple times)"
@@ -939,15 +939,29 @@ fn retina_framebuffer_size(window_size: (u32, u32)) -> Result<(u32, u32), String
     Ok((width, height))
 }
 
+fn uses_interactive_serial_console(vnc_bind: Option<&str>, native_gui: bool) -> bool {
+    vnc_bind.is_none() && !native_gui
+}
+
 #[cfg(test)]
 mod retina_tests {
-    use super::retina_framebuffer_size;
+    use super::{retina_framebuffer_size, uses_interactive_serial_console};
 
     #[test]
     fn doubles_guest_resolution_and_rejects_oversized_buffers() {
         assert_eq!(retina_framebuffer_size((1024, 768)).unwrap(), (2048, 1536));
         assert!(retina_framebuffer_size((8192, 8192)).is_err());
         assert!(retina_framebuffer_size((u32::MAX, 768)).is_err());
+    }
+
+    #[test]
+    fn graphical_frontends_do_not_take_over_the_host_terminal() {
+        assert!(uses_interactive_serial_console(None, false));
+        assert!(!uses_interactive_serial_console(
+            Some("127.0.0.1:5901"),
+            false
+        ));
+        assert!(!uses_interactive_serial_console(None, true));
     }
 }
 
@@ -1047,15 +1061,29 @@ fn boot_os_kernel(
     let vcpu_mgr = VcpuManager::new(cpus, cpu_model);
     terminal::install_shutdown_handlers();
 
-    // Attach interactive PL011 UART console
+    // Graphical frontends own guest input and display. Keep their serial output
+    // available in --serial-log without putting the launching terminal in raw
+    // mode or replaying EFI/console escape sequences into it.
+    let interactive_serial = uses_interactive_serial_console(vnc_bind, native_gui);
     vm.mmio_mut().register(
         MMIO_UART_BASE,
         MMIO_UART_SIZE,
-        Box::new(Pl011Uart::with_log(UART_IRQ, true, serial_log)),
+        Box::new(Pl011Uart::with_log_output(
+            UART_IRQ,
+            interactive_serial,
+            interactive_serial,
+            serial_log,
+        )),
     );
     println!(
-        "[Cube] Registered interactive PL011 UART console at GPA 0x{:08x} (IRQ {})",
-        MMIO_UART_BASE, UART_IRQ
+        "[Cube] Registered {} PL011 UART console at GPA 0x{:08x} (IRQ {})",
+        if interactive_serial {
+            "interactive"
+        } else {
+            "log-only"
+        },
+        MMIO_UART_BASE,
+        UART_IRQ
     );
 
     // Attach ARM PL031 Real-Time Clock
@@ -1367,15 +1395,16 @@ fn boot_os_kernel(
         size: MMIO_XHCI_SIZE,
         irq: XHCI_IRQ,
     });
-    let dtb_bytes = match fdt::generate_dtb(
+    let dtb_bytes = match fdt::generate_dtb_ext(
         DEFAULT_RAM_BASE,
         ram_size as u64,
         bootargs,
         cpus,
         &virtio_devices,
-        if uefi_firmware.is_some() { None } else { fb_cfg },
+        fb_cfg,
         xhci_fdt,
         initrd_info,
+        uefi_firmware.is_some(),
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -1750,13 +1779,20 @@ fn boot_os_kernel(
         }
     }
 
-    println!("[Cube] Entering interactive console (raw terminal). Press Ctrl-] to quit.");
-    println!("--------------------------------------------------");
+    let term_guard = if interactive_serial {
+        println!("[Cube] Entering interactive console (raw terminal). Press Ctrl-] to quit.");
+        println!("--------------------------------------------------");
+        // Set terminal to raw mode so keystrokes are sent immediately to the guest.
+        Some(terminal::TerminalGuard::enter_raw_mode())
+    } else {
+        println!("[Cube] Guest serial console is non-interactive for graphical mode.");
+        if let Some(path) = serial_log {
+            println!("[Cube] Guest serial log: {path}");
+        }
+        None
+    };
 
-    // Set terminal to raw mode so keystrokes are sent immediately to the guest
-    let term_guard = terminal::TerminalGuard::enter_raw_mode();
-
-    let result = run_loop(&mut vcpu0, vm.mmio(), Some(term_guard));
+    let result = run_loop(&mut vcpu0, vm.mmio(), term_guard);
 
     // Signal shutdown to secondary vCPUs and join threads
     vcpu_mgr.request_shutdown();

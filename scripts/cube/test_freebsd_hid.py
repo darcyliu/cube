@@ -6,15 +6,22 @@ import tempfile
 import unittest
 
 
-class FreeBSDHidStartup(unittest.TestCase):
+class FreeBSDCubeHidStartup(unittest.TestCase):
+    def test_service_identity_matches_installed_name(self):
+        source = (Path(__file__).resolve().parents[1] / "freebsd-cube-hid.rc").read_text()
+        self.assertIn("# PROVIDE: cube_hid", source)
+        self.assertIn("name=cube_hid", source)
+        self.assertIn("rcvar=cube_hid_enable", source)
+        self.assertIn("start_cmd=cube_hid_start", source)
+
     def test_reprobes_only_the_descriptor_matched_tablet(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            source = (Path(__file__).resolve().parents[1] / "freebsd-vmm-hid.rc").read_text()
+            source = (Path(__file__).resolve().parents[1] / "freebsd-cube-hid.rc").read_text()
             source = source.replace(
                 ". /etc/rc.subr",
                 'load_rc_config() { :; }; run_rc_command() { "$start_cmd"; }')
-            script = root / "vmm_hid"
+            script = root / "cube_hid"
             script.write_text(source)
             bin_dir = root / "bin"
             bin_dir.mkdir()

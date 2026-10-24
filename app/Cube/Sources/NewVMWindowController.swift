@@ -39,6 +39,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
 
     // UI Architecture
     private var rootVisualEffect: NSVisualEffectView!
+    private var formScrollView: NSScrollView!
     private var stackView: NSStackView!
     private var logCardView: NewVMCardView!
 
@@ -48,11 +49,15 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
     private var isoPathField: NSTextField!
     private var browseButton: NSButton!
     private var unattendedCheckbox: NSButton!
+    private var desktopPopUp: NSPopUpButton!
     private var cpuPopUp: NSPopUpButton!
     private var ramPopUp: NSPopUpButton!
     private var memPreallocCheckbox: NSButton!
     private var diskField: NSTextField!
-    private var passwordField: NSSecureTextField!
+    private var passwordField: NSTextField!
+    private var securePasswordField: NSSecureTextField!
+    private var visiblePasswordField: NSTextField!
+    private var passwordVisibilityButton: NSButton!
     private var netPopUp: NSPopUpButton!
     private var netHintLabel: NSTextField!
     private var sshPortField: NSTextField!
@@ -134,11 +139,17 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         populateOSOptions()
         osPopUp.selectItem(at: 0)
         osSelectionChanged()
+        desktopPopUp.selectItem(at: 0)
         cpuPopUp.selectItem(at: 1) // 2 vCPUs
         ramPopUp.selectItem(at: 1) // 2048 MB
         memPreallocCheckbox?.state = .off
         diskField.stringValue = "20"
-        passwordField.stringValue = "root"
+        securePasswordField.stringValue = "root"
+        visiblePasswordField.stringValue = "root"
+        securePasswordField.isHidden = false
+        visiblePasswordField.isHidden = true
+        passwordField = securePasswordField
+        passwordVisibilityButton.title = "Show"
         setupNetPopUp()
         sshPortField.stringValue = "\(VMManager.shared.nextAvailableSSHPort())"
         vncPortField.stringValue = "\(VMManager.shared.nextAvailableVNCPort())"
@@ -248,17 +259,17 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         statusBarView.addSubview(createButton)
 
         // Middle Scroll View
-        let scrollView = NSScrollView()
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.drawsBackground = false
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.automaticallyAdjustsContentInsets = false
-        rootVisualEffect.addSubview(scrollView)
+        formScrollView = NSScrollView()
+        formScrollView.translatesAutoresizingMaskIntoConstraints = false
+        formScrollView.drawsBackground = false
+        formScrollView.hasVerticalScroller = true
+        formScrollView.autohidesScrollers = true
+        formScrollView.automaticallyAdjustsContentInsets = false
+        rootVisualEffect.addSubview(formScrollView)
 
         let scrollContentView = NewVMContentView()
         scrollContentView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = scrollContentView
+        formScrollView.documentView = scrollContentView
 
         stackView = NSStackView()
         stackView.translatesAutoresizingMaskIntoConstraints = false
@@ -319,15 +330,15 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             copyLogsButton.centerYAnchor.constraint(equalTo: statusBarView.centerYAnchor),
 
             // Scroll View Layout
-            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: rootVisualEffect.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: rootVisualEffect.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: statusBarView.topAnchor),
+            formScrollView.topAnchor.constraint(equalTo: header.bottomAnchor),
+            formScrollView.leadingAnchor.constraint(equalTo: rootVisualEffect.leadingAnchor),
+            formScrollView.trailingAnchor.constraint(equalTo: rootVisualEffect.trailingAnchor),
+            formScrollView.bottomAnchor.constraint(equalTo: statusBarView.topAnchor),
 
-            scrollContentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            scrollContentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            scrollContentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-            scrollContentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            scrollContentView.topAnchor.constraint(equalTo: formScrollView.contentView.topAnchor),
+            scrollContentView.leadingAnchor.constraint(equalTo: formScrollView.contentView.leadingAnchor),
+            scrollContentView.trailingAnchor.constraint(equalTo: formScrollView.contentView.trailingAnchor),
+            scrollContentView.widthAnchor.constraint(equalTo: formScrollView.contentView.widthAnchor),
 
             stackView.topAnchor.constraint(equalTo: scrollContentView.topAnchor, constant: 14),
             stackView.leadingAnchor.constraint(equalTo: scrollContentView.leadingAnchor, constant: 18),
@@ -382,7 +393,15 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         return sep.bottomAnchor
     }
 
-    private func addFormRow(label: String, control: NSView, in card: NSView, topAnchor: NSLayoutYAxisAnchor, topOffset: CGFloat = 10, height: CGFloat? = nil) -> NSLayoutYAxisAnchor {
+    private func addFormRow(
+        label: String,
+        control: NSView,
+        in card: NSView,
+        topAnchor: NSLayoutYAxisAnchor,
+        topOffset: CGFloat = 10,
+        height: CGFloat? = nil,
+        baselineView: NSView? = nil
+    ) -> NSLayoutYAxisAnchor {
         let labelField = NSTextField(labelWithString: label)
         labelField.translatesAutoresizingMaskIntoConstraints = false
         labelField.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
@@ -396,7 +415,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         var constraints = [
             labelField.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
             labelField.widthAnchor.constraint(equalToConstant: 120),
-            labelField.firstBaselineAnchor.constraint(equalTo: control.firstBaselineAnchor),
+            labelField.firstBaselineAnchor.constraint(equalTo: (baselineView ?? control).firstBaselineAnchor),
 
             control.leadingAnchor.constraint(equalTo: labelField.trailingAnchor, constant: 12),
             control.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
@@ -464,13 +483,16 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             browseButton.centerYAnchor.constraint(equalTo: isoRow.centerYAnchor),
             browseButton.widthAnchor.constraint(equalToConstant: 80)
         ])
-        lastAnchor = addFormRow(label: "Custom ISO:", control: isoRow, in: card, topAnchor: lastAnchor, height: 24)
+        lastAnchor = addFormRow(
+            label: "Custom ISO:", control: isoRow, in: card, topAnchor: lastAnchor,
+            height: 24, baselineView: isoPathField
+        )
 
         // Unattended checkbox & hint
         let unattendedContainer = NSView()
         unattendedContainer.translatesAutoresizingMaskIntoConstraints = false
 
-        unattendedCheckbox = NSButton(checkboxWithTitle: "Run Automated Unattended Installation (Zero Prompts)", target: nil, action: nil)
+        unattendedCheckbox = NSButton(checkboxWithTitle: "Run Automated Unattended Installation (Zero Prompts)", target: self, action: #selector(unattendedChanged))
         unattendedCheckbox.translatesAutoresizingMaskIntoConstraints = false
         unattendedCheckbox.state = .on
         unattendedCheckbox.font = NSFont.systemFont(ofSize: 12)
@@ -510,7 +532,37 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             unattendedContainer.leadingAnchor.constraint(equalTo: unattendedLabel.trailingAnchor, constant: 12),
             unattendedContainer.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
             unattendedContainer.topAnchor.constraint(equalTo: unattendedLabel.topAnchor),
-            unattendedContainer.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+        ])
+
+        let desktopLabel = NSTextField(labelWithString: "Desktop:")
+        desktopLabel.translatesAutoresizingMaskIntoConstraints = false
+        desktopLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        desktopLabel.textColor = CubeTokens.secondaryText
+        desktopLabel.alignment = .right
+        card.addSubview(desktopLabel)
+
+        desktopPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        desktopPopUp.translatesAutoresizingMaskIntoConstraints = false
+        desktopPopUp.font = NSFont.systemFont(ofSize: 12)
+        desktopPopUp.addItems(withTitles: ["None (Server)", "XFCE", "KDE Plasma"])
+        desktopPopUp.item(at: 0)?.representedObject = ""
+        desktopPopUp.item(at: 1)?.representedObject = "xfce"
+        desktopPopUp.item(at: 2)?.representedObject = "plasma"
+        desktopPopUp.target = self
+        desktopPopUp.action = #selector(desktopChanged)
+        desktopPopUp.toolTip = "Install a graphical desktop after the unattended base-system installation."
+        card.addSubview(desktopPopUp)
+
+        NSLayoutConstraint.activate([
+            desktopLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            desktopLabel.widthAnchor.constraint(equalToConstant: 120),
+            desktopLabel.centerYAnchor.constraint(equalTo: desktopPopUp.centerYAnchor),
+
+            desktopPopUp.topAnchor.constraint(equalTo: unattendedContainer.bottomAnchor, constant: 12),
+            desktopPopUp.leadingAnchor.constraint(equalTo: desktopLabel.trailingAnchor, constant: 12),
+            desktopPopUp.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            desktopPopUp.heightAnchor.constraint(equalToConstant: 24),
+            desktopPopUp.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
         ])
     }
 
@@ -558,7 +610,10 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             memPreallocCheckbox.trailingAnchor.constraint(lessThanOrEqualTo: ramRow.trailingAnchor),
             memPreallocCheckbox.centerYAnchor.constraint(equalTo: ramRow.centerYAnchor)
         ])
-        lastAnchor = addFormRow(label: "Memory (RAM):", control: ramRow, in: card, topAnchor: lastAnchor, height: 24)
+        lastAnchor = addFormRow(
+            label: "Memory (RAM):", control: ramRow, in: card, topAnchor: lastAnchor,
+            height: 24, baselineView: ramPopUp
+        )
 
         // Virtual Disk Size
         let diskRow = NSView()
@@ -588,7 +643,10 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             gbLabel.trailingAnchor.constraint(lessThanOrEqualTo: diskRow.trailingAnchor),
             gbLabel.centerYAnchor.constraint(equalTo: diskRow.centerYAnchor)
         ])
-        lastAnchor = addFormRow(label: "Virtual Disk Size:", control: diskRow, in: card, topAnchor: lastAnchor, height: 24)
+        lastAnchor = addFormRow(
+            label: "Virtual Disk Size:", control: diskRow, in: card, topAnchor: lastAnchor,
+            height: 24, baselineView: diskField
+        )
 
         // Storage Location
         let storageRow = NSView()
@@ -615,7 +673,10 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             customizeStorageButton.centerYAnchor.constraint(equalTo: storageRow.centerYAnchor),
             customizeStorageButton.widthAnchor.constraint(equalToConstant: 88)
         ])
-        lastAnchor = addFormRow(label: "Storage Location:", control: storageRow, in: card, topAnchor: lastAnchor, height: 24)
+        lastAnchor = addFormRow(
+            label: "Storage Location:", control: storageRow, in: card, topAnchor: lastAnchor,
+            height: 24, baselineView: storagePathLabel
+        )
 
         card.bottomAnchor.constraint(equalTo: lastAnchor, constant: 14).isActive = true
         updateStoragePathDisplay()
@@ -631,11 +692,58 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         var lastAnchor = addCardHeader(title: "Networking & Security", to: card)
 
         // Root Password
-        passwordField = NSSecureTextField()
-        passwordField.font = NSFont.systemFont(ofSize: 12)
-        passwordField.stringValue = "root"
-        passwordField.toolTip = "Root password for guest console login and SSH connections (default: root)."
-        lastAnchor = addFormRow(label: "Root Password:", control: passwordField, in: card, topAnchor: lastAnchor, height: 22)
+        let passwordRow = NSView()
+        passwordRow.translatesAutoresizingMaskIntoConstraints = false
+
+        securePasswordField = NSSecureTextField()
+        securePasswordField.translatesAutoresizingMaskIntoConstraints = false
+        securePasswordField.identifier = NSUserInterfaceItemIdentifier("rootPasswordSecureField")
+        securePasswordField.font = NSFont.systemFont(ofSize: 12)
+        securePasswordField.stringValue = "root"
+        securePasswordField.toolTip = "Root password for guest console login and SSH connections (default: root)."
+        passwordRow.addSubview(securePasswordField)
+
+        visiblePasswordField = NSTextField()
+        visiblePasswordField.translatesAutoresizingMaskIntoConstraints = false
+        visiblePasswordField.identifier = NSUserInterfaceItemIdentifier("rootPasswordVisibleField")
+        visiblePasswordField.font = NSFont.systemFont(ofSize: 12)
+        visiblePasswordField.stringValue = "root"
+        visiblePasswordField.toolTip = securePasswordField.toolTip
+        visiblePasswordField.isHidden = true
+        passwordRow.addSubview(visiblePasswordField)
+
+        passwordVisibilityButton = NSButton(title: "Show", target: self, action: #selector(togglePasswordVisibility))
+        passwordVisibilityButton.translatesAutoresizingMaskIntoConstraints = false
+        passwordVisibilityButton.identifier = NSUserInterfaceItemIdentifier("rootPasswordVisibilityButton")
+        passwordVisibilityButton.bezelStyle = .rounded
+        passwordVisibilityButton.font = NSFont.systemFont(ofSize: 11)
+        passwordVisibilityButton.toolTip = "Show or hide the root password."
+        passwordRow.addSubview(passwordVisibilityButton)
+
+        NSLayoutConstraint.activate([
+            securePasswordField.leadingAnchor.constraint(equalTo: passwordRow.leadingAnchor),
+            securePasswordField.topAnchor.constraint(equalTo: passwordRow.topAnchor),
+            securePasswordField.bottomAnchor.constraint(equalTo: passwordRow.bottomAnchor),
+            securePasswordField.trailingAnchor.constraint(equalTo: passwordVisibilityButton.leadingAnchor, constant: -8),
+
+            visiblePasswordField.leadingAnchor.constraint(equalTo: securePasswordField.leadingAnchor),
+            visiblePasswordField.trailingAnchor.constraint(equalTo: securePasswordField.trailingAnchor),
+            visiblePasswordField.topAnchor.constraint(equalTo: securePasswordField.topAnchor),
+            visiblePasswordField.bottomAnchor.constraint(equalTo: securePasswordField.bottomAnchor),
+
+            passwordVisibilityButton.trailingAnchor.constraint(equalTo: passwordRow.trailingAnchor),
+            passwordVisibilityButton.centerYAnchor.constraint(equalTo: passwordRow.centerYAnchor),
+            passwordVisibilityButton.widthAnchor.constraint(equalToConstant: 58)
+        ])
+        passwordField = securePasswordField
+        lastAnchor = addFormRow(
+            label: "Root Password:",
+            control: passwordRow,
+            in: card,
+            topAnchor: lastAnchor,
+            height: 22,
+            baselineView: securePasswordField
+        )
 
         // Network Mode
         let netContainer = NSView()
@@ -665,7 +773,10 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             netHintLabel.trailingAnchor.constraint(equalTo: netContainer.trailingAnchor),
             netHintLabel.bottomAnchor.constraint(equalTo: netContainer.bottomAnchor)
         ])
-        lastAnchor = addFormRow(label: "Network Mode:", control: netContainer, in: card, topAnchor: lastAnchor)
+        lastAnchor = addFormRow(
+            label: "Network Mode:", control: netContainer, in: card, topAnchor: lastAnchor,
+            baselineView: netPopUp
+        )
 
         // Forwarded Ports Row (SSH and VNC)
         let portsRow = NSView()
@@ -694,7 +805,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         vncPortField.translatesAutoresizingMaskIntoConstraints = false
         vncPortField.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
         vncPortField.stringValue = "\(VMManager.shared.nextAvailableVNCPort())"
-        vncPortField.toolTip = "Host port for VNC graphical display console (port 5900+). Connect with: open vnc://127.0.0.1:<port>"
+        vncPortField.toolTip = "Host port for the VNC display (port 5900+). Cube.app opens it with TigerVNC."
         portsRow.addSubview(vncPortField)
 
         NSLayoutConstraint.activate([
@@ -715,7 +826,10 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             vncPortField.heightAnchor.constraint(equalToConstant: 22),
             vncPortField.trailingAnchor.constraint(lessThanOrEqualTo: portsRow.trailingAnchor)
         ])
-        lastAnchor = addFormRow(label: "Network Ports:", control: portsRow, in: card, topAnchor: lastAnchor, height: 24)
+        lastAnchor = addFormRow(
+            label: "Network Ports:", control: portsRow, in: card, topAnchor: lastAnchor,
+            height: 24, baselineView: sshPortField
+        )
 
         card.bottomAnchor.constraint(equalTo: lastAnchor, constant: 14).isActive = true
     }
@@ -757,7 +871,10 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             shareBrowseButton.centerYAnchor.constraint(equalTo: sharePathRow.centerYAnchor),
             shareBrowseButton.widthAnchor.constraint(equalToConstant: 80)
         ])
-        lastAnchor = addFormRow(label: "Host Directory:", control: sharePathRow, in: card, topAnchor: lastAnchor, height: 24)
+        lastAnchor = addFormRow(
+            label: "Host Directory:", control: sharePathRow, in: card, topAnchor: lastAnchor,
+            height: 24, baselineView: sharePathField
+        )
 
         // Options Row (Tag, Read-only, Clear)
         let shareOptionsRow = NSView()
@@ -804,7 +921,10 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             clearBtn.centerYAnchor.constraint(equalTo: shareOptionsRow.centerYAnchor),
             clearBtn.widthAnchor.constraint(equalToConstant: 60)
         ])
-        lastAnchor = addFormRow(label: "Share Options:", control: shareOptionsRow, in: card, topAnchor: lastAnchor, height: 24)
+        lastAnchor = addFormRow(
+            label: "Share Options:", control: shareOptionsRow, in: card, topAnchor: lastAnchor,
+            height: 24, baselineView: shareTagField
+        )
 
         // Mount hint
         let shareHint = NSTextField(labelWithString: "💡 Mount inside guest: mount -t p9fs <tag> /mnt/host")
@@ -852,6 +972,15 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         ])
 
         logCardView.isHidden = true
+    }
+
+    func revealProvisioningLogs() {
+        logCardView.isHidden = false
+        window?.contentView?.layoutSubtreeIfNeeded()
+        guard let documentView = formScrollView.documentView else { return }
+        let logRect = logCardView.convert(logCardView.bounds, to: documentView)
+        documentView.scrollToVisible(logRect)
+        formScrollView.reflectScrolledClipView(formScrollView.contentView)
     }
 
     // MARK: - Popups & Options
@@ -959,6 +1088,46 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
 
         unattendedCheckbox.isEnabled = true
         unattendedCheckbox.toolTip = "Automates disk partitioning (ZFS), root user account setup, and SSH service configuration with zero installer prompts."
+        unattendedChanged()
+    }
+
+    @objc private func unattendedChanged() {
+        desktopPopUp?.isEnabled = unattendedCheckbox.state == .on && !isBusy
+        if unattendedCheckbox.state != .on {
+            desktopPopUp?.selectItem(at: 0)
+        }
+    }
+
+    @objc private func desktopChanged() {
+        if desktopPopUp.indexOfSelectedItem > 0 {
+            if cpuPopUp.indexOfSelectedItem < 2 { cpuPopUp.selectItem(at: 2) }
+            if ramPopUp.indexOfSelectedItem < 2 { ramPopUp.selectItem(at: 2) }
+        }
+    }
+
+    @objc private func togglePasswordVisibility() {
+        let showPassword = visiblePasswordField.isHidden
+        let currentValue = passwordField.stringValue
+        let wasEditingPassword = passwordField.currentEditor() != nil
+
+        if showPassword {
+            visiblePasswordField.stringValue = currentValue
+            securePasswordField.isHidden = true
+            visiblePasswordField.isHidden = false
+            passwordField = visiblePasswordField
+            passwordVisibilityButton.title = "Hide"
+        } else {
+            securePasswordField.stringValue = currentValue
+            visiblePasswordField.isHidden = true
+            securePasswordField.isHidden = false
+            passwordField = securePasswordField
+            passwordVisibilityButton.title = "Show"
+        }
+
+        if wasEditingPassword {
+            window?.makeFirstResponder(passwordField)
+            passwordField.currentEditor()?.selectedRange = NSRange(location: currentValue.utf16.count, length: 0)
+        }
     }
 
     @objc private func browseIsoClicked() {
@@ -1031,7 +1200,17 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         let rams = [1024, 2048, 4096, 8192, 16384][ramPopUp.indexOfSelectedItem]
         let diskGB = Int(diskField.stringValue) ?? 20
         let password = passwordField.stringValue.isEmpty ? "root" : passwordField.stringValue
+        let desktopValue = desktopPopUp.selectedItem?.representedObject as? String
+        let desktop = desktopValue?.isEmpty == false ? desktopValue : nil
+        if desktop != nil && unattendedCheckbox.state != .on {
+            showError("Desktop installation requires automated unattended installation.")
+            return
+        }
         let netMode = (netPopUp.selectedItem?.representedObject as? String) ?? (VMManager.shared.hasNetworkingEntitlement() ? "vmnet" : "vmnet-proxy")
+        if desktop != nil && netMode == "none" {
+            showError("Desktop installation requires networking to download FreeBSD packages.")
+            return
+        }
         let sshPort = Int(sshPortField.stringValue)
         let vncPort = Int(vncPortField.stringValue)
 
@@ -1045,6 +1224,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             osVersion: osVersion,
             customIsoPath: customIso,
             isUnattended: (unattendedCheckbox.state == .on),
+            desktop: desktop,
             cpus: cpus,
             ramMB: rams,
             diskSizeGB: diskGB,
@@ -1061,7 +1241,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
 
         isBusy = true
         setFormEnabled(false)
-        logCardView.isHidden = false
+        revealProvisioningLogs()
         copyLogsButton.isHidden = false
         progressIndicator.isHidden = false
         progressIndicator.startAnimation(nil)
@@ -1076,6 +1256,8 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             self.logTextView.scrollToEndOfDocument(nil)
             if chunk.contains("Downloading") {
                 self.statusLabel.stringValue = "Downloading ISO image..."
+            } else if chunk.contains("desktop") || chunk.contains("Installing XFCE") || chunk.contains("Installing Plasma") {
+                self.statusLabel.stringValue = "Installing desktop environment..."
             } else if chunk.contains("unattended") || chunk.contains("install") {
                 self.statusLabel.stringValue = "Running installation..."
             }
@@ -1090,12 +1272,21 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
                 DashboardWindowController.shared.selectVM(name: name)
                 let alert = NSAlert()
                 alert.messageText = "Virtual Machine Ready"
-                alert.informativeText = "VM '\(name)' was created successfully. Would you like to start it now?"
-                alert.addButton(withTitle: "Start VM")
-                alert.addButton(withTitle: "Done")
+                let desktopNote = desktop == nil ? "" : " The desktop user is 'cube' and uses the root password you entered."
+                alert.informativeText = "VM '\(name)' was created successfully.\(desktopNote) Would you like to start it now?"
+                if desktop != nil {
+                    alert.addButton(withTitle: "Start Native Display")
+                    alert.addButton(withTitle: "Start VNC")
+                    alert.addButton(withTitle: "Done")
+                } else {
+                    alert.addButton(withTitle: "Start VM")
+                    alert.addButton(withTitle: "Done")
+                }
                 let resp = alert.runModal()
-                if resp == .alertFirstButtonReturn {
-                    VMManager.shared.startVM(name: name) { startSuccess, startError in
+                if resp == .alertFirstButtonReturn || (desktop != nil && resp == .alertSecondButtonReturn) {
+                    let mode: CubeCommandDisplayMode? = desktop == nil ? nil :
+                        (resp == .alertFirstButtonReturn ? .native : .vnc)
+                    VMManager.shared.startVM(name: name, displayMode: mode) { startSuccess, startError in
                         if !startSuccess {
                             DispatchQueue.main.async {
                                 let errAlert = NSAlert()
@@ -1103,6 +1294,12 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
                                 errAlert.informativeText = startError ?? "An unknown error occurred while starting the VM."
                                 errAlert.alertStyle = .warning
                                 errAlert.runModal()
+                            }
+                        } else if mode == .vnc {
+                            VMManager.shared.refreshVMs { vms in
+                                if let running = vms.first(where: { $0.name == name }) {
+                                    VMManager.shared.openVNC(for: running)
+                                }
                             }
                         }
                     }
@@ -1119,11 +1316,14 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         nameField.isEnabled = enabled
         osPopUp.isEnabled = enabled
         unattendedCheckbox.isEnabled = enabled
+        desktopPopUp.isEnabled = enabled && unattendedCheckbox.state == .on
         cpuPopUp.isEnabled = enabled
         ramPopUp.isEnabled = enabled
         memPreallocCheckbox?.isEnabled = enabled
         diskField.isEnabled = enabled
-        passwordField.isEnabled = enabled
+        securePasswordField.isEnabled = enabled
+        visiblePasswordField.isEnabled = enabled
+        passwordVisibilityButton.isEnabled = enabled
         netPopUp.isEnabled = enabled
         sshPortField.isEnabled = enabled
         vncPortField.isEnabled = enabled

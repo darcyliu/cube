@@ -42,6 +42,21 @@ in an alert; **Open Service Log** provides the helper's diagnostics.
 The socket and log are under `~/Library/Application Support/cube/`.
 Stopping or restarting networking disconnects attached guests.
 
+## Installing a FreeBSD desktop
+
+The **New Virtual Machine** window includes a **Desktop** selector with server,
+XFCE, and KDE Plasma choices. Desktop installation requires **Automated
+Unattended Installation** and guest networking. Selecting a desktop raises CPU
+and memory choices below the recommended baseline to 4 vCPUs and 4 GiB.
+
+Cube first installs the FreeBSD base system, then boots the managed VM and uses
+an automatically generated per-VM SSH key to install the desktop packages. It
+creates the graphical user `cube`, using the root password entered in the form,
+configures LightDM or SDDM, installs the SCFB Xorg configuration and `cube_hid`
+service, and powers the VM off when provisioning finishes. The default desktop
+framebuffer is 1280×800. Package download time depends on the FreeBSD mirror and
+can be substantially longer than the base installation.
+
 ## Regression checks
 
 ```sh

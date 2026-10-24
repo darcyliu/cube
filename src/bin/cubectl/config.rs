@@ -15,6 +15,8 @@ pub struct VmConfig {
     #[serde(default)]
     pub os: Option<String>,
     #[serde(default)]
+    pub desktop: Option<String>,
+    #[serde(default)]
     pub binary: Option<String>,
     pub boot: BootConfig,
     #[serde(default = "default_ram")]
@@ -421,11 +423,13 @@ pub fn build_launch_spec(
         resources.push(format!("listen-port:{}", port_part));
     }
 
-    // 7. VNC & Display
-    let mut vnc_bind = cli_overrides.vnc.clone();
+    // 7. Graphical frontend & display. Native is an explicit override because
+    // it cannot be combined with the VNC frontend saved in the configuration.
+    let native_gui = cli_overrides.gui.as_deref() == Some("native");
+    let mut vnc_bind = if native_gui { None } else { cli_overrides.vnc.clone() };
     let mut vnc_display = cli_overrides.display.clone();
     if let Some(ref v) = config.vnc {
-        if vnc_bind.is_none() {
+        if !native_gui && vnc_bind.is_none() {
             vnc_bind = Some(v.bind.clone());
         }
         if vnc_display.is_none() {
@@ -433,7 +437,12 @@ pub fn build_launch_spec(
         }
     }
 
-    if let Some(ref bind) = vnc_bind {
+    if native_gui {
+        command.extend(["--gui".into(), "native".into()]);
+        if let Some(disp) = vnc_display {
+            command.extend(["--display".into(), disp]);
+        }
+    } else if let Some(ref bind) = vnc_bind {
         command.extend(["--vnc".into(), bind.clone()]);
         let port_part = bind.rsplit(':').next().unwrap_or(bind);
         resources.push(format!("listen-port:{}", port_part));

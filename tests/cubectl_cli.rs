@@ -203,7 +203,20 @@ fn test_cubectl_cli_lifecycle_and_conflicts() {
     assert_eq!(start_json.get("ip"), Some(&serde_json::Value::Null));
 
     let runtime_path = state_root.join("vm-one/runtime.json");
-    let initial_runtime: serde_json::Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+    let runtime_deadline = Instant::now() + Duration::from_secs(5);
+    let initial_runtime: serde_json::Value = loop {
+        if let Ok(bytes) = fs::read(&runtime_path) {
+            if let Ok(value) = serde_json::from_slice(&bytes) {
+                break value;
+            }
+        }
+        assert!(
+            Instant::now() < runtime_deadline,
+            "fake VM did not publish valid runtime status at {}",
+            runtime_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(initial_runtime["instance_id"], start_json["id"], "manager must pass launch identity to cube");
     // A misleading log message must not override structured runtime status.
     fs::write(state_root.join("vm-one/vmm.log"),
@@ -419,11 +432,15 @@ fn test_cubectl_iso_workflow_and_eject() {
     let config_file = vm_dest.join("ubuntu-vm.json");
     let config_val: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_file).unwrap()).unwrap();
     let vnc_bind = config_val["vnc"]["bind"].as_str().unwrap();
-    assert!(create_stdout.contains(&format!("open vnc://{}", vnc_bind)));
     let disks = config_val.get("disks").and_then(|d| d.as_array()).unwrap();
     assert_eq!(disks.len(), 2, "expected primary disk and iso disk");
     assert_eq!(disks[1].get("read_only").and_then(|ro| ro.as_bool()), Some(true));
     let address: std::net::SocketAddr = vnc_bind.parse().unwrap();
+    assert!(create_stdout.contains(&format!(
+        "vncviewer {}::{}",
+        address.ip(),
+        address.port()
+    )));
     assert_eq!(address.ip(), std::net::Ipv4Addr::LOCALHOST);
     assert!(address.port() >= 5901);
 

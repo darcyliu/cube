@@ -32,7 +32,7 @@ Running a graphical desktop (such as Debian GNOME/XFCE, Alpine desktop, or FreeB
 +------v------------------------------------------------v-----------------+
 | Host Presentation Backend (macOS Host)                                  |
 |                                                                         |
-|  [Option 1: Built-in RFB/VNC Server] -> macOS Screen Sharing            |
+|  [Option 1: Built-in RFB/VNC Server] -> TigerVNC Viewer                 |
 |  [Option 2: Native Cocoa Window]     -> NSWindow / MetalKit (CAMetal)   |
 |  [Option 3: Web Canvas]              -> HTTP / WebSocket HTML5          |
 +-------------------------------------------------------------------------+
@@ -154,7 +154,7 @@ pub struct VirtioInputEvent {
 
 | Backend | Implementation Details | Pros | Cons |
 | :--- | :--- | :--- | :--- |
-| **1. Embedded RFB/VNC Server** *(Recommended)* | Lightweight TCP server on `localhost:5900` implementing RFC 6143 (RFB 3.8). | **Zero external dependencies**.<br>Works headless/SSH.<br>Native macOS client via `open vnc://127.0.0.1:5900`. | 1–2ms network encoding overhead. |
+| **1. Embedded RFB/VNC Server** *(Recommended)* | Lightweight TCP server on `localhost:5900` implementing RFC 6143 (RFB 3.8). | Works headless/SSH with a standard client such as TigerVNC. | Requires a compatible VNC viewer; macOS Screen Sharing requires password authentication. |
 | **2. Native Cocoa / Metal Window** *(first pass implemented)* | AppKit window with an `MTKView` presenting the existing guest framebuffer. | Local desktop in one window; no VNC viewer or RFB encoding. | Fixed guest resolution and US physical key mapping; full desktop input validation and packaging remain. |
 | **3. WebSocket / HTML5 Canvas** | Mini HTTP server + WebSocket streaming raw RGBA / PNG frames to a browser. | Works in any browser without client software. | Requires JavaScript frontend. |
 
@@ -236,7 +236,7 @@ as the owner of the application event loop.
 3. **VNC Server (`src/devices/display/vnc.rs`)**:
    - Implement minimal RFB protocol (`ProtocolVersion`, `SecurityHandshake`, `SetPixelFormat`, `FramebufferUpdateRequest`).
    - Listen on `127.0.0.1:5900`.
-4. **Validation**: Run `make debian` or `make alpine` and execute `open vnc://127.0.0.1:5900` on macOS to view the graphical desktop or installer.
+4. **Validation**: Run `make debian` or `make alpine`, install TigerVNC with `brew install --cask tigervnc`, and connect with `/Applications/TigerVNC.app/Contents/MacOS/vncviewer 127.0.0.1::5900`.
 
 ### Phase 2: Interactive Pointer & Keyboard via VirtIO-Input
 1. Implement `VirtioInput` MMIO device for Tablet (`EV_ABS`) and Keyboard (`EV_KEY`).

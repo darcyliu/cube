@@ -47,6 +47,49 @@ The SSH endpoint used for shutdown must be reachable from the host. The example
 uses `ssh_port` forwarding to a DHCP guest; use a static `network.forwards`
 rule and matching shutdown port for a static guest address.
 
+### Choosing UEFI or direct kernel boot
+
+Cube supports two FreeBSD boot paths. They expose the same virtual devices, but
+they differ in who selects and prepares the kernel.
+
+| | UEFI boot | Direct kernel boot |
+|---|---|---|
+| Configuration | `"mode": "uefi"` with a firmware path | `"mode": "freebsd"` with a kernel path |
+| Boot sequence | EDK2 → disk EFI loader → FreeBSD loader → kernel | Cube → host-supplied FreeBSD kernel |
+| Kernel source | Loaded from the guest disk | Loaded from a host file |
+| `/boot/loader.conf` | Read by the FreeBSD loader | Bypassed |
+| Kernel modules | The loader can load modules from the guest disk | Must be built in, loaded at runtime, or supplied with `--module` |
+| EFI variables | Persist through the VM's `efi-vars.fd` | Not used |
+| Best suited to | Installed systems, ZFS, and normal Cube.app use | Kernel development, diagnostics, and disposable tests |
+
+Use UEFI for a normal installed VM. It follows the conventional FreeBSD boot
+chain, supports the disk's bootloader and `/boot/loader.conf`, and automatically
+uses a private EFI variable store unless `efi_vars` or `--efi-vars` selects one.
+Guest kernel upgrades take effect because the next boot loads the kernel from
+the disk.
+
+```sh
+cube --uefi firmware/QEMU_EFI.fd \
+  --disk /path/to/installed.img \
+  --efi-vars /path/to/efi-vars.fd
+```
+
+Direct kernel boot skips EDK2 and the FreeBSD loader. It starts the specified
+kernel immediately, which is useful for development and repeatable tests, but
+loader tunables and module entries in `/boot/loader.conf` do not take effect.
+Keep the host-side kernel file synchronized with the guest when testing an
+installed disk.
+
+```sh
+cube --freebsd /path/to/kernel \
+  --disk /path/to/installed.img \
+  --root ufs:/dev/vtbd0p2 --multiuser
+```
+
+For stock FreeBSD root-on-ZFS, use UEFI. Cube's direct kernel/module ZFS path is
+experimental; the verified path is documented in the
+[FreeBSD UEFI/ZFS runbook](freebsd_zfs_runbook.md).
+
 ```sh
 # ----------------------------------------------------------------------
 # 1. Automated Unattended OS Installation (Approach A - Recommended)
@@ -59,8 +102,19 @@ cubectl create my-freebsd \
   --ssh-port 2222 \
   --password root
 
+# Install a graphical desktop as part of the same unattended workflow:
+cubectl create my-desktop \
+  --version 15.1 --unattended --desktop xfce \
+  --ram 4096 --cpus 4 --password change-me
+
+# KDE Plasma is also available with --desktop plasma. The desktop account is
+# "cube" by default and uses --desktop-password, or --password when omitted.
+
 # Start directly into your ready-to-use FreeBSD VM:
 cubectl start my-freebsd
+
+# Start the same managed VM in a native Cocoa window instead of its saved VNC frontend:
+cubectl start my-freebsd --gui native
 
 # Connect via SSH with key or password:
 ssh root@127.0.0.1 -p 2222
@@ -81,7 +135,8 @@ cubectl create my-ubuntu \
 cubectl start my-ubuntu -i --no-reboot
 
 # Connect to the graphical installer (if VNC is enabled)
-open vnc://127.0.0.1:5901
+brew install --cask tigervnc  # one-time setup
+/Applications/TigerVNC.app/Contents/MacOS/vncviewer 127.0.0.1::5901
 
 # Once installed, stop the VM and eject the installer ISO
 cubectl stop my-ubuntu
@@ -136,12 +191,17 @@ needed. It is a host stop, not a guest-coordinated shutdown. Uncatchable manager
 termination or host loss cannot guarantee a final state record.
 
 Only `start` accepts `--binary`, `--ram`, `--cpus`, `--net`, `--mac`,
-`--ssh-port`, `--vnc`, `--display`, `--efi-vars`, `--disk`, and `--forward`.
+`--ssh-port`, `--vnc`, `--gui native`, `--display`, `--efi-vars`, `--disk`, and `--forward`.
 Each supplied scalar replaces its JSON value. Any `--disk` replaces the entire
 disk list; any `--forward` replaces the entire forwarding list. CLI paths are
 relative to the current directory. An override affects that run only; it does
 not rewrite the configuration file. The effective VMM command and resource
 claims are retained in `launch.json` for inspection.
+
+`--gui native` suppresses the saved VNC frontend for that run; the two display
+frontends cannot be combined. In Cube.app, choose **View CLI Commands…**, select
+**Native**, and click **Start with Native Display**. The menu bar VM submenu also
+offers **Start with Native Display** when the VM is stopped.
 
 `cubectl status` and `cubectl list --json` include an `ip` field for running
 VMs. The hypervisor publishes its NIC's learned DHCP address to `runtime.json`

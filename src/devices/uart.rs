@@ -67,6 +67,7 @@ pub struct Pl011Uart {
     rx_queue: Arc<Mutex<VecDeque<u8>>>,
     irq_num: u32,
     log_file: Option<std::fs::File>,
+    mirror_stdout: bool,
     running: Arc<AtomicBool>,
     workers: Vec<thread::JoinHandle<()>>,
 }
@@ -96,6 +97,15 @@ impl Pl011Uart {
     }
 
     pub fn with_log(irq_num: u32, interactive_stdin: bool, log_path: Option<&str>) -> Self {
+        Self::with_log_output(irq_num, interactive_stdin, true, log_path)
+    }
+
+    pub fn with_log_output(
+        irq_num: u32,
+        interactive_stdin: bool,
+        mirror_stdout: bool,
+        log_path: Option<&str>,
+    ) -> Self {
         let rx_queue = Arc::new(Mutex::new(VecDeque::new()));
         let running = Arc::new(AtomicBool::new(true));
         let mut workers = Vec::new();
@@ -171,6 +181,7 @@ impl Pl011Uart {
             rx_queue,
             irq_num,
             log_file,
+            mirror_stdout,
             running,
             workers,
         }
@@ -245,13 +256,15 @@ impl MmioDevice for Pl011Uart {
         match offset {
             UART_DR => {
                 let ch = (data & 0xff) as u8;
-                let mut stdout = io::stdout().lock();
-                if ch == b'\n' {
-                    let _ = stdout.write_all(b"\r\n");
-                } else {
-                    let _ = stdout.write_all(&[ch]);
+                if self.mirror_stdout {
+                    let mut stdout = io::stdout().lock();
+                    if ch == b'\n' {
+                        let _ = stdout.write_all(b"\r\n");
+                    } else {
+                        let _ = stdout.write_all(&[ch]);
+                    }
+                    let _ = stdout.flush();
                 }
-                let _ = stdout.flush();
                 if let Some(ref mut f) = self.log_file {
                     let _ = f.write_all(&[ch]);
                     let _ = f.flush();

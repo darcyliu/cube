@@ -30,8 +30,8 @@ class PlanTests(unittest.TestCase):
 
     def test_default_is_interactive_14_4_distribution_sets(self):
         spec = install_vm.specification()
-        self.assertEqual((spec.version, spec.base, spec.unattended, spec.desktop),
-                         ("14.4", "distsets", False, None))
+        self.assertEqual((spec.version, spec.base, spec.filesystem, spec.unattended, spec.desktop),
+                         ("14.4", "distsets", "zfs", False, None))
         self.assertEqual(spec.name, "freebsd-14-4")
         self.assertEqual((spec.ram, spec.cpus, spec.disk_gib), (1024, 2, 20))
         self.assertIsNone(spec.hint)
@@ -52,6 +52,8 @@ class PlanTests(unittest.TestCase):
             install_vm.specification(version="15.0", unattended=True, desktop="plasma")
         with self.assertRaisesRegex(ValueError, "unknown"):
             install_vm.specification(version="13.2")
+        with self.assertRaisesRegex(ValueError, "filesystem"):
+            install_vm.specification(filesystem="ext4")
 
     def test_interactive_15_explains_the_package_menu(self):
         spec = install_vm.specification(version="15.0")
@@ -80,12 +82,15 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(elevated[elevated.index("--net") + 1], "vmnet")
 
     def test_base_and_interactive_commands_pass_the_installer_mode(self):
-        spec = install_vm.specification(version="15.1", unattended=True, dest_root=Path("/tmp/vms"))
+        spec = install_vm.specification(version="15.1", unattended=True, filesystem="ufs",
+                                        dest_root=Path("/tmp/vms"))
         argv = install_vm.command(spec, Path("/images/disc.iso"), Path("/cube"),
                                   cubectl=Path("/cubectl"), password="secret")
         self.assertEqual(argv[:2], ["/cubectl", "create"])
         self.assertIn("--unattended", argv)
         self.assertEqual(argv[argv.index("--base") + 1], "pkgbase")
+        self.assertEqual(argv[argv.index("--filesystem") + 1], "ufs")
+        self.assertEqual(argv[argv.index("--boot") + 1], "freebsd")
         self.assertEqual(argv[argv.index("--password") + 1], "secret")
         self.assertEqual(argv[argv.index("--disk") + 1], "installed.img:20G")
         interactive = install_vm.command(
@@ -93,7 +98,15 @@ class PlanTests(unittest.TestCase):
             Path("/images/disc.iso"), Path("/cube"), cubectl=Path("/cubectl"))
         self.assertNotIn("--unattended", interactive)
         self.assertNotIn("--base", interactive)
+        self.assertNotIn("--filesystem", interactive)
+        self.assertNotIn("--boot", interactive)
         self.assertEqual(interactive[interactive.index("--binary") + 1], "/cube")
+
+        zfs = install_vm.command(
+            install_vm.specification(version="14.4", unattended=True,
+                                      filesystem="zfs", dest_root=Path("/tmp/vms")),
+            Path("/images/disc.iso"), Path("/cube"), cubectl=Path("/cubectl"))
+        self.assertNotIn("--boot", zfs)
 
     def test_iso_cache_skips_a_finished_image_and_replaces_a_partial_download(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -135,6 +148,7 @@ class PlanTests(unittest.TestCase):
             self.assertEqual(install_vm.vm_config(spec, Path("/vmm"), key, sudo=True)["network"]["mode"],
                              "vmnet")
             self.assertEqual(json.loads((spec.dest / "source.json").read_text())["version"], "15.1")
+            self.assertEqual(json.loads((spec.dest / "source.json").read_text())["filesystem"], "zfs")
             without_key = install_vm.vm_config(spec, Path("/vmm"), None)
             self.assertNotIn("shutdown", without_key)
 
@@ -156,11 +170,30 @@ class PlanTests(unittest.TestCase):
                                          dest_root=Path("/tmp/vms"))
         output = io.StringIO()
         with redirect_stdout(output):
-            install_vm.print_next_steps(spec)
+            install_vm.print_next_steps(spec, root_password="root-secret")
         text = output.getvalue()
         self.assertIn("installation finished successfully", text)
+        self.assertIn("Root user:     root", text)
+        self.assertIn("Root password: root-secret", text)
+        self.assertNotIn("Desktop user:", text)
         self.assertIn("cubectl start box", text)
         self.assertNotIn("--freebsd", text)
+
+    def test_desktop_next_steps_print_both_logins(self):
+        spec = install_vm.specification(version="14.4", unattended=True, desktop="xfce",
+                                         name="desktop", dest_root=Path("/tmp/vms"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            install_vm.print_next_steps(
+                spec,
+                root_password="root-secret",
+                desktop_user="cube-user",
+                desktop_password="desktop-secret",
+            )
+        text = output.getvalue()
+        self.assertIn("Root password: root-secret", text)
+        self.assertIn("Desktop user:     cube-user", text)
+        self.assertIn("Desktop password: desktop-secret", text)
 
     def test_main_rejects_a_bad_combination_before_using_a_binary(self):
         self.assertEqual(install_vm.main(["--version", "15.0", "--unattended"]), 2)

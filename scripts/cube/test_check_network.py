@@ -62,14 +62,25 @@ class GuestModeTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "stop")
         execvp.assert_not_called()
         self.assertTrue(any("missing-tap" in command for command in probes))
-        args = launched["args"]
-        return args[args.index("--net") + 1]
+        return launched["args"]
 
     def test_proxy_guest_is_not_started_on_the_missing_tap(self):
-        self.assertEqual(self.launch([], 501), "vmnet-proxy")
+        args = self.launch([], 501)
+        self.assertEqual(args[args.index("--net") + 1], "vmnet-proxy")
+        self.assertIn("--ssh-port", args)
+        self.assertNotIn("--forward", args)
 
     def test_sudo_guest_stays_on_in_process_vmnet(self):
-        self.assertEqual(self.launch(["--sudo"], 0), "vmnet")
+        args = self.launch(["--sudo"], 0)
+        self.assertEqual(args[args.index("--net") + 1], "vmnet")
+        self.assertIn("--ssh-port", args)
+        self.assertNotIn("--forward", args)
+
+    def test_bridge_guest_keeps_static_forwarding(self):
+        args = self.launch(["--net", "bridge:en0"], 0)
+        self.assertEqual(args[args.index("--net") + 1], "bridge:en0")
+        self.assertIn("--forward", args)
+        self.assertNotIn("--ssh-port", args)
 
 
 if __name__ == "__main__":

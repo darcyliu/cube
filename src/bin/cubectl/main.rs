@@ -200,6 +200,10 @@ pub struct StartArgs {
     #[arg(long, help = "Override VNC bind address (IP:PORT)")]
     pub vnc: Option<String>,
 
+    #[arg(long, value_name = "MODE", value_parser = ["native"], conflicts_with = "vnc",
+          help = "Override graphical frontend (native)")]
+    pub gui: Option<String>,
+
     #[arg(long, help = "Override display resolution (WIDTHxHEIGHT)")]
     pub display: Option<String>,
 
@@ -367,6 +371,18 @@ pub struct CreateArgs {
     #[arg(long = "password", default_value = "root")]
     pub password: String,
 
+    /// Install and configure a graphical desktop after unattended installation
+    #[arg(long, value_parser = ["xfce", "plasma"], requires = "unattended")]
+    pub desktop: Option<String>,
+
+    /// Desktop login user (default: cube)
+    #[arg(long = "desktop-user", default_value = "cube", requires = "desktop")]
+    pub desktop_user: String,
+
+    /// Desktop login password (default: same as --password)
+    #[arg(long = "desktop-password", requires = "desktop")]
+    pub desktop_password: Option<String>,
+
     /// Hostname for the VM (default: VM name)
     #[arg(long = "hostname")]
     pub hostname: Option<String>,
@@ -480,5 +496,43 @@ fn main() {
     if let Err(err) = res {
         eprintln!("cubectl: {}", err);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn desktop_create_requires_unattended() {
+        let result = Cli::try_parse_from(["cubectl", "create", "test", "--desktop", "xfce"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn desktop_create_parses_credentials() {
+        let cli = Cli::try_parse_from([
+            "cubectl",
+            "create",
+            "test",
+            "--unattended",
+            "--desktop",
+            "plasma",
+            "--desktop-user",
+            "darcy",
+            "--desktop-password",
+            "secret",
+        ])
+        .expect("desktop create arguments should parse");
+
+        match cli.command {
+            Commands::Create(args) => {
+                assert_eq!(args.desktop.as_deref(), Some("plasma"));
+                assert_eq!(args.desktop_user, "darcy");
+                assert_eq!(args.desktop_password.as_deref(), Some("secret"));
+            }
+            command => panic!("expected create command, got {command:?}"),
+        }
     }
 }

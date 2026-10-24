@@ -66,6 +66,17 @@ class ManagerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("duplicate", result.stderr.lower())
 
+    def test_native_gui_override_replaces_saved_vnc(self):
+        config = self.config("native", vnc={"bind": "127.0.0.1:5999", "display": "1440x900"})
+        status = self.ctl.call("start", config, "--gui", "native")
+        spec = json.loads((self.state / "native/launch.json").read_text())
+        command = spec["command"]
+        self.assertEqual(command[command.index("--gui") + 1], "native")
+        self.assertEqual(command[command.index("--display") + 1], "1440x900")
+        self.assertNotIn("--vnc", command)
+        self.assertIsNone(status["vnc"])
+        self.assertNotIn("listen-port:5999", status["resources"])
+
     def test_instances_conflicts_and_stop_are_independent(self):
         first = self.config("first")
         second = self.config("second")

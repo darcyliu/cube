@@ -31,6 +31,9 @@ class VMCommandsSheetController: NSWindowController, NSWindowDelegate {
     private var rootVisualEffect: NSVisualEffectView!
     private var stackView: NSStackView!
     private var bottomBarView: NSView!
+    private var commandTextView: NSTextView!
+    private var launchButton: NSButton!
+    private var displayMode: CubeCommandDisplayMode
 
     deinit {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -39,6 +42,7 @@ class VMCommandsSheetController: NSWindowController, NSWindowDelegate {
     init(vm: VMInfo, parent: NSWindow? = nil) {
         self.vm = vm
         self.parentSheetWindow = parent
+        self.displayMode = vm.loadConfig().vnc == nil ? .native : .vnc
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
@@ -417,7 +421,24 @@ class VMCommandsSheetController: NSWindowController, NSWindowDelegate {
         c2Sub.textColor = CubeTokens.tertiaryText
         card.addSubview(c2Sub)
 
-        let cubeCmd = vm.generateCubeCommand()
+        let displayLabel = NSTextField(labelWithString: "Display:")
+        displayLabel.translatesAutoresizingMaskIntoConstraints = false
+        displayLabel.font = CubeTokens.bodyLabelFont
+        displayLabel.textColor = CubeTokens.secondaryText
+        card.addSubview(displayLabel)
+
+        let displayControl = NSSegmentedControl(
+            labels: ["VNC", "Native"],
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(displayModeChanged(_:))
+        )
+        displayControl.translatesAutoresizingMaskIntoConstraints = false
+        displayControl.selectedSegment = displayMode == .vnc ? 0 : 1
+        displayControl.toolTip = "Choose one graphical frontend for the generated command"
+        card.addSubview(displayControl)
+
+        let cubeCmd = vm.generateCubeCommand(displayMode: displayMode)
         let cmdScrollView = NSScrollView()
         cmdScrollView.translatesAutoresizingMaskIntoConstraints = false
         cmdScrollView.wantsLayer = true
@@ -430,18 +451,18 @@ class VMCommandsSheetController: NSWindowController, NSWindowDelegate {
         cmdScrollView.autohidesScrollers = true
         card.addSubview(cmdScrollView)
 
-        let cmdTextView = NSTextView()
-        cmdTextView.string = cubeCmd
-        cmdTextView.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
-        cmdTextView.textColor = NSColor(red: 0.90, green: 0.94, blue: 0.98, alpha: 1.0)
-        cmdTextView.backgroundColor = NSColor(white: 0.08, alpha: 1.0)
-        cmdTextView.drawsBackground = false
-        cmdTextView.isEditable = false
-        cmdTextView.isSelectable = true
-        cmdTextView.isVerticallyResizable = true
-        cmdTextView.isHorizontallyResizable = false
-        cmdTextView.textContainer?.widthTracksTextView = true
-        cmdScrollView.documentView = cmdTextView
+        commandTextView = NSTextView()
+        commandTextView.string = cubeCmd
+        commandTextView.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        commandTextView.textColor = NSColor(red: 0.90, green: 0.94, blue: 0.98, alpha: 1.0)
+        commandTextView.backgroundColor = NSColor(white: 0.08, alpha: 1.0)
+        commandTextView.drawsBackground = false
+        commandTextView.isEditable = false
+        commandTextView.isSelectable = true
+        commandTextView.isVerticallyResizable = true
+        commandTextView.isHorizontallyResizable = false
+        commandTextView.textContainer?.widthTracksTextView = true
+        cmdScrollView.documentView = commandTextView
 
         let copyEngineBtn = NSButton(title: "Copy Direct Command", target: self, action: #selector(copyEngineClicked(_:)))
         copyEngineBtn.translatesAutoresizingMaskIntoConstraints = false
@@ -450,12 +471,29 @@ class VMCommandsSheetController: NSWindowController, NSWindowDelegate {
         copyEngineBtn.font = NSFont.systemFont(ofSize: 11)
         card.addSubview(copyEngineBtn)
 
+        launchButton = NSButton(title: launchButtonTitle(), target: self, action: #selector(launchSelectedDisplay(_:)))
+        launchButton.translatesAutoresizingMaskIntoConstraints = false
+        launchButton.bezelStyle = .rounded
+        launchButton.controlSize = .small
+        launchButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        launchButton.isEnabled = !vm.isRunning
+        launchButton.toolTip = vm.isRunning ? "Stop the VM before launching it again" : "Start this managed VM using the selected display frontend"
+        card.addSubview(launchButton)
+
         NSLayoutConstraint.activate([
             c2Sub.topAnchor.constraint(equalTo: headerAnchor, constant: 8),
             c2Sub.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
             c2Sub.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
 
-            cmdScrollView.topAnchor.constraint(equalTo: c2Sub.bottomAnchor, constant: 6),
+            displayLabel.topAnchor.constraint(equalTo: c2Sub.bottomAnchor, constant: 8),
+            displayLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            displayLabel.centerYAnchor.constraint(equalTo: displayControl.centerYAnchor),
+
+            displayControl.topAnchor.constraint(equalTo: c2Sub.bottomAnchor, constant: 6),
+            displayControl.leadingAnchor.constraint(equalTo: displayLabel.trailingAnchor, constant: 8),
+            displayControl.widthAnchor.constraint(equalToConstant: 150),
+
+            cmdScrollView.topAnchor.constraint(equalTo: displayControl.bottomAnchor, constant: 8),
             cmdScrollView.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
             cmdScrollView.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
             cmdScrollView.heightAnchor.constraint(equalToConstant: 80),
@@ -463,7 +501,11 @@ class VMCommandsSheetController: NSWindowController, NSWindowDelegate {
             copyEngineBtn.topAnchor.constraint(equalTo: cmdScrollView.bottomAnchor, constant: 8),
             copyEngineBtn.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
             copyEngineBtn.heightAnchor.constraint(equalToConstant: 24),
-            copyEngineBtn.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+            copyEngineBtn.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
+
+            launchButton.centerYAnchor.constraint(equalTo: copyEngineBtn.centerYAnchor),
+            launchButton.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            launchButton.heightAnchor.constraint(equalToConstant: 24),
         ])
     }
 
@@ -498,7 +540,7 @@ class VMCommandsSheetController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func copyEngineClicked(_ sender: NSButton) {
-        let cubeCmd = vm.generateCubeCommand()
+        let cubeCmd = vm.generateCubeCommand(displayMode: displayMode)
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(cubeCmd, forType: .string)
@@ -510,6 +552,41 @@ class VMCommandsSheetController: NSWindowController, NSWindowDelegate {
             originalIcon: "doc.on.doc",
             duration: 1.2
         )
+    }
+
+    @objc private func displayModeChanged(_ sender: NSSegmentedControl) {
+        displayMode = sender.selectedSegment == 0 ? .vnc : .native
+        commandTextView.string = vm.generateCubeCommand(displayMode: displayMode)
+        launchButton.title = launchButtonTitle()
+    }
+
+    private func launchButtonTitle() -> String {
+        displayMode == .native ? "Start with Native Display" : "Start with VNC"
+    }
+
+    @objc private func launchSelectedDisplay(_ sender: NSButton) {
+        sender.isEnabled = false
+        let originalTitle = launchButtonTitle()
+        let mode = displayMode
+        sender.title = "Starting…"
+        VMManager.shared.startVM(name: vm.name, displayMode: mode) { [weak self, weak sender] success, error in
+            guard let self else { return }
+            sender?.title = originalTitle
+            sender?.isEnabled = !success
+            if !success {
+                let alert = NSAlert()
+                alert.messageText = "Failed to Start VM"
+                alert.informativeText = error ?? "Unknown error"
+                alert.alertStyle = .critical
+                alert.beginSheetModal(for: self.window!)
+            } else if mode == .vnc {
+                VMManager.shared.refreshVMs { vms in
+                    if let running = vms.first(where: { $0.name == self.vm.name }) {
+                        VMManager.shared.openVNC(for: running)
+                    }
+                }
+            }
+        }
     }
 
     @objc private func revealPathClicked(_ sender: NSButton) {

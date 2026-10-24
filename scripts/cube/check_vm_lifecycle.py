@@ -19,6 +19,17 @@ import tempfile
 import time
 
 
+def wait_for_file(path, text, timeout=45, count=1):
+    deadline = time.monotonic() + timeout
+    output = ""
+    while time.monotonic() < deadline:
+        output = path.read_text(errors="replace") if path.exists() else ""
+        if output.count(text) >= count:
+            return output
+        time.sleep(0.1)
+    raise AssertionError(f"Timed out waiting for {text!r} in {path}:\n{output[-4000:]}")
+
+
 OFF = "movz x0, #8\nmovk x0, #0x8400, lsl #16\nhvc #0\nb .\n"
 RESET = "movz x0, #9\nmovk x0, #0x8400, lsl #16\nhvc #0\nb .\n"
 CYCLE = """
@@ -100,11 +111,13 @@ def main():
                 with socket.socket() as sock:
                     sock.bind(("127.0.0.1", 0))
                     port = sock.getsockname()[1]
+                serial = directory / "freebsd.console.log"
                 vm = VM(binary, directory, "freebsd", ["--freebsd", args.kernel, "--cpus", 2,
                                                          "--vnc", f"127.0.0.1:{port}",
-                                                         "--display", "1024x768"])
+                                                         "--display", "1024x768",
+                                                         "--serial-log", serial])
                 machines.append(vm)
-                vm.wait_for("mountroot>", timeout=90)
+                wait_for_file(serial, "mountroot>", timeout=90)
                 sock, size = connect("127.0.0.1", port)
                 assert size == (1024, 768), size
                 key(sock, 0xffe1, 1)  # Drop the connection while Shift is held.
@@ -127,12 +140,15 @@ def main():
                     key(sock, symbol, 1)
                     key(sock, symbol, 0)
                     time.sleep(0.1)
-                vm.wait_for("mountroot>", count=2)
-                assert "\n.\n" in vm.text(), vm.text()[-2000:]
+                serial_output = wait_for_file(serial, "mountroot>", count=2)
+                assert "mountroot> ." in serial_output, serial_output[-2000:]
                 sock.close()
                 vm.wait_for("Session metrics:", count=2)
-                vm.finish(stop=True)
-                print("PASS FreeBSD SMP, custom VNC geometry, region/RGB565, pointer events, held-key cleanup, metrics, Ctrl-]", flush=True)
+                vm.proc.terminate()
+                code = vm.proc.wait(timeout=15)
+                assert code == 0, vm.text()[-4000:]
+                vm.log.close()
+                print("PASS FreeBSD SMP, custom VNC geometry, region/RGB565, pointer events, held-key cleanup, metrics, SIGTERM", flush=True)
             if args.firmware:
                 vm = VM(binary, directory, "uefi", ["--uefi", args.firmware, "--cpus", 2,
                                                     "--efi-vars", directory / "vars.fd"])

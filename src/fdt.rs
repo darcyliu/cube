@@ -31,6 +31,26 @@ pub fn generate_dtb(
     xhci: Option<XhciMmioDevice>,
     initrd: Option<(u64, u64)>,
 ) -> Result<Vec<u8>, String> {
+    generate_dtb_ext(
+        ram_base, ram_size, bootargs, num_cpus, virtio_devices, framebuffer, xhci, initrd, false,
+    )
+}
+
+/// Like [`generate_dtb`]. With `single_memory_node` (UEFI boot), the memory node
+/// stays one contiguous range because EDK2's QemuVirtMemInfo cannot parse a split
+/// one; the framebuffer is excluded from guest RAM via `/reserved-memory`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_dtb_ext(
+    ram_base: u64,
+    ram_size: u64,
+    bootargs: &str,
+    num_cpus: usize,
+    virtio_devices: &[VirtioMmioDevice],
+    framebuffer: Option<crate::devices::display::FramebufferConfig>,
+    xhci: Option<XhciMmioDevice>,
+    initrd: Option<(u64, u64)>,
+    single_memory_node: bool,
+) -> Result<Vec<u8>, String> {
     let mut fdt = FdtWriter::new().map_err(|e| format!("FDT init error: {:?}", e))?;
 
     // Root node
@@ -125,16 +145,20 @@ pub fn generate_dtb(
         if fb.gpa < ram_base || fb_end > end {
             return Err("Framebuffer is outside guest RAM".into());
         }
-        let mut ranges = Vec::new();
-        if fb.gpa > ram_base {
-            ranges.push(ram_base);
-            ranges.push(fb.gpa - ram_base);
+        if single_memory_node {
+            vec![ram_base, ram_size]
+        } else {
+            let mut ranges = Vec::new();
+            if fb.gpa > ram_base {
+                ranges.push(ram_base);
+                ranges.push(fb.gpa - ram_base);
+            }
+            if fb_end < end {
+                ranges.push(fb_end);
+                ranges.push(end - fb_end);
+            }
+            ranges
         }
-        if fb_end < end {
-            ranges.push(fb_end);
-            ranges.push(end - fb_end);
-        }
-        ranges
     } else {
         vec![ram_base, ram_size]
     };
@@ -142,6 +166,20 @@ pub fn generate_dtb(
     fdt.property_string("device_type", "memory").map_err(|e| e.to_string())?;
     fdt.property_array_u64("reg", &memory_ranges).map_err(|e| e.to_string())?;
     fdt.end_node(memory).map_err(|e| e.to_string())?;
+
+    if let (Some(fb), true) = (framebuffer, single_memory_node) {
+        let rm = fdt.begin_node("reserved-memory").map_err(|e| e.to_string())?;
+        fdt.property_u32("#address-cells", 2).map_err(|e| e.to_string())?;
+        fdt.property_u32("#size-cells", 2).map_err(|e| e.to_string())?;
+        fdt.property_null("ranges").map_err(|e| e.to_string())?;
+        let rm_fb = fdt
+            .begin_node(&format!("framebuffer@{:x}", fb.gpa))
+            .map_err(|e| e.to_string())?;
+        fdt.property_array_u64("reg", &[fb.gpa, fb.reg_size]).map_err(|e| e.to_string())?;
+        fdt.property_null("no-map").map_err(|e| e.to_string())?;
+        fdt.end_node(rm_fb).map_err(|e| e.to_string())?;
+        fdt.end_node(rm).map_err(|e| e.to_string())?;
+    }
 
     // In GICv3, each vCPU has a 128KB (0x20000) Redistributor region (RD_base + SGI_base)
     let redist_size = (cpus_count as u64) * 0x20000;

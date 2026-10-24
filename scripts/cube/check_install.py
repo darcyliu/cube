@@ -444,11 +444,11 @@ def run(args, directory):
                 require(services is not None and services.returncode == 0,
                         f"Could not configure {args.desktop_environment}/D-Bus/login manager; "
                         "see ssh.log")
-                hid_service = (Path(__file__).resolve().parents[1] / "freebsd-vmm-hid.rc").read_text()
+                hid_service = (Path(__file__).resolve().parents[1] / "freebsd-cube-hid.rc").read_text()
                 persist_hid = execute(
-                    "cat > /usr/local/etc/rc.d/vmm_hid && "
-                    "chmod 555 /usr/local/etc/rc.d/vmm_hid && "
-                    "sysrc vmm_hid_enable=YES && service vmm_hid onestart",
+                    "cat > /usr/local/etc/rc.d/cube_hid && "
+                    "chmod 555 /usr/local/etc/rc.d/cube_hid && "
+                    "sysrc cube_hid_enable=YES && service cube_hid onestart",
                     deadline, input_text=hid_service)
                 require(persist_hid is not None and persist_hid.returncode == 0,
                         "Could not install the boot-time USB tablet reprobe; see ssh.log")
