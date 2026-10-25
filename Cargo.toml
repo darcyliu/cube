@@ -2,7 +2,7 @@
 name = "cube"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.89.0"
 description = "Lightweight macOS ARM64 Hypervisor.framework Virtual Machine Monitor and CLI manager"
 readme = "README.md"
 homepage = "https://github.com/darcyliu/cube"
@@ -18,6 +18,7 @@ include = [
     "/entitlements.plist",
     "/src/**/*",
     "/guest/**/*",
+    "/scripts/freebsd-cube-hid.rc",
 ]
 
 [dependencies]
