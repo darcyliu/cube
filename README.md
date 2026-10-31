@@ -17,3 +17,15 @@ make test
 ```
 
 `make sign` codesigns with `entitlements.plist`. `make test` is `cargo test --lib`.
+
+## Quick start
+
+On an Intel Mac running macOS 10.15 or newer, sign the binary before it starts a guest:
+
+```bash
+make build
+make sign
+./target/debug/vmm --uefi --disk disk.img --cpus 2 --ram 1024
+```
+
+`--uefi` is the firmware boot (`firmware/OVMF_CODE.fd` unless a path is given). EFI variables persist in `disk.img.vars.fd`; `--efi-vars PATH` overrides that. The first boot copies `firmware/OVMF_VARS.fd` (540672 bytes) into the store, and later boots open the same file. `--cow` attaches each `--disk` through a `PATH.cow` overlay. Do not combine `cow` and `ro`. With no arguments, `vmm` prints help and exits 1.

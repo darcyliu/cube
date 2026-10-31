@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 
+use vmm::cli::{self, DiskSpec, NetConfig};
 use vmm::devices::MmioBus;
 use vmm::devices::PioBus;
 use vmm::devices::cmos::Cmos;
@@ -23,37 +24,11 @@ use vmm::forward::{self, ForwardRule, PortForward};
 use vmm::gpa::{self, GuestSpace};
 use vmm::memory::GuestMemory;
 use vmm::terminal::{self, TerminalGuard};
-use vmm::x86::{self, GUEST_RAM_BYTES, PAYLOAD_GPA, UEFI_RAM_BYTES};
+use vmm::x86::{self, GUEST_RAM_BYTES, PAYLOAD_GPA};
 
 use crate::hypervisor::*;
 use crate::machine::Machine;
 use crate::vcpu::{self, Entry, Kick, VcpuDone};
-
-/// One virtio-blk image. `cow` uses `<path>.cow` and cannot be combined with `read_only`.
-pub struct DiskSpec {
-    pub path: PathBuf,
-    pub cow: bool,
-    pub read_only: bool,
-}
-
-/// `--net` omitted stays `none`, so the payload and OVMF smokes do not need root.
-pub struct NetConfig {
-    pub mode: String,
-    pub mac: [u8; 6],
-    pub socket: Option<PathBuf>,
-    pub ssh_port: Option<u16>,
-}
-
-impl Default for NetConfig {
-    fn default() -> Self {
-        Self {
-            mode: "none".into(),
-            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
-            socket: None,
-            ssh_port: None,
-        }
-    }
-}
 
 struct VmGuard;
 
@@ -69,11 +44,12 @@ pub fn run_payload(
     path: Option<PathBuf>,
     serial_log: Option<PathBuf>,
     cpus: u32,
+    ram_mb: Option<u32>,
     disks: Vec<DiskSpec>,
     net: NetConfig,
     forwards: Vec<ForwardRule>,
 ) -> Vec<VcpuDone> {
-    match run_payload_inner(path, serial_log, cpus, disks, net, forwards) {
+    match run_payload_inner(path, serial_log, cpus, ram_mb, disks, net, forwards) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
     }
@@ -83,11 +59,22 @@ pub fn run_uefi(
     firmware: PathBuf,
     serial_log: Option<PathBuf>,
     cpus: u32,
+    ram_mb: Option<u32>,
     disks: Vec<DiskSpec>,
     net: NetConfig,
     forwards: Vec<ForwardRule>,
+    efi_vars: Option<PathBuf>,
 ) -> Vec<VcpuDone> {
-    match run_uefi_inner(firmware, serial_log, cpus, disks, net, forwards) {
+    match run_uefi_inner(
+        firmware,
+        serial_log,
+        cpus,
+        ram_mb,
+        disks,
+        net,
+        forwards,
+        efi_vars,
+    ) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
     }
@@ -105,13 +92,20 @@ fn run_payload_inner(
     path: Option<PathBuf>,
     serial_log: Option<PathBuf>,
     cpus: u32,
+    ram_mb: Option<u32>,
     disks: Vec<DiskSpec>,
     net: NetConfig,
     forwards: Vec<ForwardRule>,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let bytes = load_payload(path)?;
-    let mem = Arc::new(GuestMemory::allocate(0, GUEST_RAM_BYTES)?);
+    let ram_bytes = match ram_mb {
+        Some(mb) => cli::ram_bytes(mb)?,
+        None => GUEST_RAM_BYTES,
+    };
+    // Tables have to fit under the stack page. Reject before the guest allocation.
+    x86::identity_map_fits(ram_bytes as u64)?;
+    let mem = Arc::new(GuestMemory::allocate(0, ram_bytes)?);
     let cr3 = x86::install_identity_map(&mem)?;
     x86::write_gdt_tss(&mem)?;
     let entry = PAYLOAD_GPA;
@@ -150,9 +144,11 @@ fn run_uefi_inner(
     firmware: PathBuf,
     serial_log: Option<PathBuf>,
     cpus: u32,
+    ram_mb: Option<u32>,
     disks: Vec<DiskSpec>,
     net: NetConfig,
     forwards: Vec<ForwardRule>,
+    efi_vars: Option<PathBuf>,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let code_bytes =
@@ -176,18 +172,20 @@ fn run_uefi_inner(
             gpa::VARS_FLASH_SIZE
         ));
     }
-    let mut store = firmware.clone().into_os_string();
-    store.push(".vars.fd");
-    let flash = CfiPflash::open(Path::new(&store), template, 4096)?;
+    // First boot copies the template. Later boots reopen this same file.
+    let store = cli::efi_store_path(efi_vars.as_deref(), &disks);
+    eprintln!("[VMM] EFI variable store {}", store.display());
+    let flash = CfiPflash::open(&store, template, 4096)?;
 
-    let ram = Arc::new(GuestMemory::allocate(0, UEFI_RAM_BYTES)?);
+    let ram_bytes = cli::ram_bytes(ram_mb.unwrap_or(cli::DEFAULT_RAM_MB))?;
+    let ram = Arc::new(GuestMemory::allocate(0, ram_bytes)?);
     let code = Arc::new(GuestMemory::from_buffer(gpa::CODE_FLASH_BASE, &code_bytes)?);
     // A missing image, forward bind, or NIC must not call hv_vm_create.
     let blocks = load_blocks(&ram, &disks)?;
     let (nic, _forwards) = attach_net(&ram, &net, &forwards)?;
     let pci = assemble_pci(blocks, nic, true)?.expect("UEFI always has a PCI host");
     let gsis = pci.virtio_gsis();
-    let tables = vmm::acpi::build_with_prt(cpus, UEFI_RAM_BYTES as u64, &pci.prt());
+    let tables = vmm::acpi::build_with_prt(cpus, ram_bytes as u64, &pci.prt());
     let cfg = FwCfg::from_files(
         Arc::clone(&ram),
         &[
@@ -225,7 +223,7 @@ fn run_uefi_inner(
     let mut pio = standard_pio(serial.clone());
     // DMA low is a dword at 0x518, so the window runs through 0x51B.
     pio.register(0x510, 12, Arc::new(FwCfgPio::new(cfg)));
-    pio.register(0x70, 2, Arc::new(Cmos::new(UEFI_RAM_BYTES as u64)));
+    pio.register(0x70, 2, Arc::new(Cmos::new(ram_bytes as u64)));
     let kbd = Arc::new(I8042::new());
     pio.register(0x60, 5, kbd.clone());
     let mut mmio = MmioBus::new();

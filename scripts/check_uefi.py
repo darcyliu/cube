@@ -14,6 +14,7 @@ VARS = os.path.join(ROOT, "firmware", "OVMF_VARS.fd")
 ENTITLEMENTS = os.path.join(ROOT, "entitlements.plist")
 LOG = os.path.join(ROOT, "target", "check_uefi.log")
 SERIAL = os.path.join(ROOT, "target", "check_uefi-serial.log")
+VARS_STORE = os.path.join(ROOT, "target", "check_uefi.vars.fd")
 MARKERS = (b"UEFI Interactive Shell", b"EDK II", b"BdsDxe")
 TIMEOUT_S = 60
 
@@ -72,6 +73,8 @@ def main():
             "1",
             "--uefi",
             "firmware/OVMF_CODE.fd",
+            "--efi-vars",
+            VARS_STORE,
             "--serial-log",
             SERIAL,
         ],

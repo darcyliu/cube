@@ -6,8 +6,8 @@ use crate::memory::GuestMemory;
 
 /// 64 MiB identity map at GPA 0, entered at [`PAYLOAD_GPA`].
 pub const GUEST_RAM_BYTES: usize = 64 * 1024 * 1024;
-/// OVMF RAM. No `--ram` flag; E820 and CMOS use this size.
-pub const UEFI_RAM_BYTES: usize = 128 * 1024 * 1024;
+/// Default OVMF RAM. `--ram` / `-m` selects the size (default 1024 MiB, max 3072).
+pub const UEFI_RAM_BYTES: usize = 1024 * 1024 * 1024;
 pub const PAYLOAD_GPA: u64 = 0x10_0000;
 pub const STACK_GPA: u64 = 0x8_0000;
 pub const GDT_GPA: u64 = 0x1000;
@@ -58,30 +58,48 @@ pub fn vmx_cap_control(cap: u64, desired: u64) -> u64 {
     (desired | must_1) & may_1
 }
 
+/// `[STACK_GPA - 0x1000, STACK_GPA)` is the payload stack. `RSP` is `STACK_GPA`,
+/// so the first `PUSH` writes that page. Page tables must end at or below it.
+const STACK_PAGE: u64 = STACK_GPA - 0x1000;
+
+/// Reject a payload RAM size whose 4 KiB tables would touch the stack page.
+/// Identity PTs grow up from [`PT_GPA`]. The I/O APIC and LAPIC then need one
+/// shared PD plus a PT each (three pages), both above 3 GiB.
+pub fn identity_map_fits(ram: u64) -> Result<(), String> {
+    if ram == 0 || ram % 0x1000 != 0 {
+        return Err("identity map requires a 4 KiB multiple".into());
+    }
+    let n_pt = (ram / 0x1000).div_ceil(512);
+    if n_pt == 0 || n_pt > 512 {
+        return Err(format!(
+            "identity map page-table count {n_pt} is out of range"
+        ));
+    }
+    let end = PT_GPA + (n_pt + 3) * 0x1000;
+    if end > STACK_PAGE || end > PAYLOAD_GPA || end > ram {
+        return Err("page tables overlap the payload, stack, or end of RAM".into());
+    }
+    Ok(())
+}
+
 /// Identity-map `[0, ram)` with 4 KiB pages. Returns the PML4 guest physical address (CR3).
 pub fn install_identity_map(mem: &GuestMemory) -> Result<u64, String> {
     if mem.guest_base() != 0 {
         return Err("identity map requires guest RAM at GPA 0".into());
     }
     let ram = mem.size() as u64;
-    if ram % 0x1000 != 0 {
-        return Err("identity map requires a 4 KiB multiple".into());
-    }
+    // Fail before any table store, including the stack page.
+    identity_map_fits(ram)?;
     let n_pages = (ram / 0x1000) as usize;
     let n_pt = n_pages.div_ceil(512);
-    if n_pt == 0 || n_pt > 512 {
-        return Err(format!(
-            "identity map page-table count {n_pt} is out of range"
-        ));
-    }
     let tables_end = PT_GPA + (n_pt as u64) * 0x1000;
-    if tables_end > PAYLOAD_GPA || tables_end > STACK_GPA || tables_end > ram {
-        return Err("page tables overlap the payload, stack, or end of RAM".into());
-    }
     mem.write_u64(PML4_GPA, PDPT_GPA | TABLE_FLAGS)?;
     mem.write_u64(PDPT_GPA, PD_GPA | TABLE_FLAGS)?;
     for i in 0..n_pt {
         let pt = PT_GPA + (i as u64) * 0x1000;
+        if pt.saturating_add(0x1000) > STACK_PAGE {
+            return Err("page tables overlap the payload, stack, or end of RAM".into());
+        }
         mem.write_u64(PD_GPA + (i as u64) * 8, pt | TABLE_FLAGS)?;
         for j in 0..512 {
             let pfn = i * 512 + j;
@@ -96,7 +114,7 @@ pub fn install_identity_map(mem: &GuestMemory) -> Result<u64, String> {
     let mut extra = tables_end;
     map_identity_page(mem, IOAPIC_MMIO, &mut extra)?;
     map_identity_page(mem, LAPIC_MMIO, &mut extra)?;
-    if extra > PAYLOAD_GPA || extra > STACK_GPA || extra > ram {
+    if extra > STACK_PAGE || extra > PAYLOAD_GPA || extra > ram {
         return Err("MMIO page tables overlap the payload, stack, or end of RAM".into());
     }
     Ok(PML4_GPA)
@@ -117,7 +135,14 @@ fn ensure_table(mem: &GuestMemory, entry_gpa: u64, extra: &mut u64) -> Result<u6
         return Ok(entry & 0x000f_ffff_ffff_f000);
     }
     let page = *extra;
-    *extra += 0x1000;
+    let next = page
+        .checked_add(0x1000)
+        .ok_or_else(|| "page table address overflow".to_string())?;
+    // Do not store a table into the stack page. The check runs before the write.
+    if next > STACK_PAGE || next > PAYLOAD_GPA {
+        return Err("MMIO page tables overlap the payload, stack, or end of RAM".into());
+    }
+    *extra = next;
     mem.write_u64(entry_gpa, page | TABLE_FLAGS)?;
     Ok(page)
 }
@@ -232,6 +257,25 @@ mod tests {
         let leaf = mem.read_u64(PT_GPA).unwrap();
         assert_eq!(leaf & PAGE_FLAGS, PAGE_FLAGS);
         assert_eq!(leaf & (1 << 7), 0);
+    }
+
+    #[test]
+    fn large_payload_ram_does_not_alias_the_stack_page() {
+        let mib = 1024 * 1024u64;
+        assert!(identity_map_fits(1024 * mib).is_err());
+        assert!(identity_map_fits(240 * mib).is_err());
+        assert!(identity_map_fits(239 * mib).is_err());
+        assert!(identity_map_fits(238 * mib).is_ok());
+        assert!(identity_map_fits(GUEST_RAM_BYTES as u64).is_ok());
+
+        let mem = GuestMemory::allocate(0, (239 * mib) as usize).unwrap();
+        assert!(install_identity_map(&mem).is_err());
+        let mut stack_page = [0u8; 0x1000];
+        mem.read(STACK_GPA - 0x1000, &mut stack_page).unwrap();
+        assert!(
+            stack_page.iter().all(|&byte| byte == 0),
+            "239 MiB placed a page table in [0x7F000, 0x80000)"
+        );
     }
 
     #[test]

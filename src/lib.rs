@@ -1,4 +1,5 @@
 pub mod acpi;
+pub mod cli;
 pub mod cow;
 pub mod cpuid;
 pub mod decode;

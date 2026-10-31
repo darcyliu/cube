@@ -9,12 +9,10 @@ mod machine;
 mod vcpu;
 mod vm;
 
-use std::path::PathBuf;
+use std::os::unix::process::CommandExt;
 use std::process;
 
-use std::os::unix::process::CommandExt;
-
-use vmm::forward::ForwardRule;
+use vmm::cli::{self, Boot};
 
 fn main() {
     enforce_host_gate();
@@ -26,28 +24,37 @@ fn main() {
         }
         return;
     }
-    match parse_args() {
-        Cli::Help => {
-            print_help();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match cli::parse(&args) {
+        cli::Cli::Help => {
+            println!("{}", cli::help_text());
             process::exit(1);
         }
-        Cli::Error(message) => {
+        cli::Cli::Error(message) => {
             eprintln!("{message}");
             process::exit(1);
         }
-        Cli::Run {
-            boot,
-            serial_log,
-            cpus,
-            disks,
-            net,
-            forwards,
-        } => {
-            let dones = match boot {
-                Boot::Payload(path) => {
-                    vm::run_payload(path, serial_log, cpus, disks, net, forwards)
-                }
-                Boot::Uefi(path) => vm::run_uefi(path, serial_log, cpus, disks, net, forwards),
+        cli::Cli::Run(run) => {
+            let dones = match run.boot {
+                Boot::Payload(path) => vm::run_payload(
+                    path,
+                    run.serial_log,
+                    run.cpus,
+                    run.ram_mb,
+                    run.disks,
+                    run.net,
+                    run.forwards,
+                ),
+                Boot::Uefi(path) => vm::run_uefi(
+                    path,
+                    run.serial_log,
+                    run.cpus,
+                    run.ram_mb,
+                    run.disks,
+                    run.net,
+                    run.forwards,
+                    run.efi_vars,
+                ),
             };
             let mut failed = false;
             for done in dones {
@@ -80,270 +87,6 @@ fn main() {
     }
 }
 
-enum Boot {
-    Payload(Option<PathBuf>),
-    Uefi(PathBuf),
-}
-
-enum Cli {
-    Help,
-    Error(String),
-    Run {
-        boot: Boot,
-        serial_log: Option<PathBuf>,
-        cpus: u32,
-        disks: Vec<vm::DiskSpec>,
-        net: vm::NetConfig,
-        forwards: Vec<ForwardRule>,
-    },
-}
-
-fn parse_args() -> Cli {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        return Cli::Help;
-    }
-    let mut payload: Option<Option<PathBuf>> = None;
-    let mut uefi: Option<PathBuf> = None;
-    let mut serial_log = None;
-    let mut cpus = 1u32;
-    let mut cdrom: Option<PathBuf> = None;
-    let mut disks = Vec::new();
-    let mut net = vm::NetConfig::default();
-    let mut forwards = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => return Cli::Help,
-            "--cpus" | "-c" => {
-                let Some(text) = args.get(i + 1) else {
-                    return Cli::Error("--cpus needs a count".into());
-                };
-                if text.starts_with('-') {
-                    return Cli::Error("--cpus needs a count".into());
-                }
-                let Ok(n) = text.parse::<u32>() else {
-                    return Cli::Error("--cpus needs a count".into());
-                };
-                if !(1..=16).contains(&n) {
-                    return Cli::Error("--cpus must be from 1 to 16".into());
-                }
-                cpus = n;
-                i += 1;
-            }
-            "--payload" => {
-                let path = args
-                    .get(i + 1)
-                    .filter(|next| !next.starts_with('-'))
-                    .cloned();
-                if path.is_some() {
-                    i += 1;
-                }
-                payload = Some(path.map(PathBuf::from));
-            }
-            "--uefi" | "--firmware" => {
-                if uefi.is_some() {
-                    return Cli::Error("pass only one of --uefi and --firmware".into());
-                }
-                let path = args
-                    .get(i + 1)
-                    .filter(|next| !next.starts_with('-'))
-                    .cloned();
-                if path.is_some() {
-                    i += 1;
-                }
-                uefi = Some(PathBuf::from(
-                    path.unwrap_or_else(|| "firmware/OVMF_CODE.fd".to_string()),
-                ));
-            }
-            "--cdrom" | "--iso" => {
-                if cdrom.is_some() {
-                    return Cli::Error("pass only one of --cdrom and --iso".into());
-                }
-                let Some(path) = args.get(i + 1) else {
-                    return Cli::Error("--cdrom needs a path".into());
-                };
-                if path.starts_with('-') {
-                    return Cli::Error("--cdrom needs a path".into());
-                }
-                cdrom = Some(PathBuf::from(path));
-                i += 1;
-            }
-            "--disk" | "-d" => {
-                let Some(text) = args.get(i + 1) else {
-                    return Cli::Error("--disk needs a path".into());
-                };
-                if text.starts_with('-') {
-                    return Cli::Error("--disk needs a path".into());
-                }
-                match parse_disk(text) {
-                    Ok(disk) => disks.push(disk),
-                    Err(message) => return Cli::Error(message),
-                }
-                i += 1;
-            }
-            "--serial-log" | "--console-log" => {
-                let Some(path) = args.get(i + 1) else {
-                    return Cli::Error("--serial-log needs a path".into());
-                };
-                if path.starts_with('-') {
-                    return Cli::Error("--serial-log needs a path".into());
-                }
-                serial_log = Some(PathBuf::from(path));
-                i += 1;
-            }
-            "--net" | "-n" => {
-                let Some(mode) = args.get(i + 1).filter(|mode| !mode.starts_with('-')) else {
-                    return Cli::Error(
-                        "--net needs vmnet, vmnet-proxy, bridge[:interface], tap:<path>, mock, or none"
-                            .into(),
-                    );
-                };
-                net.mode = mode.clone();
-                i += 1;
-            }
-            "--vmnet-socket" => {
-                let Some(path) = args.get(i + 1).filter(|path| !path.starts_with('-')) else {
-                    return Cli::Error("--vmnet-socket needs a path".into());
-                };
-                net.socket = Some(PathBuf::from(path));
-                i += 1;
-            }
-            "--mac" => {
-                let Some(text) = args.get(i + 1).filter(|text| !text.starts_with('-')) else {
-                    return Cli::Error("--mac needs an address like 52:54:00:12:34:56".into());
-                };
-                let Some(mac) = parse_mac(text) else {
-                    return Cli::Error("--mac needs an address like 52:54:00:12:34:56".into());
-                };
-                net.mac = mac;
-                i += 1;
-            }
-            "--forward" => {
-                let Some(rule) = args.get(i + 1).filter(|rule| !rule.starts_with('-')) else {
-                    return Cli::Error("--forward needs HOST_IP:PORT=GUEST_IP:PORT".into());
-                };
-                match ForwardRule::parse(rule) {
-                    Ok(rule) => forwards.push(rule),
-                    Err(message) => return Cli::Error(message),
-                }
-                i += 1;
-            }
-            "--ssh-port" => {
-                let Some(port) = args
-                    .get(i + 1)
-                    .filter(|text| !text.starts_with('-'))
-                    .and_then(|text| text.parse::<u16>().ok())
-                    .filter(|port| *port != 0)
-                else {
-                    return Cli::Error("--ssh-port needs a nonzero port".into());
-                };
-                net.ssh_port = Some(port);
-                i += 1;
-            }
-            other => return Cli::Error(format!("unknown argument {other}")),
-        }
-        i += 1;
-    }
-    let mut images = Vec::new();
-    if let Some(path) = cdrom {
-        // The ISO is vtbd0 even when --disk appears earlier on the command line.
-        images.push(vm::DiskSpec {
-            path,
-            cow: false,
-            read_only: true,
-        });
-    }
-    images.extend(disks);
-    match (payload, uefi) {
-        (Some(_), Some(_)) => Cli::Error("pass only one of --payload and --uefi/--firmware".into()),
-        (Some(path), None) => Cli::Run {
-            boot: Boot::Payload(path),
-            serial_log,
-            cpus,
-            disks: images,
-            net,
-            forwards,
-        },
-        (None, Some(path)) => Cli::Run {
-            boot: Boot::Uefi(path),
-            serial_log,
-            cpus,
-            disks: images,
-            net,
-            forwards,
-        },
-        (None, None) => Cli::Error("no boot path; pass --payload".into()),
-    }
-}
-
-fn parse_disk(text: &str) -> Result<vm::DiskSpec, String> {
-    let mut parts = text.split(',');
-    let path = parts.next().unwrap_or("");
-    if path.is_empty() {
-        return Err("--disk needs a path".into());
-    }
-    let mut cow = false;
-    let mut read_only = false;
-    for flag in parts {
-        match flag {
-            "cow" => cow = true,
-            "ro" => read_only = true,
-            _ => return Err(format!("--disk flag {flag} is not cow or ro")),
-        }
-    }
-    if cow && read_only {
-        return Err("--disk cannot combine cow and ro".into());
-    }
-    Ok(vm::DiskSpec {
-        path: PathBuf::from(path),
-        cow,
-        read_only,
-    })
-}
-
-fn parse_mac(text: &str) -> Option<[u8; 6]> {
-    let parts: Vec<&str> = text.split(|c| c == ':' || c == '-').collect();
-    if parts.len() != 6 {
-        return None;
-    }
-    let mut mac = [0u8; 6];
-    for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16).ok()?;
-    }
-    Some(mac)
-}
-
-fn print_help() {
-    println!(
-        "\
-vmm-intel: Intel-only x86_64 guest on macOS 10.15+ (Hypervisor.framework VMX).
-
-This fork does not run on Apple Silicon and must not be merged back into the
-AArch64 VMM.
-
-Usage:
-  vmm --payload [PATH] [--cpus N]
-                         Long-mode guest. PATH defaults to the built-in COM1 banner.
-  vmm --uefi [PATH] [--cpus N]
-  vmm --firmware [PATH] [--cpus N]
-                         OVMF. PATH defaults to firmware/OVMF_CODE.fd.
-                         --cpus / -c is 1..=16 (default 1). vCPU 0 is the BSP.
-                         --disk / -d PATH[,cow][,ro]  virtio-blk, repeatable.
-                         --cdrom / --iso PATH         read-only virtio-blk, first disk.
-                         --net / -n MODE              vmnet, vmnet-proxy, bridge[:interface],
-                                                      tap:<path>, mock, or none (default none).
-                         --vmnet-socket PATH          socket for vmnet-proxy
-                                                      (default ~/Library/Application Support/vmm/vmnet.sock).
-                         --mac MAC                    default 52:54:00:12:34:56.
-                         --forward HOST:PORT=GUEST:PORT
-                                                      TCP forward, repeatable.
-                         --ssh-port PORT              localhost PORT to this guest's DHCP address:22.
-  vmm --vmnet-service [--subnet CIDR | --bridge [IFACE]]
-
-With no arguments, vmm prints this help and exits 1."
-    );
-}
 
 /// Marketing major >= 10, before any `hv_*` call.
 /// 10.15 may omit `kern.osproductversion`; Darwin 19 is macOS 10.15.

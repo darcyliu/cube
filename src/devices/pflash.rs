@@ -420,6 +420,43 @@ mod tests {
     }
 
     #[test]
+    fn programmed_byte_survives_reopen_and_4k_erase_keeps_fv_header() {
+        const VARS_LEN: usize = 540672;
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path("ovmf.vars.fd");
+        let mut template = vec![0xff; VARS_LEN];
+        // EFI firmware-volume signature. It lives in the first 4 KiB block.
+        template[0x28..0x2c].copy_from_slice(b"_FVH");
+        let mut flash = CfiPflash::open(&path, template, 4096).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), VARS_LEN as u64);
+        flash.write(0x2100, CMD_PROGRAM as u64, 1);
+        flash.write(0x2100, 0x3c, 1);
+        flash.shutdown().unwrap();
+        drop(flash);
+
+        let mut flash = CfiPflash::open(&path, vec![0xff; VARS_LEN], 4096).unwrap();
+        assert_eq!(flash.read(0x2100, 1) & 0xff, 0x3c);
+        let header = flash.storage[..0x1000].to_vec();
+        assert_eq!(&header[0x28..0x2c], b"_FVH");
+        flash.write(0x1000, CMD_ERASE as u64, 1);
+        flash.write(0x1000, CMD_CONFIRM as u64, 1);
+        flash.shutdown().unwrap();
+        drop(flash);
+
+        let image = std::fs::read(&path).unwrap();
+        assert_eq!(&image[..0x1000], header.as_slice());
+        assert_eq!(image[0x1000..0x2000].len(), 4096);
+        assert!(image[0x1000..0x2000].iter().all(|&b| b == 0xff));
+        assert_eq!(image[0x2100], 0x3c);
+        let mut flash = CfiPflash::open(&path, vec![0xff; VARS_LEN], 4096).unwrap();
+        assert_eq!(flash.read(0x2100, 1) & 0xff, 0x3c);
+        assert_eq!(
+            flash.read(0x28, 4) & 0xffff_ffff,
+            u32::from_le_bytes(*b"_FVH") as u64
+        );
+    }
+
+    #[test]
     fn erase_clears_one_4k_block_of_ovmf_vars() {
         const VARS_LEN: usize = 540672;
         let mut flash = CfiPflash::new(vec![0xa5; VARS_LEN], 4096);
