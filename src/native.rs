@@ -195,17 +195,17 @@ extern "C" fn vmm_native_key(mac_keycode: u16, down: bool) {
 
 #[unsafe(no_mangle)]
 extern "C" fn vmm_native_pointer(x: u16, y: u16, buttons: u8) {
-    let (usb, sx, sy, buttons) = {
+    let (usb, sx, sy) = {
         let mut lock = lock_attached();
         let Some(state) = lock.as_mut() else { return };
         state.position = (x, y);
+        // Bits 0–2 are the buttons release must clear. Bits 8 and 16 are the wheel.
         state.buttons = buttons & 7;
         let cfg = state.fb.config();
         (
             Arc::clone(&state.usb),
             scale_axis(x, cfg.width, state.tablet.0),
             scale_axis(y, cfg.height, state.tablet.1),
-            state.buttons,
         )
     };
     lock_usb(&usb).pointer_event(sx, sy, buttons);
@@ -388,6 +388,14 @@ mod tests {
         let report = usb.lock().unwrap().tablet_report();
         assert_eq!(u16::from_le_bytes([report[1], report[2]]), 0x7fff);
         assert_eq!(u16::from_le_bytes([report[3], report[4]]), 0x7fff);
+        vmm_native_pointer(1, 1, 1 | 8);
+        let report = usb.lock().unwrap().tablet_report();
+        assert_eq!(report[0] & 1, 1);
+        assert_eq!(report[5], 1);
+        vmm_native_pointer(1, 1, 1);
+        assert_eq!(usb.lock().unwrap().tablet_report()[5], 0);
+        vmm_native_pointer(1, 1, 16);
+        assert_eq!(usb.lock().unwrap().tablet_report()[5], 255);
         vmm_native_release_input();
         assert_eq!(usb.lock().unwrap().keyboard_report(), [0; 8]);
 

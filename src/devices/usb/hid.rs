@@ -174,6 +174,10 @@ impl HidFrontend {
         r[0] = self.tablet_buttons;
         r[1..3].copy_from_slice(&self.tablet_x.to_le_bytes());
         r[3..5].copy_from_slice(&self.tablet_y.to_le_bytes());
+        // The wheel is a one-shot on the queued report, not a latched axis.
+        if let Some(queued) = self.tablet_pending.back() {
+            r[5] = queued[5];
+        }
         r
     }
 }
