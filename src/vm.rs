@@ -78,6 +78,7 @@ pub fn run_uefi(
     share: Option<ShareConfig>,
     vnc: Option<SocketAddr>,
     display: Option<(u32, u32)>,
+    gui: bool,
 ) -> Vec<VcpuDone> {
     match run_uefi_inner(
         firmware,
@@ -91,6 +92,7 @@ pub fn run_uefi(
         share,
         vnc,
         display,
+        gui,
     ) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
@@ -188,6 +190,7 @@ fn run_uefi_inner(
     share: Option<ShareConfig>,
     vnc: Option<SocketAddr>,
     display: Option<(u32, u32)>,
+    gui: bool,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let code_bytes =
@@ -225,8 +228,8 @@ fn run_uefi_inner(
     let share = open_share(&ram, share)?;
     let (width, height) = display.unwrap_or((display::FB_WIDTH, display::FB_HEIGHT));
     let ramfb = Arc::new(Ramfb::reserve(ram_bytes as u64, width, height)?);
-    // Pointer exists only with --vnc. Serial-only and payload boots stay without xHCI.
-    let xhci = if vnc.is_some() {
+    // Pointer exists only with --vnc or --gui. Serial-only and payload boots stay without xHCI.
+    let xhci = if vnc.is_some() || gui {
         let abs_x =
             u16::try_from(width).map_err(|_| "display width does not fit the HID tablet")?;
         let abs_y =
@@ -253,7 +256,7 @@ fn run_uefi_inner(
         None => None,
     };
     let mut pci = assemble_pci(blocks, nic, share, true)?.expect("UEFI always has a PCI host");
-    if let Some(ctrl) = xhci {
+    if let Some(ctrl) = xhci.clone() {
         pci.add_xhci(ctrl)?;
         eprintln!(
             "[VMM] xHCI HID keyboard and tablet at 00:0a.0 INTx GSI {}",
@@ -272,6 +275,13 @@ fn run_uefi_inner(
         "[VMM] ramfb {}x{} stride {} at GPA {:#x}",
         cfg_now.width, cfg_now.height, cfg_now.stride, cfg_now.gpa
     );
+    // Held until this function returns, including `boot_cpus`, so Drop releases
+    // keys. The window copies `cfg_now.gpa` and does not borrow PciHost or fw_cfg.
+    let _attachment = if gui {
+        xhci.map(|ctrl| crate::native::attach(Arc::clone(&ram), cfg_now, ctrl))
+    } else {
+        None
+    };
     let cfg = FwCfg::from_files_with_ramfb(
         Arc::clone(&ram),
         &[

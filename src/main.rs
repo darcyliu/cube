@@ -6,6 +6,7 @@ compile_error!("vmm-intel builds only for x86_64-apple-darwin");
 
 mod hypervisor;
 mod machine;
+mod native;
 mod vcpu;
 mod vm;
 
@@ -31,7 +32,37 @@ fn main() {
         }
         return;
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Cocoa must run on this thread. The worker owns the VM and calls
+    // `native::attach` only after ramfb and xHCI exist.
+    if native_window_requested(&raw) {
+        let (width, height) = cli::window_point_size(&raw);
+        let worker = std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&raw)));
+            native::mark_finished();
+            result
+        });
+        let window_ok = native::run_window(width, height);
+        vmm::terminal::request_shutdown();
+        let worker_ok = matches!(worker.join(), Ok(Ok(Ok(()))));
+        if !window_ok || !worker_ok {
+            process::exit(1);
+        }
+        return;
+    }
+    if dispatch(&raw).is_err() {
+        process::exit(1);
+    }
+}
+
+fn native_window_requested(args: &[String]) -> bool {
+    !args.iter().any(|arg| arg == "--help" || arg == "-h")
+        && args
+            .windows(2)
+            .any(|pair| pair[0] == "--gui" && pair[1] == "native")
+}
+
+fn dispatch(raw: &[String]) -> Result<(), ()> {
+    let args: Vec<String> = raw.iter().skip(1).cloned().collect();
     match cli::parse(&args) {
         cli::Cli::Help => {
             println!("{}", cli::help_text());
@@ -39,7 +70,7 @@ fn main() {
         }
         cli::Cli::Error(message) => {
             eprintln!("{message}");
-            process::exit(1);
+            Err(())
         }
         cli::Cli::Run(run) => {
             let dones = match run.boot {
@@ -67,6 +98,7 @@ fn main() {
                     run.share,
                     run.vnc,
                     run.display,
+                    run.gui,
                 ),
             };
             let mut failed = false;
@@ -80,21 +112,23 @@ fn main() {
                 }
             }
             if failed {
-                process::exit(1);
+                return Err(());
             }
             if vmm::terminal::reboot_requested() {
                 let exe = match std::env::current_exe() {
                     Ok(path) => path,
                     Err(error) => {
                         eprintln!("re-exec: {error}");
-                        process::exit(1);
+                        return Err(());
                     }
                 };
                 let error = process::Command::new(exe)
                     .args(std::env::args().skip(1))
                     .exec();
                 eprintln!("re-exec failed: {error}");
-                process::exit(1);
+                Err(())
+            } else {
+                Ok(())
             }
         }
     }

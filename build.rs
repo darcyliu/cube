@@ -6,10 +6,39 @@ fn main() {
     // forces the framework in, because ld drops it when a target has no hv_* use.
     println!("cargo:rustc-link-arg-bin=vmm=-Wl,-needed_framework,Hypervisor");
     println!("cargo:rerun-if-changed=guest/payload.S");
+    println!("cargo:rerun-if-changed=src/native.m");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     let out_bin = std::path::Path::new(&out_dir).join("payload.bin");
     let out_obj = std::path::Path::new(&out_dir).join("payload.o");
+    let cocoa_obj = std::path::Path::new(&out_dir).join("native.o");
+    let cocoa_lib = std::path::Path::new(&out_dir).join("libvmm_native.a");
+    let status = Command::new("clang")
+        .args(["-fobjc-arc", "-c", "src/native.m", "-o"])
+        .arg(&cocoa_obj)
+        .status()
+        .expect("build.rs: clang is required for the native Cocoa frontend");
+    assert!(
+        status.success(),
+        "build.rs: failed to compile native Cocoa frontend"
+    );
+    let status = Command::new("ar")
+        .arg("rcs")
+        .arg(&cocoa_lib)
+        .arg(&cocoa_obj)
+        .status()
+        .expect("build.rs: ar is required for the native Cocoa frontend");
+    assert!(
+        status.success(),
+        "build.rs: failed to archive native Cocoa frontend"
+    );
+    // native.o calls back into the vmm bin. Lib tests do not reference it, and
+    // must not link Hypervisor.framework (that stays on the bin link line above).
+    println!("cargo:rustc-link-search=native={out_dir}");
+    println!("cargo:rustc-link-lib=static=vmm_native");
+    println!("cargo:rustc-link-lib=framework=AppKit");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=MetalKit");
 
     // guest/*.bin is gitignored — this step must succeed on every clean build.
     let status = Command::new("clang")

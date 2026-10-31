@@ -64,6 +64,8 @@ pub struct Run {
     pub share: Option<ShareConfig>,
     pub vnc: Option<SocketAddr>,
     pub display: Option<(u32, u32)>,
+    /// `--gui native`. The guest framebuffer is already doubled when `--retina` is set.
+    pub gui: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,8 +133,11 @@ Options:
   --share TAG PATH             one read-only virtio-9p folder
   --share-rw TAG PATH          one read-write virtio-9p folder
   --vnc [ADDR]                 loopback RFB server (default 127.0.0.1:5900)
-                               UEFI with --vnc attaches xHCI HID at 00:0a.0 (INTx GSI 24)
-  --display WIDTHxHEIGHT       framebuffer size; requires --vnc (default 1280x720, max 256 MiB)
+  --gui native                 open a Cocoa window
+                               UEFI with --vnc or --gui native attaches xHCI HID at 00:0a.0 (INTx GSI 24)
+  --retina                     double the guest framebuffer; requires --gui native
+  --display WIDTHxHEIGHT       framebuffer size; requires --vnc or --gui native
+                               (default 1280x720, max 256 MiB)
   --serial-log, --console-log PATH
   -h, --help                   print this help and exit 1
 
@@ -162,6 +167,8 @@ pub fn parse(args: &[String]) -> Cli {
     let mut ssh_port = None;
     let mut vnc = None;
     let mut display = None;
+    let mut gui = false;
+    let mut retina = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -333,13 +340,29 @@ pub fn parse(args: &[String]) -> Cli {
                     Err(message) => return Cli::Error(format!("--display {message}")),
                 }
             }
+            "--gui" => {
+                let Some(text) = value_at(args, &mut i) else {
+                    return Cli::Error("--gui requires 'native'".into());
+                };
+                if text != "native" {
+                    return Cli::Error("--gui requires 'native'".into());
+                }
+                gui = true;
+            }
+            "--retina" => retina = true,
             other => return Cli::Error(format!("unknown argument {other}")),
         }
         i += 1;
     }
 
-    if display.is_some() && vnc.is_none() {
-        return Cli::Error("--display requires --vnc".into());
+    if gui && vnc.is_some() {
+        return Cli::Error("--gui native and --vnc cannot be combined".into());
+    }
+    if retina && !gui {
+        return Cli::Error("--retina requires --gui native".into());
+    }
+    if display.is_some() && vnc.is_none() && !gui {
+        return Cli::Error("--display requires --vnc or --gui native".into());
     }
 
     let boot = match (payload, uefi) {
@@ -350,6 +373,16 @@ pub fn parse(args: &[String]) -> Cli {
         (Some(path), None) => Boot::Payload(path),
         (None, Some(path)) => Boot::Uefi(path),
     };
+    if gui && matches!(boot, Boot::Payload(_)) {
+        return Cli::Error("--gui native requires --uefi".into());
+    }
+    if retina {
+        let size = display.unwrap_or((display::FB_WIDTH, display::FB_HEIGHT));
+        match retina_framebuffer_size(size) {
+            Ok(doubled) => display = Some(doubled),
+            Err(message) => return Cli::Error(message),
+        }
+    }
     // CD-ROM stays read-only. cow and ro on the same image is rejected.
     if global_cow {
         if disks.is_empty() {
@@ -393,7 +426,30 @@ pub fn parse(args: &[String]) -> Cli {
         share,
         vnc,
         display,
+        gui,
     })
+}
+
+/// Point size passed to the Cocoa window. [`parse`] doubles the guest
+/// framebuffer when `--retina` is set; this does not.
+pub fn window_point_size(args: &[String]) -> (u32, u32) {
+    args.windows(2)
+        .find(|pair| pair[0] == "--display")
+        .and_then(|pair| display::parse_size(&pair[1]).ok())
+        .unwrap_or((display::FB_WIDTH, display::FB_HEIGHT))
+}
+
+fn retina_framebuffer_size(window_size: (u32, u32)) -> Result<(u32, u32), String> {
+    let width = window_size
+        .0
+        .checked_mul(2)
+        .ok_or_else(|| "--retina width overflow".to_string())?;
+    let height = window_size
+        .1
+        .checked_mul(2)
+        .ok_or_else(|| "--retina height overflow".to_string())?;
+    display::parse_size(&format!("{width}x{height}"))
+        .map_err(|message| format!("--retina {message}"))
 }
 
 fn parse_vnc(text: &str) -> Result<SocketAddr, String> {
@@ -525,6 +581,8 @@ mod tests {
             "--console-log",
             "--vnc",
             "--display",
+            "--gui native",
+            "--retina",
         ] {
             assert!(help.contains(flag), "missing {flag}");
         }
@@ -538,16 +596,13 @@ mod tests {
         assert!(help.contains("otherwise efi-vars.fd"));
         assert!(help.contains("127.0.0.1:5900"));
         assert!(help.contains("1280x720"));
-        assert!(help.contains("requires --vnc"));
+        assert!(help.contains("requires --vnc or --gui native"));
+        assert!(help.contains("requires --gui native"));
+        assert!(help.contains("00:0a.0"));
+        assert!(help.contains("GSI 24"));
         assert!(help.contains("max 256 MiB"));
         assert!(help.find("--uefi").unwrap() < help.find("--payload").unwrap());
-        for flag in [
-            "--freebsd",
-            "--kernel",
-            "--multiuser",
-            "--gui",
-            "--retina",
-        ] {
+        for flag in ["--freebsd", "--kernel", "--multiuser"] {
             assert!(!help.contains(flag), "advertised {flag}");
         }
         assert!(!help.contains("Darwin"));
@@ -557,14 +612,7 @@ mod tests {
 
     #[test]
     fn dropped_flags_are_unknown_and_cow_cannot_combine_with_ro() {
-        for flag in [
-            "--freebsd",
-            "--kernel",
-            "--multiuser",
-            "--gui",
-            "--retina",
-            "--memory",
-        ] {
+        for flag in ["--freebsd", "--kernel", "--multiuser", "--memory"] {
             assert!(error(&[flag]).contains("unknown argument"), "{flag}");
         }
         assert!(error(&["--uefi", "--disk", "a.img,cow,ro"]).contains("cannot combine"));
@@ -702,14 +750,80 @@ mod tests {
         ]);
         assert_eq!(sized.vnc.unwrap().to_string(), "127.0.0.1:5901");
         assert_eq!(sized.display, Some((1024, 768)));
-        assert!(error(&["--display", "1024x768"]).contains("--display requires --vnc"));
+        assert!(
+            error(&["--display", "1024x768"]).contains("--display requires --vnc or --gui native")
+        );
         assert!(
             error(&["--uefi", "--vnc", "--display", "16384x16384"]).contains("maximum is 256 MiB")
         );
         assert!(error(&["--uefi", "--vnc", "0.0.0.0:5900"]).contains("loopback"));
         assert!(error(&["--uefi", "--vnc", "192.168.1.1:5900"]).contains("loopback"));
         assert!(error(&["--uefi", "--display"]).contains("WIDTHxHEIGHT"));
-        assert!(error(&["--gui"]).contains("unknown argument"));
-        assert!(error(&["--retina", "--uefi"]).contains("unknown argument"));
+        assert!(error(&["--gui"]).contains("--gui requires 'native'"));
+        assert!(error(&["--gui", "cocoa", "--uefi"]).contains("--gui requires 'native'"));
+        assert!(error(&["--retina", "--uefi"]).contains("--retina requires --gui native"));
+        assert!(error(&["--retina"]).contains("--retina requires --gui native"));
+        assert!(error(&["--uefi", "--gui", "native", "--vnc"]).contains("cannot be combined"));
+        assert!(error(&["--gui", "native", "--payload"]).contains("requires --uefi"));
+        let gui = run(&["--uefi", "--gui", "native", "--display", "1024x768"]);
+        assert!(gui.gui);
+        assert!(gui.vnc.is_none());
+        assert_eq!(gui.display, Some((1024, 768)));
+        let retina = run(&[
+            "--uefi",
+            "--gui",
+            "native",
+            "--retina",
+            "--display",
+            "1024x768",
+        ]);
+        assert_eq!(retina.display, Some((2048, 1536)));
+        assert_eq!(
+            run(&["--uefi", "--gui", "native", "--retina"]).display,
+            Some((2560, 1440))
+        );
+        assert_eq!(
+            window_point_size(&args(&[
+                "vmm",
+                "--gui",
+                "native",
+                "--retina",
+                "--display",
+                "1024x768",
+            ])),
+            (1024, 768)
+        );
+        assert_eq!(
+            window_point_size(&args(&["vmm", "--gui", "native"])),
+            (1280, 720)
+        );
+        assert!(
+            error(&[
+                "--uefi",
+                "--gui",
+                "native",
+                "--retina",
+                "--display",
+                "8192x8192"
+            ])
+            .contains("maximum is 256 MiB")
+        );
+        assert!(
+            error(&[
+                "--uefi",
+                "--gui",
+                "native",
+                "--retina",
+                "--display",
+                "40000x100"
+            ])
+            .contains("65535")
+        );
+        assert!(
+            retina_framebuffer_size((u32::MAX, 768))
+                .unwrap_err()
+                .contains("overflow")
+        );
+        assert!(retina_framebuffer_size((8192, 8192)).is_err());
     }
 }

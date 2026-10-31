@@ -300,7 +300,6 @@ impl XhciController {
         self.try_complete_pending_intr();
     }
 
-    #[cfg(test)]
     pub fn keyboard_report(&self) -> [u8; 8] {
         self.hid.current_keyboard_report()
     }
