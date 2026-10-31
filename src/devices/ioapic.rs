@@ -1,6 +1,5 @@
 //! One I/O APIC at `0xFEC00000`. 25 redirection entries, GSI base 0.
-//! GSI 24 is the xHCI pin. `set_level` keeps one level per pin, so that
-//! line cannot be shared with disk, net, or 9p.
+//! `set_level` stores one level per pin, so a line cannot be shared.
 
 pub const IOAPIC_MMIO: u64 = 0xFEC0_0000;
 pub const IOAPIC_MMIO_LEN: u64 = 0x1000;

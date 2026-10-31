@@ -1,9 +1,7 @@
-//! Minimal MMIO xHCI host controller for FreeBSD `generic-xhci`.
+//! Minimal MMIO xHCI host controller.
 //!
-//! The register file is what a PCI BAR maps. Interrupt state is `irq_level`
-//! only: this module does not call the hypervisor. Guest memory is not
-//! touched while bus master is clear. `PciHost::add_xhci` starts with that
-//! bit clear; unit tests leave it set.
+//! BAR0 is [`MMIO_XHCI_SIZE`] bytes of this register file. Guest memory is
+//! not touched while bus master is clear.
 //!
 //! Layout mirrors QEMU (`CAPLENGTH=0x40`, runtime@0x1000, doorbell@0x2000).
 //! Implemented enough for FreeBSD to attach, enumerate two HS HID devices on
@@ -25,6 +23,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::devices::MmioDevice;
 use crate::memory::GuestMemory;
@@ -201,10 +200,13 @@ pub struct XhciController {
     setup: [Option<SetupState>; (MAX_SLOTS + 1) as usize],
 
     irq_level: bool,
-    /// PCI bus-master. Default true so controller unit tests can DMA.
+    /// Default set so unit tests can DMA. The PCI function clears it before the guest runs.
     bus_master: bool,
     intx_disable: bool,
-    irq_hook: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    /// PCI Status Interrupt Status. The IRQ hook publishes this. Interrupt
+    /// Disable forces the pin idle without clearing it.
+    irq_status: Arc<AtomicBool>,
+    irq_hook: Option<Arc<dyn Fn(bool, bool) + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
@@ -255,13 +257,24 @@ impl XhciController {
             irq_level: false,
             bus_master: true,
             intx_disable: false,
+            irq_status: Arc::new(AtomicBool::new(false)),
             irq_hook: None,
         }
     }
 
-    /// `high` is the electrical INTx level (active-low: asserted is `false`).
-    pub fn set_irq_hook(&mut self, hook: Arc<dyn Fn(bool) + Send + Sync>) {
-        self.irq_hook = Some(hook);
+    pub(crate) fn irq_status_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.irq_status)
+    }
+
+    /// `pin_high` is the electrical INTx level (active-low: asserted is `false`).
+    /// `requested` is the PCI status bit. The wrapper publishes `requested`
+    /// before the caller's hook so a config read does not take this mutex.
+    pub fn set_irq_hook(&mut self, hook: Arc<dyn Fn(bool, bool) + Send + Sync>) {
+        let status = Arc::clone(&self.irq_status);
+        self.irq_hook = Some(Arc::new(move |pin_high, requested| {
+            status.store(requested, Ordering::Release);
+            hook(pin_high, requested);
+        }));
         self.notify_irq();
     }
 
@@ -278,8 +291,9 @@ impl XhciController {
         self.notify_irq();
     }
 
-    pub fn irq_asserted(&self) -> bool {
-        self.irq_level && !self.intx_disable
+    #[cfg(test)]
+    pub fn pci_flags(&self) -> (bool, bool) {
+        (self.bus_master, self.intx_disable)
     }
 
     #[cfg(test)]
@@ -314,26 +328,26 @@ impl XhciController {
     fn raise_irq(&mut self) {
         self.usbsts |= USBSTS_EINT;
         self.iman |= IMAN_IP;
-        if self.usbcmd & USBCMD_INTE != 0 && self.iman & IMAN_IE != 0 && !self.irq_level {
-            self.irq_level = true;
-            self.notify_irq();
-        }
+        self.sync_irq_level();
     }
 
-    fn lower_irq_if_clear(&mut self) {
-        // Guest clears IP by writing 1; also clears EINT via USBSTS W1C.
-        if self.iman & IMAN_IP == 0 && self.usbsts & USBSTS_EINT == 0 && self.irq_level {
-            self.irq_level = false;
+    /// IP && IE && INTE. Interrupt Disable is not part of this; it only forces
+    /// the pin idle in [`Self::notify_irq`].
+    fn sync_irq_level(&mut self) {
+        let request =
+            self.iman & IMAN_IP != 0 && self.iman & IMAN_IE != 0 && self.usbcmd & USBCMD_INTE != 0;
+        if request != self.irq_level {
+            self.irq_level = request;
             self.notify_irq();
         }
     }
 
     fn notify_irq(&mut self) {
-        let high = !self.irq_level || self.intx_disable;
+        let pin_high = !self.irq_level || self.intx_disable;
         let Some(hook) = self.irq_hook.clone() else {
             return;
         };
-        hook(high);
+        hook(pin_high, self.irq_level);
     }
 
     fn hcrst(&mut self) {
@@ -361,10 +375,7 @@ impl XhciController {
         for p in &mut self.portsc {
             *p = PORTSC_CCS | PORTSC_PP | PORTSC_SPEED_HS | PORTSC_CSC;
         }
-        if self.irq_level {
-            self.irq_level = false;
-            self.notify_irq();
-        }
+        self.sync_irq_level();
     }
 
     fn read_trb(&self, addr: u64) -> Option<Trb> {
@@ -1535,7 +1546,7 @@ impl XhciController {
                         // Announce port change
                         self.usbsts |= USBSTS_PCD;
                         for i in 0..MAX_PORTS as usize {
-                            // Port Status Change Event: Port ID in control[31:24], ptr=0
+                            // Port Status Change Event: Port ID is parameter bits 31:24.
                             self.portsc[i] |= PORTSC_CSC;
                             let port = (i as u32) + 1;
                             self.enqueue_event(
@@ -1548,11 +1559,12 @@ impl XhciController {
                 } else {
                     self.usbsts |= USBSTS_HCH;
                 }
+                self.sync_irq_level();
             }
             0x04 => {
                 // W1C
                 self.usbsts &= !(data & (USBSTS_HSE | USBSTS_EINT | USBSTS_PCD));
-                self.lower_irq_if_clear();
+                self.sync_irq_level();
             }
             0x14 => self.dnctrl = data,
             0x18 => {
@@ -1656,7 +1668,7 @@ impl XhciController {
                     self.iman &= !IMAN_IP;
                 }
                 self.iman = (self.iman & !IMAN_IE) | (data32 & IMAN_IE);
-                self.lower_irq_if_clear();
+                self.sync_irq_level();
             }
             0x04 => self.imod = data32,
             0x08 => self.erstsz = data32 & 0xffff,
@@ -1900,5 +1912,34 @@ mod tests {
         c.set_pci_flags(true, false);
         assert_eq!(c.read_trb(0x2000).unwrap().ptr, 1);
         assert!(c.pending_events.is_empty());
+    }
+
+    #[test]
+    fn enabling_ie_or_inte_raises_a_pending_interrupt() {
+        use std::sync::Mutex;
+
+        let mut c = controller();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        c.set_irq_hook(Arc::new(move |high, requested| {
+            log.lock().unwrap().push((high, requested));
+        }));
+        c.usbcmd = USBCMD_INTE;
+        c.usbsts |= USBSTS_EINT;
+        c.iman = IMAN_IP;
+        c.runtime_write(0x20, u64::from(IMAN_IE), 4);
+        assert_eq!(seen.lock().unwrap().last().copied(), Some((false, true)));
+
+        let mut c = controller();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        c.set_irq_hook(Arc::new(move |high, requested| {
+            log.lock().unwrap().push((high, requested));
+        }));
+        c.iman = IMAN_IP | IMAN_IE;
+        c.oper_write(0, u64::from(USBCMD_INTE), 4);
+        assert_eq!(seen.lock().unwrap().last().copied(), Some((false, true)));
+        c.set_pci_flags(true, true);
+        assert_eq!(seen.lock().unwrap().last().copied(), Some((true, true)));
     }
 }

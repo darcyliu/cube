@@ -183,9 +183,9 @@ impl Machine {
             return;
         };
         let weak = Arc::downgrade(self);
-        lock_xhci(&ctrl).set_irq_hook(Arc::new(move |high| {
+        lock_xhci(&ctrl).set_irq_hook(Arc::new(move |pin_high, _requested| {
             if let Some(machine) = weak.upgrade() {
-                machine.set_gsi(XHCI_GSI, high);
+                machine.set_gsi(XHCI_GSI, pin_high);
             }
         }));
     }
