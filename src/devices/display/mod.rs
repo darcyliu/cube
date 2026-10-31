@@ -4,7 +4,6 @@
 //! framebuffer GPA on this machine: RAM now starts at 0, so that constant
 //! sits in ordinary memory, below the PCI hole at `0xC0000000`.
 
-pub mod keysym;
 pub mod vnc;
 
 use std::sync::Mutex;
@@ -76,7 +75,10 @@ impl Ramfb {
     }
 
     pub fn config(&self) -> FramebufferConfig {
-        *self.active.lock().unwrap()
+        match self.active.lock() {
+            Ok(cfg) => *cfg,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
     }
 
     pub fn reserved_base(&self) -> u64 {
@@ -92,7 +94,11 @@ impl Ramfb {
         let Some(cfg) = parse_guest(bytes, self.ram_end) else {
             return;
         };
-        *self.active.lock().unwrap() = cfg;
+        // A poisoned lock means a previous update panicked. Skip this one.
+        let Ok(mut active) = self.active.lock() else {
+            return;
+        };
+        *active = cfg;
     }
 }
 

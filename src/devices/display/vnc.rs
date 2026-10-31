@@ -3,7 +3,6 @@
 //! macOS Screen Sharing is picky with third-party servers; prefer TigerVNC
 //! Viewer (`brew install --cask tigervnc-viewer`) if Screen Sharing drops.
 
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -13,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::memory::GuestMemory;
 
-use super::{FramebufferConfig, Ramfb, keysym};
+use super::{FramebufferConfig, Ramfb};
 
 const RFB_VERSION: &[u8] = b"RFB 003.008\n";
 
@@ -93,38 +92,11 @@ impl Drop for VncServer {
         let Some(worker) = self.worker.take() else {
             return;
         };
-        // Shutdown can run on the worker if a session hook drops the server.
-        // Joining ourselves deadlocks; detaching lets the thread exit.
+        // Joining the worker from the worker thread deadlocks.
         if worker.thread().id() == thread::current().id() {
             return;
         }
         let _ = worker.join();
-    }
-}
-
-/// Pressed keys for this session. Drop releases them. There is no HID device yet,
-/// so the release only clears this set.
-struct SessionInput {
-    keys: BTreeSet<u16>,
-}
-
-impl SessionInput {
-    fn key(&mut self, code: u16, down: bool) {
-        if down {
-            self.keys.insert(code);
-        } else {
-            self.keys.remove(&code);
-        }
-    }
-
-    fn release_all(&mut self) {
-        self.keys.clear();
-    }
-}
-
-impl Drop for SessionInput {
-    fn drop(&mut self) {
-        self.release_all();
     }
 }
 
@@ -197,9 +169,6 @@ fn handle_client(
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     stream.set_nonblocking(false).map_err(|e| e.to_string())?;
-    let mut input = SessionInput {
-        keys: BTreeSet::new(),
-    };
     stream
         .set_read_timeout(Some(Duration::from_millis(250)))
         .ok();
@@ -380,35 +349,16 @@ fn handle_client(
                 thread::sleep(Duration::from_millis(16));
             }
             4 => {
-                let mut rest = [0u8; 7];
-                read_exact_timeout(&mut stream, &mut rest, &stop)?;
-                let down = rest[0] != 0;
-                let keysym_val = u32::from_be_bytes([rest[3], rest[4], rest[5], rest[6]]);
-                crate::device_trace!("[VNC] KeyEvent keysym={keysym_val:#x} down={down}");
-                if let Some(code) = keysym::keysym_to_linux(keysym_val) {
-                    input.key(code, down);
-                } else {
-                    crate::device_trace!("[VNC] unmapped keysym {keysym_val:#x}");
-                }
+                read_exact_timeout(&mut stream, &mut [0u8; 7], &stop)?;
             }
             5 => {
-                // Pointer events are ignored until HID is wired.
-                let mut rest = [0u8; 5];
-                read_exact_timeout(&mut stream, &mut rest, &stop)?;
+                read_exact_timeout(&mut stream, &mut [0u8; 5], &stop)?;
             }
             255 => {
                 let mut rest = [0u8; 11];
                 read_exact_timeout(&mut stream, &mut rest, &stop)?;
                 if rest[0] != 0 {
                     return Err("Unsupported QEMU VNC subtype".into());
-                }
-                let down = u16::from_be_bytes([rest[1], rest[2]]) != 0;
-                let keysym_val = u32::from_be_bytes([rest[3], rest[4], rest[5], rest[6]]);
-                crate::device_trace!("[VNC] ExtKey keysym={keysym_val:#x} down={down}");
-                if let Some(code) = keysym::keysym_to_linux(keysym_val) {
-                    input.key(code, down);
-                } else {
-                    crate::device_trace!("[VNC] unmapped ext keysym {keysym_val:#x}");
                 }
             }
             6 => {
@@ -594,20 +544,6 @@ fn read_exact_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn disconnect_releases_held_keys() {
-        let mut input = SessionInput {
-            keys: BTreeSet::new(),
-        };
-        input.key(42, true);
-        input.key(30, true);
-        assert_eq!(input.keys.len(), 2);
-        input.release_all();
-        assert!(input.keys.is_empty());
-        input.key(30, true);
-        drop(input);
-    }
 
     #[test]
     fn rejects_non_loopback_bind() {
