@@ -290,7 +290,6 @@ impl XhciController {
         (self.bus_master, self.intx_disable)
     }
 
-    #[cfg(test)]
     pub fn tablet_report(&self) -> [u8; 6] {
         self.hid.current_tablet_report()
     }

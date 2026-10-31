@@ -229,11 +229,13 @@ fn run_uefi_inner(
     let (width, height) = display.unwrap_or((display::FB_WIDTH, display::FB_HEIGHT));
     let ramfb = Arc::new(Ramfb::reserve(ram_bytes as u64, width, height)?);
     // Pointer exists only with --vnc or --gui. Serial-only and payload boots stay without xHCI.
+    let mut tablet = (0u16, 0u16);
     let xhci = if vnc.is_some() || gui {
         let abs_x =
             u16::try_from(width).map_err(|_| "display width does not fit the HID tablet")?;
         let abs_y =
             u16::try_from(height).map_err(|_| "display height does not fit the HID tablet")?;
+        tablet = (abs_x, abs_y);
         Some(Arc::new(Mutex::new(
             vmm::devices::usb::xhci::XhciController::new(
                 vmm::devices::pci::XHCI_GSI,
@@ -276,9 +278,9 @@ fn run_uefi_inner(
         cfg_now.width, cfg_now.height, cfg_now.stride, cfg_now.gpa
     );
     // Held until this function returns, including `boot_cpus`, so Drop releases
-    // keys. The window copies `cfg_now.gpa` and does not borrow PciHost or fw_cfg.
+    // keys. The window reads `Ramfb::config` per frame and does not borrow PciHost.
     let _attachment = if gui {
-        xhci.map(|ctrl| crate::native::attach(Arc::clone(&ram), cfg_now, ctrl))
+        xhci.map(|ctrl| crate::native::attach(Arc::clone(&ram), Arc::clone(&ramfb), ctrl, tablet))
     } else {
         None
     };
@@ -316,6 +318,18 @@ fn run_uefi_inner(
 
     let slot: Arc<OnceLock<Weak<Machine>>> = Arc::new(OnceLock::new());
     let serial = open_serial(serial_log.as_deref(), &slot)?;
+    if gui {
+        // `hv_vcpu_run` does not return for `request_shutdown` alone. The UART
+        // hook interrupts; closing the window has to do the same, and must not
+        // join the worker (that join is on the main thread).
+        let slot_stop = Arc::clone(&slot);
+        crate::native::set_stop_hook(Arc::new(move || {
+            terminal::request_shutdown();
+            if let Some(machine) = slot_stop.get().and_then(|weak| weak.upgrade()) {
+                machine.stop_cpus();
+            }
+        }));
+    }
     let (kicks, lapics) = vcpu_parts(n);
     let mut pio = standard_pio(serial.clone());
     // DMA low is a dword at 0x518, so the window runs through 0x51B.
@@ -499,6 +513,11 @@ fn boot_cpus(
     let mut console = HostConsole::start(serial);
     let _raw = TerminalGuard::enter_raw_mode();
     terminal::install_shutdown_handlers();
+    // A close during firmware load sets the flag before any vCPU exists.
+    // APs park on `boot.stop`, which `request_shutdown` does not set.
+    if terminal::shutdown_requested() {
+        machine.stop_cpus();
+    }
 
     let n = kicks.len();
     let mut handles = Vec::with_capacity(n);

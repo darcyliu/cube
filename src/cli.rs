@@ -63,9 +63,12 @@ pub struct Run {
     pub forwards: Vec<ForwardRule>,
     pub share: Option<ShareConfig>,
     pub vnc: Option<SocketAddr>,
+    /// Guest framebuffer. Doubled when `--retina` is set; `None` is 1280x720.
     pub display: Option<(u32, u32)>,
-    /// `--gui native`. The guest framebuffer is already doubled when `--retina` is set.
+    /// `--gui native`.
     pub gui: bool,
+    /// Cocoa point size. `--retina` does not change this.
+    pub window: (u32, u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,9 +379,9 @@ pub fn parse(args: &[String]) -> Cli {
     if gui && matches!(boot, Boot::Payload(_)) {
         return Cli::Error("--gui native requires --uefi".into());
     }
+    let window = display.unwrap_or((display::FB_WIDTH, display::FB_HEIGHT));
     if retina {
-        let size = display.unwrap_or((display::FB_WIDTH, display::FB_HEIGHT));
-        match retina_framebuffer_size(size) {
+        match retina_framebuffer_size(window) {
             Ok(doubled) => display = Some(doubled),
             Err(message) => return Cli::Error(message),
         }
@@ -427,16 +430,8 @@ pub fn parse(args: &[String]) -> Cli {
         vnc,
         display,
         gui,
+        window,
     })
-}
-
-/// Point size passed to the Cocoa window. [`parse`] doubles the guest
-/// framebuffer when `--retina` is set; this does not.
-pub fn window_point_size(args: &[String]) -> (u32, u32) {
-    args.windows(2)
-        .find(|pair| pair[0] == "--display")
-        .and_then(|pair| display::parse_size(&pair[1]).ok())
-        .unwrap_or((display::FB_WIDTH, display::FB_HEIGHT))
 }
 
 fn retina_framebuffer_size(window_size: (u32, u32)) -> Result<(u32, u32), String> {
@@ -769,6 +764,7 @@ mod tests {
         assert!(gui.gui);
         assert!(gui.vnc.is_none());
         assert_eq!(gui.display, Some((1024, 768)));
+        assert_eq!(gui.window, (1024, 768));
         let retina = run(&[
             "--uefi",
             "--gui",
@@ -778,25 +774,11 @@ mod tests {
             "1024x768",
         ]);
         assert_eq!(retina.display, Some((2048, 1536)));
-        assert_eq!(
-            run(&["--uefi", "--gui", "native", "--retina"]).display,
-            Some((2560, 1440))
-        );
-        assert_eq!(
-            window_point_size(&args(&[
-                "vmm",
-                "--gui",
-                "native",
-                "--retina",
-                "--display",
-                "1024x768",
-            ])),
-            (1024, 768)
-        );
-        assert_eq!(
-            window_point_size(&args(&["vmm", "--gui", "native"])),
-            (1280, 720)
-        );
+        assert_eq!(retina.window, (1024, 768));
+        let retina_default = run(&["--uefi", "--gui", "native", "--retina"]);
+        assert_eq!(retina_default.display, Some((2560, 1440)));
+        assert_eq!(retina_default.window, (1280, 720));
+        assert_eq!(run(&["--uefi", "--gui", "native"]).window, (1280, 720));
         assert!(
             error(&[
                 "--uefi",

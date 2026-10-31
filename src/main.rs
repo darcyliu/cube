@@ -13,7 +13,13 @@ mod vm;
 use std::os::unix::process::CommandExt;
 use std::process;
 
-use vmm::cli::{self, Boot};
+use vmm::cli::{self, Boot, Run};
+
+enum VmExit {
+    Stopped,
+    Failed,
+    Reboot,
+}
 
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
@@ -32,106 +38,103 @@ fn main() {
         }
         return;
     }
-    // Cocoa must run on this thread. The worker owns the VM and calls
-    // `native::attach` only after ramfb and xHCI exist.
-    if native_window_requested(&raw) {
-        let (width, height) = cli::window_point_size(&raw);
-        let worker = std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&raw)));
-            native::mark_finished();
-            result
-        });
-        let window_ok = native::run_window(width, height);
-        vmm::terminal::request_shutdown();
-        let worker_ok = matches!(worker.join(), Ok(Ok(Ok(()))));
-        if !window_ok || !worker_ok {
-            process::exit(1);
-        }
-        return;
-    }
-    if dispatch(&raw).is_err() {
-        process::exit(1);
-    }
-}
-
-fn native_window_requested(args: &[String]) -> bool {
-    !args.iter().any(|arg| arg == "--help" || arg == "-h")
-        && args
-            .windows(2)
-            .any(|pair| pair[0] == "--gui" && pair[1] == "native")
-}
-
-fn dispatch(raw: &[String]) -> Result<(), ()> {
-    let args: Vec<String> = raw.iter().skip(1).cloned().collect();
-    match cli::parse(&args) {
+    let args: Vec<String> = raw.into_iter().skip(1).collect();
+    let run = match cli::parse(&args) {
         cli::Cli::Help => {
             println!("{}", cli::help_text());
             process::exit(1);
         }
         cli::Cli::Error(message) => {
             eprintln!("{message}");
-            Err(())
+            process::exit(1);
         }
-        cli::Cli::Run(run) => {
-            let dones = match run.boot {
-                Boot::Payload(path) => vm::run_payload(
-                    path,
-                    run.serial_log,
-                    run.cpus,
-                    run.ram_mb,
-                    run.disks,
-                    run.net,
-                    run.forwards,
-                    run.share,
-                    run.vnc,
-                    run.display,
-                ),
-                Boot::Uefi(path) => vm::run_uefi(
-                    path,
-                    run.serial_log,
-                    run.cpus,
-                    run.ram_mb,
-                    run.disks,
-                    run.net,
-                    run.forwards,
-                    run.efi_vars,
-                    run.share,
-                    run.vnc,
-                    run.display,
-                    run.gui,
-                ),
-            };
-            let mut failed = false;
-            for done in dones {
-                if let Some(ns) = done.exec_ns {
-                    eprintln!("[VMM] vCPU {} exec time: {ns} ns", done.index);
-                }
-                if let Some(error) = done.error {
-                    eprintln!("{error}");
-                    failed = true;
-                }
-            }
-            if failed {
-                return Err(());
-            }
-            if vmm::terminal::reboot_requested() {
-                let exe = match std::env::current_exe() {
-                    Ok(path) => path,
-                    Err(error) => {
-                        eprintln!("re-exec: {error}");
-                        return Err(());
-                    }
-                };
-                let error = process::Command::new(exe)
-                    .args(std::env::args().skip(1))
-                    .exec();
-                eprintln!("re-exec failed: {error}");
-                Err(())
-            } else {
-                Ok(())
-            }
+        cli::Cli::Run(run) => run,
+    };
+    // Cocoa must stay on this thread. The worker owns the VM.
+    if run.gui {
+        let (width, height) = run.window;
+        let worker = std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_vm(run)));
+            native::mark_finished();
+            result
+        });
+        let window_ok = native::run_window(width, height);
+        vmm::terminal::request_shutdown();
+        match worker.join() {
+            Ok(Ok(VmExit::Reboot)) => reexec(),
+            Ok(Ok(VmExit::Stopped)) if window_ok => {}
+            _ => process::exit(1),
+        }
+        return;
+    }
+    match run_vm(run) {
+        VmExit::Stopped => {}
+        VmExit::Failed => process::exit(1),
+        VmExit::Reboot => reexec(),
+    }
+}
+
+fn run_vm(run: Run) -> VmExit {
+    let dones = match run.boot {
+        Boot::Payload(path) => vm::run_payload(
+            path,
+            run.serial_log,
+            run.cpus,
+            run.ram_mb,
+            run.disks,
+            run.net,
+            run.forwards,
+            run.share,
+            run.vnc,
+            run.display,
+        ),
+        Boot::Uefi(path) => vm::run_uefi(
+            path,
+            run.serial_log,
+            run.cpus,
+            run.ram_mb,
+            run.disks,
+            run.net,
+            run.forwards,
+            run.efi_vars,
+            run.share,
+            run.vnc,
+            run.display,
+            run.gui,
+        ),
+    };
+    let mut failed = false;
+    for done in dones {
+        if let Some(ns) = done.exec_ns {
+            eprintln!("[VMM] vCPU {} exec time: {ns} ns", done.index);
+        }
+        if let Some(error) = done.error {
+            eprintln!("{error}");
+            failed = true;
         }
     }
+    if failed {
+        VmExit::Failed
+    } else if vmm::terminal::reboot_requested() {
+        VmExit::Reboot
+    } else {
+        VmExit::Stopped
+    }
+}
+
+fn reexec() -> ! {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("re-exec: {error}");
+            process::exit(1);
+        }
+    };
+    let error = process::Command::new(exe)
+        .args(std::env::args().skip(1))
+        .exec();
+    eprintln!("re-exec failed: {error}");
+    process::exit(1);
 }
 
 /// Marketing major >= 10, before any `hv_*` call.

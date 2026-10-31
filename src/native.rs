@@ -1,26 +1,41 @@
-//! Cocoa runs on the process main thread. It copies pixels from the ramfb GPA
-//! and forwards HID to PCI xHCI. It does not take a fw_cfg or machine lock.
+//! Cocoa runs on the process main thread. Each frame reads `Ramfb::config`
+//! and drops that lock before touching guest memory. Close kicks vCPUs the
+//! same way the UART shutdown hook does, and does not join the VM worker.
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use vmm::devices::display::FramebufferConfig;
+use vmm::devices::display::Ramfb;
 use vmm::devices::usb::xhci::XhciController;
 use vmm::memory::GuestMemory;
 
 struct Attached {
     memory: Arc<GuestMemory>,
-    framebuffer: FramebufferConfig,
+    fb: Arc<Ramfb>,
     usb: Arc<Mutex<XhciController>>,
+    /// Absolute range passed to `XhciController::new`. The guest mode can change later.
+    tablet: (u16, u16),
     keys: BTreeSet<u16>,
     position: (u16, u16),
     buttons: u8,
+    /// `request_shutdown` plus `Machine::stop_cpus`. Set next to the serial open.
+    stop: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 static ATTACHED: Mutex<Option<Attached>> = Mutex::new(None);
 static FINISHED: AtomicBool = AtomicBool::new(false);
+
+fn lock_attached() -> MutexGuard<'static, Option<Attached>> {
+    ATTACHED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_usb(usb: &Mutex<XhciController>) -> MutexGuard<'_, XhciController> {
+    usb.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 unsafe extern "C" {
     fn vmm_cocoa_run(width: u32, height: u32) -> bool;
@@ -38,37 +53,69 @@ pub struct Attachment;
 
 pub fn attach(
     memory: Arc<GuestMemory>,
-    framebuffer: FramebufferConfig,
+    fb: Arc<Ramfb>,
     usb: Arc<Mutex<XhciController>>,
+    tablet: (u16, u16),
 ) -> Attachment {
-    *ATTACHED.lock().unwrap() = Some(Attached {
+    *lock_attached() = Some(Attached {
         memory,
-        framebuffer,
+        fb,
         usb,
+        tablet,
         keys: BTreeSet::new(),
         position: (0, 0),
         buttons: 0,
+        stop: None,
     });
     Attachment
+}
+
+/// Registered beside the serial open, once the machine slot exists.
+/// Closing the window must `hv_vcpu_interrupt`; `request_shutdown` alone
+/// does not wake a vCPU blocked in `hv_vcpu_run`.
+pub fn set_stop_hook(hook: Arc<dyn Fn() + Send + Sync>) {
+    if let Some(state) = lock_attached().as_mut() {
+        state.stop = Some(hook);
+    }
 }
 
 impl Drop for Attachment {
     fn drop(&mut self) {
         release_input();
-        *ATTACHED.lock().unwrap() = None;
+        *lock_attached() = None;
     }
 }
 
 fn release_input() {
-    if let Some(state) = ATTACHED.lock().unwrap().as_mut() {
-        if let Ok(mut usb) = state.usb.lock() {
-            for key in std::mem::take(&mut state.keys) {
-                usb.key_event(key, false);
-            }
-            usb.pointer_event(state.position.0, state.position.1, 0);
-        }
+    let (keys, x, y, usb) = {
+        let mut guard = lock_attached();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let keys = std::mem::take(&mut state.keys);
         state.buttons = 0;
+        let cfg = state.fb.config();
+        let x = scale_axis(state.position.0, cfg.width, state.tablet.0);
+        let y = scale_axis(state.position.1, cfg.height, state.tablet.1);
+        let usb = Arc::clone(&state.usb);
+        (keys, x, y, usb)
+    };
+    let mut usb = lock_usb(&usb);
+    for key in keys {
+        usb.key_event(key, false);
     }
+    usb.pointer_event(x, y, 0);
+}
+
+/// Map a pixel in the current guest mode onto the tablet range from `XhciController::new`.
+fn scale_axis(pos: u16, guest: u32, tablet_max: u16) -> u16 {
+    let guest = guest.max(1);
+    let limit = u32::from(tablet_max.saturating_sub(1));
+    let pos = u32::from(pos).min(guest.saturating_sub(1));
+    if guest == 1 {
+        return 0;
+    }
+    (pos * limit / (guest - 1)) as u16
 }
 
 #[unsafe(no_mangle)]
@@ -78,8 +125,15 @@ extern "C" fn vmm_native_finished() -> bool {
 
 #[unsafe(no_mangle)]
 extern "C" fn vmm_native_close() {
-    vmm::terminal::request_shutdown();
+    let stop = lock_attached()
+        .as_ref()
+        .and_then(|state| state.stop.clone());
     release_input();
+    if let Some(stop) = stop {
+        stop();
+    } else {
+        vmm::terminal::request_shutdown();
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -88,29 +142,37 @@ extern "C" fn vmm_native_release_input() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn vmm_native_geometry(width: *mut u32, height: *mut u32) -> bool {
-    let lock = ATTACHED.lock().unwrap();
+extern "C" fn vmm_native_geometry(width: *mut u32, height: *mut u32, stride: *mut u32) -> bool {
+    if width.is_null() || height.is_null() || stride.is_null() {
+        return false;
+    }
+    let lock = lock_attached();
     let Some(state) = lock.as_ref() else {
         return false;
     };
+    let cfg = state.fb.config();
     unsafe {
-        *width = state.framebuffer.width;
-        *height = state.framebuffer.height;
+        *width = cfg.width;
+        *height = cfg.height;
+        *stride = cfg.stride;
     }
     true
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn vmm_native_copy_frame(target: *mut c_void, length: usize) -> bool {
-    let lock = ATTACHED.lock().unwrap();
-    let Some(state) = lock.as_ref() else {
+    let Some((memory, cfg)) = (|| {
+        let lock = lock_attached();
+        let state = lock.as_ref()?;
+        Some((Arc::clone(&state.memory), state.fb.config()))
+    })() else {
         return false;
     };
-    if target.is_null() || length != state.framebuffer.pixel_bytes() {
+    if target.is_null() || length != cfg.pixel_bytes() {
         return false;
     }
     let pixels = unsafe { std::slice::from_raw_parts_mut(target.cast::<u8>(), length) };
-    state.memory.read(state.framebuffer.gpa, pixels).is_ok()
+    memory.read(cfg.gpa, pixels).is_ok()
 }
 
 #[unsafe(no_mangle)]
@@ -118,27 +180,35 @@ extern "C" fn vmm_native_key(mac_keycode: u16, down: bool) {
     let Some(code) = mac_keycode_to_linux(mac_keycode) else {
         return;
     };
-    let lock = &mut *ATTACHED.lock().unwrap();
-    let Some(state) = lock.as_mut() else { return };
-    if down {
-        state.keys.insert(code);
-    } else {
-        state.keys.remove(&code);
-    }
-    if let Ok(mut usb) = state.usb.lock() {
-        usb.key_event(code, down);
-    }
+    let usb = {
+        let mut lock = lock_attached();
+        let Some(state) = lock.as_mut() else { return };
+        if down {
+            state.keys.insert(code);
+        } else {
+            state.keys.remove(&code);
+        }
+        Arc::clone(&state.usb)
+    };
+    lock_usb(&usb).key_event(code, down);
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn vmm_native_pointer(x: u16, y: u16, buttons: u8) {
-    let lock = &mut *ATTACHED.lock().unwrap();
-    let Some(state) = lock.as_mut() else { return };
-    state.position = (x, y);
-    state.buttons = buttons & 7;
-    if let Ok(mut usb) = state.usb.lock() {
-        usb.pointer_event(x, y, buttons);
-    }
+    let (usb, sx, sy, buttons) = {
+        let mut lock = lock_attached();
+        let Some(state) = lock.as_mut() else { return };
+        state.position = (x, y);
+        state.buttons = buttons & 7;
+        let cfg = state.fb.config();
+        (
+            Arc::clone(&state.usb),
+            scale_axis(x, cfg.width, state.tablet.0),
+            scale_axis(y, cfg.height, state.tablet.1),
+            state.buttons,
+        )
+    };
+    lock_usb(&usb).pointer_event(sx, sy, buttons);
 }
 
 // macOS virtual keycodes describe physical US-layout keys. Keep the mapping
@@ -251,6 +321,11 @@ fn mac_keycode_to_linux(key: u16) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::AtomicBool;
+
+    use vmm::devices::display::descriptor_bytes;
+
     use super::*;
 
     #[test]
@@ -274,36 +349,90 @@ mod tests {
     }
 
     #[test]
-    fn native_frontend_copies_pixels_and_releases_held_input() {
-        let memory = Arc::new(GuestMemory::allocate(0x1000, 0x4000).unwrap());
-        let framebuffer = FramebufferConfig {
-            gpa: 0x1000,
-            width: 2,
-            height: 2,
-            stride: 8,
-            reg_size: 0x4000,
-        };
-        let pixels = [7u8; 16];
-        memory.write(framebuffer.gpa, &pixels).unwrap();
-        let usb = Arc::new(Mutex::new(XhciController::new(41, memory.clone(), 2, 2)));
-        let attachment = attach(memory, framebuffer, usb.clone());
+    fn native_frontend_tracks_the_guest_mode_and_releases_held_input() {
+        let ram = 2 * 1024 * 1024;
+        let memory = Arc::new(GuestMemory::allocate(0, ram).unwrap());
+        let fb = Arc::new(Ramfb::reserve(ram as u64, 2, 2).unwrap());
+        let initial = fb.config();
+        let pixels = vec![7u8; initial.pixel_bytes()];
+        memory.write(initial.gpa, &pixels).unwrap();
+        let usb = Arc::new(Mutex::new(XhciController::new(
+            41,
+            Arc::clone(&memory),
+            8,
+            4,
+        )));
+        let attachment = attach(
+            Arc::clone(&memory),
+            Arc::clone(&fb),
+            Arc::clone(&usb),
+            (8, 4),
+        );
         let mut width = 0;
         let mut height = 0;
-        assert!(vmm_native_geometry(&mut width, &mut height));
-        assert_eq!((width, height), (2, 2));
-        let mut copied = [0u8; 16];
+        let mut stride = 0;
+        assert!(vmm_native_geometry(&mut width, &mut height, &mut stride));
+        assert_eq!((width, height, stride), (2, 2, initial.stride));
+        let mut copied = vec![0u8; initial.pixel_bytes()];
         assert!(vmm_native_copy_frame(
             copied.as_mut_ptr().cast(),
             copied.len()
         ));
         assert_eq!(copied, pixels);
+
         vmm_native_key(56, true);
         vmm_native_key(0, true);
         assert_eq!(usb.lock().unwrap().keyboard_report()[0], 2);
         assert_eq!(usb.lock().unwrap().keyboard_report()[2], 4);
+        vmm_native_pointer(1, 1, 1);
+        let report = usb.lock().unwrap().tablet_report();
+        assert_eq!(u16::from_le_bytes([report[1], report[2]]), 0x7fff);
+        assert_eq!(u16::from_le_bytes([report[3], report[4]]), 0x7fff);
         vmm_native_release_input();
         assert_eq!(usb.lock().unwrap().keyboard_report(), [0; 8]);
+
+        let mut next = initial;
+        next.gpa = 0x180000;
+        next.width = 4;
+        next.height = 1;
+        next.stride = 32;
+        fb.guest_wrote(&descriptor_bytes(&next));
+        assert!(vmm_native_geometry(&mut width, &mut height, &mut stride));
+        assert_eq!((width, height, stride), (4, 1, 32));
+        let wide = vec![9u8; next.pixel_bytes()];
+        memory.write(next.gpa, &wide).unwrap();
+        assert!(!vmm_native_copy_frame(copied.as_mut_ptr().cast(), 16));
+        copied.resize(wide.len(), 0);
+        assert!(vmm_native_copy_frame(
+            copied.as_mut_ptr().cast(),
+            copied.len()
+        ));
+        assert_eq!(copied, wide);
+
+        let hit = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&hit);
+        set_stop_hook(Arc::new(move || flag.store(true, Ordering::SeqCst)));
+        vmm_native_close();
+        assert!(hit.load(Ordering::SeqCst));
+
+        vmm_native_key(0, true);
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = usb.lock().unwrap();
+            panic!("poison usb");
+        }));
+        vmm_native_release_input();
+        assert_eq!(
+            usb.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .keyboard_report(),
+            [0; 8]
+        );
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = ATTACHED.lock().unwrap();
+            panic!("poison attached");
+        }));
+        assert!(vmm_native_geometry(&mut width, &mut height, &mut stride));
         drop(attachment);
-        assert!(!vmm_native_geometry(&mut width, &mut height));
+        assert!(!vmm_native_geometry(&mut width, &mut height, &mut stride));
     }
 }

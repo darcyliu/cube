@@ -10,7 +10,7 @@
 extern bool vmm_native_finished(void);
 extern void vmm_native_close(void);
 extern void vmm_native_release_input(void);
-extern bool vmm_native_geometry(uint32_t *width, uint32_t *height);
+extern bool vmm_native_geometry(uint32_t *width, uint32_t *height, uint32_t *stride);
 extern bool vmm_native_copy_frame(void *pixels, size_t length);
 extern void vmm_native_key(uint16_t key, bool down);
 extern void vmm_native_pointer(uint16_t x, uint16_t y, uint8_t buttons);
@@ -57,6 +57,7 @@ static void stopApp(void) {
     size_t _pixelLength;
     uint32_t _guestWidth;
     uint32_t _guestHeight;
+    uint32_t _guestStride;
     uint8_t _buttons;
     bool _modifierKeys[128];
     bool _reportedFrame;
@@ -119,13 +120,14 @@ static void stopApp(void) {
         stopApp();
         return;
     }
-    uint32_t width = 0, height = 0;
-    if (!vmm_native_geometry(&width, &height)) return;
-    if (width != _guestWidth || height != _guestHeight) {
+    uint32_t width = 0, height = 0, stride = 0;
+    if (!vmm_native_geometry(&width, &height, &stride)) return;
+    if (width != _guestWidth || height != _guestHeight || stride != _guestStride) {
         _guestWidth = width;
         _guestHeight = height;
+        _guestStride = stride;
         free(_pixels);
-        _pixelLength = (size_t)width * height * 4;
+        _pixelLength = (size_t)stride * (size_t)height;
         _pixels = malloc(_pixelLength);
         MTLTextureDescriptor *desc = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -142,7 +144,7 @@ static void stopApp(void) {
     }
     if (!vmm_native_copy_frame(_pixels, _pixelLength)) return;
     [_frame replaceRegion:MTLRegionMake2D(0, 0, width, height)
-            mipmapLevel:0 withBytes:_pixels bytesPerRow:width * 4];
+            mipmapLevel:0 withBytes:_pixels bytesPerRow:_guestStride];
     CGSize drawableSize = self.drawableSize;
     if (drawableSize.width <= 0 || drawableSize.height <= 0) return;
     NSRect rect = guestRect(drawableSize, width, height);
@@ -253,7 +255,7 @@ bool vmm_cocoa_run(uint32_t width, uint32_t height) {
         }
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
-        NSRect frame = NSMakeRect(0, 0, MIN(width, 1280), MIN(height, 800));
+        NSRect frame = NSMakeRect(0, 0, width, height);
         NSWindow *window = [[NSWindow alloc]
             initWithContentRect:frame
             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -271,7 +273,7 @@ bool vmm_cocoa_run(uint32_t width, uint32_t height) {
         }
         window.contentView = view;
         window.delegate = view;
-        window.title = @"VMM — FreeBSD";
+        window.title = @"vmm-intel";
         [window center];
         [window makeKeyAndOrderFront:nil];
         [window makeFirstResponder:view];
