@@ -131,6 +131,7 @@ Options:
   --share TAG PATH             one read-only virtio-9p folder
   --share-rw TAG PATH          one read-write virtio-9p folder
   --vnc [ADDR]                 loopback RFB server (default 127.0.0.1:5900)
+                               UEFI with --vnc attaches xHCI HID at 00:0a.0 (INTx GSI 24)
   --display WIDTHxHEIGHT       framebuffer size; requires --vnc (default 1280x720, max 256 MiB)
   --serial-log, --console-log PATH
   -h, --help                   print this help and exit 1

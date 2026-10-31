@@ -1,14 +1,17 @@
-//! PCI CAM at ports `0xCF8`/`0xCFC`, the PIIX4 PM block, virtio-blk, virtio-net, and virtio-9p.
-//! No ECAM and no MCFG. Host-bridge and PIIX BARs do not decode.
-//! Virtio BAR0 does, inside the 32-bit PCI hole.
+//! PCI CAM at ports `0xCF8`/`0xCFC`, the PIIX4 PM block, virtio-blk, virtio-net,
+//! virtio-9p, and xHCI. No ECAM and no MCFG. Host-bridge and PIIX BARs do not decode.
+//! Virtio and xHCI BAR0 do, inside the 32-bit PCI hole.
 
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use super::MmioDevice;
+use super::usb::xhci::{MMIO_XHCI_SIZE, XhciController};
 use super::virtio::block::VirtioBlock;
 use super::virtio::net::{NetIrqHook, TxSubmit, VirtioNet};
 use super::virtio::transport::{
-    NET_BAR, PCI_HOLE_START, VIRTIO_BAR_SIZE, VirtioPciDev, VirtioPciTransport,
+    NET_BAR, PCI_HOLE_END, PCI_HOLE_START, VIRTIO_BAR_SIZE, VirtioPciDev, VirtioPciTransport,
 };
 
 pub use super::virtio::transport::PciIrq;
@@ -17,6 +20,19 @@ pub use super::virtio::transport::PciIrq;
 pub const PM_TIMER_HZ: u64 = 3_579_545;
 
 pub const PMBA_DEFAULT: u32 = 0xB000;
+
+/// `00:0a.0`. Not a virtio slot: disks use `00:02.0` and `00:04.0`–`00:08.0`,
+/// net is `00:03.0`, and 9p keeps `00:09` free with GSI 18.
+pub const XHCI_DEV: u8 = 10;
+/// Next pin after extra-disk GSI 23. Not shared with 16–23.
+pub const XHCI_GSI: u32 = 24;
+/// Default BAR0, clear of virtio-blk (`0xC0000000` + n * 16 KiB) and net (`0xC0100000`).
+pub const XHCI_BAR_DEFAULT: u32 = 0xC020_0000;
+
+const CMD_MEM: u16 = 1 << 1;
+const CMD_MASTER: u16 = 1 << 2;
+const CMD_INTX_DISABLE: u16 = 1 << 10;
+const XHCI_BAR_MASK: u32 = !(MMIO_XHCI_SIZE as u32 - 1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PciAction {
@@ -73,6 +89,8 @@ pub struct PciHost {
     blks: Vec<VirtioPciTransport>,
     net: Option<VirtioPciTransport>,
     p9: Option<VirtioPciTransport>,
+    xhci: Option<XhciFn>,
+    xhci_link: Option<XhciLink>,
     pending_irqs: Vec<PciIrq>,
     pending_tx: Option<TxSubmit>,
 }
@@ -104,6 +122,8 @@ impl PciHost {
             blks: Vec::new(),
             net: None,
             p9: None,
+            xhci: None,
+            xhci_link: None,
             pending_irqs: Vec::new(),
             pending_tx: None,
         }
@@ -148,6 +168,35 @@ impl PciHost {
         Ok(())
     }
 
+    /// One xHCI at [`XHCI_DEV`], INTx [`XHCI_GSI`]. The controller is shared
+    /// with the VNC thread; BAR ops lock it only after `PciHost` is dropped.
+    pub fn add_xhci(&mut self, ctrl: Arc<Mutex<XhciController>>) -> Result<(), String> {
+        if self.xhci.is_some() {
+            return Err("xHCI is already attached".into());
+        }
+        {
+            let mut ctrl = lock_ctrl(&ctrl);
+            ctrl.set_pci_flags(false, false);
+        }
+        self.xhci = Some(XhciFn::new(ctrl));
+        Ok(())
+    }
+
+    pub fn xhci_controller(&self) -> Option<Arc<Mutex<XhciController>>> {
+        self.xhci.as_ref().map(|xhci| Arc::clone(&xhci.ctrl))
+    }
+
+    /// Command-bit change to apply after `PciHost` is dropped. Applying it
+    /// here would walk guest memory under the host lock.
+    pub fn take_xhci_link(&mut self) -> Option<XhciLink> {
+        let link = self.xhci_link.take()?;
+        if let Some(xhci) = &mut self.xhci {
+            xhci.published_master = link.bus_master;
+            xhci.published_intx = link.intx_disable;
+        }
+        Some(link)
+    }
+
     pub fn set_net_hook(&self, hook: NetIrqHook) {
         if let Some(net) = &self.net {
             net.set_irq_hook(hook);
@@ -181,6 +230,9 @@ impl PciHost {
         if let Some(p9) = &self.p9 {
             entries.push(p9.prt());
         }
+        if let Some(xhci) = &self.xhci {
+            entries.push(xhci.prt());
+        }
         entries
     }
 
@@ -195,6 +247,14 @@ impl PciHost {
         gsis
     }
 
+    pub fn intx_gsis(&self) -> Vec<u32> {
+        let mut gsis = self.virtio_gsis();
+        if self.xhci.is_some() {
+            gsis.push(XHCI_GSI);
+        }
+        gsis
+    }
+
     pub fn take_intx(&mut self) -> Vec<PciIrq> {
         std::mem::take(&mut self.pending_irqs)
     }
@@ -204,18 +264,41 @@ impl PciHost {
         self.pending_tx.take()
     }
 
+    /// xHCI BAR hit. The caller drops `PciHost` before locking the controller
+    /// so a HID report copy does not run under the host mutex.
+    pub fn xhci_mmio_target(
+        &self,
+        gpa: u64,
+        size: usize,
+    ) -> Option<(Arc<Mutex<XhciController>>, u64)> {
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let xhci = self.xhci.as_ref()?;
+        let offset = bar_window(xhci.mapped_base(), gpa, size as u64, MMIO_XHCI_SIZE)?;
+        Some((Arc::clone(&xhci.ctrl), offset))
+    }
+
     pub fn mmio_read(&mut self, gpa: u64, size: usize) -> Option<u64> {
+        if let Some((ctrl, offset)) = self.xhci_mmio_target(gpa, size) {
+            return Some(lock_ctrl(&ctrl).read(offset, size));
+        }
         let (hit, offset) = self.bar_hit(gpa, size)?;
         let (value, irqs) = match hit {
             Hit::Blk(index) => self.blks[index].bar_read(offset, size),
             Hit::Net => self.net.as_mut().unwrap().bar_read(offset, size),
             Hit::P9 => self.p9.as_mut().unwrap().bar_read(offset, size),
+            Hit::Xhci => unreachable!("xHCI BAR is handled before bar_hit"),
         };
         self.pending_irqs.extend(irqs);
         Some(value)
     }
 
     pub fn mmio_write(&mut self, gpa: u64, data: u64, size: usize) -> bool {
+        if let Some((ctrl, offset)) = self.xhci_mmio_target(gpa, size) {
+            lock_ctrl(&ctrl).write(offset, data, size);
+            return true;
+        }
         let Some((hit, offset)) = self.bar_hit(gpa, size) else {
             return false;
         };
@@ -223,6 +306,7 @@ impl PciHost {
             Hit::Blk(index) => self.blks[index].bar_write(offset, data, size),
             Hit::Net => self.net.as_mut().unwrap().bar_write(offset, data, size),
             Hit::P9 => self.p9.as_mut().unwrap().bar_write(offset, data, size),
+            Hit::Xhci => unreachable!("xHCI BAR is handled before bar_hit"),
         };
         self.pending_irqs.extend(irqs);
         self.pending_tx = tx;
@@ -235,17 +319,17 @@ impl PciHost {
         }
         let len = size as u64;
         for (index, blk) in self.blks.iter().enumerate() {
-            if let Some(offset) = bar_window(blk.mapped_base(), gpa, len) {
+            if let Some(offset) = bar_window(blk.mapped_base(), gpa, len, VIRTIO_BAR_SIZE) {
                 return Some((Hit::Blk(index), offset));
             }
         }
         if let Some(net) = &self.net
-            && let Some(offset) = bar_window(net.mapped_base(), gpa, len)
+            && let Some(offset) = bar_window(net.mapped_base(), gpa, len, VIRTIO_BAR_SIZE)
         {
             return Some((Hit::Net, offset));
         }
         if let Some(p9) = &self.p9
-            && let Some(offset) = bar_window(p9.mapped_base(), gpa, len)
+            && let Some(offset) = bar_window(p9.mapped_base(), gpa, len, VIRTIO_BAR_SIZE)
         {
             return Some((Hit::P9, offset));
         }
@@ -323,11 +407,16 @@ impl PciHost {
 
     fn config_read(&self, port: u16, size: usize) -> u64 {
         let off = ((self.address & 0xfc) as usize) + (port - 0xCFC) as usize;
-        if let Some(hit) = self.addressed_virtio() {
+        if let Some(hit) = self.addressed_dev() {
             return match hit {
                 Hit::Blk(index) => self.blks[index].cfg_read(off, size),
                 Hit::Net => self.net.as_ref().unwrap().cfg_read(off, size),
                 Hit::P9 => self.p9.as_ref().unwrap().cfg_read(off, size),
+                Hit::Xhci => {
+                    let xhci = self.xhci.as_ref().unwrap();
+                    let irq = lock_ctrl(&xhci.ctrl).irq_asserted();
+                    xhci.cfg_read(off, size, irq)
+                }
             };
         }
         let Some(slot) = self.slot() else {
@@ -344,13 +433,26 @@ impl PciHost {
         if bus != 0 {
             return;
         }
-        if let Some(hit) = self.addressed_virtio() {
-            let irqs = match hit {
-                Hit::Blk(index) => self.blks[index].cfg_write(off, data, size),
-                Hit::Net => self.net.as_mut().unwrap().cfg_write(off, data, size),
-                Hit::P9 => self.p9.as_mut().unwrap().cfg_write(off, data, size),
-            };
-            self.pending_irqs.extend(irqs);
+        if let Some(hit) = self.addressed_dev() {
+            match hit {
+                Hit::Blk(index) => {
+                    let irqs = self.blks[index].cfg_write(off, data, size);
+                    self.pending_irqs.extend(irqs);
+                }
+                Hit::Net => {
+                    let irqs = self.net.as_mut().unwrap().cfg_write(off, data, size);
+                    self.pending_irqs.extend(irqs);
+                }
+                Hit::P9 => {
+                    let irqs = self.p9.as_mut().unwrap().cfg_write(off, data, size);
+                    self.pending_irqs.extend(irqs);
+                }
+                Hit::Xhci => {
+                    if self.xhci.as_mut().unwrap().cfg_write(off, data, size) {
+                        self.note_xhci_link();
+                    }
+                }
+            }
             return;
         }
         {
@@ -368,12 +470,15 @@ impl PciHost {
         }
     }
 
-    fn addressed_virtio(&self) -> Option<Hit> {
+    fn addressed_dev(&self) -> Option<Hit> {
         let bus = ((self.address >> 16) & 0xff) as u8;
         let dev = ((self.address >> 11) & 0x1f) as u8;
         let func = ((self.address >> 8) & 7) as u8;
         if bus != 0 || func != 0 {
             return None;
+        }
+        if self.xhci.is_some() && dev == XHCI_DEV {
+            return Some(Hit::Xhci);
         }
         if self.net.as_ref().is_some_and(|net| net.dev() == dev) {
             return Some(Hit::Net);
@@ -385,6 +490,24 @@ impl PciHost {
             .iter()
             .position(|blk| blk.dev() == dev)
             .map(Hit::Blk)
+    }
+
+    fn note_xhci_link(&mut self) {
+        let Some(xhci) = &self.xhci else {
+            return;
+        };
+        let bus_master = xhci.command & CMD_MASTER != 0;
+        let intx_disable = xhci.command & CMD_INTX_DISABLE != 0;
+        if bus_master == xhci.published_master && intx_disable == xhci.published_intx {
+            self.xhci_link = None;
+            return;
+        }
+        let ctrl = Arc::clone(&xhci.ctrl);
+        self.xhci_link = Some(XhciLink {
+            ctrl,
+            bus_master,
+            intx_disable,
+        });
     }
 
     fn slot(&self) -> Option<&Slot> {
@@ -505,16 +628,135 @@ enum Hit {
     Blk(usize),
     Net,
     P9,
+    Xhci,
 }
 
-fn bar_window(base: Option<u64>, gpa: u64, len: u64) -> Option<u64> {
+fn bar_window(base: Option<u64>, gpa: u64, len: u64, window: u64) -> Option<u64> {
     let base = base?;
     let offset = gpa.checked_sub(base)?;
-    if offset < VIRTIO_BAR_SIZE && len <= VIRTIO_BAR_SIZE - offset {
+    if offset < window && len <= window - offset {
         Some(offset)
     } else {
         None
     }
+}
+
+fn lock_ctrl(ctrl: &Mutex<XhciController>) -> std::sync::MutexGuard<'_, XhciController> {
+    ctrl.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct XhciFn {
+    command: u16,
+    bar_raw: u32,
+    interrupt_line: u8,
+    ctrl: Arc<Mutex<XhciController>>,
+    template: [u8; 256],
+    published_master: bool,
+    published_intx: bool,
+}
+
+impl XhciFn {
+    fn new(ctrl: Arc<Mutex<XhciController>>) -> Self {
+        Self {
+            command: 0,
+            bar_raw: XHCI_BAR_DEFAULT,
+            interrupt_line: 0,
+            ctrl,
+            template: xhci_template(),
+            published_master: false,
+            published_intx: false,
+        }
+    }
+
+    fn prt(&self) -> (u32, u32) {
+        (u32::from(XHCI_DEV) << 16, XHCI_GSI)
+    }
+
+    fn mapped_base(&self) -> Option<u64> {
+        if self.command & CMD_MEM == 0 {
+            return None;
+        }
+        let base = u64::from(self.bar_raw & XHCI_BAR_MASK);
+        let end = base.checked_add(MMIO_XHCI_SIZE)?;
+        if base < PCI_HOLE_START || end > PCI_HOLE_END {
+            return None;
+        }
+        Some(base)
+    }
+
+    fn cfg_read(&self, off: usize, size: usize, irq_asserted: bool) -> u64 {
+        if size == 0 || off >= 256 || size > 256 - off {
+            return 0;
+        }
+        read_le_bytes(&self.cfg_image(irq_asserted), off, size)
+    }
+
+    fn cfg_write(&mut self, off: usize, data: u64, size: usize) -> bool {
+        let mut command_changed = false;
+        for i in 0..size {
+            let at = off + i;
+            if at >= 256 {
+                break;
+            }
+            let byte = ((data >> (8 * i)) & 0xff) as u8;
+            match at {
+                0x04 | 0x05 => {
+                    let mut raw = self.command.to_le_bytes();
+                    raw[at - 0x04] = byte;
+                    self.command = u16::from_le_bytes(raw);
+                    command_changed = true;
+                }
+                0x10..=0x13 => {
+                    let mut raw = self.bar_raw.to_le_bytes();
+                    raw[at - 0x10] = byte;
+                    self.bar_raw = u32::from_le_bytes(raw);
+                }
+                0x3c => self.interrupt_line = byte,
+                _ => {}
+            }
+        }
+        command_changed
+    }
+
+    fn cfg_image(&self, irq_asserted: bool) -> [u8; 256] {
+        let mut cfg = self.template;
+        cfg[0x04..0x06].copy_from_slice(&self.command.to_le_bytes());
+        let mut status = 0u16;
+        if irq_asserted {
+            status |= 1 << 3;
+        }
+        cfg[0x06..0x08].copy_from_slice(&status.to_le_bytes());
+        let bar = self.bar_raw & XHCI_BAR_MASK;
+        cfg[0x10..0x14].copy_from_slice(&bar.to_le_bytes());
+        cfg[0x3c] = self.interrupt_line;
+        cfg
+    }
+}
+
+/// PCI command bits to publish onto [`XhciController`] after the host lock drops.
+pub struct XhciLink {
+    ctrl: Arc<Mutex<XhciController>>,
+    bus_master: bool,
+    intx_disable: bool,
+}
+
+impl XhciLink {
+    pub fn apply(self) {
+        lock_ctrl(&self.ctrl).set_pci_flags(self.bus_master, self.intx_disable);
+    }
+}
+
+fn xhci_template() -> [u8; 256] {
+    let mut cfg = [0u8; 256];
+    // qemu-xhci: Red Hat 1b36:000d, class 0x0c0330, INTA, no MSI.
+    cfg[0..2].copy_from_slice(&0x1b36u16.to_le_bytes());
+    cfg[2..4].copy_from_slice(&0x000du16.to_le_bytes());
+    cfg[0x08] = 0x01;
+    cfg[0x09] = 0x30;
+    cfg[0x0a] = 0x03;
+    cfg[0x0b] = 0x0c;
+    cfg[0x3d] = 1;
+    cfg
 }
 
 fn virtio_blk_bdf(index: usize) -> Result<(u8, u32), String> {
@@ -1004,6 +1246,51 @@ mod tests {
         assert!(pci.mmio_write(bar + 0x14, 0, 1));
         assert_eq!(pci.mmio_read(bar + 0x18, 2).unwrap(), 128);
         assert!(pci.take_intx().is_empty());
+    }
+
+    #[test]
+    fn xhci_bar0_hits_caplength_and_pointer_changes_the_hid_report() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::devices::usb::xhci::XhciController;
+        use crate::memory::GuestMemory;
+
+        let mem = Arc::new(GuestMemory::allocate(0, 0x1_0000).unwrap());
+        let ctrl = Arc::new(Mutex::new(XhciController::new(XHCI_GSI, mem, 1280, 720)));
+        let mut pci = PciHost::new();
+        assert!(pci.prt().iter().all(|(_, gsi)| *gsi != XHCI_GSI));
+        assert!(!pci.intx_gsis().contains(&XHCI_GSI));
+        pci.add_xhci(Arc::clone(&ctrl)).unwrap();
+        assert!(pci.add_xhci(Arc::clone(&ctrl)).is_err());
+        assert_eq!(pci.prt(), vec![(u32::from(XHCI_DEV) << 16, XHCI_GSI)]);
+        assert!(pci.intx_gsis().contains(&XHCI_GSI));
+        assert!(!pci.virtio_gsis().contains(&XHCI_GSI));
+        for reserved in 16..=23 {
+            assert!(!pci.prt().iter().any(|(_, gsi)| *gsi == reserved));
+        }
+
+        assert_eq!(cfg_in(&mut pci, 0x5000, 4), 0x000d_1b36);
+        assert_eq!(cfg_in(&mut pci, 0x5008, 4), 0x0c03_3001);
+        assert_eq!(cfg_in(&mut pci, 0x503c, 2) >> 8, 1);
+
+        cfg(&mut pci, 0x5010, 0xffff_ffff, 4);
+        assert_eq!(cfg_in(&mut pci, 0x5010, 4), 0xffff_0000);
+        cfg(&mut pci, 0x5010, u64::from(XHCI_BAR_DEFAULT), 4);
+        assert!(pci.mmio_read(u64::from(XHCI_BAR_DEFAULT), 4).is_none());
+        cfg(&mut pci, 0x5004, 0x6, 2);
+        if let Some(link) = pci.take_xhci_link() {
+            link.apply();
+        }
+        assert_eq!(
+            pci.mmio_read(u64::from(XHCI_BAR_DEFAULT), 4).unwrap(),
+            0x0100_0040
+        );
+
+        let before = ctrl.lock().unwrap().tablet_report();
+        ctrl.lock().unwrap().pointer_event(100, 200, 1);
+        let after = ctrl.lock().unwrap().tablet_report();
+        assert_ne!(before, after);
+        assert_eq!(after[0] & 1, 1);
     }
 
     fn cfg(pci: &mut PciHost, addr: u32, data: u64, size: usize) {

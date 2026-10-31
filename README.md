@@ -47,6 +47,8 @@ make vmnet-service
 
 After install, drop `--cdrom` and keep the disk, the vars file, and `--cpus 2`.
 
+`--vnc` on a UEFI boot serves the ramfb window and attaches a PCI xHCI keyboard and absolute tablet at `00:0a.0` (INTx GSI 24, BAR0 `0x10000`). A serial-only boot does not attach xHCI. There is no platform device at `0x0A010000`. Payload boots can serve VNC and do not attach xHCI.
+
 `--uefi` is the firmware boot (`firmware/OVMF_CODE.fd` unless a path is given). EFI variables persist in `<writable disk>.vars.fd`. For the installer disk that is `$HOME/VMs/freebsd-amd64/disk.img.vars.fd`. `--efi-vars PATH` overrides that. The first boot copies `firmware/OVMF_VARS.fd` (540672 bytes) into the store, and later boots open the same file. `--cow` attaches each `--disk` through a `PATH.cow` overlay. Do not combine `cow` and `ro`. With no arguments, `vmm` prints help and exits 1. See [docs/freebsd_amd64.md](docs/freebsd_amd64.md).
 
 `python3 -B scripts/verify.py` runs library tests plus the payload and OVMF smokes. `--suite full` adds the FreeBSD installer smoke. See [docs/verification.md](docs/verification.md).

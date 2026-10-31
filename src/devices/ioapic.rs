@@ -1,8 +1,10 @@
-//! One I/O APIC at `0xFEC00000`. 24 redirection entries, GSI base 0.
+//! One I/O APIC at `0xFEC00000`. 25 redirection entries, GSI base 0.
+//! GSI 24 is the xHCI pin. `set_level` keeps one level per pin, so that
+//! line cannot be shared with disk, net, or 9p.
 
 pub const IOAPIC_MMIO: u64 = 0xFEC0_0000;
 pub const IOAPIC_MMIO_LEN: u64 = 0x1000;
-const PINS: usize = 24;
+const PINS: usize = 25;
 const VERSION: u32 = 0x11 | ((PINS as u32 - 1) << 16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,5 +212,20 @@ mod tests {
         assert!(io.eoi(0x30).is_empty());
         io.write32(0x00, 0x01);
         assert_eq!(io.read32(0x10), VERSION);
+    }
+
+    #[test]
+    fn gsi_24_is_not_an_alias_of_gsi_0() {
+        let mut io = IoApic::new();
+        io.set_level(24, true);
+        io.write32(0x00, 0x10);
+        assert!(io.write32(0x10, 0x20).is_empty());
+        io.write32(0x00, 0x10 + 24 * 2);
+        assert!(io.write32(0x10, 0x30).is_empty());
+        assert!(io.set_level(24, false).is_empty());
+        let msgs = io.set_level(24, true);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].vector, 0x30);
+        assert!(io.set_level(0, true).iter().all(|msg| msg.vector != 0x30));
     }
 }

@@ -4,6 +4,7 @@
 //! framebuffer GPA on this machine: RAM now starts at 0, so that constant
 //! sits in ordinary memory, below the PCI hole at `0xC0000000`.
 
+pub mod keysym;
 pub mod vnc;
 
 use std::sync::Mutex;

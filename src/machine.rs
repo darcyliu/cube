@@ -9,8 +9,9 @@ use vmm::devices::ioapic::{IOAPIC_MMIO, IOAPIC_MMIO_LEN, IoApic, IoapicMsg};
 use vmm::devices::lapic::{
     DeliveryMode, LAPIC_MMIO, LAPIC_MMIO_LEN, Lapic, LapicEffect, Peer, logical_match,
 };
-use vmm::devices::pci::{PciAction, PciHost, PciIrq, deliver_intx_then_send};
-use vmm::devices::{MmioBus, PioBus};
+use vmm::devices::pci::{PciAction, PciHost, PciIrq, XHCI_GSI, deliver_intx_then_send};
+use vmm::devices::usb::xhci::XhciController;
+use vmm::devices::{MmioBus, MmioDevice, PioBus};
 use vmm::gpa::GuestSpace;
 use vmm::terminal::host_log;
 
@@ -86,11 +87,18 @@ impl Machine {
 
     pub fn pio_write(&self, port: u16, data: u64, size: usize) -> Result<(), String> {
         if let Some(pci) = &self.pci {
-            let mut pci = pci.lock().unwrap();
-            if pci.try_out(port, data, size) {
-                let action = pci.take_action();
-                let irqs = pci.take_intx();
-                drop(pci);
+            let hit = {
+                let mut pci = pci.lock().unwrap();
+                if !pci.try_out(port, data, size) {
+                    None
+                } else {
+                    Some((pci.take_action(), pci.take_intx(), pci.take_xhci_link()))
+                }
+            };
+            if let Some((action, irqs, link)) = hit {
+                if let Some(link) = link {
+                    link.apply();
+                }
                 self.deliver_intx(irqs);
                 self.apply_pci(action);
                 return Ok(());
@@ -163,6 +171,23 @@ impl Machine {
         });
         pci.lock().unwrap().set_net_hook(hook);
         self.kick_net_irq();
+    }
+
+    /// The hook calls `set_gsi` and must not take `PciHost`: VNC holds the
+    /// controller across a HID update and may raise the pin from that lock.
+    pub fn wire_xhci_irq(self: &Arc<Self>) {
+        let Some(pci) = &self.pci else {
+            return;
+        };
+        let Some(ctrl) = pci.lock().unwrap().xhci_controller() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        lock_xhci(&ctrl).set_irq_hook(Arc::new(move |high| {
+            if let Some(machine) = weak.upgrade() {
+                machine.set_gsi(XHCI_GSI, high);
+            }
+        }));
     }
 
     /// Stop the RX thread while this `Arc` is still alive. `Drop` cannot do
@@ -323,6 +348,13 @@ impl Machine {
 
     fn pci_bar_read(&self, gpa: u64, size: usize) -> Option<u64> {
         let pci = self.pci.as_ref()?;
+        let xhci = {
+            let pci = pci.lock().unwrap();
+            pci.xhci_mmio_target(gpa, size)
+        };
+        if let Some((ctrl, offset)) = xhci {
+            return Some(lock_xhci(&ctrl).read(offset, size));
+        }
         let mut pci = pci.lock().unwrap();
         let value = pci.mmio_read(gpa, size)?;
         let irqs = pci.take_intx();
@@ -335,6 +367,14 @@ impl Machine {
         let Some(pci) = self.pci.as_ref() else {
             return false;
         };
+        let xhci = {
+            let pci = pci.lock().unwrap();
+            pci.xhci_mmio_target(gpa, size)
+        };
+        if let Some((ctrl, offset)) = xhci {
+            lock_xhci(&ctrl).write(offset, value, size);
+            return true;
+        }
         let (irqs, tx) = {
             let mut pci = pci.lock().unwrap();
             if !pci.mmio_write(gpa, value, size) {
@@ -429,6 +469,10 @@ impl Drop for Machine {
         let worker = self.take_net_worker();
         join_foreign_worker(worker);
     }
+}
+
+fn lock_xhci(ctrl: &Mutex<XhciController>) -> std::sync::MutexGuard<'_, XhciController> {
+    ctrl.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn join_foreign_worker(worker: Option<JoinHandle<()>>) {

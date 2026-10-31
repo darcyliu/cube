@@ -146,12 +146,12 @@ fn run_payload_inner(
             "[VMM] ramfb {}x{} stride {} at GPA {:#x}",
             cfg.width, cfg.height, cfg.stride, cfg.gpa
         );
-        Some(display::vnc::spawn(Arc::clone(&mem), ramfb, addr)?)
+        Some(display::vnc::spawn(Arc::clone(&mem), ramfb, addr, None)?)
     } else {
         None
     };
     let pci = assemble_pci(blocks, nic, share, false)?;
-    let gsis = pci.as_ref().map(PciHost::virtio_gsis).unwrap_or_default();
+    let gsis = pci.as_ref().map(PciHost::intx_gsis).unwrap_or_default();
 
     let _vm = create_vm(&mem)?;
     let slot: Arc<OnceLock<Weak<Machine>>> = Arc::new(OnceLock::new());
@@ -170,6 +170,7 @@ fn run_payload_inner(
     let _ = slot.set(Arc::downgrade(&machine));
     machine.wire_uart_irq(&serial);
     machine.wire_net_irq();
+    machine.wire_xhci_irq();
     idle_intx(&machine, &gsis);
     boot_cpus(machine, kicks, serial, Entry::Payload { cr3 })
 }
@@ -224,17 +225,42 @@ fn run_uefi_inner(
     let share = open_share(&ram, share)?;
     let (width, height) = display.unwrap_or((display::FB_WIDTH, display::FB_HEIGHT));
     let ramfb = Arc::new(Ramfb::reserve(ram_bytes as u64, width, height)?);
+    // Pointer exists only with --vnc. Serial-only and payload boots stay without xHCI.
+    let xhci = if vnc.is_some() {
+        let abs_x =
+            u16::try_from(width).map_err(|_| "display width does not fit the HID tablet")?;
+        let abs_y =
+            u16::try_from(height).map_err(|_| "display height does not fit the HID tablet")?;
+        Some(Arc::new(Mutex::new(
+            vmm::devices::usb::xhci::XhciController::new(
+                vmm::devices::pci::XHCI_GSI,
+                Arc::clone(&ram),
+                abs_x,
+                abs_y,
+            ),
+        )))
+    } else {
+        None
+    };
     // `_vnc` stays live across `boot_cpus` so Drop joins the worker on this thread.
     let _vnc = match vnc {
         Some(addr) => Some(display::vnc::spawn(
             Arc::clone(&ram),
             Arc::clone(&ramfb),
             addr,
+            xhci.clone(),
         )?),
         None => None,
     };
-    let pci = assemble_pci(blocks, nic, share, true)?.expect("UEFI always has a PCI host");
-    let gsis = pci.virtio_gsis();
+    let mut pci = assemble_pci(blocks, nic, share, true)?.expect("UEFI always has a PCI host");
+    if let Some(ctrl) = xhci {
+        pci.add_xhci(ctrl)?;
+        eprintln!(
+            "[VMM] xHCI HID keyboard and tablet at 00:0a.0 INTx GSI {}",
+            vmm::devices::pci::XHCI_GSI
+        );
+    }
+    let gsis = pci.intx_gsis();
     let mut tables = vmm::acpi::build_with_prt(cpus, ram_bytes as u64, &pci.prt());
     tables.e820 = vmm::acpi::e820_reserving(
         ram_bytes as u64,
@@ -302,6 +328,7 @@ fn run_uefi_inner(
     let _ = slot.set(Arc::downgrade(&machine));
     machine.wire_uart_irq(&serial);
     machine.wire_net_irq();
+    machine.wire_xhci_irq();
     idle_intx(&machine, &gsis);
     boot_cpus(machine, kicks, serial, Entry::Firmware)
 }

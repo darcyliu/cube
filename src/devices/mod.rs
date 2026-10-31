@@ -12,6 +12,7 @@ pub mod pflash;
 pub mod pic;
 pub mod pit;
 pub mod serial;
+pub mod usb;
 pub mod virtio;
 
 use std::sync::{Arc, Mutex};

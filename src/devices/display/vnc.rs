@@ -3,16 +3,18 @@
 //! macOS Screen Sharing is picky with third-party servers; prefer TigerVNC
 //! Viewer (`brew install --cask tigervnc-viewer`) if Screen Sharing drops.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::devices::usb::xhci::XhciController;
 use crate::memory::GuestMemory;
 
-use super::{FramebufferConfig, Ramfb};
+use super::{FramebufferConfig, Ramfb, keysym};
 
 const RFB_VERSION: &[u8] = b"RFB 003.008\n";
 
@@ -100,8 +102,56 @@ impl Drop for VncServer {
     }
 }
 
+/// A session owns its pressed keys. Drop releases them even after protocol errors.
+struct SessionInput {
+    keys: BTreeSet<u16>,
+    position: (u16, u16),
+    usb: Option<Arc<Mutex<XhciController>>>,
+}
+
+impl SessionInput {
+    fn key(&mut self, code: u16, down: bool) {
+        if down {
+            self.keys.insert(code);
+        } else {
+            self.keys.remove(&code);
+        }
+        let Some(usb) = &self.usb else {
+            return;
+        };
+        // Poisoned lock: keep delivering. Do not touch PciHost here.
+        lock_xhci(usb).key_event(code, down);
+    }
+
+    fn pointer(&mut self, x: u16, y: u16, buttons: u8) {
+        self.position = (x, y);
+        let Some(usb) = &self.usb else {
+            return;
+        };
+        lock_xhci(usb).pointer_event(x, y, buttons);
+    }
+}
+
+impl Drop for SessionInput {
+    fn drop(&mut self) {
+        for code in self.keys.clone() {
+            self.key(code, false);
+        }
+        self.pointer(self.position.0, self.position.1, 0);
+    }
+}
+
+fn lock_xhci(usb: &Mutex<XhciController>) -> std::sync::MutexGuard<'_, XhciController> {
+    usb.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// One session at a time. The listener is loopback-only and unauthenticated.
-pub fn spawn(mem: Arc<GuestMemory>, fb: Arc<Ramfb>, bind: SocketAddr) -> Result<VncServer, String> {
+pub fn spawn(
+    mem: Arc<GuestMemory>,
+    fb: Arc<Ramfb>,
+    bind: SocketAddr,
+    usb: Option<Arc<Mutex<XhciController>>>,
+) -> Result<VncServer, String> {
     if !bind.ip().is_loopback() {
         return Err(
             "VNC without authentication must bind to loopback; use an SSH tunnel for remote access"
@@ -117,6 +167,7 @@ pub fn spawn(mem: Arc<GuestMemory>, fb: Arc<Ramfb>, bind: SocketAddr) -> Result<
     let stop_thr = Arc::clone(&stop);
     let mem_thr = Arc::clone(&mem);
     let fb_thr = Arc::clone(&fb);
+    let usb_thr = usb.clone();
 
     let worker = thread::Builder::new()
         .name("vmm-vnc".into())
@@ -139,7 +190,8 @@ pub fn spawn(mem: Arc<GuestMemory>, fb: Arc<Ramfb>, bind: SocketAddr) -> Result<
                         let mem_c = Arc::clone(&mem_thr);
                         let fb_c = Arc::clone(&fb_thr);
                         let stop_c = Arc::clone(&stop_thr);
-                        if let Err(e) = handle_client(stream, mem_c, fb_c, stop_c) {
+                        let usb_c = usb_thr.clone();
+                        if let Err(e) = handle_client(stream, mem_c, fb_c, stop_c, usb_c) {
                             crate::host_log!("[VNC] Client session ended: {e}");
                         }
                         crate::host_log!("[VNC] Client disconnected");
@@ -167,7 +219,13 @@ fn handle_client(
     mem: Arc<GuestMemory>,
     ramfb: Arc<Ramfb>,
     stop: Arc<AtomicBool>,
+    usb: Option<Arc<Mutex<XhciController>>>,
 ) -> Result<(), String> {
+    let mut input = SessionInput {
+        keys: BTreeSet::new(),
+        position: (0, 0),
+        usb,
+    };
     stream.set_nonblocking(false).map_err(|e| e.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_millis(250)))
@@ -349,16 +407,41 @@ fn handle_client(
                 thread::sleep(Duration::from_millis(16));
             }
             4 => {
-                read_exact_timeout(&mut stream, &mut [0u8; 7], &stop)?;
+                // KeyEvent: down(u8), pad(u16), keysym(u32 BE)
+                let mut rest = [0u8; 7];
+                read_exact_timeout(&mut stream, &mut rest, &stop)?;
+                let down = rest[0] != 0;
+                let keysym_val = u32::from_be_bytes([rest[3], rest[4], rest[5], rest[6]]);
+                if let Some(code) = keysym::keysym_to_linux(keysym_val) {
+                    input.key(code, down);
+                } else {
+                    crate::device_trace!("[VNC] unmapped keysym {keysym_val:#x}");
+                }
             }
             5 => {
-                read_exact_timeout(&mut stream, &mut [0u8; 5], &stop)?;
+                // PointerEvent: mask(u8), x(u16 BE), y(u16 BE)
+                let mut rest = [0u8; 5];
+                read_exact_timeout(&mut stream, &mut rest, &stop)?;
+                let buttons = rest[0];
+                let x = u16::from_be_bytes([rest[1], rest[2]]);
+                let y = u16::from_be_bytes([rest[3], rest[4]]);
+                input.pointer(x, y, buttons);
             }
             255 => {
+                // QEMU extension: subtype(u8), down(u16), keysym(u32), keycode(u32).
                 let mut rest = [0u8; 11];
                 read_exact_timeout(&mut stream, &mut rest, &stop)?;
                 if rest[0] != 0 {
                     return Err("Unsupported QEMU VNC subtype".into());
+                }
+                let down = u16::from_be_bytes([rest[1], rest[2]]) != 0;
+                let keysym_val = u32::from_be_bytes([rest[3], rest[4], rest[5], rest[6]]);
+                // QEMU keycodes are XT scancodes, not Linux evdev codes.
+                match keysym::keysym_to_linux(keysym_val) {
+                    Some(code) => input.key(code, down),
+                    None => {
+                        crate::device_trace!("[VNC] unmapped ext keysym {keysym_val:#x}");
+                    }
                 }
             }
             6 => {
@@ -550,7 +633,7 @@ mod tests {
         let mem = Arc::new(GuestMemory::allocate(0, 8 * 1024 * 1024).unwrap());
         let fb = Arc::new(Ramfb::reserve(8 * 1024 * 1024, 64, 64).unwrap());
         let addr = "0.0.0.0:9".parse().unwrap();
-        let Err(err) = spawn(mem, fb, addr) else {
+        let Err(err) = spawn(mem, fb, addr, None) else {
             panic!("non-loopback bind should fail");
         };
         assert!(err.contains("loopback"), "{err}");

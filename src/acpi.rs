@@ -1,5 +1,5 @@
 //! ACPI tables, e820, and QEMU bios-linker-loader records.
-//! `_PRT` is emitted only for virtio functions passed to [`build_with_prt`].
+//! `_PRT` lists only the INTx pins passed to [`build_with_prt`].
 
 use crate::devices::pci::{PMBA_DEFAULT, pm_timer_port};
 
@@ -17,7 +17,7 @@ pub fn build(ncpus: u32, ram_size: u64) -> FirmwareFiles {
     build_with_prt(ncpus, ram_size, &[])
 }
 
-/// `prt` entries are `(slot << 16 | function, gsi)` for each virtio INTA pin.
+/// `prt` entries are `(slot << 16 | function, gsi)` for each INTA pin.
 pub fn build_with_prt(ncpus: u32, ram_size: u64, prt: &[(u32, u32)]) -> FirmwareFiles {
     let dsdt = build_dsdt(prt);
     let madt = build_madt(ncpus);
