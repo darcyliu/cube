@@ -177,11 +177,7 @@ impl PciHost {
         let irq_status = {
             let mut ctrl = lock_ctrl(&ctrl);
             ctrl.set_pci_flags(false, false);
-            let irq_status = ctrl.irq_status_flag();
-            // The wrapper records irq_level for config space. `wire_xhci_irq`
-            // replaces the pin side and keeps that publish.
-            ctrl.set_irq_hook(Arc::new(|_, _| {}));
-            irq_status
+            ctrl.irq_status_flag()
         };
         self.xhci = Some(XhciFn::new(ctrl, irq_status));
         Ok(())
@@ -1341,11 +1337,9 @@ mod tests {
         pci.add_xhci(Arc::clone(&ctrl)).unwrap();
         {
             let seen = Arc::clone(&seen);
-            ctrl.lock()
-                .unwrap()
-                .set_irq_hook(Arc::new(move |high, requested| {
-                    seen.lock().unwrap().push((high, requested));
-                }));
+            ctrl.lock().unwrap().set_irq_hook(Arc::new(move |high| {
+                seen.lock().unwrap().push(high);
+            }));
         }
         cfg(&mut pci, 0x5010, u64::from(XHCI_BAR_DEFAULT), 4);
         cfg(&mut pci, 0x5004, 0x6, 2);
@@ -1365,11 +1359,11 @@ mod tests {
         assert_eq!(status_bit(&mut pci), 0);
         write(&pci, bar + 0x40, 5); // USBCMD RS|INTE, posts port events
         assert_eq!(status_bit(&mut pci), 8);
-        assert_eq!(seen.lock().unwrap().last().copied(), Some((false, true)));
+        assert_eq!(seen.lock().unwrap().last().copied(), Some(false));
         cfg(&mut pci, 0x5004, 0x406, 2);
         pci.take_xhci_link().unwrap().apply();
         assert_eq!(status_bit(&mut pci), 8);
-        assert_eq!(seen.lock().unwrap().last().copied(), Some((true, true)));
+        assert_eq!(seen.lock().unwrap().last().copied(), Some(true));
     }
 
     fn cfg(pci: &mut PciHost, addr: u32, data: u64, size: usize) {

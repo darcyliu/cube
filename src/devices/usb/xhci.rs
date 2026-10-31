@@ -203,10 +203,10 @@ pub struct XhciController {
     /// Default set so unit tests can DMA. The PCI function clears it before the guest runs.
     bus_master: bool,
     intx_disable: bool,
-    /// PCI Status Interrupt Status. The IRQ hook publishes this. Interrupt
-    /// Disable forces the pin idle without clearing it.
+    /// PCI Status Interrupt Status. [`Self::notify_irq`] stores `irq_level`
+    /// here. Interrupt Disable forces the pin idle without clearing it.
     irq_status: Arc<AtomicBool>,
-    irq_hook: Option<Arc<dyn Fn(bool, bool) + Send + Sync>>,
+    irq_hook: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
@@ -266,15 +266,9 @@ impl XhciController {
         Arc::clone(&self.irq_status)
     }
 
-    /// `pin_high` is the electrical INTx level (active-low: asserted is `false`).
-    /// `requested` is the PCI status bit. The wrapper publishes `requested`
-    /// before the caller's hook so a config read does not take this mutex.
-    pub fn set_irq_hook(&mut self, hook: Arc<dyn Fn(bool, bool) + Send + Sync>) {
-        let status = Arc::clone(&self.irq_status);
-        self.irq_hook = Some(Arc::new(move |pin_high, requested| {
-            status.store(requested, Ordering::Release);
-            hook(pin_high, requested);
-        }));
+    /// `high` is the electrical INTx level (active-low: asserted is `false`).
+    pub fn set_irq_hook(&mut self, hook: Arc<dyn Fn(bool) + Send + Sync>) {
+        self.irq_hook = Some(hook);
         self.notify_irq();
     }
 
@@ -343,11 +337,11 @@ impl XhciController {
     }
 
     fn notify_irq(&mut self) {
-        let pin_high = !self.irq_level || self.intx_disable;
+        self.irq_status.store(self.irq_level, Ordering::Release);
         let Some(hook) = self.irq_hook.clone() else {
             return;
         };
-        hook(pin_high, self.irq_level);
+        hook(!self.irq_level || self.intx_disable);
     }
 
     fn hcrst(&mut self) {
@@ -1921,25 +1915,27 @@ mod tests {
         let mut c = controller();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
-        c.set_irq_hook(Arc::new(move |high, requested| {
-            log.lock().unwrap().push((high, requested));
+        c.set_irq_hook(Arc::new(move |high| {
+            log.lock().unwrap().push(high);
         }));
         c.usbcmd = USBCMD_INTE;
         c.usbsts |= USBSTS_EINT;
         c.iman = IMAN_IP;
         c.runtime_write(0x20, u64::from(IMAN_IE), 4);
-        assert_eq!(seen.lock().unwrap().last().copied(), Some((false, true)));
+        assert_eq!(seen.lock().unwrap().last().copied(), Some(false));
+        assert!(c.irq_status.load(Ordering::Acquire));
 
         let mut c = controller();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
-        c.set_irq_hook(Arc::new(move |high, requested| {
-            log.lock().unwrap().push((high, requested));
+        c.set_irq_hook(Arc::new(move |high| {
+            log.lock().unwrap().push(high);
         }));
         c.iman = IMAN_IP | IMAN_IE;
         c.oper_write(0, u64::from(USBCMD_INTE), 4);
-        assert_eq!(seen.lock().unwrap().last().copied(), Some((false, true)));
+        assert_eq!(seen.lock().unwrap().last().copied(), Some(false));
         c.set_pci_flags(true, true);
-        assert_eq!(seen.lock().unwrap().last().copied(), Some((true, true)));
+        assert_eq!(seen.lock().unwrap().last().copied(), Some(true));
+        assert!(c.irq_status.load(Ordering::Acquire));
     }
 }
