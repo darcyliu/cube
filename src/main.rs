@@ -52,6 +52,8 @@ fn main() {
                     run.net,
                     run.forwards,
                     run.share,
+                    run.vnc,
+                    run.display,
                 ),
                 Boot::Uefi(path) => vm::run_uefi(
                     path,
@@ -63,6 +65,8 @@ fn main() {
                     run.forwards,
                     run.efi_vars,
                     run.share,
+                    run.vnc,
+                    run.display,
                 ),
             };
             let mut failed = false;
@@ -95,7 +99,6 @@ fn main() {
         }
     }
 }
-
 
 /// Marketing major >= 10, before any `hv_*` call.
 /// 10.15 may omit `kern.osproductversion`; Darwin 19 is macOS 10.15.

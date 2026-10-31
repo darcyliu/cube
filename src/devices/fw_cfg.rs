@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::memory::GuestMemory;
 
+use super::display::{self, Ramfb};
 use super::{MmioDevice, PioDevice};
 
 const FW_CFG_SIGNATURE: u16 = 0x00;
@@ -18,6 +19,7 @@ const FW_CFG_DMA_CTL_ERROR: u32 = 0x01;
 const FW_CFG_DMA_CTL_READ: u32 = 0x02;
 const FW_CFG_DMA_CTL_SKIP: u32 = 0x04;
 const FW_CFG_DMA_CTL_SELECT: u32 = 0x08;
+const FW_CFG_DMA_CTL_WRITE: u32 = 0x10;
 
 const REG_DATA: u64 = 0x00;
 const REG_SELECTOR: u64 = 0x08;
@@ -27,6 +29,7 @@ struct FwCfgItem {
     selector: u16,
     name: [u8; 56],
     data: Vec<u8>,
+    writable: bool,
 }
 
 pub struct FwCfg {
@@ -35,43 +38,53 @@ pub struct FwCfg {
     offset: usize,
     dma_addr: u64,
     ram: Arc<GuestMemory>,
+    /// `etc/ramfb`. Guest DMA writes update the framebuffer reader.
+    ramfb: Option<Arc<Ramfb>>,
 }
 
 impl FwCfg {
     pub fn from_files(ram: Arc<GuestMemory>, files: &[(&str, &[u8])]) -> Self {
+        Self::build(ram, files, None)
+    }
+
+    /// Same directory as [`Self::from_files`], plus a writable `etc/ramfb` blob.
+    pub fn from_files_with_ramfb(
+        ram: Arc<GuestMemory>,
+        files: &[(&str, &[u8])],
+        ramfb: Arc<Ramfb>,
+    ) -> Self {
+        Self::build(ram, files, Some(ramfb))
+    }
+
+    fn build(ram: Arc<GuestMemory>, files: &[(&str, &[u8])], ramfb: Option<Arc<Ramfb>>) -> Self {
         let mut items = Vec::new();
-        items.push(FwCfgItem {
-            selector: FW_CFG_SIGNATURE,
-            name: [0; 56],
-            data: b"QEMU".to_vec(),
-        });
-        items.push(FwCfgItem {
-            selector: FW_CFG_ID,
-            name: [0; 56],
-            data: (FW_CFG_VERSION | FW_CFG_VERSION_DMA).to_le_bytes().to_vec(),
-        });
+        items.push(fixed_item(FW_CFG_SIGNATURE, b"QEMU".to_vec()));
+        items.push(fixed_item(
+            FW_CFG_ID,
+            (FW_CFG_VERSION | FW_CFG_VERSION_DMA).to_le_bytes().to_vec(),
+        ));
 
         for (index, (name, data)) in files.iter().enumerate() {
-            let mut item_name = [0u8; 56];
-            let raw = name.as_bytes();
-            let n = raw.len().min(55);
-            item_name[..n].copy_from_slice(&raw[..n]);
-            items.push(FwCfgItem {
-                selector: FW_CFG_FILE_FIRST + index as u16,
-                name: item_name,
-                data: data.to_vec(),
-            });
+            items.push(file_item(
+                FW_CFG_FILE_FIRST + index as u16,
+                name,
+                data.to_vec(),
+                false,
+            ));
+        }
+        if let Some(ramfb) = &ramfb {
+            let index = files.len();
+            let cfg = ramfb.config();
+            items.push(file_item(
+                FW_CFG_FILE_FIRST + index as u16,
+                "etc/ramfb",
+                display::descriptor_bytes(&cfg).to_vec(),
+                true,
+            ));
         }
 
         let dir = build_file_dir(&items);
-        items.insert(
-            2,
-            FwCfgItem {
-                selector: FW_CFG_FILE_DIR,
-                name: [0; 56],
-                data: dir,
-            },
-        );
+        items.insert(2, fixed_item(FW_CFG_FILE_DIR, dir));
 
         Self {
             items,
@@ -79,6 +92,7 @@ impl FwCfg {
             offset: 0,
             dma_addr: 0,
             ram,
+            ramfb,
         }
     }
 
@@ -171,6 +185,10 @@ impl FwCfg {
                 let _ = self.ram.write(dma_buf + chunk.len() as u64, &zeros);
             }
             self.offset = end;
+        } else if control & FW_CFG_DMA_CTL_WRITE != 0 {
+            if length > 0 && !self.dma_write(dma_buf, length) {
+                err = FW_CFG_DMA_CTL_ERROR;
+            }
         } else if control & FW_CFG_DMA_CTL_SKIP != 0 {
             self.offset = self.offset.saturating_add(length);
         }
@@ -178,6 +196,73 @@ impl FwCfg {
         let result = err.to_be_bytes();
         let _ = self.ram.write(addr, &result);
     }
+
+    /// Copy `length` guest bytes into the selected file. Only `etc/ramfb` is writable.
+    /// A write that does not fit is refused without changing the blob.
+    fn dma_write(&mut self, dma_buf: u64, length: usize) -> bool {
+        if length > 16 * 1024 * 1024 {
+            return false;
+        }
+        let selector = self.selector;
+        let offset = self.offset;
+        let Some(index) = self.items.iter().position(|item| item.selector == selector) else {
+            return false;
+        };
+        let item = &self.items[index];
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
+        if !item.writable
+            || end > item.data.len()
+            || self.ram.checked_offset(dma_buf, length).is_err()
+        {
+            return false;
+        }
+        let mut tmp = vec![0u8; length];
+        if self.ram.read(dma_buf, &mut tmp).is_err() {
+            return false;
+        }
+        let item = &mut self.items[index];
+        item.data[offset..end].copy_from_slice(&tmp);
+        self.offset = end;
+        if item_name(&item.name) == b"etc/ramfb" {
+            let bytes = item.data.clone();
+            if let Some(ramfb) = &self.ramfb {
+                ramfb.guest_wrote(&bytes);
+            }
+        }
+        true
+    }
+}
+
+fn fixed_item(selector: u16, data: Vec<u8>) -> FwCfgItem {
+    FwCfgItem {
+        selector,
+        name: [0; 56],
+        data,
+        writable: false,
+    }
+}
+
+fn file_item(selector: u16, name: &str, data: Vec<u8>, writable: bool) -> FwCfgItem {
+    let mut item_name = [0u8; 56];
+    let raw = name.as_bytes();
+    let n = raw.len().min(55);
+    item_name[..n].copy_from_slice(&raw[..n]);
+    FwCfgItem {
+        selector,
+        name: item_name,
+        data,
+        writable,
+    }
+}
+
+fn item_name(name: &[u8; 56]) -> &[u8] {
+    let end = name
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(name.len());
+    &name[..end]
 }
 
 fn build_file_dir(items: &[FwCfgItem]) -> Vec<u8> {
@@ -321,5 +406,145 @@ mod tests {
         let mut ctl = [0u8; 4];
         ram.read(0x100, &mut ctl).unwrap();
         assert_eq!(ctl, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn ramfb_directory_entry_tracks_a_guest_write() {
+        let ram_size = 8 * 1024 * 1024;
+        let ram = Arc::new(GuestMemory::allocate(0, ram_size).unwrap());
+        let ramfb = Arc::new(Ramfb::reserve(ram_size as u64, 64, 64).unwrap());
+        let initial = ramfb.config();
+        let mut cfg = FwCfg::from_files_with_ramfb(
+            Arc::clone(&ram),
+            &[("etc/e820", &[1, 2, 3, 4])],
+            Arc::clone(&ramfb),
+        );
+        let dir = cfg
+            .items
+            .iter()
+            .find(|item| item.selector == FW_CFG_FILE_DIR)
+            .unwrap()
+            .data
+            .clone();
+        assert!(dir.windows(10).any(|w| w == b"etc/ramfb\0"));
+        assert!(!dir.windows(8).any(|w| w == b"etc/fdt\0"));
+        let (size, selector) = dir_file(&dir, "etc/ramfb").unwrap();
+        assert_eq!(size, 28);
+        let published = cfg
+            .items
+            .iter()
+            .find(|item| item.selector == selector)
+            .unwrap();
+        assert!(published.writable);
+        assert_eq!(
+            published.data.as_slice(),
+            display::descriptor_bytes(&initial)
+        );
+
+        // Little-endian guest write, the layout named in the ramfb descriptor.
+        let mut le = display::descriptor_bytes(&initial);
+        le[0..8].copy_from_slice(&0x20_0000u64.to_le_bytes());
+        le[16..20].copy_from_slice(&32u32.to_le_bytes());
+        le[20..24].copy_from_slice(&16u32.to_le_bytes());
+        le[24..28].copy_from_slice(&128u32.to_le_bytes());
+        guest_dma_write(&mut cfg, &ram, selector, 0x1000, 0x2000, &le);
+        assert_eq!(ramfb.config().gpa, 0x20_0000);
+        assert_eq!(ramfb.config().width, 32);
+        assert_eq!(ramfb.config().height, 16);
+        assert_eq!(ramfb.config().stride, 128);
+        assert_eq!(
+            cfg.items
+                .iter()
+                .find(|item| item.selector == selector)
+                .unwrap()
+                .data
+                .as_slice(),
+            le.as_slice()
+        );
+
+        // OVMF QemuRamfbDxe SwapBytes the fields, so the on-wire image is big-endian.
+        let mut be = [0u8; 28];
+        be[0..8].copy_from_slice(&0x30_0000u64.to_be_bytes());
+        be[8..12].copy_from_slice(&display::XRGB8888.to_be_bytes());
+        be[16..20].copy_from_slice(&8u32.to_be_bytes());
+        be[20..24].copy_from_slice(&8u32.to_be_bytes());
+        be[24..28].copy_from_slice(&32u32.to_be_bytes());
+        guest_dma_write(&mut cfg, &ram, selector, 0x1000, 0x2000, &be);
+        assert_eq!(ramfb.config().gpa, 0x30_0000);
+        assert_eq!(ramfb.config().width, 8);
+        assert_eq!(ramfb.config().height, 8);
+        assert_eq!(ramfb.config().stride, 32);
+        assert_eq!(
+            cfg.items
+                .iter()
+                .find(|item| item.selector == selector)
+                .unwrap()
+                .data
+                .as_slice(),
+            be.as_slice()
+        );
+
+        be[0..8].copy_from_slice(&(ram_size as u64).to_be_bytes());
+        guest_dma_write(&mut cfg, &ram, selector, 0x1000, 0x2000, &be);
+        assert_eq!(
+            ramfb.config().gpa,
+            0x30_0000,
+            "out-of-range write is ignored"
+        );
+
+        let (e820_size, e820_sel) = dir_file(&dir, "etc/e820").unwrap();
+        assert_eq!(e820_size, 4);
+        guest_dma_write(&mut cfg, &ram, e820_sel, 0x1000, 0x2000, &[9, 9, 9, 9]);
+        let e820 = cfg
+            .items
+            .iter()
+            .find(|item| item.selector == e820_sel)
+            .unwrap();
+        assert!(!e820.writable);
+        assert_eq!(e820.data, [1, 2, 3, 4]);
+        let mut ctl = [0u8; 4];
+        ram.read(0x1000, &mut ctl).unwrap();
+        assert_eq!(ctl, 1u32.to_be_bytes());
+        let dir_now = cfg
+            .items
+            .iter()
+            .find(|item| item.selector == FW_CFG_FILE_DIR)
+            .unwrap();
+        assert_eq!(dir_now.data, dir);
+    }
+
+    fn dir_file(dir: &[u8], name: &str) -> Option<(u32, u16)> {
+        let count = u32::from_be_bytes(dir[0..4].try_into().ok()?) as usize;
+        let mut off = 4;
+        for _ in 0..count {
+            let size = u32::from_be_bytes(dir[off..off + 4].try_into().ok()?);
+            let selector = u16::from_be_bytes(dir[off + 4..off + 6].try_into().ok()?);
+            let raw = &dir[off + 8..off + 64];
+            let end = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
+            if &raw[..end] == name.as_bytes() {
+                return Some((size, selector));
+            }
+            off += 64;
+        }
+        None
+    }
+
+    fn guest_dma_write(
+        cfg: &mut FwCfg,
+        ram: &GuestMemory,
+        selector: u16,
+        desc_gpa: u64,
+        src_gpa: u64,
+        bytes: &[u8],
+    ) {
+        ram.write(src_gpa, bytes).unwrap();
+        let mut desc = [0u8; 16];
+        desc[0..4].copy_from_slice(&FW_CFG_DMA_CTL_WRITE.to_be_bytes());
+        desc[4..8].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+        desc[8..16].copy_from_slice(&src_gpa.to_be_bytes());
+        ram.write(desc_gpa, &desc).unwrap();
+        cfg.pio_out(0, u64::from(selector), 2);
+        cfg.pio_out(4, u64::from(((desc_gpa >> 32) as u32).swap_bytes()), 4);
+        cfg.pio_out(8, u64::from((desc_gpa as u32).swap_bytes()), 4);
     }
 }

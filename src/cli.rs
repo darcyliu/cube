@@ -3,8 +3,10 @@
 //! The variable-store path is `<first writable disk>.vars.fd`. It is never
 //! derived from the firmware file: renaming the code flash must not move NVRAM.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use crate::devices::display;
 use crate::forward::ForwardRule;
 use crate::shared_fs::ShareConfig;
 
@@ -60,6 +62,8 @@ pub struct Run {
     pub net: NetConfig,
     pub forwards: Vec<ForwardRule>,
     pub share: Option<ShareConfig>,
+    pub vnc: Option<SocketAddr>,
+    pub display: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +130,8 @@ Options:
   --efi-vars PATH              variable store (default <first writable disk>.vars.fd, otherwise efi-vars.fd)
   --share TAG PATH             one read-only virtio-9p folder
   --share-rw TAG PATH          one read-write virtio-9p folder
+  --vnc [ADDR]                 loopback RFB server (default 127.0.0.1:5900)
+  --display WIDTHxHEIGHT       framebuffer size; requires --vnc (default 1280x720, max 256 MiB)
   --serial-log, --console-log PATH
   -h, --help                   print this help and exit 1
 
@@ -153,6 +159,8 @@ pub fn parse(args: &[String]) -> Cli {
     let mut mac = None;
     let mut forwards = Vec::new();
     let mut ssh_port = None;
+    let mut vnc = None;
+    let mut display = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -299,9 +307,38 @@ pub fn parse(args: &[String]) -> Cli {
                     _ => return Cli::Error("--ssh-port needs a nonzero port".into()),
                 }
             }
+            "--vnc" => {
+                let text = args
+                    .get(i + 1)
+                    .filter(|next| !next.starts_with('-'))
+                    .map(|value| value.as_str());
+                let spec = if let Some(text) = text {
+                    i += 1;
+                    text
+                } else {
+                    "127.0.0.1:5900"
+                };
+                match parse_vnc(spec) {
+                    Ok(addr) => vnc = Some(addr),
+                    Err(message) => return Cli::Error(message),
+                }
+            }
+            "--display" => {
+                let Some(text) = value_at(args, &mut i) else {
+                    return Cli::Error("--display requires WIDTHxHEIGHT".into());
+                };
+                match display::parse_size(text) {
+                    Ok(size) => display = Some(size),
+                    Err(message) => return Cli::Error(format!("--display {message}")),
+                }
+            }
             other => return Cli::Error(format!("unknown argument {other}")),
         }
         i += 1;
+    }
+
+    if display.is_some() && vnc.is_none() {
+        return Cli::Error("--display requires --vnc".into());
     }
 
     let boot = match (payload, uefi) {
@@ -353,7 +390,21 @@ pub fn parse(args: &[String]) -> Cli {
         net,
         forwards,
         share,
+        vnc,
+        display,
     })
+}
+
+fn parse_vnc(text: &str) -> Result<SocketAddr, String> {
+    let addr: SocketAddr = text
+        .parse()
+        .map_err(|_| format!("--vnc needs a loopback socket address, not {text}"))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "--vnc must bind to loopback, not {text}; use an SSH tunnel for remote access"
+        ));
+    }
+    Ok(addr)
 }
 
 fn value_at<'a>(args: &'a [String], i: &mut usize) -> Option<&'a str> {
@@ -471,6 +522,8 @@ mod tests {
             "--share-rw",
             "--serial-log",
             "--console-log",
+            "--vnc",
+            "--display",
         ] {
             assert!(help.contains(flag), "missing {flag}");
         }
@@ -482,13 +535,17 @@ mod tests {
         assert!(help.contains("Firmware boot"));
         assert!(help.contains("<first writable disk>.vars.fd"));
         assert!(help.contains("otherwise efi-vars.fd"));
+        assert!(help.contains("127.0.0.1:5900"));
+        assert!(help.contains("1280x720"));
+        assert!(help.contains("requires --vnc"));
+        assert!(help.contains("max 256 MiB"));
         assert!(help.find("--uefi").unwrap() < help.find("--payload").unwrap());
         for flag in [
             "--freebsd",
             "--kernel",
             "--multiuser",
-            "--vnc",
             "--gui",
+            "--retina",
         ] {
             assert!(!help.contains(flag), "advertised {flag}");
         }
@@ -503,8 +560,8 @@ mod tests {
             "--freebsd",
             "--kernel",
             "--multiuser",
-            "--vnc",
             "--gui",
+            "--retina",
             "--memory",
         ] {
             assert!(error(&[flag]).contains("unknown argument"), "{flag}");
@@ -608,25 +665,50 @@ mod tests {
         assert_eq!(none.ram_mb, None);
         assert_eq!(none.net.mode, "none");
         assert_eq!(none.net.mac, [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
-        let proxy = run(&[
-            "--uefi",
-            "--net",
-            "vmnet-proxy",
-            "--vmnet-socket",
-            "sock",
-        ]);
+        let proxy = run(&["--uefi", "--net", "vmnet-proxy", "--vmnet-socket", "sock"]);
         assert_eq!(proxy.net.mode, "vmnet-proxy");
         assert_eq!(proxy.net.socket.as_deref(), Some(Path::new("sock")));
-        assert_eq!(run(&["--uefi", "--ssh-port", "2222"]).net.ssh_port, Some(2222));
+        assert_eq!(
+            run(&["--uefi", "--ssh-port", "2222"]).net.ssh_port,
+            Some(2222)
+        );
         assert_eq!(
             run(&["--uefi", "--forward", "127.0.0.1:9=10.0.0.2:22"])
                 .forwards
                 .len(),
             1
         );
-        assert_eq!(run(&["--uefi", "--net", "bridged:en0"]).net.mode, "bridged:en0");
+        assert_eq!(
+            run(&["--uefi", "--net", "bridged:en0"]).net.mode,
+            "bridged:en0"
+        );
         assert!(error(&["--uefi", "--net", "tap:"]).contains("--net needs"));
         assert!(error(&["--uefi", "--mac", "nope"]).contains("--mac"));
         assert!(error(&["--uefi", "--ssh-port", "0"]).contains("nonzero"));
+    }
+
+    #[test]
+    fn vnc_binds_loopback_and_display_requires_it() {
+        let plain = run(&["--uefi", "--vnc"]);
+        assert_eq!(plain.vnc.unwrap().to_string(), "127.0.0.1:5900");
+        assert_eq!(plain.display, None);
+        let sized = run(&[
+            "--payload",
+            "--display",
+            "1024x768",
+            "--vnc",
+            "127.0.0.1:5901",
+        ]);
+        assert_eq!(sized.vnc.unwrap().to_string(), "127.0.0.1:5901");
+        assert_eq!(sized.display, Some((1024, 768)));
+        assert!(error(&["--display", "1024x768"]).contains("--display requires --vnc"));
+        assert!(
+            error(&["--uefi", "--vnc", "--display", "16384x16384"]).contains("maximum is 256 MiB")
+        );
+        assert!(error(&["--uefi", "--vnc", "0.0.0.0:5900"]).contains("loopback"));
+        assert!(error(&["--uefi", "--vnc", "192.168.1.1:5900"]).contains("loopback"));
+        assert!(error(&["--uefi", "--display"]).contains("WIDTHxHEIGHT"));
+        assert!(error(&["--gui"]).contains("unknown argument"));
+        assert!(error(&["--retina", "--uefi"]).contains("unknown argument"));
     }
 }

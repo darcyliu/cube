@@ -2,6 +2,7 @@
 
 pub mod cmos;
 pub mod debugcon;
+pub mod display;
 pub mod fw_cfg;
 pub mod i8042;
 pub mod ioapic;

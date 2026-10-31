@@ -46,10 +46,30 @@ pub fn build_with_prt(ncpus: u32, ram_size: u64, prt: &[(u32, u32)]) -> Firmware
 }
 
 pub fn e820_bytes(ram_size: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(60);
+    e820_reserving(ram_size, 0, 0)
+}
+
+/// Carve `[reserved_base, reserved_base + reserved_len)` out of the high usable
+/// range. A zero length keeps the three-entry map `e820_bytes` has always returned.
+pub fn e820_reserving(ram_size: u64, reserved_base: u64, reserved_len: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
     push_e820(&mut out, 0, 640 * 1024, 1);
     push_e820(&mut out, 0xA_0000, 384 * 1024, 2);
-    push_e820(&mut out, 0x10_0000, ram_size.saturating_sub(0x10_0000), 1);
+    let high = 0x10_0000u64;
+    let reserved_end = reserved_base.saturating_add(reserved_len);
+    let carve = reserved_len > 0
+        && reserved_base > high
+        && reserved_end <= ram_size
+        && reserved_base < reserved_end;
+    if !carve {
+        push_e820(&mut out, high, ram_size.saturating_sub(high), 1);
+        return out;
+    }
+    push_e820(&mut out, high, reserved_base - high, 1);
+    push_e820(&mut out, reserved_base, reserved_len, 2);
+    if reserved_end < ram_size {
+        push_e820(&mut out, reserved_end, ram_size - reserved_end, 1);
+    }
     out
 }
 
@@ -525,5 +545,26 @@ mod tests {
             u32::from_le_bytes(files.e820[16..20].try_into().unwrap()),
             1
         );
+    }
+
+    #[test]
+    fn e820_carves_a_reserved_window_off_the_top_of_ram() {
+        let ram = 128 * 1024 * 1024;
+        assert_eq!(e820_bytes(ram).len(), 60);
+        assert_eq!(e820_reserving(ram, 0, 0).len(), 60);
+        let len = 4 * 1024 * 1024;
+        let base = ram - len;
+        let map = e820_reserving(ram, base, len);
+        assert_eq!(map.len(), 80);
+        let entry = |index: usize| {
+            let at = index * 20;
+            (
+                u64::from_le_bytes(map[at..at + 8].try_into().unwrap()),
+                u64::from_le_bytes(map[at + 8..at + 16].try_into().unwrap()),
+                u32::from_le_bytes(map[at + 16..at + 20].try_into().unwrap()),
+            )
+        };
+        assert_eq!(entry(2), (0x10_0000, base - 0x10_0000, 1));
+        assert_eq!(entry(3), (base, len, 2));
     }
 }

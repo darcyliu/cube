@@ -1,6 +1,7 @@
 //! Map guest RAM at GPA 0 and run a payload or OVMF. vCPU 0 is the BSP.
 //! Extra vCPUs are created, then wait for INIT/SIPI outside `hv_vcpu_run`.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
@@ -10,6 +11,7 @@ use vmm::devices::MmioBus;
 use vmm::devices::PioBus;
 use vmm::devices::cmos::Cmos;
 use vmm::devices::debugcon::DebugCon;
+use vmm::devices::display::{self, Ramfb};
 use vmm::devices::fw_cfg::{FwCfg, FwCfgPio};
 use vmm::devices::i8042::I8042;
 use vmm::devices::lapic::Lapic;
@@ -42,6 +44,7 @@ impl Drop for VmGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_payload(
     path: Option<PathBuf>,
     serial_log: Option<PathBuf>,
@@ -51,15 +54,18 @@ pub fn run_payload(
     net: NetConfig,
     forwards: Vec<ForwardRule>,
     share: Option<ShareConfig>,
+    vnc: Option<SocketAddr>,
+    display: Option<(u32, u32)>,
 ) -> Vec<VcpuDone> {
     match run_payload_inner(
-        path, serial_log, cpus, ram_mb, disks, net, forwards, share,
+        path, serial_log, cpus, ram_mb, disks, net, forwards, share, vnc, display,
     ) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_uefi(
     firmware: PathBuf,
     serial_log: Option<PathBuf>,
@@ -70,6 +76,8 @@ pub fn run_uefi(
     forwards: Vec<ForwardRule>,
     efi_vars: Option<PathBuf>,
     share: Option<ShareConfig>,
+    vnc: Option<SocketAddr>,
+    display: Option<(u32, u32)>,
 ) -> Vec<VcpuDone> {
     match run_uefi_inner(
         firmware,
@@ -81,6 +89,8 @@ pub fn run_uefi(
         forwards,
         efi_vars,
         share,
+        vnc,
+        display,
     ) {
         Ok(done) => done,
         Err(error) => vec![failed(error)],
@@ -95,6 +105,7 @@ fn failed(error: String) -> VcpuDone {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_payload_inner(
     path: Option<PathBuf>,
     serial_log: Option<PathBuf>,
@@ -104,6 +115,8 @@ fn run_payload_inner(
     net: NetConfig,
     forwards: Vec<ForwardRule>,
     share: Option<ShareConfig>,
+    vnc: Option<SocketAddr>,
+    display: Option<(u32, u32)>,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let bytes = load_payload(path)?;
@@ -121,10 +134,22 @@ fn run_payload_inner(
         return Err("payload does not fit in guest RAM".into());
     }
     mem.write(entry, &bytes)?;
-    // A missing image, forward bind, NIC, or share must not call hv_vm_create.
+    // A missing image, forward bind, NIC, share, or VNC port must not call hv_vm_create.
     let blocks = load_blocks(&mem, &disks)?;
     let (nic, _forwards) = attach_net(&mem, &net, &forwards)?;
     let share = open_share(&mem, share)?;
+    let _vnc = if let Some(addr) = vnc {
+        let (width, height) = display.unwrap_or((display::FB_WIDTH, display::FB_HEIGHT));
+        let ramfb = Arc::new(Ramfb::reserve(ram_bytes as u64, width, height)?);
+        let cfg = ramfb.config();
+        eprintln!(
+            "[VMM] ramfb {}x{} stride {} at GPA {:#x}",
+            cfg.width, cfg.height, cfg.stride, cfg.gpa
+        );
+        Some(display::vnc::spawn(Arc::clone(&mem), ramfb, addr)?)
+    } else {
+        None
+    };
     let pci = assemble_pci(blocks, nic, share, false)?;
     let gsis = pci.as_ref().map(PciHost::virtio_gsis).unwrap_or_default();
 
@@ -149,6 +174,7 @@ fn run_payload_inner(
     boot_cpus(machine, kicks, serial, Entry::Payload { cr3 })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_uefi_inner(
     firmware: PathBuf,
     serial_log: Option<PathBuf>,
@@ -159,6 +185,8 @@ fn run_uefi_inner(
     forwards: Vec<ForwardRule>,
     efi_vars: Option<PathBuf>,
     share: Option<ShareConfig>,
+    vnc: Option<SocketAddr>,
+    display: Option<(u32, u32)>,
 ) -> Result<Vec<VcpuDone>, String> {
     let n = cpu_count(cpus)?;
     let code_bytes =
@@ -190,14 +218,35 @@ fn run_uefi_inner(
     let ram_bytes = cli::ram_bytes(ram_mb.unwrap_or(cli::DEFAULT_RAM_MB))?;
     let ram = Arc::new(GuestMemory::allocate(0, ram_bytes)?);
     let code = Arc::new(GuestMemory::from_buffer(gpa::CODE_FLASH_BASE, &code_bytes)?);
-    // A missing image, forward bind, NIC, or share must not call hv_vm_create.
+    // A missing image, forward bind, NIC, share, or VNC port must not call hv_vm_create.
     let blocks = load_blocks(&ram, &disks)?;
     let (nic, _forwards) = attach_net(&ram, &net, &forwards)?;
     let share = open_share(&ram, share)?;
+    let (width, height) = display.unwrap_or((display::FB_WIDTH, display::FB_HEIGHT));
+    let ramfb = Arc::new(Ramfb::reserve(ram_bytes as u64, width, height)?);
+    // `_vnc` stays live across `boot_cpus` so Drop joins the worker on this thread.
+    let _vnc = match vnc {
+        Some(addr) => Some(display::vnc::spawn(
+            Arc::clone(&ram),
+            Arc::clone(&ramfb),
+            addr,
+        )?),
+        None => None,
+    };
     let pci = assemble_pci(blocks, nic, share, true)?.expect("UEFI always has a PCI host");
     let gsis = pci.virtio_gsis();
-    let tables = vmm::acpi::build_with_prt(cpus, ram_bytes as u64, &pci.prt());
-    let cfg = FwCfg::from_files(
+    let mut tables = vmm::acpi::build_with_prt(cpus, ram_bytes as u64, &pci.prt());
+    tables.e820 = vmm::acpi::e820_reserving(
+        ram_bytes as u64,
+        ramfb.reserved_base(),
+        ramfb.reserved_len(),
+    );
+    let cfg_now = ramfb.config();
+    eprintln!(
+        "[VMM] ramfb {}x{} stride {} at GPA {:#x}",
+        cfg_now.width, cfg_now.height, cfg_now.stride, cfg_now.gpa
+    );
+    let cfg = FwCfg::from_files_with_ramfb(
         Arc::clone(&ram),
         &[
             ("etc/e820", tables.e820.as_slice()),
@@ -205,6 +254,7 @@ fn run_uefi_inner(
             ("etc/acpi/tables", tables.tables.as_slice()),
             ("etc/table-loader", tables.loader.as_slice()),
         ],
+        ramfb,
     );
 
     let _vm = create_vm(&ram)?;
