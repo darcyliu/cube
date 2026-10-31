@@ -45,8 +45,8 @@ make vmnet-service
   --serial-log "$HOME/VMs/freebsd-amd64/install.log"
 ```
 
-If the guest stops at `mountroot>`, type `cd9660:/dev/vtbd0` and only that line. After install, drop `--cdrom` and keep the disk, the vars file, and `--cpus 2`.
+After install, drop `--cdrom` and keep the disk, the vars file, and `--cpus 2`.
 
-`--uefi` is the firmware boot (`firmware/OVMF_CODE.fd` unless a path is given). EFI variables persist in `disk.img.vars.fd`; `--efi-vars PATH` overrides that. The first boot copies `firmware/OVMF_VARS.fd` (540672 bytes) into the store, and later boots open the same file. `--cow` attaches each `--disk` through a `PATH.cow` overlay. Do not combine `cow` and `ro`. With no arguments, `vmm` prints help and exits 1.
+`--uefi` is the firmware boot (`firmware/OVMF_CODE.fd` unless a path is given). EFI variables persist in `<writable disk>.vars.fd`. For the installer disk that is `$HOME/VMs/freebsd-amd64/disk.img.vars.fd`. `--efi-vars PATH` overrides that. The first boot copies `firmware/OVMF_VARS.fd` (540672 bytes) into the store, and later boots open the same file. `--cow` attaches each `--disk` through a `PATH.cow` overlay. Do not combine `cow` and `ro`. With no arguments, `vmm` prints help and exits 1. See [docs/freebsd_amd64.md](docs/freebsd_amd64.md).
 
 `python3 -B scripts/verify.py` runs library tests plus the payload and OVMF smokes. `--suite full` adds the FreeBSD installer smoke. See [docs/verification.md](docs/verification.md).

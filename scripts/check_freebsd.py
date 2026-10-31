@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Boot the FreeBSD amd64 disc1 ISO and require a COM1 loader or installer prompt.
 
-The ISO is virtio-blk (vtbd0), not an AHCI CD. This script does not set
-vfs.root.mountfrom and does not type the mountroot line. A mountroot prompt
-is a pass; the line to type by hand is cd9660:/dev/vtbd0.
+The ISO is virtio-blk, not an AHCI CD. This script does not set
+vfs.root.mountfrom. A mountroot prompt is a pass. The guest console is not
+written except Ctrl-] after a marker is seen.
 """
 
 import os

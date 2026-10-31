@@ -155,46 +155,12 @@ This document describes the modern VirtIO Network (virtio-net) device implementa
 
 ## 1. Network Architecture
 
-The network subsystem provides full-duplex Ethernet connectivity between the ARM64 guest (FreeBSD 14.4) and the macOS host using Apple Silicon's hardware virtualization capabilities and standard VirtIO MMIO v2 protocols.
-
-```
-+-------------------------------------------------------------------------+
-| FreeBSD Guest (Kernel & Userland)                                      |
-|                                                                         |
-|  fetch / curl / ssh / pkg                                               |
-|      |                                                                  |
-|      v (TCP / UDP / ICMP)                                               |
-|  vtnet0 interface (192.168.18.2, MAC 52:54:00:12:34:56)                 |
-|  Default Gateway: 192.168.18.1                                          |
-+------------------------------------+------------------------------------+
-                                     |
-                         VirtIO MMIO v2 (GPA: 0x0a000200, IRQ 35)
-                         - RX Queue 0 (128 Descriptors)
-                         - TX Queue 1 (128 Descriptors)
-                         - Modern Header Size: 12 bytes
-                                     |
-+------------------------------------v------------------------------------+
-| VMM (src/devices/virtio/net.rs)                                         |
-|                                                                         |
-|  - Process TX Virtqueue -> vmnet_write()                                |
-|  - Background RX Thread -> vmnet_read() -> Deliver RX Virtqueue         |
-|  - GICv3 SPI 35 Assertion & vCPU Kick (hv_vcpus_exit)                   |
-+------------------------------------+------------------------------------+
-                                     |
-+------------------------------------v------------------------------------+
-| macOS Host Networking                                                   |
-|                                                                         |
-|  vmnet.framework (VMNET_SHARED_MODE) -> bridge100 (192.168.18.1)        |
-|  macOS bootpd (Built-in DHCP server)                                    |
-|                                                                         |
-|  macOS Packet Filter (pf) NAT Anchor (com.apple/vmm):                   |
-|  nat on en0 from 192.168.18.0/24 to any -> (en0)                        |
-|                                                                         |
-|  Physical Upstream Interface: en0 (Wi-Fi / Ethernet, 192.168.1.97)     |
-+------------------------------------+------------------------------------+
-                                     |
-                                     v Internet (1.1.1.1, freebsd.org)
-```
+The guest is x86_64. The NIC is virtio-pci at `00:03.0` with INTx on GSI 17.
+It is not virtio-mmio, and this machine has no GICv3. Frames leave through
+the backend selected by `--net`: in-process `vmnet` (`VMNET_SHARED_MODE` on
+`bridge100`, macOS `bootpd`, PF NAT), `vmnet-proxy` (the same shared port,
+frames over the service socket), `bridge` (in-process LAN bridge, no PF NAT),
+`tap`, `mock`, or `none`. The guest interface is still `vtnet0`.
 
 ---
 

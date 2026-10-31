@@ -26,16 +26,8 @@ EFI variables default to `<disk>.vars.fd`
 proxy rejects uid 0. In-process NAT is the same command under sudo with
 `--net vmnet` instead of `--net vmnet-proxy`.
 
-If the guest stops at the `mountroot>` prompt, type only this line:
-
-```text
-cd9660:/dev/vtbd0
-```
-
-Do not set `vfs.root.mountfrom`. `cd0` is not this machine.
-
 The installer is interactive. This tree does not automate a desktop, ZFS, or
-unattended bsdinstall.
+unattended bsdinstall. Do not set `vfs.root.mountfrom`. There is no AHCI CD.
 
 After install, drop `--cdrom` and keep the disk, the vars file, and `--cpus 2`:
 
@@ -49,8 +41,12 @@ After install, drop `--cdrom` and keep the disk, the vars file, and `--cpus 2`:
 ```
 
 `scripts/check_freebsd.py` boots that ISO on an empty disk with the same flags,
-waits up to 10 minutes, and passes when the COM1 log shows the FreeBSD loader,
-the installer, or the mountroot prompt. It records
-`target/check_freebsd-serial.log` and does not type the mountroot line.
-`python3 -B scripts/verify.py --suite full` runs that smoke.
-`make vmnet-service` must already be listening.
+including `--net vmnet-proxy`. It waits up to 10 minutes and passes when the
+COM1 log shows the FreeBSD loader, the installer, or a mountroot prompt. It
+records `target/check_freebsd-serial.log`. `python3 -B scripts/verify.py
+--suite full` runs that check. `make vmnet-service` must already be listening.
+The script does not start the service and does not fall back to `--net none`.
+
+The disc1 boot was not run. The vmnet proxy was not listening, and
+non-interactive sudo cannot start `make vmnet-service`. An OVMF shell is not
+a substitute.
