@@ -7,16 +7,17 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{
-    build_launch_spec, find_config_for_target, resolve_target_dir, validate_vm_name, BootConfig,
-    DiskItem, NetworkConfig, ShareItem, ShutdownConfig, VmConfig, VncConfig,
+    BootConfig, DiskItem, NetworkConfig, ShareItem, ShutdownConfig, VmConfig, VncConfig,
+    build_launch_spec, find_config_for_target, resolve_target_dir, validate_vm_name,
 };
 use crate::server::{active_resources, do_action, live_status};
 use crate::unattended::{
     auto_detect_iso, find_default_firmware, resolve_ssh_public_key, run_unattended_install,
 };
 use crate::util::{
-    self, canonical_path_str, create_sparse_file, default_state_root, default_vms_root, ensure_cube_entitlements,
-    find_cube_binary, parse_disk_spec, require, resolve_path, write_json_atomic,
+    self, canonical_path_str, create_sparse_file, default_state_root, default_vms_root,
+    ensure_cube_entitlements, find_cube_binary, parse_disk_spec, require, resolve_path,
+    write_json_atomic,
 };
 use crate::{CreateArgs, InstallArgs, SshArgs, StartArgs};
 
@@ -26,7 +27,12 @@ const DESKTOP_COMMON_PACKAGES: &str =
 
 fn create_network_mode(explicit: Option<String>, has_entitlement: impl FnOnce() -> bool) -> String {
     explicit.unwrap_or_else(|| {
-        if has_entitlement() { "vmnet" } else { "vmnet-proxy" }.into()
+        if has_entitlement() {
+            "vmnet"
+        } else {
+            "vmnet-proxy"
+        }
+        .into()
     })
 }
 
@@ -34,20 +40,33 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     validate_vm_name(&args.name)?;
     let desktop = args.desktop.clone();
     let desktop_user = args.desktop_user.clone();
-    let desktop_password = args.desktop_password.clone().unwrap_or_else(|| args.password.clone());
+    let desktop_password = args
+        .desktop_password
+        .clone()
+        .unwrap_or_else(|| args.password.clone());
     if desktop.is_some() {
         require(args.unattended, "--desktop requires --unattended")?;
-        require(args.net.as_deref() != Some("none"), "--desktop requires guest networking")?;
-        require(args.ssh_port != Some(0), "--desktop requires an SSH forwarding port")?;
+        require(
+            args.net.as_deref() != Some("none"),
+            "--desktop requires guest networking",
+        )?;
+        require(
+            args.ssh_port != Some(0),
+            "--desktop requires an SSH forwarding port",
+        )?;
         require(
             !desktop_user.is_empty()
                 && desktop_user.len() <= 32
-                && desktop_user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                && desktop_user
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
             "desktop user must be 1–32 letters, digits, underscores, or hyphens",
         )?;
         require(
             !desktop_password.is_empty()
-                && !desktop_password.chars().any(|c| matches!(c, '\r' | '\n' | '\0')),
+                && !desktop_password
+                    .chars()
+                    .any(|c| matches!(c, '\r' | '\n' | '\0')),
             "desktop password must be one nonempty line",
         )?;
     }
@@ -57,7 +76,8 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     } else {
         default_vms_root().join(&args.name)
     };
-    fs::create_dir_all(&dest_dir).map_err(|e| format!("cannot create destination directory {:?}: {}", dest_dir, e))?;
+    fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("cannot create destination directory {:?}: {}", dest_dir, e))?;
 
     let config_path = if let Some(o) = args.output {
         o
@@ -65,7 +85,10 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         dest_dir.join(format!("{}.json", args.name))
     };
     if config_path.exists() && !args.force {
-        return Err(format!("configuration file {:?} already exists; choose another name or use --force to overwrite", config_path));
+        return Err(format!(
+            "configuration file {:?} already exists; choose another name or use --force to overwrite",
+            config_path
+        ));
     }
 
     // Resolve UEFI firmware before downloading an ISO or preparing/installing disks.
@@ -76,13 +99,21 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
             Some(canonical_path_str(&fw_path)?)
         }
         "freebsd" => None,
-        other => return Err(format!("unsupported boot mode '{}'; choose 'uefi' or 'freebsd'", other)),
+        other => {
+            return Err(format!(
+                "unsupported boot mode '{}'; choose 'uefi' or 'freebsd'",
+                other
+            ));
+        }
     };
 
     // Resolve or detect installation ISO
     let installer_iso = if let Some(ref iso) = args.iso {
         let resolved = resolve_path(&iso.to_string_lossy(), Path::new("."))?;
-        require(resolved.is_file(), format!("ISO file not found: {:?}", resolved))?;
+        require(
+            resolved.is_file(),
+            format!("ISO file not found: {:?}", resolved),
+        )?;
         Some(canonical_path_str(&resolved)?)
     } else if let Some(ref ver) = args.version {
         let downloaded = util::ensure_freebsd_iso(ver, None)?;
@@ -120,12 +151,19 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
             if !disk_path.exists() {
                 create_sparse_file(&disk_path, size)?;
                 let gib = size as f64 / (1024.0 * 1024.0 * 1024.0);
-                disk_summaries.push(format!("{} ({:.1} GiB sparse target)", disk_path.display(), gib));
+                disk_summaries.push(format!(
+                    "{} ({:.1} GiB sparse target)",
+                    disk_path.display(),
+                    gib
+                ));
             } else {
                 disk_summaries.push(format!("{} (existing)", disk_path.display()));
             }
         } else {
-            require(disk_path.is_file(), format!("disk file does not exist: {:?}", disk_path))?;
+            require(
+                disk_path.is_file(),
+                format!("disk file does not exist: {:?}", disk_path),
+            )?;
             disk_summaries.push(format!("{} (existing)", disk_path.display()));
         }
 
@@ -152,7 +190,10 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
                 .arg(&private_key)
                 .status()
                 .map_err(|e| format!("cannot generate desktop provisioning SSH key: {e}"))?;
-            require(status.success(), "ssh-keygen failed for desktop provisioning")?;
+            require(
+                status.success(),
+                "ssh-keygen failed for desktop provisioning",
+            )?;
         }
         let public = fs::read_to_string(&public_key)
             .map_err(|e| format!("cannot read generated SSH public key: {e}"))?;
@@ -173,7 +214,10 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     if args.unattended {
         let iso_canonical = installer_iso.as_ref().unwrap();
         let target_disk = primary_disk_path.ok_or("no target disk configured")?;
-        require(!disks[0].is_cow() && !disks[0].is_read_only(), "installation requires a writable, non-COW target disk")?;
+        require(
+            !disks[0].is_cow() && !disks[0].is_read_only(),
+            "installation requires a writable, non-COW target disk",
+        )?;
         // Verify target disk is not currently locked by another process
         drop(util::lock_disk(&target_disk)?);
         let cube_bin = find_cube_binary(args.binary.as_deref(), None, Path::new("."))?;
@@ -220,21 +264,22 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
 
     // Boot configuration
     let boot = match boot_mode.as_str() {
-        "uefi" => {
-            BootConfig {
-                mode: "uefi".into(),
-                firmware,
-                kernel: None,
-                multiuser: true,
-                root: args.root,
-                bootargs: args.bootargs,
-                modules: args.modules,
-            }
-        }
+        "uefi" => BootConfig {
+            mode: "uefi".into(),
+            firmware,
+            kernel: None,
+            multiuser: true,
+            root: args.root,
+            bootargs: args.bootargs,
+            modules: args.modules,
+        },
         "freebsd" => {
             let kern_str = if let Some(ref k) = args.kernel {
                 let resolved = resolve_path(&k.to_string_lossy(), Path::new("."))?;
-                require(resolved.is_file(), format!("kernel file not found: {:?}", resolved))?;
+                require(
+                    resolved.is_file(),
+                    format!("kernel file not found: {:?}", resolved),
+                )?;
                 canonical_path_str(&resolved)?
             } else {
                 let default_k = dest_dir.join("kernel");
@@ -263,14 +308,22 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
                 modules: args.modules,
             }
         }
-        other => return Err(format!("unsupported boot mode '{}'; choose 'uefi' or 'freebsd'", other)),
+        other => {
+            return Err(format!(
+                "unsupported boot mode '{}'; choose 'uefi' or 'freebsd'",
+                other
+            ));
+        }
     };
 
     // Shares configuration
     let mut shares = Vec::new();
     for chunk in args.shares.chunks_exact(2) {
         let resolved = resolve_path(&chunk[1], Path::new("."))?;
-        require(resolved.is_dir(), format!("share directory does not exist: {:?}", resolved))?;
+        require(
+            resolved.is_dir(),
+            format!("share directory does not exist: {:?}", resolved),
+        )?;
         shares.push(ShareItem {
             tag: chunk[0].clone(),
             path: resolved.to_string_lossy().into_owned(),
@@ -279,7 +332,10 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     }
     for chunk in args.shares_rw.chunks_exact(2) {
         let resolved = resolve_path(&chunk[1], Path::new("."))?;
-        require(resolved.is_dir(), format!("share directory does not exist: {:?}", resolved))?;
+        require(
+            resolved.is_dir(),
+            format!("share directory does not exist: {:?}", resolved),
+        )?;
         shares.push(ShareItem {
             tag: chunk[0].clone(),
             path: resolved.to_string_lossy().into_owned(),
@@ -312,7 +368,11 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     let allocated_ssh_port = if let Some(p) = args.ssh_port {
         if p == 0 { None } else { Some(p) }
     } else if net_mode != "none" {
-        Some(find_next_available_ssh_port(state_root, &vms_root, &reserved_ssh_ports))
+        Some(find_next_available_ssh_port(
+            state_root,
+            &vms_root,
+            &reserved_ssh_ports,
+        ))
     } else {
         None
     };
@@ -351,7 +411,10 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     // Shutdown configuration
     let shutdown = if let Some(key) = args.shutdown_key {
         let resolved_key = resolve_path(&key.to_string_lossy(), Path::new("."))?;
-        require(resolved_key.is_file(), format!("shutdown SSH key does not exist: {:?}", resolved_key))?;
+        require(
+            resolved_key.is_file(),
+            format!("shutdown SSH key does not exist: {:?}", resolved_key),
+        )?;
         Some(ShutdownConfig {
             host: "127.0.0.1".into(),
             port: allocated_ssh_port,
@@ -376,7 +439,10 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
             format!("FreeBSD {}", ver)
         }
     } else if let Some(ref iso) = installer_iso {
-        let filename = Path::new(iso).file_name().unwrap_or_default().to_string_lossy();
+        let filename = Path::new(iso)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
         if filename.contains("14.4") {
             "FreeBSD 14.4-RELEASE".into()
         } else if filename.contains("14.5") {
@@ -390,7 +456,11 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         "FreeBSD".into()
     };
     if let Some(ref environment) = desktop {
-        os_desc.push_str(if environment == "xfce" { " with XFCE" } else { " with KDE Plasma" });
+        os_desc.push_str(if environment == "xfce" {
+            " with XFCE"
+        } else {
+            " with KDE Plasma"
+        });
     }
 
     let config = VmConfig {
@@ -412,18 +482,24 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
     };
 
     let json_text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())? + "\n";
-    fs::write(&config_path, json_text).map_err(|e| format!("cannot write configuration {:?}: {}", config_path, e))?;
+    fs::write(&config_path, json_text)
+        .map_err(|e| format!("cannot write configuration {:?}: {}", config_path, e))?;
 
     // Remember custom destinations before the first launch so GUI and CLI
     // operations can resolve the VM by name immediately after creation.
     let registration_dir = state_root.join(&config.name);
     fs::create_dir_all(&registration_dir).map_err(|e| format!("cannot register VM: {}", e))?;
-    write_json_atomic(&registration_dir.join("registration.json"), &serde_json::json!({
-        "config": canonical_path_str(&config_path)?
-    }))?;
+    write_json_atomic(
+        &registration_dir.join("registration.json"),
+        &serde_json::json!({
+            "config": canonical_path_str(&config_path)?
+        }),
+    )?;
 
     if let Some(ref environment) = desktop {
-        let identity = ssh_priv_key.as_deref().ok_or("desktop provisioning requires an SSH private key")?;
+        let identity = ssh_priv_key
+            .as_deref()
+            .ok_or("desktop provisioning requires an SSH private key")?;
         provision_desktop(
             &config.name,
             state_root,
@@ -438,12 +514,18 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         println!("✓ Successfully created and installed VM '{}'", args.name);
         println!("  Configuration: {}", config_path.display());
         println!("  Boot Mode:     {}", config.boot.mode);
-        println!("  Resources:     {} vCPUs, {} MiB RAM", config.cpus, config.ram_mb);
+        println!(
+            "  Resources:     {} vCPUs, {} MiB RAM",
+            config.cpus, config.ram_mb
+        );
         for disk in disk_summaries {
             println!("  Disk:          {}", disk);
         }
         if let Some(ref net) = config.network {
-            let ssh_desc = net.ssh_port.map(|p| p.to_string()).unwrap_or_else(|| "none".into());
+            let ssh_desc = net
+                .ssh_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "none".into());
             println!("  Network:       {} (SSH port: {})", net.mode, ssh_desc);
         }
         println!("  Credentials:   root / {}", args.password);
@@ -461,23 +543,36 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         if let Some(ref net) = config.network {
             if let Some(port) = net.ssh_port {
                 println!("  2. Connect via SSH once booted:");
-                println!("     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {} root@127.0.0.1", port);
+                println!(
+                    "     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {} root@127.0.0.1",
+                    port
+                );
             }
         }
     } else {
         println!("✓ Successfully created VM '{}'", args.name);
         println!("  Configuration: {}", config_path.display());
         println!("  Boot Mode:     {}", config.boot.mode);
-        println!("  Resources:     {} vCPUs, {} MiB RAM", config.cpus, config.ram_mb);
+        println!(
+            "  Resources:     {} vCPUs, {} MiB RAM",
+            config.cpus, config.ram_mb
+        );
         for disk in disk_summaries {
             println!("  Disk:          {}", disk);
         }
         if let Some(ref net) = config.network {
-            let ssh_desc = net.ssh_port.map(|p| p.to_string()).unwrap_or_else(|| "none".into());
+            let ssh_desc = net
+                .ssh_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "none".into());
             println!("  Network:       {} (SSH port: {})", net.mode, ssh_desc);
         }
         if let Some(ref v) = config.vnc {
-            println!("  VNC Display:   {} (res: {})", v.bind, v.display.as_deref().unwrap_or("auto"));
+            println!(
+                "  VNC Display:   {} (res: {})",
+                v.bind,
+                v.display.as_deref().unwrap_or("auto")
+            );
         }
 
         if let Some(ref _iso) = installer_iso {
@@ -516,17 +611,28 @@ fn run_provisioning_command(
 ) -> Result<(), String> {
     let mut command = Command::new(executable);
     command.arg("--state-root").arg(state_root).args(arguments);
-    command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
-    let mut child = command.spawn().map_err(|e| format!("cannot run desktop provisioning command: {e}"))?;
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("cannot run desktop provisioning command: {e}"))?;
     if let Some(value) = input {
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(value.as_bytes()).map_err(|e| format!("cannot send desktop password: {e}"))?;
+            stdin
+                .write_all(value.as_bytes())
+                .map_err(|e| format!("cannot send desktop password: {e}"))?;
         }
     }
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            return require(status.success(), format!("desktop provisioning command failed with {status}"));
+            return require(
+                status.success(),
+                format!("desktop provisioning command failed with {status}"),
+            );
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -546,7 +652,10 @@ fn provision_desktop(
     identity: &Path,
 ) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    println!("[Cube] Starting '{}' to provision the {} desktop...", name, environment);
+    println!(
+        "[Cube] Starting '{}' to provision the {} desktop...",
+        name, environment
+    );
     run_provisioning_command(
         &executable,
         state_root,
@@ -579,9 +688,22 @@ fn provision_desktop(
 
     let provision_result = (|| {
         println!("[Cube] Waiting for SSH and bootstrapping the package manager...");
-        ssh("env ASSUME_ALWAYS_YES=yes pkg bootstrap -f", None, Duration::from_secs(900), true)?;
-        println!("[Cube] Installing {} desktop packages; this can take a while...", environment);
-        ssh(&format!("pkg install -y {packages}"), None, Duration::from_secs(7200), false)?;
+        ssh(
+            "env ASSUME_ALWAYS_YES=yes pkg bootstrap -f",
+            None,
+            Duration::from_secs(900),
+            true,
+        )?;
+        println!(
+            "[Cube] Installing {} desktop packages; this can take a while...",
+            environment
+        );
+        ssh(
+            &format!("pkg install -y {packages}"),
+            None,
+            Duration::from_secs(7200),
+            false,
+        )?;
         println!("[Cube] Creating desktop user '{}'...", user);
         ssh(
             &format!("pw useradd {user} -m -G video,wheel -s /bin/sh -h 0"),
@@ -590,8 +712,12 @@ fn provision_desktop(
             false,
         )?;
         let services = match environment {
-            "xfce" => "sysrc dbus_enable=YES lightdm_enable=YES && service dbus onestart && install -d /usr/local/etc/lightdm && printf '%s\\n' '[greeter]' 'theme-name=Adwaita' 'icon-theme-name=Adwaita' 'font-name=DejaVu Sans 11' > /usr/local/etc/lightdm/lightdm-gtk-greeter.conf",
-            "plasma" => "sysrc dbus_enable=YES sddm_enable=YES && service dbus onestart && install -d /usr/local/etc/sddm.conf.d && printf '%s\\n' '[General]' 'DisplayServer=x11' > /usr/local/etc/sddm.conf.d/10-cube.conf",
+            "xfce" => {
+                "sysrc dbus_enable=YES lightdm_enable=YES && service dbus onestart && install -d /usr/local/etc/lightdm && printf '%s\\n' '[greeter]' 'theme-name=Adwaita' 'icon-theme-name=Adwaita' 'font-name=DejaVu Sans 11' > /usr/local/etc/lightdm/lightdm-gtk-greeter.conf"
+            }
+            "plasma" => {
+                "sysrc dbus_enable=YES sddm_enable=YES && service dbus onestart && install -d /usr/local/etc/sddm.conf.d && printf '%s\\n' '[General]' 'DisplayServer=x11' > /usr/local/etc/sddm.conf.d/10-cube.conf"
+            }
             _ => unreachable!(),
         };
         println!("[Cube] Enabling the display manager and desktop services...");
@@ -614,7 +740,12 @@ fn provision_desktop(
     let shutdown_result = run_provisioning_command(
         &executable,
         state_root,
-        &["shutdown".into(), name.into(), "--timeout".into(), "120".into()],
+        &[
+            "shutdown".into(),
+            name.into(),
+            "--timeout".into(),
+            "120".into(),
+        ],
         None,
         Duration::from_secs(150),
     );
@@ -635,16 +766,27 @@ fn provision_desktop(
 
 pub fn do_install(args: InstallArgs, state_root: &Path) -> Result<(), String> {
     let config_path = find_config_for_target(&args.target, state_root)?;
-    let content = fs::read_to_string(&config_path).map_err(|e| format!("cannot read {:?}: {}", config_path, e))?;
-    let mut config: VmConfig = serde_json::from_str(&content).map_err(|e| format!("json error in {:?}: {}", config_path, e))?;
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("cannot read {:?}: {}", config_path, e))?;
+    let mut config: VmConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("json error in {:?}: {}", config_path, e))?;
     let dest_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
     require(!config.disks.is_empty(), "VM configuration has no disks")?;
     let target_disk_path = resolve_path(config.disks[0].path(), dest_dir)?;
-    require(target_disk_path.is_file(), format!("target disk does not exist: {:?}", target_disk_path))?;
+    require(
+        target_disk_path.is_file(),
+        format!("target disk does not exist: {:?}", target_disk_path),
+    )?;
 
-    require(!config.disks[0].is_cow() && !config.disks[0].is_read_only(), "installation requires a writable, non-COW target disk")?;
-    require(live_status(&state_root.join(&config.name)).is_none(), "cannot install into a running VM")?;
+    require(
+        !config.disks[0].is_cow() && !config.disks[0].is_read_only(),
+        "installation requires a writable, non-COW target disk",
+    )?;
+    require(
+        live_status(&state_root.join(&config.name)).is_none(),
+        "cannot install into a running VM",
+    )?;
     // Verify target disk is not currently locked by another process
     drop(util::lock_disk(&target_disk_path)?);
 
@@ -699,7 +841,9 @@ pub fn do_install(args: InstallArgs, state_root: &Path) -> Result<(), String> {
         cpus,
     )?;
 
-    config.disks.retain(|d| !d.path().to_lowercase().ends_with(".iso"));
+    config
+        .disks
+        .retain(|d| !d.path().to_lowercase().ends_with(".iso"));
     if config.os.is_none() {
         let os_desc = if let Some(ref ver) = args.version {
             if let Ok((resolved, _)) = util::resolve_freebsd_version(ver) {
@@ -735,16 +879,24 @@ pub fn do_install(args: InstallArgs, state_root: &Path) -> Result<(), String> {
     let json_val = serde_json::to_value(&config).map_err(|e| e.to_string())?;
     write_json_atomic(&config_path, &json_val)?;
 
-    println!("✓ Unattended OS installation complete for '{}'!", config.name);
+    println!(
+        "✓ Unattended OS installation complete for '{}'!",
+        config.name
+    );
     println!("  Configuration updated: {}", config_path.display());
-    println!("\nStart your VM anytime with:\n  cubectl start {}", config.name);
+    println!(
+        "\nStart your VM anytime with:\n  cubectl start {}",
+        config.name
+    );
     Ok(())
 }
 
 pub fn do_eject(target: &str, state_root: &Path) -> Result<(), String> {
     let config_path = find_config_for_target(target, state_root)?;
-    let content = fs::read_to_string(&config_path).map_err(|e| format!("cannot read {:?}: {}", config_path, e))?;
-    let mut config: VmConfig = serde_json::from_str(&content).map_err(|e| format!("json error in {:?}: {}", config_path, e))?;
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("cannot read {:?}: {}", config_path, e))?;
+    let mut config: VmConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("json error in {:?}: {}", config_path, e))?;
 
     let mut removed = Vec::new();
     let mut remaining = Vec::new();
@@ -759,7 +911,10 @@ pub fn do_eject(target: &str, state_root: &Path) -> Result<(), String> {
     }
 
     if removed.is_empty() {
-        println!("No installer ISO disks found attached to {:?}.", config_path);
+        println!(
+            "No installer ISO disks found attached to {:?}.",
+            config_path
+        );
         return Ok(());
     }
 
@@ -782,9 +937,17 @@ fn path_is_within(path: &Path, directory: &Path) -> bool {
     }
 }
 
-pub fn do_delete(target: &str, state_root: &Path, force: bool, keep_disks: bool) -> Result<(), String> {
+pub fn do_delete(
+    target: &str,
+    state_root: &Path,
+    force: bool,
+    keep_disks: bool,
+) -> Result<(), String> {
     let (state_dir, maybe_explicit_config) = resolve_target_dir(target, state_root)?;
-    let vm_name = state_dir.file_name().and_then(|n| n.to_str()).unwrap_or(target);
+    let vm_name = state_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(target);
 
     // 1. Check if VM is running
     if let Some(status) = live_status(&state_dir) {
@@ -826,7 +989,9 @@ pub fn do_delete(target: &str, state_root: &Path, force: bool, keep_disks: bool)
                         let resolved = resolve_path(p, vm_dir)
                             .ok()
                             .filter(|p| p.is_file())
-                            .or_else(|| resolve_path(p, Path::new(".")).ok().filter(|p| p.is_file()));
+                            .or_else(|| {
+                                resolve_path(p, Path::new(".")).ok().filter(|p| p.is_file())
+                            });
                         if let Some(r) = resolved {
                             let _disk_lock = util::lock_disk(&r)?;
                             if fs::remove_file(&r).is_ok() {
@@ -934,8 +1099,10 @@ pub fn do_delete(target: &str, state_root: &Path, force: bool, keep_disks: bool)
 
 pub fn do_start(args: StartArgs, state_root: &Path) -> Result<(), String> {
     let config_path = find_config_for_target(&args.config.to_string_lossy(), state_root)?;
-    let content = fs::read_to_string(&config_path).map_err(|e| format!("cannot read {:?}: {}", config_path, e))?;
-    let config: VmConfig = serde_json::from_str(&content).map_err(|e| format!("json error in {:?}: {}", config_path, e))?;
+    let content = fs::read_to_string(&config_path)
+        .map_err(|e| format!("cannot read {:?}: {}", config_path, e))?;
+    let config: VmConfig = serde_json::from_str(&content)
+        .map_err(|e| format!("json error in {:?}: {}", config_path, e))?;
 
     fs::create_dir_all(state_root).map_err(|e| format!("cannot create state root: {}", e))?;
     let state_dir = state_root.join(&config.name);
@@ -943,7 +1110,10 @@ pub fn do_start(args: StartArgs, state_root: &Path) -> Result<(), String> {
 
     let root_meta = fs::symlink_metadata(state_root).map_err(|e| e.to_string())?;
     let dir_meta = fs::symlink_metadata(&state_dir).map_err(|e| e.to_string())?;
-    require(!root_meta.file_type().is_symlink() && !dir_meta.file_type().is_symlink(), "state directories cannot be symlinks")?;
+    require(
+        !root_meta.file_type().is_symlink() && !dir_meta.file_type().is_symlink(),
+        "state directories cannot be symlinks",
+    )?;
 
     let lock_file = OpenOptions::new()
         .read(true)
@@ -957,23 +1127,43 @@ pub fn do_start(args: StartArgs, state_root: &Path) -> Result<(), String> {
     let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
     require(rc == 0, "cannot acquire start lock")?;
 
-    require(live_status(&state_dir).is_none(), "this VM is already running")?;
+    require(
+        live_status(&state_dir).is_none(),
+        "this VM is already running",
+    )?;
 
     let spec = build_launch_spec(&config_path, &config, &state_dir, &args)?;
 
     let active = active_resources(state_root, &state_dir);
-    let mut collisions: Vec<_> = spec.resources.iter().filter(|r| active.contains(*r)).cloned().collect();
+    let mut collisions: Vec<_> = spec
+        .resources
+        .iter()
+        .filter(|r| active.contains(*r))
+        .cloned()
+        .collect();
     collisions.sort();
-    require(collisions.is_empty(), format!("resource already used by a running VM: {}", collisions.join(", ")))?;
+    require(
+        collisions.is_empty(),
+        format!(
+            "resource already used by a running VM: {}",
+            collisions.join(", ")
+        ),
+    )?;
 
     drop(util::lock_resources(&spec.resources)?);
 
     if args.sudo {
         let status = Command::new("sudo").args(["-n", "true"]).output();
-        require(status.map(|s| s.status.success()).unwrap_or(false), "sudo -n is unavailable; run sudo -v first")?;
+        require(
+            status.map(|s| s.status.success()).unwrap_or(false),
+            "sudo -n is unavailable; run sudo -v first",
+        )?;
     }
 
-    write_json_atomic(&state_dir.join("launch.json"), &serde_json::to_value(&spec).unwrap())?;
+    write_json_atomic(
+        &state_dir.join("launch.json"),
+        &serde_json::to_value(&spec).unwrap(),
+    )?;
 
     if args.interactive {
         println!("==> Starting VM '{}' interactively...", config.name);
@@ -995,7 +1185,9 @@ pub fn do_start(args: StartArgs, state_root: &Path) -> Result<(), String> {
     cmd.stderr(log_file);
     cmd.process_group(0);
 
-    let child = cmd.spawn().map_err(|e| format!("cannot spawn manager daemon: {}", e))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot spawn manager daemon: {}", e))?;
     let manager_pid = child.id();
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1006,9 +1198,18 @@ pub fn do_start(args: StartArgs, state_root: &Path) -> Result<(), String> {
             if let Ok(last_data) = fs::read_to_string(&last_path) {
                 if let Ok(ended) = serde_json::from_str::<serde_json::Value>(&last_data) {
                     if ended.get("id").and_then(|id| id.as_str()) == Some(&spec.id) {
-                        let vmm_log = fs::read_to_string(state_dir.join("vmm.log")).unwrap_or_default();
-                        let tail = if vmm_log.len() > 2000 { &vmm_log[vmm_log.len() - 2000..] } else { &vmm_log };
-                        return Err(format!("VM exited during startup (code {:?}):\n{}", ended.get("exit_code"), tail.trim()));
+                        let vmm_log =
+                            fs::read_to_string(state_dir.join("vmm.log")).unwrap_or_default();
+                        let tail = if vmm_log.len() > 2000 {
+                            &vmm_log[vmm_log.len() - 2000..]
+                        } else {
+                            &vmm_log
+                        };
+                        return Err(format!(
+                            "VM exited during startup (code {:?}):\n{}",
+                            ended.get("exit_code"),
+                            tail.trim()
+                        ));
                     }
                 }
             }
@@ -1019,9 +1220,20 @@ pub fn do_start(args: StartArgs, state_root: &Path) -> Result<(), String> {
         if res > 0 {
             let m_log = fs::read_to_string(state_dir.join("manager.log")).unwrap_or_default();
             let v_log = fs::read_to_string(state_dir.join("vmm.log")).unwrap_or_default();
-            let err = if !v_log.trim().is_empty() { v_log } else { m_log };
-            let tail = if err.len() > 2000 { &err[err.len() - 2000..] } else { &err };
-            return Err(format!("VM manager exited during startup:\n{}", tail.trim()));
+            let err = if !v_log.trim().is_empty() {
+                v_log
+            } else {
+                m_log
+            };
+            let tail = if err.len() > 2000 {
+                &err[err.len() - 2000..]
+            } else {
+                &err
+            };
+            return Err(format!(
+                "VM manager exited during startup:\n{}",
+                tail.trim()
+            ));
         }
 
         if let Some(status) = live_status(&state_dir) {
@@ -1042,7 +1254,10 @@ pub fn do_start(args: StartArgs, state_root: &Path) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    Err(format!("VM did not start within 10s; inspect {:?}", state_dir.join("manager.log")))
+    Err(format!(
+        "VM did not start within 10s; inspect {:?}",
+        state_dir.join("manager.log")
+    ))
 }
 
 fn ssh_identity(
@@ -1074,7 +1289,9 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
     // Attempt to locate the config to extract shutdown credentials / ssh_port if present
     let config_path = explicit_config.or_else(|| find_config_for_target(&vm_name, state_root).ok());
     let vm_config = config_path.as_ref().and_then(|cp| {
-        fs::read_to_string(&cp).ok().and_then(|c| serde_json::from_str::<VmConfig>(&c).ok())
+        fs::read_to_string(&cp)
+            .ok()
+            .and_then(|c| serde_json::from_str::<VmConfig>(&c).ok())
     });
 
     // 1. Determine Port & Host
@@ -1093,7 +1310,12 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
             .get("ssh_port")
             .and_then(|p| p.as_u64())
             .map(|p| p as u16)
-            .or_else(|| vm_config.as_ref().and_then(|c| c.network.as_ref()).and_then(|n| n.ssh_port));
+            .or_else(|| {
+                vm_config
+                    .as_ref()
+                    .and_then(|c| c.network.as_ref())
+                    .and_then(|n| n.ssh_port)
+            });
 
         if let Some(port) = configured_ssh_port {
             ("127.0.0.1".to_string(), port)
@@ -1125,11 +1347,16 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
     if args.wait {
         let deadline = Instant::now() + Duration::from_secs(args.wait_timeout);
         let mut ready = false;
-        eprintln!("[Cube] Waiting for SSH on {}:{} to become ready...", host, port);
+        eprintln!(
+            "[Cube] Waiting for SSH on {}:{} to become ready...",
+            host, port
+        );
         while Instant::now() < deadline {
             if let Ok(mut addrs) = (host.as_str(), port).to_socket_addrs() {
                 if let Some(addr) = addrs.next() {
-                    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+                    if let Ok(mut stream) =
+                        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+                    {
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
                         let mut banner = [0u8; 4];
                         use std::io::Read;
@@ -1143,7 +1370,10 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(500));
         }
         if !ready {
-            return Err(format!("timed out after {}s waiting for SSH on {}:{}", args.wait_timeout, host, port));
+            return Err(format!(
+                "timed out after {}s waiting for SSH on {}:{}",
+                args.wait_timeout, host, port
+            ));
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -1151,12 +1381,18 @@ pub fn do_ssh(args: SshArgs, state_root: &Path) -> Result<(), String> {
     // 5. Build and exec ssh
     let mut ssh_cmd = Command::new("ssh");
     ssh_cmd.args([
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        "-o", "ConnectTimeout=5",
-        "-o", "ConnectionAttempts=5",
-        "-p", &port.to_string(),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ConnectionAttempts=5",
+        "-p",
+        &port.to_string(),
     ]);
 
     if let Some(ref id) = identity {
@@ -1186,13 +1422,18 @@ pub fn do_status(target: &str, state_root: &Path) -> Result<(), String> {
     let last_path = state_dir.join("last.json");
     if last_path.is_file() {
         let content = fs::read_to_string(&last_path).map_err(|e| e.to_string())?;
-        let mut parsed: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        let mut parsed: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| e.to_string())?;
         if let Some(obj) = parsed.as_object_mut() {
             obj.insert("ip".into(), serde_json::Value::Null);
         }
         println!("{}", serde_json::to_string_pretty(&parsed).unwrap());
     } else {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"state": "stopped", "ip": null})).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"state": "stopped", "ip": null}))
+                .unwrap()
+        );
     }
     Ok(())
 }
@@ -1203,7 +1444,12 @@ fn detect_os_from_serial_log(serial_log_path: &Path) -> Option<String> {
             if let Some(idx) = line.find("FreeBSD ") {
                 let rest = &line[idx..];
                 let parts: Vec<&str> = rest.split_whitespace().collect();
-                if parts.len() >= 2 && parts[0] == "FreeBSD" && (parts[1].contains("-RELEASE") || parts[1].contains("-CURRENT") || parts[1].contains("-STABLE")) {
+                if parts.len() >= 2
+                    && parts[0] == "FreeBSD"
+                    && (parts[1].contains("-RELEASE")
+                        || parts[1].contains("-CURRENT")
+                        || parts[1].contains("-STABLE"))
+                {
                     return Some(format!("FreeBSD {}", parts[1]));
                 }
             }
@@ -1218,7 +1464,10 @@ fn enrich_vm_item(item: &mut serde_json::Value, state_root: &Path) {
         None => return,
     };
 
-    let config_path = item.get("config").and_then(|c| c.as_str()).map(PathBuf::from)
+    let config_path = item
+        .get("config")
+        .and_then(|c| c.as_str())
+        .map(PathBuf::from)
         .or_else(|| find_config_for_target(&name, state_root).ok());
 
     if let Some(ref cp) = config_path {
@@ -1227,7 +1476,8 @@ fn enrich_vm_item(item: &mut serde_json::Value, state_root: &Path) {
                 obj.insert("config".into(), serde_json::json!(cp.to_string_lossy()));
             }
         }
-        let needs_ssh = item.get("ssh_port").is_none() || item.get("ssh_port").map_or(false, |v| v.is_null());
+        let needs_ssh =
+            item.get("ssh_port").is_none() || item.get("ssh_port").map_or(false, |v| v.is_null());
         let needs_vnc = item.get("vnc").is_none() || item.get("vnc").map_or(false, |v| v.is_null());
         let needs_os = item.get("os").is_none() || item.get("os").map_or(false, |v| v.is_null());
         if needs_ssh || needs_vnc || needs_os {
@@ -1245,18 +1495,28 @@ fn enrich_vm_item(item: &mut serde_json::Value, state_root: &Path) {
                             }
                         }
                         if needs_os {
-                            let os_val = cfg.os.clone().or_else(|| {
-                                let serial_log = state_root.join(&name).join("serial.log");
-                                detect_os_from_serial_log(&serial_log)
-                            }).or_else(|| {
-                                for d in &cfg.disks {
-                                    let p = d.path();
-                                    if p.contains("14.4") { return Some("FreeBSD 14.4-RELEASE".into()); }
-                                    if p.contains("14.5") { return Some("FreeBSD 14.5-RELEASE".into()); }
-                                    if p.contains("15.1") { return Some("FreeBSD 15.1-RELEASE".into()); }
-                                }
-                                Some("FreeBSD".into())
-                            });
+                            let os_val = cfg
+                                .os
+                                .clone()
+                                .or_else(|| {
+                                    let serial_log = state_root.join(&name).join("serial.log");
+                                    detect_os_from_serial_log(&serial_log)
+                                })
+                                .or_else(|| {
+                                    for d in &cfg.disks {
+                                        let p = d.path();
+                                        if p.contains("14.4") {
+                                            return Some("FreeBSD 14.4-RELEASE".into());
+                                        }
+                                        if p.contains("14.5") {
+                                            return Some("FreeBSD 14.5-RELEASE".into());
+                                        }
+                                        if p.contains("15.1") {
+                                            return Some("FreeBSD 15.1-RELEASE".into());
+                                        }
+                                    }
+                                    Some("FreeBSD".into())
+                                });
                             if let Some(os) = os_val {
                                 obj.insert("os".into(), serde_json::json!(os));
                             }
@@ -1288,7 +1548,11 @@ pub fn do_list(state_root: &Path, as_json: bool) -> Result<(), String> {
         if !p.is_dir() {
             continue;
         }
-        let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         if name.starts_with('.') {
             continue;
         }
@@ -1320,8 +1584,16 @@ pub fn do_list(state_root: &Path, as_json: bool) -> Result<(), String> {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.is_dir() {
-                        let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                        if !name.starts_with('.') && !list.iter().any(|item| item.get("name").and_then(|n| n.as_str()) == Some(&name)) {
+                        let name = p
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        if !name.starts_with('.')
+                            && !list.iter().any(|item| {
+                                item.get("name").and_then(|n| n.as_str()) == Some(&name)
+                            })
+                        {
                             let cfg_file = p.join(format!("{}.json", name));
                             if cfg_file.is_file() {
                                 list.push(serde_json::json!({
@@ -1357,16 +1629,44 @@ pub fn do_list(state_root: &Path, as_json: bool) -> Result<(), String> {
     } else if list.is_empty() {
         println!("No VMs configured in {:?}", state_root);
     } else {
-        println!("{:<20} {:<10} {:<24} {:<15} {:<8} {:<10}", "NAME", "STATE", "OS", "IP", "PID", "STARTED");
-        println!("{:-<20} {:-<10} {:-<24} {:-<15} {:-<8} {:-<10}", "", "", "", "", "", "");
+        println!(
+            "{:<20} {:<10} {:<24} {:<15} {:<8} {:<10}",
+            "NAME", "STATE", "OS", "IP", "PID", "STARTED"
+        );
+        println!(
+            "{:-<20} {:-<10} {:-<24} {:-<15} {:-<8} {:-<10}",
+            "", "", "", "", "", ""
+        );
         for item in &list {
             let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("-");
             let state = item.get("state").and_then(|s| s.as_str()).unwrap_or("-");
             let os = item.get("os").and_then(|o| o.as_str()).unwrap_or("FreeBSD");
             let ip = item.get("ip").and_then(|ip| ip.as_str()).unwrap_or("-");
-            let pid = item.get("pid").filter(|_| state != "stopped").and_then(|p| p.as_u64()).map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-            let started = item.get("started").filter(|_| state != "stopped").and_then(|s| s.as_f64()).map(|s| format!("{:.0}s ago", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64() - s)).unwrap_or_else(|| "-".into());
-            println!("{:<20} {:<10} {:<24} {:<15} {:<8} {:<10}", name, state, os, ip, pid, started);
+            let pid = item
+                .get("pid")
+                .filter(|_| state != "stopped")
+                .and_then(|p| p.as_u64())
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".into());
+            let started = item
+                .get("started")
+                .filter(|_| state != "stopped")
+                .and_then(|s| s.as_f64())
+                .map(|s| {
+                    format!(
+                        "{:.0}s ago",
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs_f64()
+                            - s
+                    )
+                })
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "{:<20} {:<10} {:<24} {:<15} {:<8} {:<10}",
+                name, state, os, ip, pid, started
+            );
         }
     }
     Ok(())
@@ -1379,7 +1679,10 @@ pub fn do_config_get(key: &str, _state_root: &Path) -> Result<(), String> {
             println!("{}", current.display());
             Ok(())
         }
-        _ => Err(format!("unknown configuration key '{}'. Supported keys: vms-dir", key)),
+        _ => Err(format!(
+            "unknown configuration key '{}'. Supported keys: vms-dir",
+            key
+        )),
     }
 }
 
@@ -1391,17 +1694,24 @@ pub fn do_config_set(key: &str, value: &str, state_root: &Path) -> Result<(), St
             if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
                 settings.vms_dir = None;
                 util::save_cube_settings(state_root, &settings)?;
-                println!("Reset vms-dir to default: {}", util::default_vms_root().display());
+                println!(
+                    "Reset vms-dir to default: {}",
+                    util::default_vms_root().display()
+                );
             } else {
                 let resolved = util::resolve_path(trimmed, Path::new("."))?;
-                fs::create_dir_all(&resolved).map_err(|e| format!("cannot create directory {:?}: {}", resolved, e))?;
+                fs::create_dir_all(&resolved)
+                    .map_err(|e| format!("cannot create directory {:?}: {}", resolved, e))?;
                 settings.vms_dir = Some(resolved.display().to_string());
                 util::save_cube_settings(state_root, &settings)?;
                 println!("Set vms-dir to: {}", resolved.display());
             }
             Ok(())
         }
-        _ => Err(format!("unknown configuration key '{}'. Supported keys: vms-dir", key)),
+        _ => Err(format!(
+            "unknown configuration key '{}'. Supported keys: vms-dir",
+            key
+        )),
     }
 }
 
@@ -1425,7 +1735,10 @@ pub fn do_config_list(state_root: &Path) -> Result<(), String> {
     let vms_dir = util::default_vms_root();
     println!("vms-dir = {}", vms_dir.display());
     if let Some(ref _explicit) = settings.vms_dir {
-        println!("  (customized in {})", util::settings_path(state_root).display());
+        println!(
+            "  (customized in {})",
+            util::settings_path(state_root).display()
+        );
     } else {
         println!("  (default: ~/Cube)");
     }
@@ -1443,10 +1756,18 @@ pub fn parse_vnc_port(bind: &str) -> Option<u16> {
     if let Some(idx) = clean.rfind(':') {
         let suffix = &clean[idx + 1..];
         if let Ok(val) = suffix.parse::<u16>() {
-            return if val < 100 { Some(5900 + val) } else { Some(val) };
+            return if val < 100 {
+                Some(5900 + val)
+            } else {
+                Some(val)
+            };
         }
     } else if let Ok(val) = clean.parse::<u16>() {
-        return if val < 100 { Some(5900 + val) } else { Some(val) };
+        return if val < 100 {
+            Some(5900 + val)
+        } else {
+            Some(val)
+        };
     }
     None
 }
@@ -1469,7 +1790,13 @@ pub fn tigervnc_address(bind: &str) -> Option<String> {
     Some(format!("{host}::{port}"))
 }
 
-pub fn collect_used_ports(state_root: &Path, vms_root: &Path) -> (std::collections::HashSet<u16>, std::collections::HashSet<u16>) {
+pub fn collect_used_ports(
+    state_root: &Path,
+    vms_root: &Path,
+) -> (
+    std::collections::HashSet<u16>,
+    std::collections::HashSet<u16>,
+) {
     let mut used_ssh = std::collections::HashSet::new();
     let mut used_vnc = std::collections::HashSet::new();
     let mut candidate_configs = Vec::new();
@@ -1480,7 +1807,11 @@ pub fn collect_used_ports(state_root: &Path, vms_root: &Path) -> (std::collectio
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let name = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
                     if !name.starts_with('.') {
                         if let Ok(cfg_path) = find_config_for_target(&name, state_root) {
                             candidate_configs.push(cfg_path);
@@ -1497,7 +1828,11 @@ pub fn collect_used_ports(state_root: &Path, vms_root: &Path) -> (std::collectio
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let name = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
                     if !name.starts_with('.') {
                         let cfg_file = p.join(format!("{}.json", name));
                         if cfg_file.is_file() {
@@ -1543,7 +1878,11 @@ pub fn collect_used_ports(state_root: &Path, vms_root: &Path) -> (std::collectio
     (used_ssh, used_vnc)
 }
 
-pub fn find_next_available_ssh_port(state_root: &Path, vms_root: &Path, extra_reserved: &[u16]) -> u16 {
+pub fn find_next_available_ssh_port(
+    state_root: &Path,
+    vms_root: &Path,
+    extra_reserved: &[u16],
+) -> u16 {
     let (mut used_ssh, _) = collect_used_ports(state_root, vms_root);
     for &p in extra_reserved {
         used_ssh.insert(p);
@@ -1602,12 +1941,20 @@ mod tests {
     fn explicit_create_network_skips_entitlement_detection() {
         use clap::Parser;
         for mode in ["vmnet-proxy", "vmnet", "bridge", "mock", "none"] {
-            let cli = crate::Cli::try_parse_from(["cubectl", "create", "test", "--net", mode]).unwrap();
-            let crate::Commands::Create(args) = cli.command else { panic!("expected create") };
-            assert_eq!(create_network_mode(args.net, || panic!("explicit mode must take precedence")), mode);
+            let cli =
+                crate::Cli::try_parse_from(["cubectl", "create", "test", "--net", mode]).unwrap();
+            let crate::Commands::Create(args) = cli.command else {
+                panic!("expected create")
+            };
+            assert_eq!(
+                create_network_mode(args.net, || panic!("explicit mode must take precedence")),
+                mode
+            );
         }
         let cli = crate::Cli::try_parse_from(["cubectl", "create", "test"]).unwrap();
-        let crate::Commands::Create(args) = cli.command else { panic!("expected create") };
+        let crate::Commands::Create(args) = cli.command else {
+            panic!("expected create")
+        };
         assert_eq!(args.net, None);
     }
 
@@ -1617,7 +1964,8 @@ mod tests {
             "name": "example",
             "boot": {"mode": "uefi"},
             "shutdown": {"identity_file": "keys/id_ed25519", "user": "root"}
-        })).unwrap();
+        }))
+        .unwrap();
         let config_path = Path::new("/tmp/vms/example/example.json");
         assert_eq!(
             ssh_identity(None, Some(&config), Some(config_path)),
@@ -1638,7 +1986,10 @@ mod tests {
         assert_eq!(parse_vnc_port("5902"), Some(5902));
         assert_eq!(parse_vnc_port("0.0.0.0:5905"), Some(5905));
         assert_eq!(parse_vnc_port("invalid"), None);
-        assert_eq!(tigervnc_address("127.0.0.1:5901"), Some("127.0.0.1::5901".into()));
+        assert_eq!(
+            tigervnc_address("127.0.0.1:5901"),
+            Some("127.0.0.1::5901".into())
+        );
         assert_eq!(tigervnc_address("[::1]:5901"), Some("[::1]::5901".into()));
         assert_eq!(tigervnc_address("invalid"), None);
     }
@@ -1657,4 +2008,3 @@ mod tests {
         assert!(vnc_port >= 5901);
     }
 }
-

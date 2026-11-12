@@ -9,8 +9,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{resolve_target_dir, InstanceRecord, LaunchSpec};
-use crate::util::{control_socket_path, ensure_control_root, query_socket, require, write_json_atomic};
+use crate::config::{InstanceRecord, LaunchSpec, resolve_target_dir};
+use crate::util::{
+    control_socket_path, ensure_control_root, query_socket, require, write_json_atomic,
+};
 
 pub fn live_status(state_dir: &Path) -> Option<serde_json::Value> {
     let sock = control_socket_path(state_dir);
@@ -36,8 +38,9 @@ fn guest_ip_from_runtime(state_dir: &Path, instance_id: &str) -> Option<Ipv4Addr
     if status.version != 1 || status.instance_id != instance_id {
         return None;
     }
-    status.ip.filter(|ip| !ip.is_unspecified() && !ip.is_broadcast()
-        && !ip.is_multicast() && !ip.is_loopback())
+    status.ip.filter(|ip| {
+        !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() && !ip.is_loopback()
+    })
 }
 
 #[cfg(test)]
@@ -46,23 +49,44 @@ mod runtime_tests {
 
     #[test]
     fn rejects_stale_invalid_and_unsupported_runtime_status() {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("cube-runtime-reader-{}-{stamp}", std::process::id()));
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cube-runtime-reader-{}-{stamp}",
+            std::process::id()
+        ));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("runtime.json");
         assert_eq!(guest_ip_from_runtime(&dir, "current"), None);
         for (version, id, ip) in [
-            (1, "old", "10.0.0.2"), (2, "current", "10.0.0.2"),
-            (1, "current", "invalid"), (1, "current", "0.0.0.0"),
-            (1, "current", "127.0.0.1"), (1, "current", "224.0.0.1"),
+            (1, "old", "10.0.0.2"),
+            (2, "current", "10.0.0.2"),
+            (1, "current", "invalid"),
+            (1, "current", "0.0.0.0"),
+            (1, "current", "127.0.0.1"),
+            (1, "current", "224.0.0.1"),
         ] {
-            fs::write(&path, serde_json::json!({"version": version, "instance_id": id, "ip": ip}).to_string()).unwrap();
+            fs::write(
+                &path,
+                serde_json::json!({"version": version, "instance_id": id, "ip": ip}).to_string(),
+            )
+            .unwrap();
             assert_eq!(guest_ip_from_runtime(&dir, "current"), None);
         }
         fs::write(&path, b"{\"version\":").unwrap();
         assert_eq!(guest_ip_from_runtime(&dir, "current"), None);
-        fs::write(&path, serde_json::json!({"version": 1, "instance_id": "current", "ip": "10.0.0.2"}).to_string()).unwrap();
-        assert_eq!(guest_ip_from_runtime(&dir, "current"), Some(Ipv4Addr::new(10, 0, 0, 2)));
+        fs::write(
+            &path,
+            serde_json::json!({"version": 1, "instance_id": "current", "ip": "10.0.0.2"})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            guest_ip_from_runtime(&dir, "current"),
+            Some(Ipv4Addr::new(10, 0, 0, 2))
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -116,7 +140,8 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
     }
 
     let spec_path = state_dir.join("launch.json");
-    let spec_data = fs::read_to_string(&spec_path).map_err(|e| format!("cannot read {:?}: {}", spec_path, e))?;
+    let spec_data = fs::read_to_string(&spec_path)
+        .map_err(|e| format!("cannot read {:?}: {}", spec_path, e))?;
     let spec: LaunchSpec = serde_json::from_str(&spec_data).map_err(|e| e.to_string())?;
 
     drop(crate::util::lock_resources(&spec.resources)?);
@@ -125,7 +150,8 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
     ensure_control_root(&control)?;
     let _ = fs::remove_file(&control);
 
-    let listener = UnixListener::bind(&control).map_err(|e| format!("cannot bind {:?}: {}", control, e))?;
+    let listener =
+        UnixListener::bind(&control).map_err(|e| format!("cannot bind {:?}: {}", control, e))?;
     fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
@@ -137,10 +163,13 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         .map_err(|e| format!("cannot open vmm.log: {}", e))?;
 
     let uart_path = state_dir.join("uart");
-    let runtime_path = state_dir.canonicalize().map_err(|e| e.to_string())?.join("runtime.json");
+    let runtime_path = state_dir
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        .join("runtime.json");
     match fs::remove_file(&runtime_path) {
-        Ok(()) => {},
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("cannot clear runtime status: {e}")),
     }
     let runtime_env = [
@@ -149,7 +178,11 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
     ];
     let mut cmd = if spec.sudo {
         let mut c = Command::new("sudo");
-        c.args(["-n", "/usr/bin/env", &format!("VMM_UART_IN={}", uart_path.display())]);
+        c.args([
+            "-n",
+            "/usr/bin/env",
+            &format!("VMM_UART_IN={}", uart_path.display()),
+        ]);
         c.args(&runtime_env);
         c.args(&spec.command);
         c
@@ -162,7 +195,11 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         c
     };
 
-    let interactive_log = if spec.interactive { Some(log_file.try_clone().map_err(|e| e.to_string())?) } else { None };
+    let interactive_log = if spec.interactive {
+        Some(log_file.try_clone().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     if spec.interactive {
         cmd.stdout(Stdio::piped());
     } else {
@@ -173,13 +210,17 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
     }
     // Interactive children share the foreground terminal's process group.
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn {:?}: {}", spec.command[0], e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {:?}: {}", spec.command[0], e))?;
     let mut output_thread = interactive_log.map(|mut log| {
         let mut output = child.stdout.take().expect("interactive stdout is piped");
         std::thread::spawn(move || {
             let mut buffer = [0; 8192];
             while let Ok(count) = output.read(&mut buffer) {
-                if count == 0 { break; }
+                if count == 0 {
+                    break;
+                }
                 let _ = log.write_all(&buffer[..count]);
                 let mut stdout = std::io::stdout().lock();
                 let _ = stdout.write_all(&buffer[..count]);
@@ -188,7 +229,10 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         })
     });
     let child_pid = child.id();
-    let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
 
     let record = InstanceRecord {
         id: spec.id.clone(),
@@ -203,7 +247,10 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         ssh_port: spec.ssh_port,
         vnc: spec.vnc.clone(),
     };
-    write_json_atomic(&state_dir.join("instance.json"), &serde_json::to_value(&record).unwrap())?;
+    write_json_atomic(
+        &state_dir.join("instance.json"),
+        &serde_json::to_value(&record).unwrap(),
+    )?;
 
     drop(start_lock);
 
@@ -220,7 +267,14 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_ok() && !line.is_empty() {
-                    let resp = handle_client_request(&line, &mut child, &spec, state_dir, &record, &mut output_thread);
+                    let resp = handle_client_request(
+                        &line,
+                        &mut child,
+                        &spec,
+                        state_dir,
+                        &record,
+                        &mut output_thread,
+                    );
                     let mut payload = serde_json::to_string(&resp).unwrap();
                     payload.push('\n');
                     let _ = stream.write_all(payload.as_bytes());
@@ -233,8 +287,13 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         }
     };
 
-    if let Some(thread) = output_thread.take() { let _ = thread.join(); }
-    let ended = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+    if let Some(thread) = output_thread.take() {
+        let _ = thread.join();
+    }
+    let ended = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
     let last = serde_json::json!({
         "id": record.id,
         "name": record.name,
@@ -314,26 +373,48 @@ fn handle_client_request(
         }
         "stop" => {
             let timeout = req.get("timeout").and_then(|t| t.as_u64()).unwrap_or(10);
-            let signal = force_stop_child(child, spec.sudo, spec.interactive, Duration::from_secs(timeout));
+            let signal = force_stop_child(
+                child,
+                spec.sudo,
+                spec.interactive,
+                Duration::from_secs(timeout),
+            );
             serde_json::json!({"ok": true, "result": "forced-stop", "signal": signal})
         }
         "shutdown" => {
             let timeout = req.get("timeout").and_then(|t| t.as_u64()).unwrap_or(120);
-            let force_after = req.get("force_after").and_then(|f| f.as_bool()).unwrap_or(false);
-            guest_shutdown(child, spec, state_dir, Duration::from_secs(timeout), force_after, output_thread)
+            let force_after = req
+                .get("force_after")
+                .and_then(|f| f.as_bool())
+                .unwrap_or(false);
+            guest_shutdown(
+                child,
+                spec,
+                state_dir,
+                Duration::from_secs(timeout),
+                force_after,
+                output_thread,
+            )
         }
         other => serde_json::json!({"ok": false, "error": format!("unknown action: {}", other)}),
     }
 }
 
-fn force_stop_child(child: &mut std::process::Child, sudo: bool, interactive: bool, timeout: Duration) -> &'static str {
+fn force_stop_child(
+    child: &mut std::process::Child,
+    sudo: bool,
+    interactive: bool,
+    timeout: Duration,
+) -> &'static str {
     if child.try_wait().ok().flatten().is_some() {
         return "none";
     }
     let pid = child.id() as i32;
     let signal_target = if interactive { pid } else { -pid };
     if sudo {
-        let _ = Command::new("sudo").args(["-n", "/bin/kill", "-15", "--", &signal_target.to_string()]).output();
+        let _ = Command::new("sudo")
+            .args(["-n", "/bin/kill", "-15", "--", &signal_target.to_string()])
+            .output();
     } else {
         unsafe { libc::kill(signal_target, libc::SIGTERM) };
     }
@@ -347,7 +428,9 @@ fn force_stop_child(child: &mut std::process::Child, sudo: bool, interactive: bo
     }
 
     if sudo {
-        let _ = Command::new("sudo").args(["-n", "/bin/kill", "-9", "--", &signal_target.to_string()]).output();
+        let _ = Command::new("sudo")
+            .args(["-n", "/bin/kill", "-9", "--", &signal_target.to_string()])
+            .output();
     } else {
         unsafe { libc::kill(signal_target, libc::SIGKILL) };
     }
@@ -365,7 +448,9 @@ fn guest_shutdown(
 ) -> serde_json::Value {
     let cfg = match spec.shutdown {
         Some(ref c) => c,
-        None => return serde_json::json!({"ok": false, "error": "no guest SSH shutdown configured; use stop"}),
+        None => {
+            return serde_json::json!({"ok": false, "error": "no guest SSH shutdown configured; use stop"});
+        }
     };
 
     let target = format!("{}@{}", cfg.user, cfg.host);
@@ -379,14 +464,22 @@ fn guest_shutdown(
         if !ssh_sent {
             let ssh_out = Command::new("ssh")
                 .args([
-                    "-F", "/dev/null",
-                    "-o", "BatchMode=yes",
-                    "-o", "ConnectTimeout=5",
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile=/dev/null",
-                    "-o", "LogLevel=ERROR",
-                    "-i", &cfg.identity_file,
-                    "-p", &port_str,
+                    "-F",
+                    "/dev/null",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "UserKnownHostsFile=/dev/null",
+                    "-o",
+                    "LogLevel=ERROR",
+                    "-i",
+                    &cfg.identity_file,
+                    "-p",
+                    &port_str,
                     &target,
                     "/sbin/shutdown -p now",
                 ])
@@ -407,7 +500,9 @@ fn guest_shutdown(
         }
 
         if let Ok(Some(code)) = child.try_wait() {
-            if let Some(thread) = output_thread.take() { let _ = thread.join(); }
+            if let Some(thread) = output_thread.take() {
+                let _ = thread.join();
+            }
             let log_text = fs::read_to_string(state_dir.join("vmm.log")).unwrap_or_default();
             let graceful = code.success() && log_text.contains("Guest requested PSCI SYSTEM_OFF");
             return serde_json::json!({
@@ -432,7 +527,13 @@ fn guest_shutdown(
     }
 }
 
-pub fn do_action(target: &str, state_root: &Path, action: &str, timeout: u64, force_after: bool) -> Result<(), String> {
+pub fn do_action(
+    target: &str,
+    state_root: &Path,
+    action: &str,
+    timeout: u64,
+    force_after: bool,
+) -> Result<(), String> {
     let (state_dir, _) = resolve_target_dir(target, state_root)?;
     let sock = control_socket_path(&state_dir);
     require(sock.exists(), "VM is not running")?;

@@ -205,20 +205,44 @@ mod tests {
         assert_eq!(recs[0], (MODINFO_NAME, b"kernel\0".to_vec()));
         assert_eq!(recs[1], (MODINFO_TYPE, b"elf kernel\0".to_vec()));
         assert_eq!(recs[2].0, MODINFO_ADDR);
-        assert_eq!(u64::from_le_bytes(recs[2].1.clone().try_into().unwrap()), 0x4020_0000);
+        assert_eq!(
+            u64::from_le_bytes(recs[2].1.clone().try_into().unwrap()),
+            0x4020_0000
+        );
         assert_eq!(recs[3].0, MODINFO_SIZE);
-        assert_eq!(u64::from_le_bytes(recs[3].1.clone().try_into().unwrap()), 0x1000);
+        assert_eq!(
+            u64::from_le_bytes(recs[3].1.clone().try_into().unwrap()),
+            0x1000
+        );
 
         // Kernel-scoped metadata must precede the next MODINFO_NAME (zfs).
-        let zfs_name = recs.iter().position(|(t, v)| *t == MODINFO_NAME && v == b"zfs\0").unwrap();
-        let dtbp_at = recs.iter().position(|(t, _)| *t == MODINFO_METADATA | MODINFOMD_DTBP).unwrap();
-        let kernend_at = recs.iter().position(|(t, _)| *t == MODINFO_METADATA | MODINFOMD_KERNEND).unwrap();
+        let zfs_name = recs
+            .iter()
+            .position(|(t, v)| *t == MODINFO_NAME && v == b"zfs\0")
+            .unwrap();
+        let dtbp_at = recs
+            .iter()
+            .position(|(t, _)| *t == MODINFO_METADATA | MODINFOMD_DTBP)
+            .unwrap();
+        let kernend_at = recs
+            .iter()
+            .position(|(t, _)| *t == MODINFO_METADATA | MODINFOMD_KERNEND)
+            .unwrap();
         assert!(dtbp_at < zfs_name && kernend_at < zfs_name);
-        assert!(recs.iter().all(|(t, _)| *t != MODINFO_METADATA | MODINFOMD_ENVP));
-        assert!(recs.iter().all(|(t, _)| *t != MODINFO_METADATA | MODINFOMD_HOWTO));
+        assert!(
+            recs.iter()
+                .all(|(t, _)| *t != MODINFO_METADATA | MODINFOMD_ENVP)
+        );
+        assert!(
+            recs.iter()
+                .all(|(t, _)| *t != MODINFO_METADATA | MODINFOMD_HOWTO)
+        );
 
         assert_eq!(recs[zfs_name], (MODINFO_NAME, b"zfs\0".to_vec()));
-        assert_eq!(recs[zfs_name + 1], (MODINFO_TYPE, b"elf obj module\0".to_vec()));
+        assert_eq!(
+            recs[zfs_name + 1],
+            (MODINFO_TYPE, b"elf obj module\0".to_vec())
+        );
         assert_eq!(recs[zfs_name + 2].0, MODINFO_ADDR);
         assert_eq!(
             u64::from_le_bytes(recs[zfs_name + 2].1.clone().try_into().unwrap()),
@@ -226,9 +250,15 @@ mod tests {
         );
 
         let dtbp = &recs[dtbp_at];
-        assert_eq!(u64::from_le_bytes(dtbp.1.clone().try_into().unwrap()), 0x4800_0000);
+        assert_eq!(
+            u64::from_le_bytes(dtbp.1.clone().try_into().unwrap()),
+            0x4800_0000
+        );
 
-        let kernend = recs.iter().find(|(t, _)| *t == MODINFO_METADATA | MODINFOMD_KERNEND).unwrap();
+        let kernend = recs
+            .iter()
+            .find(|(t, _)| *t == MODINFO_METADATA | MODINFOMD_KERNEND)
+            .unwrap();
         let end = u64::from_le_bytes(kernend.1.clone().try_into().unwrap());
         assert_eq!(end, meta_gpa + blob.len() as u64);
         assert!(end > meta_gpa);

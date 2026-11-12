@@ -12,6 +12,12 @@ pub fn socket_path_for(uid: u32) -> Result<PathBuf, String> {
     Ok(home.join("Library/Application Support/cube/vmnet.sock"))
 }
 
+/// Directory of exclusive virtio-vsock CID lock files.
+pub fn vsock_dir() -> Result<PathBuf, String> {
+    let (_name, home) = lookup_user(unsafe { libc::geteuid() })?;
+    Ok(home.join("Library/Application Support/cube/vsock"))
+}
+
 pub fn lookup_user(uid: u32) -> Result<(String, PathBuf), String> {
     let pw = unsafe { libc::getpwuid(uid) };
     if pw.is_null() {

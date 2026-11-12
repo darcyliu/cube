@@ -101,6 +101,8 @@ FreeBSD 14.4 X11 desktop session passed the disposable regression on 2026-09-22.
   further display optimizations.
 - [x] Investigate FreeBSD guest-driver compatibility and firmware requirements
   for virtio-gpu; record a go/no-go decision before implementation.
+- [x] Implement the optional 2D virtio-gpu device and verify FreeBSD `vtgpu`
+  plus EDK2 `VirtioGpuDxe` GOP output through VNC.
 
 `--display WIDTHxHEIGHT` now drives one validated geometry through the FDT, VNC
 handshake, and both tablet devices. Reservations grow from the 8 MiB minimum,
@@ -108,9 +110,11 @@ are page aligned, and are limited to 256 MiB. The lifecycle check exercises a
 non-default resolution and invalid geometry.
 
 FreeBSD 14.4's ARM64 GENERIC kernel includes its base-system 2D virtio-gpu
-console driver, while ArmVirtQemu EDK2 includes VirtioGpuDxe. The decision is to
-defer the host device: the FreeBSD driver is a `vt(4)` framebuffer rather than
-an accelerated DRM desktop, so measurements from simple-framebuffer come first.
+console driver, while ArmVirtQemu EDK2 includes VirtioGpuDxe. Cube now exposes
+the optional device with `--gpu virtio`; both the kernel console and firmware
+GOP path passed live tests. The FreeBSD driver remains a `vt(4)` framebuffer
+rather than an accelerated DRM desktop, so the longer SCFB measurements remain
+the broad desktop baseline.
 The user-confirmed run passed unattended install, XI2 pointer edges, primary
 button, both wheel directions, modifiers, disconnect releases, VNC reconnect,
 installed-disk SSH, guest reboot, marker persistence, and clean poweroff.
@@ -145,9 +149,10 @@ See [GUI architecture](gui_architecture.md) and the
   screenshot exposed missing fonts despite protocol checks passing; the XFCE
   variant now installs DejaVu fonts and Adwaita icons. The recorded 1024×768
   pointer-driven update sample is not a high-resolution workload benchmark.
-- **Display capability:** simple-framebuffer/scfb uses a fixed boot-time
-  resolution. There is no runtime resize, multi-head display, virtio-gpu host
-  device, or 3D acceleration. Virtio-gpu remains deferred by the decision above.
+- **Display capability:** simple-framebuffer/scfb and the current 2D virtio-gpu
+  scanout use fixed boot-time resolution. There is no runtime resize, multi-head
+  display, VirGL/Venus, or 3D acceleration. The virtio-gpu path has firmware and
+  console coverage but not the full SCFB X11 workload matrix above.
 - **Remote-desktop features:** VNC serves one loopback client with raw rectangle
   encoding. It does not provide clipboard synchronization; incoming
   `ClientCutText` is discarded. The keysym table covers common Latin-1 keys

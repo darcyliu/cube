@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::devices::display::FramebufferConfig;
+use crate::devices::display::{FramePublisher, FramebufferConfig};
 use crate::devices::usb::xhci::XhciController;
 use crate::memory::GuestMemory;
 
@@ -13,6 +13,7 @@ struct Attached {
     memory: Arc<GuestMemory>,
     framebuffer: FramebufferConfig,
     usb: Arc<Mutex<XhciController>>,
+    frames: Option<Arc<FramePublisher>>,
     keys: BTreeSet<u16>,
     position: (u16, u16),
     buttons: u8,
@@ -39,11 +40,13 @@ pub fn attach(
     memory: Arc<GuestMemory>,
     framebuffer: FramebufferConfig,
     usb: Arc<Mutex<XhciController>>,
+    frames: Option<Arc<FramePublisher>>,
 ) -> Attachment {
     *ATTACHED.lock().unwrap() = Some(Attached {
         memory,
         framebuffer,
         usb,
+        frames,
         keys: BTreeSet::new(),
         position: (0, 0),
         buttons: 0,
@@ -109,6 +112,11 @@ extern "C" fn vmm_native_copy_frame(target: *mut c_void, length: usize) -> bool 
         return false;
     }
     let pixels = unsafe { std::slice::from_raw_parts_mut(target.cast::<u8>(), length) };
+    if let Some(frames) = &state.frames {
+        if frames.copy_published(pixels) {
+            return true;
+        }
+    }
     state.memory.read(state.framebuffer.gpa, pixels).is_ok()
 }
 
@@ -252,6 +260,9 @@ fn mac_keycode_to_linux(key: u16) -> Option<u16> {
 mod tests {
     use super::*;
 
+    /// The Cocoa callbacks share one process-global attachment.
+    static ATTACH_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn native_physical_keys_cover_login_and_navigation() {
         for (mac, linux) in [
@@ -274,6 +285,7 @@ mod tests {
 
     #[test]
     fn native_frontend_copies_pixels_and_releases_held_input() {
+        let _guard = ATTACH_LOCK.lock().unwrap();
         let memory = Arc::new(GuestMemory::new_test(0x1000, 0x4000));
         let framebuffer = FramebufferConfig {
             gpa: 0x1000,
@@ -285,7 +297,7 @@ mod tests {
         let pixels = [7u8; 16];
         memory.write(framebuffer.gpa, &pixels).unwrap();
         let usb = Arc::new(Mutex::new(XhciController::new(41, memory.clone(), 2, 2)));
-        let attachment = attach(memory, framebuffer, usb.clone());
+        let attachment = attach(memory, framebuffer, usb.clone(), None);
         let mut width = 0;
         let mut height = 0;
         assert!(vmm_native_geometry(&mut width, &mut height));
@@ -304,5 +316,50 @@ mod tests {
         assert_eq!(usb.lock().unwrap().keyboard_report(), [0; 8]);
         drop(attachment);
         assert!(!vmm_native_geometry(&mut width, &mut height));
+    }
+
+    #[test]
+    fn native_frontend_prefers_a_published_scanout() {
+        let _guard = ATTACH_LOCK.lock().unwrap();
+        let memory = Arc::new(GuestMemory::new_test(0x1000, 0x4000));
+        let framebuffer = FramebufferConfig {
+            gpa: 0x1000,
+            width: 2,
+            height: 2,
+            stride: 8,
+            reg_size: 0x4000,
+        };
+        memory.write(framebuffer.gpa, &[1u8; 16]).unwrap();
+        let frames = Arc::new(FramePublisher::new(2, 2));
+        let usb = Arc::new(Mutex::new(XhciController::new(41, memory.clone(), 2, 2)));
+        let attachment = attach(memory, framebuffer, usb, Some(frames.clone()));
+        let mut copied = [0u8; 16];
+        assert!(vmm_native_copy_frame(
+            copied.as_mut_ptr().cast(),
+            copied.len()
+        ));
+        assert_eq!(copied, [1u8; 16]);
+        frames.blit(
+            crate::devices::display::DamageRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            &[9u8; 16],
+            8,
+        );
+        assert!(vmm_native_copy_frame(
+            copied.as_mut_ptr().cast(),
+            copied.len()
+        ));
+        assert_eq!(copied, [9u8; 16]);
+        frames.clear();
+        assert!(vmm_native_copy_frame(
+            copied.as_mut_ptr().cast(),
+            copied.len()
+        ));
+        assert_eq!(copied, [1u8; 16]);
+        drop(attachment);
     }
 }

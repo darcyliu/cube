@@ -10,8 +10,7 @@ const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x400;
 const EXT4_GOOD_OLD_INODE_SIZE: usize = 128;
 
-const FALLBACK_ROOT_HASH: &str =
-    "$6$vmmdebian$cTEwBCyPjJIDXBkb6D0Y/V9H8hJhcCWneA6klgFte2bqsmPQJ2jolV/JDKPAKdgyR0WxLRni1t7Asnlj2GI7w/";
+const FALLBACK_ROOT_HASH: &str = "$6$vmmdebian$cTEwBCyPjJIDXBkb6D0Y/V9H8hJhcCWneA6klgFte2bqsmPQJ2jolV/JDKPAKdgyR0WxLRni1t7Asnlj2GI7w/";
 
 pub fn crc32c(data: &[u8], mut crc: u32) -> u32 {
     const TABLE: [u32; 256] = {
@@ -22,7 +21,11 @@ pub fn crc32c(data: &[u8], mut crc: u32) -> u32 {
             let mut c = i as u32;
             let mut j = 0;
             while j < 8 {
-                c = if (c & 1) != 0 { (c >> 1) ^ poly } else { c >> 1 };
+                c = if (c & 1) != 0 {
+                    (c >> 1) ^ poly
+                } else {
+                    c >> 1
+                };
                 j += 1;
             }
             table[i] = c;
@@ -213,8 +216,10 @@ impl<'a> Ext4Fs<'a> {
                 } else {
                     ee_len_raw as u32
                 };
-                let ee_start_hi = u16::from_le_bytes(buf[off + 6..off + 8].try_into().unwrap()) as u64;
-                let ee_start_lo = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as u64;
+                let ee_start_hi =
+                    u16::from_le_bytes(buf[off + 6..off + 8].try_into().unwrap()) as u64;
+                let ee_start_lo =
+                    u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as u64;
                 let disk_blk = (ee_start_hi << 32) | ee_start_lo;
                 extents.push((ee_block, disk_blk, ee_len));
             }
@@ -263,14 +268,16 @@ impl<'a> Ext4Fs<'a> {
         let mut pos = 0;
         while pos + 8 <= content.len() {
             let inum = u32::from_le_bytes(content[pos..pos + 4].try_into().unwrap());
-            let rec_len = u16::from_le_bytes(content[pos + 4..pos + 6].try_into().unwrap()) as usize;
+            let rec_len =
+                u16::from_le_bytes(content[pos + 4..pos + 6].try_into().unwrap()) as usize;
             let name_len = content[pos + 6] as usize;
             let ftype = content[pos + 7];
             if rec_len == 0 {
                 break;
             }
             if inum != 0 && pos + 8 + name_len <= content.len() {
-                let name = String::from_utf8_lossy(&content[pos + 8..pos + 8 + name_len]).to_string();
+                let name =
+                    String::from_utf8_lossy(&content[pos + 8..pos + 8 + name_len]).to_string();
                 entries.push((name, inum, ftype));
             }
             pos += rec_len;
@@ -383,7 +390,8 @@ impl<'a> Ext4Fs<'a> {
                 if dst_off >= new_content.len() {
                     break;
                 }
-                let src_chunk = &new_content[dst_off..(dst_off + bs as usize).min(new_content.len())];
+                let src_chunk =
+                    &new_content[dst_off..(dst_off + bs as usize).min(new_content.len())];
                 let mut block_data = self.read_block(disk_blk + i as u64)?;
                 block_data[..src_chunk.len()].copy_from_slice(src_chunk);
                 if (dst_off + src_chunk.len()) as u64 >= new_size && src_chunk.len() < bs as usize {
@@ -559,7 +567,11 @@ pub fn extract_debian_cloud_kernel(
 
         // Check if kernel/initrd are in /boot subdirectory (unified root partition)
         if names.contains("boot") && boot_info.is_none() {
-            if let Some(boot_ino) = root_entries.iter().find(|(n, _, _)| n == "boot").map(|(_, i, _)| *i) {
+            if let Some(boot_ino) = root_entries
+                .iter()
+                .find(|(n, _, _)| n == "boot")
+                .map(|(_, i, _)| *i)
+            {
                 if let Ok(boot_entries) = fs.list_dir(boot_ino) {
                     let mut bk_c: Vec<_> = boot_entries
                         .iter()
@@ -592,7 +604,8 @@ pub fn extract_debian_cloud_kernel(
         }
     }
 
-    let binfo = boot_info.ok_or_else(|| "No kernel/initramfs found on any partition".to_string())?;
+    let binfo =
+        boot_info.ok_or_else(|| "No kernel/initramfs found on any partition".to_string())?;
 
     let mut fs = Ext4Fs::open(&mut file, binfo.part_offset)?;
     println!(
@@ -632,7 +645,10 @@ pub fn extract_debian_cloud_kernel(
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         std::fs::write(root_path, format!("{root_dev}\n")).map_err(|e| e.to_string())?;
-        println!("[Cube] Saved root partition device to {}", root_path.display());
+        println!(
+            "[Cube] Saved root partition device to {}",
+            root_path.display()
+        );
     }
 
     Ok(())
@@ -658,7 +674,10 @@ fn hash_password(password: &str) -> Result<String, String> {
 }
 
 pub fn patch_cloud_shadow(disk_path: &Path, password: &str) -> Result<(), String> {
-    println!("[Cube] Preparing nocloud image for serial login: {}", disk_path.display());
+    println!(
+        "[Cube] Preparing nocloud image for serial login: {}",
+        disk_path.display()
+    );
     println!("[Cube] Setting root password to: '{password}'");
 
     let mut file = OpenOptions::new()
@@ -688,7 +707,8 @@ pub fn patch_cloud_shadow(disk_path: &Path, password: &str) -> Result<(), String
         let part_lba = u64::from_le_bytes(gpt_hdr[72..80].try_into().unwrap());
         let num_parts = u32::from_le_bytes(gpt_hdr[80..84].try_into().unwrap()) as usize;
         let part_size = u32::from_le_bytes(gpt_hdr[84..88].try_into().unwrap()) as usize;
-        file.seek(SeekFrom::Start(part_lba * 512)).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(part_lba * 512))
+            .map_err(|e| e.to_string())?;
         let count = num_parts.min(128);
         let mut entries = vec![0u8; count * part_size];
         file.read_exact(&mut entries).map_err(|e| e.to_string())?;
@@ -739,7 +759,10 @@ pub fn patch_cloud_shadow(disk_path: &Path, password: &str) -> Result<(), String
     }
 
     let shadow_content = fs.read_file(shadow_ino)?;
-    println!("[Cube] Read {} bytes from /etc/shadow", shadow_content.len());
+    println!(
+        "[Cube] Read {} bytes from /etc/shadow",
+        shadow_content.len()
+    );
 
     let shadow_str = String::from_utf8_lossy(&shadow_content);
     for line in shadow_str.lines() {
@@ -759,8 +782,16 @@ pub fn patch_cloud_shadow(disk_path: &Path, password: &str) -> Result<(), String
             let mut fields: Vec<&str> = line.split(':').collect();
             if fields.len() > 1 {
                 let old_hash = fields[1];
-                let old_preview = if old_hash.len() > 32 { &old_hash[..32] } else { old_hash };
-                let new_preview = if new_hash.len() > 32 { &new_hash[..32] } else { &new_hash };
+                let old_preview = if old_hash.len() > 32 {
+                    &old_hash[..32]
+                } else {
+                    old_hash
+                };
+                let new_preview = if new_hash.len() > 32 {
+                    &new_hash[..32]
+                } else {
+                    &new_hash
+                };
                 println!("  Old hash: {old_preview}...");
                 println!("  New hash: {new_preview}...");
                 fields[1] = &new_hash;
@@ -812,13 +843,17 @@ pub fn patch_cloud_shadow(disk_path: &Path, password: &str) -> Result<(), String
     let unit_path = "/usr/lib/systemd/system/serial-getty@.service";
     if let Some(ino) = fs.resolve_path(unit_path)? {
         let data = fs.read_file(ino)?;
-        if data.windows(b"--autologin".len()).any(|w| w == b"--autologin") {
+        if data
+            .windows(b"--autologin".len())
+            .any(|w| w == b"--autologin")
+        {
             println!("[Cube] serial-getty already has --autologin");
         } else {
             let target = b"ExecStart=-/sbin/agetty ";
             let replacement = b"ExecStart=-/sbin/agetty --autologin root ";
             if let Some(pos) = data.windows(target.len()).position(|w| w == target) {
-                let mut new_data = Vec::with_capacity(data.len() + replacement.len() - target.len());
+                let mut new_data =
+                    Vec::with_capacity(data.len() + replacement.len() - target.len());
                 new_data.extend_from_slice(&data[..pos]);
                 new_data.extend_from_slice(replacement);
                 new_data.extend_from_slice(&data[pos + target.len()..]);
@@ -828,7 +863,10 @@ pub fn patch_cloud_shadow(disk_path: &Path, password: &str) -> Result<(), String
         }
     }
 
-    println!("[Cube] Done. Root password in {} set to '{password}'", disk_path.display());
+    println!(
+        "[Cube] Done. Root password in {} set to '{password}'",
+        disk_path.display()
+    );
     println!("[Cube] Serial console autologin is enabled; password login is root:{password}");
     Ok(())
 }

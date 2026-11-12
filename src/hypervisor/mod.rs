@@ -120,7 +120,10 @@ impl fmt::Display for HvError {
             HV_ILLEGAL_GUEST_STATE => write!(f, "HV_ILLEGAL_GUEST_STATE: guest in illegal state"),
             HV_NO_RESOURCES => write!(f, "HV_NO_RESOURCES: out of resources"),
             HV_NO_DEVICE => write!(f, "HV_NO_DEVICE: no device"),
-            HV_DENIED => write!(f, "HV_DENIED: access denied (check entitlements / code signing)"),
+            HV_DENIED => write!(
+                f,
+                "HV_DENIED: access denied (check entitlements / code signing)"
+            ),
             HV_EXISTS => write!(f, "HV_EXISTS: resource already exists"),
             HV_UNSUPPORTED => write!(f, "HV_UNSUPPORTED: operation unsupported"),
             other => write!(f, "Hypervisor error: 0x{:08x}", other),

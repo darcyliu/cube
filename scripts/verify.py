@@ -67,6 +67,14 @@ def parse_args(argv=None):
     parser.add_argument("--suite", choices=("quick", "offline", "full"), default="quick")
     parser.add_argument("--iso", type=Path, help="ARM64 disc1 ISO; required for offline/full")
     parser.add_argument("--firmware", type=Path, help="EDK2 firmware; required for offline/full")
+    parser.add_argument("--virtio-test-disk", type=Path,
+                        help="prepared Debian cloud disk for the optional vsock/virtio-fs check")
+    parser.add_argument("--virtio-test-kernel", type=Path,
+                        help="Linux kernel for the optional vsock/virtio-fs check")
+    parser.add_argument("--virtio-test-initrd", type=Path,
+                        help="Linux initrd for the optional vsock/virtio-fs check")
+    parser.add_argument("--virtio-test-seed", type=Path,
+                        help="optional NoCloud seed ISO for the vsock/virtio-fs check")
     parser.add_argument("--binary", type=Path, help="use an existing signed binary; skip build/sign")
     parser.add_argument("--target-dir", type=Path,
                         default=Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")))
@@ -91,6 +99,14 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.suite != "quick" and not (args.iso and args.firmware):
         parser.error("offline/full requires --iso and --firmware")
+    virtio_media = (args.virtio_test_disk, args.virtio_test_kernel, args.virtio_test_initrd)
+    if any(virtio_media) and not all(virtio_media):
+        parser.error("specify --virtio-test-disk, --virtio-test-kernel, and "
+                     "--virtio-test-initrd together")
+    if args.virtio_test_seed and not all(virtio_media):
+        parser.error("--virtio-test-seed requires the three --virtio-test-* guest media options")
+    if args.suite == "quick" and all(virtio_media):
+        parser.error("the vsock/virtio-fs guest check requires --suite offline or full")
     if args.suite != "full" and (args.sudo or args.bridge is not None or args.guest_cidr or args.host_ip):
         parser.error("--sudo, --bridge, --guest-cidr, and --host-ip apply only to --suite full")
     if args.sudo and args.bridge is not None:
@@ -125,7 +141,9 @@ def parse_args(argv=None):
     if args.guest_cidr and args.guest_cidr.ip in (args.guest_cidr.network.network_address,
                                                args.guest_cidr.network.broadcast_address):
         parser.error("--guest-cidr must identify a usable guest address")
-    for name in ("iso", "firmware", "binary", "cubectl", "target_dir", "artifacts"):
+    for name in ("iso", "firmware", "virtio_test_disk", "virtio_test_kernel",
+                 "virtio_test_initrd", "virtio_test_seed", "binary", "cubectl",
+                 "target_dir", "artifacts"):
         if getattr(args, name) is not None:
             setattr(args, name, getattr(args, name).expanduser().resolve())
     return args
@@ -182,6 +200,14 @@ def make_plan(args, directory):
         steps.append(check("shared-folders", "check_shared_folders.py",
                            [binary, "--kernel", kernel, "--iso", args.iso], ready,
                            timeout=300))
+        if args.virtio_test_disk:
+            extra = [binary, "--disk", args.virtio_test_disk,
+                     "--kernel", args.virtio_test_kernel,
+                     "--initrd", args.virtio_test_initrd]
+            if args.virtio_test_seed:
+                extra += ["--seed", args.virtio_test_seed]
+            steps.append(check("vsock-virtiofs", "check_vsock_virtiofs.py", extra,
+                               ("signed-binary",), timeout=300))
         steps.append(check("vm-management", "check_vm_management.py",
                            [binary, "--cubectl", manager, "--kernel", kernel, "--iso", args.iso],
                            (*ready, *manager_needs), timeout=240))
@@ -279,7 +305,8 @@ def preflight(args):
         for tool in ("tar", "hdiutil", "ssh"):
             if not shutil.which(tool):
                 raise RuntimeError(f"Missing prerequisite: {tool}")
-    for name in ("iso", "firmware", "binary", "cubectl"):
+    for name in ("iso", "firmware", "virtio_test_disk", "virtio_test_kernel",
+                 "virtio_test_initrd", "virtio_test_seed", "binary", "cubectl"):
         path = getattr(args, name)
         if path is not None and not path.is_file():
             raise RuntimeError(f"{name} is not a file: {path}")

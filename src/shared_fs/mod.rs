@@ -1,12 +1,35 @@
-//! Bounded 9P2000.L server. Every export runs in a separate, unprivileged process.
+//! Bounded share helpers. Every export runs in a separate, unprivileged process.
+//! 9P and virtio-fs are different protocols; the virtio-fs helper does not reuse
+//! the 9P codec.
+mod fuse;
 mod server;
 pub use server::MAX_MESSAGE;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+#[cfg(test)]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareTransport {
+    #[default]
+    P9,
+    VirtioFs,
+}
+
+impl ShareTransport {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "9p" => Ok(Self::P9),
+            "virtiofs" => Ok(Self::VirtioFs),
+            _ => Err("--share-transport requires 9p or virtiofs".into()),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ShareConfig {
@@ -37,12 +60,14 @@ impl ShareConfig {
 }
 
 pub struct Backend {
-    pub child: Arc<Mutex<Child>>,
-    input: ChildStdin,
-    output: ChildStdout,
+    pub child: Arc<Mutex<Option<Child>>>,
+    helper: Option<JoinHandle<()>>,
+    input: Option<Box<dyn Write + Send>>,
+    output: Box<dyn Read + Send>,
+    output_fd: RawFd,
 }
 impl Backend {
-    fn wait_readable(output: &ChildStdout, timeout_ms: i32) -> Result<(), String> {
+    fn wait_readable(fd: RawFd, timeout_ms: i32) -> Result<(), String> {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
         loop {
@@ -50,7 +75,7 @@ impl Backend {
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis() as i32;
             let mut fd = libc::pollfd {
-                fd: output.as_raw_fd(),
+                fd,
                 events: libc::POLLIN,
                 revents: 0,
             };
@@ -68,8 +93,16 @@ impl Backend {
         }
     }
     pub fn start(config: &ShareConfig) -> Result<Self, String> {
+        Self::spawn(config, "--internal-9p-worker")
+    }
+
+    pub fn start_virtiofs(config: &ShareConfig) -> Result<Self, String> {
+        Self::spawn(config, "--internal-virtiofs-worker")
+    }
+
+    fn spawn(config: &ShareConfig, worker_flag: &str) -> Result<Self, String> {
         let mut cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
-        cmd.arg("--internal-9p-worker")
+        cmd.arg(worker_flag)
             .arg(&config.path)
             .arg(if config.read_only { "ro" } else { "rw" })
             .stdin(Stdio::piped())
@@ -104,8 +137,9 @@ impl Backend {
         let mut child = cmd.spawn().map_err(|e| format!("share helper: {e}"))?;
         let input = child.stdin.take().unwrap();
         let mut output = child.stdout.take().unwrap();
+        let output_fd = output.as_raw_fd();
         let mut ready = [0u8];
-        if Self::wait_readable(&output, 5000).is_err()
+        if Self::wait_readable(output_fd, 5000).is_err()
             || output.read_exact(&mut ready).is_err()
             || ready[0] != 1
         {
@@ -117,19 +151,73 @@ impl Backend {
             ));
         }
         Ok(Self {
-            child: Arc::new(Mutex::new(child)),
-            input,
-            output,
+            child: Arc::new(Mutex::new(Some(child))),
+            helper: None,
+            input: Some(Box::new(input)),
+            output: Box::new(output),
+            output_fd,
         })
     }
+
+    /// Same framed FUSE loop as the helper process. The cargo test harness owns
+    /// the binary entry point, so unit tests cannot re-exec `--internal-virtiofs-worker`.
+    #[cfg(test)]
+    pub fn start_virtiofs_inprocess(config: &ShareConfig) -> Result<Self, String> {
+        if !config.read_only {
+            return Err("virtiofs helper is read-only".into());
+        }
+        let (child_read, parent_write) = anon_pipe()?;
+        let (parent_read, child_write) = anon_pipe()?;
+        let path = config.path.clone();
+        let helper = std::thread::Builder::new()
+            .name("virtiofs-test-helper".into())
+            .spawn(move || {
+                let mut server = match fuse::Server::new(&path, true) {
+                    Ok(server) => server,
+                    Err(e) => {
+                        eprintln!("[virtiofs helper] {e}");
+                        return;
+                    }
+                };
+                let mut input = child_read;
+                let mut output = child_write;
+                if let Err(e) = serve_fuse(&mut server, &mut input, &mut output) {
+                    eprintln!("[virtiofs helper] {e}");
+                }
+            })
+            .map_err(|e| format!("virtiofs helper: {e}"))?;
+        let output_fd = parent_read.as_raw_fd();
+        let mut output = parent_read;
+        let mut ready = [0u8];
+        if Self::wait_readable(output_fd, 5000).is_err()
+            || output.read_exact(&mut ready).is_err()
+            || ready[0] != 1
+        {
+            drop(parent_write);
+            let _ = helper.join();
+            return Err(format!(
+                "share {}: virtiofs helper did not become ready",
+                config.tag
+            ));
+        }
+        Ok(Self {
+            child: Arc::new(Mutex::new(None)),
+            helper: Some(helper),
+            input: Some(Box::new(parent_write)),
+            output: Box::new(output),
+            output_fd,
+        })
+    }
+
     pub fn request(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
-        self.input
+        let input = self.input.as_mut().ok_or("share helper closed")?;
+        input
             .write_all(&(bytes.len() as u32).to_le_bytes())
-            .and_then(|_| self.input.write_all(bytes))
+            .and_then(|_| input.write_all(bytes))
             .map_err(|e| format!("share helper write: {e}"))?;
-        self.input.flush().map_err(|e| e.to_string())?;
+        input.flush().map_err(|e| e.to_string())?;
         let mut size = [0; 4];
-        Self::wait_readable(&self.output, 30_000)?;
+        Self::wait_readable(self.output_fd, 30_000)?;
         self.output
             .read_exact(&mut size)
             .map_err(|e| format!("share helper read: {e}"))?;
@@ -144,16 +232,93 @@ impl Backend {
         Ok(result)
     }
 }
+
+pub fn fuse_worker(args: &[String]) -> Result<(), String> {
+    let (path, read_only) = helper_export(args)?;
+    let mut server =
+        fuse::Server::new(std::path::Path::new(path), read_only).map_err(|e| e.to_string())?;
+    eprintln!(
+        "[virtiofs helper] uid={} gid={} export={} mode=ro",
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+        path
+    );
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+    serve_fuse(&mut server, &mut input, &mut output)
+}
+
+fn serve_fuse(
+    server: &mut fuse::Server,
+    input: &mut impl Read,
+    output: &mut impl Write,
+) -> Result<(), String> {
+    output
+        .write_all(&[1])
+        .and_then(|_| output.flush())
+        .map_err(|e| e.to_string())?;
+    loop {
+        let mut size = [0; 4];
+        match input.read_exact(&mut size) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        }
+        let n = u32::from_le_bytes(size) as usize;
+        if n > MAX_MESSAGE {
+            return Err("oversize helper request".into());
+        }
+        let mut request = vec![0; n];
+        input.read_exact(&mut request).map_err(|e| e.to_string())?;
+        let response = if n == 0 {
+            server.reset();
+            Vec::new()
+        } else {
+            server.request(&request)?.unwrap_or_default()
+        };
+        output
+            .write_all(&(response.len() as u32).to_le_bytes())
+            .and_then(|_| output.write_all(&response))
+            .and_then(|_| output.flush())
+            .map_err(|e| e.to_string())?;
+    }
+}
+
+#[cfg(test)]
+fn anon_pipe() -> Result<(std::fs::File, std::fs::File), String> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    for fd in fds {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+    Ok(unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    })
+}
+
 impl Drop for Backend {
     fn drop(&mut self) {
+        self.input.take();
+        if let Some(helper) = self.helper.take() {
+            let _ = helper.join();
+        }
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Some(child) = child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
 
-pub fn worker(args: &[String]) -> Result<(), String> {
+fn helper_export(args: &[String]) -> Result<(&str, bool), String> {
     if args.len() != 4 || !matches!(args[3].as_str(), "ro" | "rw") {
         return Err("invalid internal helper arguments".into());
     }
@@ -173,8 +338,13 @@ pub fn worker(args: &[String]) -> Result<(), String> {
             return Err(std::io::Error::last_os_error().to_string());
         }
     }
-    let mut server = server::Server::new(std::path::Path::new(&args[2]), args[3] == "ro")
-        .map_err(|e| e.to_string())?;
+    Ok((args[2].as_str(), args[3] == "ro"))
+}
+
+pub fn worker(args: &[String]) -> Result<(), String> {
+    let (path, read_only) = helper_export(args)?;
+    let mut server =
+        server::Server::new(std::path::Path::new(path), read_only).map_err(|e| e.to_string())?;
     eprintln!(
         "[9P helper] uid={} gid={} export={} mode={}",
         unsafe { libc::geteuid() },

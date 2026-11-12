@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::hypervisor::{
-    check_hv, hv_vm_map, hv_vm_unmap, HvResult, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
+    HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE, HvResult, check_hv, hv_vm_map, hv_vm_unmap,
 };
 
 /// Host page size on Apple Silicon is 16KB (0x4000).
@@ -109,6 +109,22 @@ impl GuestMemory {
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Host-page advice. The guest mapping stays in place; this does not unmap.
+    pub fn advise_range(&self, gpa: u64, len: usize, advice: i32) -> Result<(), String> {
+        if len == 0 || len % GUEST_PAGE_SIZE != 0 || gpa % GUEST_PAGE_SIZE as u64 != 0 {
+            return Err("advice range is not aligned to a 16 KiB host page".into());
+        }
+        let offset = self.checked_offset(gpa, len)?;
+        let rc = unsafe { libc::madvise(self.ptr.as_ptr().add(offset).cast(), len, advice) };
+        if rc != 0 {
+            return Err(format!(
+                "madvise {advice} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
     }
 
     /// Validate by subtraction, so even a guest-supplied u64::MAX cannot wrap.
@@ -216,6 +232,54 @@ impl Drop for GuestMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(deprecated)]
+    fn vm_counters() -> (u64, u64, u64) {
+        let mut raw = [0u8; 160];
+        let mut count = (raw.len() / 4) as u32;
+        let rc = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                22,
+                raw.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        assert_eq!(rc, 0, "task_info");
+        let word = |off: usize| u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        (word(16), word(80), word(144))
+    }
+
+    #[test]
+    fn reusable_advice_drops_rss_and_reuse_accepts_writes() {
+        const MADV_FREE_REUSABLE: i32 = 7;
+        const MADV_FREE_REUSE: i32 = 8;
+        let pages = 256;
+        let len = GUEST_PAGE_SIZE * pages;
+        let mem = GuestMemory::new_test(0x4000_0000, len);
+        {
+            let pattern = vec![0xABu8; len];
+            mem.write(0x4000_0000, &pattern).unwrap();
+        }
+        let (res_before, reusable_before, foot_before) = vm_counters();
+        mem.advise_range(0x4000_0000, len, MADV_FREE_REUSABLE)
+            .unwrap();
+        let (res_after, reusable_after, foot_after) = vm_counters();
+        assert!(
+            foot_before.saturating_sub(foot_after) > (len as u64) / 2
+                || reusable_after.saturating_sub(reusable_before) > (len as u64) / 2,
+            "resident {res_before}->{res_after} reusable {reusable_before}->{reusable_after} footprint {foot_before}->{foot_after}"
+        );
+        mem.advise_range(0x4000_0000, len, MADV_FREE_REUSE).unwrap();
+        mem.write(0x4000_0000, &[0xCD; 16]).unwrap();
+        let mut got = [0u8; 16];
+        mem.read(0x4000_0000, &mut got).unwrap();
+        assert_eq!(got, [0xCD; 16]);
+        let mut tail = [0u8; 1];
+        mem.read(0x4000_0000 + len as u64 - 1, &mut tail).unwrap();
+        let _ = res_after;
+    }
+
     #[test]
     fn aligned_indices_do_not_tear_across_byte_boundaries() {
         let mem = std::sync::Arc::new(GuestMemory::new_test(0, 0x4000));
@@ -229,7 +293,10 @@ mod tests {
             }
         });
         for _ in 0..100_000 {
-            assert!(matches!(mem.read_u16(2).unwrap(), 0x00ff | 0x0100 | 0xffff | 0));
+            assert!(matches!(
+                mem.read_u16(2).unwrap(),
+                0x00ff | 0x0100 | 0xffff | 0
+            ));
         }
         writer.join().unwrap();
         mem.write_u16(5, 0xabcd).unwrap();

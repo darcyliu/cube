@@ -289,6 +289,32 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(sum("--console-only" in s.command for s in steps), 2)
         self.assertIn("vm-management", [s.name for s in steps])
 
+    def test_offline_can_add_vsock_and_virtiofs_guest_check(self):
+        args = self.options(
+            "offline",
+            "--component", "cube",
+            "--virtio-test-disk", "debian.img",
+            "--virtio-test-kernel", "vmlinuz",
+            "--virtio-test-initrd", "initrd.img",
+            "--virtio-test-seed", "seed.iso",
+        )
+        step = next(s for s in verify.make_plan(args, self.directory)
+                    if s.name == "vsock-virtiofs")
+        self.assertIn("check_vsock_virtiofs.py", " ".join(map(str, step.command)))
+        self.assertEqual(step.needs, ("signed-binary",))
+        for option in ("--disk", "--kernel", "--initrd", "--seed"):
+            self.assertIn(option, step.command)
+
+    def test_vsock_and_virtiofs_media_are_explicit_and_complete(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.options("offline", "--virtio-test-disk", "debian.img")
+            with self.assertRaises(SystemExit):
+                self.options("quick",
+                             "--virtio-test-disk", "debian.img",
+                             "--virtio-test-kernel", "vmlinuz",
+                             "--virtio-test-initrd", "initrd.img")
+
     def test_existing_binary_is_not_rebuilt_or_resigned(self):
         steps = verify.make_plan(self.options("quick", "--binary", sys.executable), self.directory)
         self.assertNotIn("build", [s.name for s in steps])

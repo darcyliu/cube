@@ -22,14 +22,20 @@ fn main() {
         .arg(&cocoa_obj)
         .status()
         .expect("build.rs: clang is required for the native Cocoa frontend");
-    assert!(status.success(), "build.rs: failed to compile native Cocoa frontend");
+    assert!(
+        status.success(),
+        "build.rs: failed to compile native Cocoa frontend"
+    );
     let status = Command::new("ar")
         .arg("rcs")
         .arg(&cocoa_lib)
         .arg(&cocoa_obj)
         .status()
         .expect("build.rs: ar is required for the native Cocoa frontend");
-    assert!(status.success(), "build.rs: failed to archive native Cocoa frontend");
+    assert!(
+        status.success(),
+        "build.rs: failed to archive native Cocoa frontend"
+    );
     println!("cargo:rustc-link-search=native={out_dir}");
     println!("cargo:rustc-link-lib=static=cube_native");
 
@@ -75,15 +81,13 @@ fn main() {
         );
     }
 
-    let elf_bytes = fs::read(out_obj.to_str().unwrap()).unwrap_or_else(|e| {
-        panic!("build.rs: could not read guest/payload.o after clang: {e}")
-    });
+    let elf_bytes = fs::read(out_obj.to_str().unwrap())
+        .unwrap_or_else(|e| panic!("build.rs: could not read guest/payload.o after clang: {e}"));
     let text_section = extract_elf_text_section(&elf_bytes).unwrap_or_else(|| {
         panic!("build.rs: no .text section in guest/payload.o (expected 64-bit ELF)")
     });
-    fs::write(&out_bin, text_section).unwrap_or_else(|e| {
-        panic!("build.rs: could not write guest/payload.bin: {e}")
-    });
+    fs::write(&out_bin, text_section)
+        .unwrap_or_else(|e| panic!("build.rs: could not write guest/payload.bin: {e}"));
 
     if std::path::Path::new("guest/linux_payload.S").exists() {
         let status = Command::new("clang")
@@ -127,8 +131,10 @@ fn extract_elf_text_section(data: &[u8]) -> Option<&[u8]> {
     if shstr_hdr + 40 > data.len() {
         return None;
     }
-    let shstr_offset = u64::from_le_bytes(data[shstr_hdr + 24..shstr_hdr + 32].try_into().ok()?) as usize;
-    let shstr_size = u64::from_le_bytes(data[shstr_hdr + 32..shstr_hdr + 40].try_into().ok()?) as usize;
+    let shstr_offset =
+        u64::from_le_bytes(data[shstr_hdr + 24..shstr_hdr + 32].try_into().ok()?) as usize;
+    let shstr_size =
+        u64::from_le_bytes(data[shstr_hdr + 32..shstr_hdr + 40].try_into().ok()?) as usize;
     if shstr_offset + shstr_size > data.len() {
         return None;
     }
@@ -142,10 +148,15 @@ fn extract_elf_text_section(data: &[u8]) -> Option<&[u8]> {
         let name_idx = u32::from_le_bytes(data[hdr..hdr + 4].try_into().ok()?) as usize;
         if name_idx < shstrtab.len() {
             let name_bytes = &shstrtab[name_idx..];
-            let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+            let name_end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
             if &name_bytes[..name_end] == b".text" {
-                let sh_offset = u64::from_le_bytes(data[hdr + 24..hdr + 32].try_into().ok()?) as usize;
-                let sh_size = u64::from_le_bytes(data[hdr + 32..hdr + 40].try_into().ok()?) as usize;
+                let sh_offset =
+                    u64::from_le_bytes(data[hdr + 24..hdr + 32].try_into().ok()?) as usize;
+                let sh_size =
+                    u64::from_le_bytes(data[hdr + 32..hdr + 40].try_into().ok()?) as usize;
                 if sh_offset + sh_size <= data.len() {
                     return Some(&data[sh_offset..sh_offset + sh_size]);
                 }

@@ -26,6 +26,11 @@ class ExportFixtureTests(unittest.TestCase):
         self.assertEqual(os.readlink(export / "outside-link"), "/etc/passwd")
         self.assertEqual((self.artifacts / "export-path.txt").read_text().strip(), str(export))
 
+    def test_root_prompt_accepts_freebsd_14_and_16_formats(self):
+        self.assertIsNotNone(check.ROOT_PROMPT.search("\nroot@:/ # "))
+        self.assertIsNotNone(check.ROOT_PROMPT.search("\nroot@:~ # "))
+        self.assertIsNone(check.ROOT_PROMPT.search("\nlogin:"))
+
     def test_sudo_export_bypasses_private_artifact_ancestors(self):
         # Simulate a root-owned TMPDIR. Mock chown only; verify the actual path,
         # permissions and exactly which objects would change ownership.

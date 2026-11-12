@@ -4,12 +4,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+pub mod commands;
 pub mod config;
 pub mod ext4;
 pub mod server;
 pub mod unattended;
 pub mod util;
-pub mod commands;
 
 // ---------------------------------------------------------------------------
 // CLI Argument Parser via Clap
@@ -29,7 +29,11 @@ pub mod commands;
     )
 )]
 pub struct Cli {
-    #[arg(long, global = true, help = "Base directory for VM instances (default: ~/.local/state/cube)")]
+    #[arg(
+        long,
+        global = true,
+        help = "Base directory for VM instances (default: ~/.local/state/cube)"
+    )]
     pub state_root: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -146,9 +150,7 @@ pub enum Commands {
     },
 
     #[command(name = "_serve", hide = true)]
-    _Serve {
-        state_dir: PathBuf,
-    },
+    _Serve { state_dir: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -222,7 +224,11 @@ pub struct StartArgs {
     #[arg(long, help = "Run VMM via sudo for in-process vmnet or bridge")]
     pub sudo: bool,
 
-    #[arg(short = 'i', long = "interactive", help = "Run VM in foreground with interactive terminal attached")]
+    #[arg(
+        short = 'i',
+        long = "interactive",
+        help = "Run VM in foreground with interactive terminal attached"
+    )]
     pub interactive: bool,
 
     #[arg(long, help = "Exit instead of rebooting when guest requests reset")]
@@ -466,28 +472,47 @@ fn main() {
         Commands::Create(args) => commands::do_create(args, &state_root),
         Commands::Install(args) => commands::do_install(args, &state_root),
         Commands::Eject { target } => commands::do_eject(&target, &state_root),
-        Commands::Delete { target, force, keep_disks } => commands::do_delete(&target, &state_root, force, keep_disks),
+        Commands::Delete {
+            target,
+            force,
+            keep_disks,
+        } => commands::do_delete(&target, &state_root, force, keep_disks),
         Commands::Start(args) => commands::do_start(args, &state_root),
         Commands::Ssh(args) => commands::do_ssh(args, &state_root),
         Commands::Status { target } => commands::do_status(&target, &state_root),
         Commands::List { json } => commands::do_list(&state_root, json),
-        Commands::Shutdown { target, timeout, force_after_timeout } => {
-            server::do_action(&target, &state_root, "shutdown", timeout, force_after_timeout)
+        Commands::Shutdown {
+            target,
+            timeout,
+            force_after_timeout,
+        } => server::do_action(
+            &target,
+            &state_root,
+            "shutdown",
+            timeout,
+            force_after_timeout,
+        ),
+        Commands::Stop { target, timeout } => {
+            server::do_action(&target, &state_root, "stop", timeout, false)
         }
-        Commands::Stop { target, timeout } => server::do_action(&target, &state_root, "stop", timeout, false),
-        Commands::PreseedInitrd { input, output, preseed } => {
-            util::inject_preseed_initrd(&input, &output, &preseed)
-        }
-        Commands::ExtractKernel { disk, kernel, initrd, rootpart } => {
-            ext4::extract_debian_cloud_kernel(&disk, &kernel, &initrd, rootpart.as_deref())
-        }
-        Commands::PatchShadow { disk, password } => {
-            ext4::patch_cloud_shadow(&disk, &password)
-        }
+        Commands::PreseedInitrd {
+            input,
+            output,
+            preseed,
+        } => util::inject_preseed_initrd(&input, &output, &preseed),
+        Commands::ExtractKernel {
+            disk,
+            kernel,
+            initrd,
+            rootpart,
+        } => ext4::extract_debian_cloud_kernel(&disk, &kernel, &initrd, rootpart.as_deref()),
+        Commands::PatchShadow { disk, password } => ext4::patch_cloud_shadow(&disk, &password),
         Commands::Info => commands::do_info(&state_root),
         Commands::Config { action } => match action {
             ConfigCommands::Get { key } => commands::do_config_get(&key, &state_root),
-            ConfigCommands::Set { key, value } => commands::do_config_set(&key, &value, &state_root),
+            ConfigCommands::Set { key, value } => {
+                commands::do_config_set(&key, &value, &state_root)
+            }
             ConfigCommands::List => commands::do_config_list(&state_root),
         },
         Commands::_Serve { state_dir } => server::serve(&state_dir),

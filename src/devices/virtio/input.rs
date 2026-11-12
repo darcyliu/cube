@@ -5,9 +5,10 @@
 //! `virtio-input` bind them as normal input devices for the VNC console.
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use super::transport::WriteEffect;
 use super::*;
 use crate::devices::MmioDevice;
 use crate::memory::GuestMemory;
@@ -59,15 +60,7 @@ pub enum InputKind {
 pub struct VirtioInput {
     kind: InputKind,
     name: &'static str,
-    status: u32,
-    device_features_sel: u32,
-    driver_features_sel: u32,
-    driver_features: u64,
-    eventq: VirtQueue,
-    statusq: VirtQueue,
-    queue_sel: u32,
-    interrupt_status: u32,
-    irq_num: u32,
+    transport: MmioTransport,
     mem: Arc<GuestMemory>,
     pending: VecDeque<InputEvent>,
     cfg_select: u8,
@@ -99,23 +92,12 @@ impl VirtioInput {
         Self {
             kind,
             name,
-            status: 0,
-            device_features_sel: 0,
-            driver_features_sel: 0,
-            driver_features: 0,
-            eventq: VirtQueue {
-                max_size: QUEUE_SIZE,
-                size: QUEUE_SIZE,
-                ..Default::default()
-            },
-            statusq: VirtQueue {
-                max_size: QUEUE_SIZE,
-                size: QUEUE_SIZE,
-                ..Default::default()
-            },
-            queue_sel: 0,
-            interrupt_status: 0,
-            irq_num,
+            transport: MmioTransport::new(
+                VIRTIO_DEV_INPUT,
+                VIRTIO_F_VERSION_1,
+                &[QUEUE_SIZE, QUEUE_SIZE],
+                irq_num,
+            ),
             mem,
             pending: VecDeque::new(),
             cfg_select: 0,
@@ -204,26 +186,10 @@ impl VirtioInput {
         ]);
     }
 
-    fn active_queue_mut(&mut self) -> Option<&mut VirtQueue> {
-        match self.queue_sel {
-            0 => Some(&mut self.eventq),
-            1 => Some(&mut self.statusq),
-            _ => None,
-        }
-    }
-
-    fn active_queue(&self) -> Option<&VirtQueue> {
-        match self.queue_sel {
-            0 => Some(&self.eventq),
-            1 => Some(&self.statusq),
-            _ => None,
-        }
-    }
-
     fn raise_irq(&mut self) {
-        self.interrupt_status |= 1;
+        self.transport.raise_interrupt(1);
         unsafe {
-            crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
+            crate::hypervisor::hv_gic_set_spi(self.transport.irq(), true);
         }
         crate::vcpu::kick_vcpu();
     }
@@ -232,24 +198,29 @@ impl VirtioInput {
         if self.pending.is_empty() {
             return;
         }
-        if (self.status & VIRTIO_STATUS_DRIVER_OK) == 0 {
+        if !self.transport.operational() {
             if self.deferred_logs == 0 || self.deferred_logs % 64 == 0 {
                 eprintln!(
                     "[input] {} flush deferred: status={:#x} (need DRIVER_OK), pending={} (guest never set DRIVER_OK — FreeBSD has no virtio_input driver)",
-                    self.name, self.status, self.pending.len()
+                    self.name,
+                    self.transport.status(),
+                    self.pending.len()
                 );
             }
             self.deferred_logs = self.deferred_logs.wrapping_add(1);
             return;
         }
-        if !self.eventq.ready || self.eventq.avail_ring == 0 || self.eventq.desc_table == 0 {
+        let Some(eventq) = self.transport.queue(0).copied() else {
+            return;
+        };
+        if !eventq.ready || eventq.avail_ring == 0 || eventq.desc_table == 0 {
             if self.deferred_logs == 0 || self.deferred_logs % 64 == 0 {
                 eprintln!(
                     "[input] {} flush deferred: eventq not ready (ready={} avail={:#x} desc={:#x}) pending={}",
                     self.name,
-                    self.eventq.ready,
-                    self.eventq.avail_ring,
-                    self.eventq.desc_table,
+                    eventq.ready,
+                    eventq.avail_ring,
+                    eventq.desc_table,
                     self.pending.len()
                 );
             }
@@ -257,29 +228,30 @@ impl VirtioInput {
             return;
         }
         self.deferred_logs = 0;
-        let q_size = self.eventq.size;
+        let q_size = eventq.size;
         if q_size == 0 {
             return;
         }
-
-        let count = match self.eventq.pending_count(&self.mem) {
+        let count = match eventq.pending_count(&self.mem) {
             Ok(n) => n,
             Err(_) => {
-                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                self.transport.set_needs_reset();
                 return;
             }
         };
+        let mut eventq = *self.transport.queue(0).unwrap();
+        let indirect = self.transport.negotiated(VIRTIO_RING_F_INDIRECT_DESC);
         let mut processed_any = false;
         for _ in 0..count {
             if self.pending.is_empty() {
                 break;
             }
             std::sync::atomic::fence(Ordering::SeqCst);
-            let avail_idx = match self.mem.read_u16(self.eventq.avail_ring + 2) {
+            let avail_idx = match self.mem.read_u16(eventq.avail_ring + 2) {
                 Ok(i) => i,
                 Err(_) => break,
             };
-            if self.eventq.last_avail_idx == avail_idx {
+            if eventq.last_avail_idx == avail_idx {
                 if self.deferred_logs == 0 || self.deferred_logs % 64 == 0 {
                     eprintln!(
                         "[input] {} no eventq buffers (avail.idx={} pending={})",
@@ -291,26 +263,17 @@ impl VirtioInput {
                 self.deferred_logs = self.deferred_logs.wrapping_add(1);
                 break;
             }
-
             let head = match self.mem.read_u16(
-                self.eventq.avail_ring
-                    + 4
-                    + 2 * (self.eventq.last_avail_idx as u64 % q_size as u64),
+                eventq.avail_ring + 4 + 2 * (eventq.last_avail_idx as u64 % q_size as u64),
             ) {
                 Ok(h) => h,
                 Err(_) => break,
             };
-            self.eventq.last_avail_idx = self.eventq.last_avail_idx.wrapping_add(1);
-
-            let descriptors = match self.eventq.descriptors(
-                &self.mem,
-                head,
-                self.driver_features & VIRTIO_RING_F_INDIRECT_DESC != 0,
-                65536,
-            ) {
+            eventq.last_avail_idx = eventq.last_avail_idx.wrapping_add(1);
+            let descriptors = match eventq.descriptors(&self.mem, head, indirect, 65536) {
                 Ok(d) => d,
                 Err(_) => {
-                    self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                    self.transport.set_needs_reset();
                     break;
                 }
             };
@@ -318,13 +281,11 @@ impl VirtioInput {
                 .iter()
                 .find(|d| d.flags & VRING_DESC_F_WRITE != 0 && d.len >= 8)
                 .map(|d| (d.addr, d.len));
-
             let Some((addr, _len)) = write_addr else {
-                publish_used(&self.mem, &mut self.eventq, head, 0);
+                publish_used(&self.mem, &mut eventq, head, 0);
                 processed_any = true;
                 continue;
             };
-
             let Some(ev) = self.pending.front().copied() else {
                 break;
             };
@@ -333,54 +294,59 @@ impl VirtioInput {
                 break;
             }
             self.pending.pop_front();
-            publish_used(&self.mem, &mut self.eventq, head, 8);
+            publish_used(&self.mem, &mut eventq, head, 8);
+            self.transport.diagnostics_mut().completions += 1;
             processed_any = true;
-            // delivered; keep quiet unless debugging
         }
-
-        if processed_any && avail_wants_interrupt(&self.mem, self.eventq.avail_ring) {
+        let avail = eventq.avail_ring;
+        *self.transport.queue_mut(0).unwrap() = eventq;
+        if processed_any && avail_wants_interrupt(&self.mem, avail) {
             self.raise_irq();
         }
     }
 
     fn process_statusq(&mut self) {
-        if !self.statusq.ready || self.statusq.avail_ring == 0 || self.statusq.desc_table == 0 {
+        if !self.transport.operational() {
             return;
         }
-        let q_size = self.statusq.size;
-        if q_size == 0 {
+        let Some(statusq) = self.transport.queue(1).copied() else {
+            return;
+        };
+        if !statusq.ready || statusq.avail_ring == 0 || statusq.desc_table == 0 || statusq.size == 0
+        {
             return;
         }
-        let count = match self.statusq.pending_count(&self.mem) {
+        let count = match statusq.pending_count(&self.mem) {
             Ok(n) => n,
             Err(_) => {
-                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                self.transport.set_needs_reset();
                 return;
             }
         };
+        let mut statusq = *self.transport.queue(1).unwrap();
         let mut processed_any = false;
         for _ in 0..count {
             std::sync::atomic::fence(Ordering::SeqCst);
-            let avail_idx = match self.mem.read_u16(self.statusq.avail_ring + 2) {
+            let avail_idx = match self.mem.read_u16(statusq.avail_ring + 2) {
                 Ok(i) => i,
                 Err(_) => break,
             };
-            if self.statusq.last_avail_idx == avail_idx {
+            if statusq.last_avail_idx == avail_idx {
                 break;
             }
             let head = match self.mem.read_u16(
-                self.statusq.avail_ring
-                    + 4
-                    + 2 * (self.statusq.last_avail_idx as u64 % q_size as u64),
+                statusq.avail_ring + 4 + 2 * (statusq.last_avail_idx as u64 % statusq.size as u64),
             ) {
                 Ok(h) => h,
                 Err(_) => break,
             };
-            self.statusq.last_avail_idx = self.statusq.last_avail_idx.wrapping_add(1);
-            publish_used(&self.mem, &mut self.statusq, head, 0);
+            statusq.last_avail_idx = statusq.last_avail_idx.wrapping_add(1);
+            publish_used(&self.mem, &mut statusq, head, 0);
             processed_any = true;
         }
-        if processed_any && avail_wants_interrupt(&self.mem, self.statusq.avail_ring) {
+        let avail = statusq.avail_ring;
+        *self.transport.queue_mut(1).unwrap() = statusq;
+        if processed_any && avail_wants_interrupt(&self.mem, avail) {
             self.raise_irq();
         }
     }
@@ -522,28 +488,7 @@ impl MmioDevice for VirtioInput {
         if offset >= VIRTIO_MMIO_CONFIG {
             return self.cfg_read(offset - VIRTIO_MMIO_CONFIG, size);
         }
-        match offset {
-            VIRTIO_MMIO_MAGIC_VALUE => VIRTIO_MMIO_MAGIC as u64,
-            VIRTIO_MMIO_VERSION => VIRTIO_MMIO_VERSION_2 as u64,
-            VIRTIO_MMIO_DEVICE_ID => VIRTIO_DEV_INPUT as u64,
-            VIRTIO_MMIO_VENDOR_ID => VIRTIO_MMIO_VENDOR as u64,
-            VIRTIO_MMIO_DEVICE_FEATURES => {
-                if self.device_features_sel == 0 {
-                    0
-                } else if self.device_features_sel == 1 {
-                    (VIRTIO_F_VERSION_1 >> 32) as u64
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => {
-                self.active_queue().map(|q| q.max_size as u64).unwrap_or(0)
-            }
-            VIRTIO_MMIO_QUEUE_READY => self.active_queue().map(|q| u64::from(q.ready)).unwrap_or(0),
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status as u64,
-            VIRTIO_MMIO_STATUS => self.status as u64,
-            _ => 0,
-        }
+        self.transport.read(offset)
     }
 
     fn write(&mut self, offset: u64, data: u64, size: usize) {
@@ -551,96 +496,21 @@ impl MmioDevice for VirtioInput {
             self.cfg_write(offset - VIRTIO_MMIO_CONFIG, data, size);
             return;
         }
-        match offset {
-            VIRTIO_MMIO_DEVICE_FEATURES_SEL => self.device_features_sel = data as u32,
-            VIRTIO_MMIO_DRIVER_FEATURES => {
-                if self.driver_features_sel == 0 {
-                    self.driver_features =
-                        (self.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
-                } else if self.driver_features_sel == 1 {
-                    self.driver_features = (self.driver_features & 0xffff_ffff) | (data << 32);
+        let irq = self.transport.irq();
+        match self.transport.write(offset, data) {
+            WriteEffect::QueueReady { queue: 0 } => self.flush_events(),
+            WriteEffect::Notify { queue: 0 } => self.flush_events(),
+            WriteEffect::Notify { queue: 1 } => self.process_statusq(),
+            WriteEffect::Reset => {
+                self.pending.clear();
+                unsafe {
+                    crate::hypervisor::hv_gic_set_spi(irq, false);
                 }
             }
-            VIRTIO_MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = data as u32,
-            VIRTIO_MMIO_QUEUE_SEL => self.queue_sel = data as u32,
-            VIRTIO_MMIO_QUEUE_NUM => {
-                if let Some(q) = self.active_queue_mut() {
-                    q.size = (data as u32).min(q.max_size);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY => {
-                if let Some(q) = self.active_queue_mut() {
-                    q.ready = (data & 1) != 0;
-                }
-                self.flush_events();
-            }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                if data == 0 {
-                    self.flush_events();
-                } else if data == 1 {
-                    self.process_statusq();
-                }
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                self.interrupt_status &= !(data as u32);
-                if self.interrupt_status == 0 {
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-                    }
-                }
-            }
-            VIRTIO_MMIO_STATUS => {
-                self.status = data as u32;
-                if self.status == 0 {
-                    self.eventq = VirtQueue {
-                        max_size: QUEUE_SIZE,
-                        size: QUEUE_SIZE,
-                        ..Default::default()
-                    };
-                    self.statusq = VirtQueue {
-                        max_size: QUEUE_SIZE,
-                        size: QUEUE_SIZE,
-                        ..Default::default()
-                    };
-                    self.pending.clear();
-                    self.interrupt_status = 0;
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-                    }
-                } else if (self.status & VIRTIO_STATUS_DRIVER_OK) != 0 {
-                    self.flush_events();
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_LOW => {
-                if let Some(q) = self.active_queue_mut() {
-                    q.desc_table = (q.desc_table & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_HIGH => {
-                if let Some(q) = self.active_queue_mut() {
-                    q.desc_table = (q.desc_table & 0xffff_ffff) | (data << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DRIVER_LOW => {
-                if let Some(q) = self.active_queue_mut() {
-                    q.avail_ring = (q.avail_ring & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DRIVER_HIGH => {
-                if let Some(q) = self.active_queue_mut() {
-                    q.avail_ring = (q.avail_ring & 0xffff_ffff) | (data << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DEVICE_LOW => {
-                if let Some(q) = self.active_queue_mut() {
-                    q.used_ring = (q.used_ring & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DEVICE_HIGH => {
-                if let Some(q) = self.active_queue_mut() {
-                    q.used_ring = (q.used_ring & 0xffff_ffff) | (data << 32);
-                }
-            }
+            WriteEffect::DriverOk => self.flush_events(),
+            WriteEffect::InterruptAck { line_low: true } => unsafe {
+                crate::hypervisor::hv_gic_set_spi(irq, false);
+            },
             _ => {}
         }
     }

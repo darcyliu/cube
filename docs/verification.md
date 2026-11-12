@@ -119,6 +119,24 @@ install deletes its disk. A failed install leaves `vmm-install-*` inside the
 suite directory; repeated failures can consume substantial space. See
 [Retained install directories](#retained-install-directories).
 
+The FreeBSD `shared-folders` step already exercises VirtIO-9P. Stock FreeBSD
+15 and 16 do not provide virtio-vsock or virtio-fs guest drivers, so those data
+paths use the prepared Debian cloud guest from `make debian-cloud`. Add it to an
+offline or full suite with:
+
+```sh
+python3 -B scripts/verify.py --suite offline \
+  --iso FreeBSD-16.0-CURRENT-arm64-aarch64-disc1.iso \
+  --firmware firmware/QEMU_EFI.fd \
+  --virtio-test-disk debian-cloud.img \
+  --virtio-test-kernel boot/debian/cloud-vmlinuz \
+  --virtio-test-initrd boot/debian/cloud-initrd.img
+```
+
+Use `--virtio-test-seed PATH` when that guest still needs its NoCloud seed.
+The check has no guest NIC: it verifies a guest-to-host vsock echo plus
+virtio-fs mount, reads, symlink metadata, host coherence, and write rejection.
+
 ## Full suite, including real networking
 
 The same three guest checks run in one network mode per invocation:
@@ -209,6 +227,7 @@ Run the full suite on an appropriate test host.
 | `check_network.py`: startup and bind errors | yes | yes | yes |
 | `check_unattended_console.py` | — | yes | yes |
 | Shared folders: host/guest changes, permissions and reboot | — | yes | yes |
+| Debian vsock echo and read-only virtio-fs data path | — | optional media | optional media |
 | Two concurrent native-managed FreeBSD VMs and listener collision | — | yes | yes |
 | Native `cubectl` UFS/ZFS create/install/start | — | yes | yes |
 | Native `cubectl` SSH and guest shutdown after install | — | — | yes |

@@ -354,136 +354,95 @@ impl BlockBackend for CowBackend {
     }
 }
 
-pub struct VirtioBlock {
+struct BlockInner {
     backend: Option<Box<dyn BlockBackend>>,
     capacity_sectors: u64,
-    status: u32,
-    device_features_sel: u32,
-    driver_features_sel: u32,
-    driver_features: u64,
-    queue: VirtQueue,
-    queue_sel: u32,
-    used_idx: u16,
-    interrupt_status: u32,
-    irq_num: u32,
+    transport: MmioTransport,
     serial_id: String,
     mem: Arc<GuestMemory>,
+    read_only: bool,
+    queue_count: u32,
+    next_queue: usize,
+    work_pending: bool,
 }
 
-impl VirtioBlock {
-    pub fn new(
-        backend: Option<Box<dyn BlockBackend>>,
-        irq_num: u32,
-        serial_id: &str,
-        mem: Arc<GuestMemory>,
-    ) -> Self {
-        let capacity_sectors = backend.as_ref().map(|b| b.size_bytes() / 512).unwrap_or(0);
-        Self {
-            backend,
-            capacity_sectors,
-            status: 0,
-            device_features_sel: 0,
-            driver_features_sel: 0,
-            driver_features: 0,
-            queue: VirtQueue {
-                max_size: VTBLK_QUEUE_SIZE,
-                size: VTBLK_QUEUE_SIZE,
-                ..Default::default()
-            },
-            queue_sel: 0,
-            used_idx: 0,
-            interrupt_status: 0,
-            irq_num,
-            serial_id: serial_id.to_string(),
-            mem,
+pub struct VirtioBlock {
+    inner: Arc<Mutex<BlockInner>>,
+    wake: Arc<Condvar>,
+    running: Arc<AtomicBool>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+use std::sync::atomic::AtomicBool;
+use std::sync::{Condvar, Mutex};
+use std::thread;
+
+use super::transport::WriteEffect;
+
+const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
+const VTBLK_NUM_QUEUES_OFFSET: usize = 34;
+
+impl BlockInner {
+    fn signal_irq(&mut self) {
+        self.transport.raise_interrupt(1);
+        unsafe {
+            crate::hypervisor::hv_gic_set_spi(self.transport.irq(), true);
         }
+        crate::vcpu::kick_vcpu();
     }
 
-    pub fn from_raw(
-        path: &str,
-        read_only: bool,
-        irq_num: u32,
-        serial_id: &str,
-        mem: Arc<GuestMemory>,
-    ) -> Result<Self, String> {
-        let backend = RawFileBackend::open(path, read_only)?;
-        let size_mb = backend.size_bytes() as f64 / (1024.0 * 1024.0);
-        println!(
-            "[VirtIO-Blk] Opened disk '{}' ({}): {:.2} MB ({} sectors)",
-            path,
-            if backend.is_read_only() {
-                "read-only"
-            } else {
-                "read-write"
-            },
-            size_mb,
-            backend.size_bytes() / 512
-        );
-        Ok(Self::new(Some(Box::new(backend)), irq_num, serial_id, mem))
-    }
-
-    pub fn from_cow(
-        base_path: &str,
-        overlay_path: &str,
-        irq_num: u32,
-        serial_id: &str,
-        mem: Arc<GuestMemory>,
-    ) -> Result<Self, String> {
-        let backend = CowBackend::open(base_path, overlay_path)?;
-        Ok(Self::new(Some(Box::new(backend)), irq_num, serial_id, mem))
-    }
-
-    fn process_queue(&mut self) {
-        if !self.queue.ready || self.queue.avail_ring == 0 || self.queue.desc_table == 0 {
+    fn process_queue(&mut self, index: usize) {
+        if !self.transport.operational() {
             return;
         }
-
-        let q_size = self.queue.size;
-        if q_size == 0 {
+        let Some(queue) = self.transport.queue(index).copied() else {
+            return;
+        };
+        if !queue.ready || queue.avail_ring == 0 || queue.desc_table == 0 || queue.size == 0 {
             return;
         }
-
-        // Drain the avail ring until it stops moving. Publish used.idx with a
-        // SeqCst fence so the other vCPU cannot observe the index before the
-        // used-ring slot (fsck Phase 1 hangs without this on SMP).
-        let count = match self.queue.pending_count(&self.mem) {
+        let epoch = self.transport.queue_epoch(index);
+        let count = match queue.pending_count(&self.mem) {
             Ok(n) => n,
             Err(_) => {
-                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                self.transport.set_needs_reset();
                 return;
             }
         };
+        let mut queue = *self.transport.queue(index).unwrap();
         let mut processed_any = false;
         for _ in 0..count {
-            std::sync::atomic::fence(Ordering::SeqCst);
-            let avail_idx = match self.mem.read_u16(self.queue.avail_ring + 2) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    eprintln!("[VirtIO-Blk Error] Failed to read avail ring idx: {}", e);
-                    break;
-                }
-            };
-            if self.queue.last_avail_idx == avail_idx {
+            if self.transport.queue_epoch(index) != epoch {
                 break;
             }
-
-            let ring_elem_offset =
-                self.queue.avail_ring + 4 + 2 * (self.queue.last_avail_idx as u64 % q_size as u64);
-            let head_desc = match self.mem.read_u16(ring_elem_offset) {
-                Ok(h) => h,
+            std::sync::atomic::fence(Ordering::SeqCst);
+            let avail_idx = match self.mem.read_u16(queue.avail_ring + 2) {
+                Ok(idx) => idx,
                 Err(e) => {
-                    eprintln!(
-                        "[VirtIO-Blk Error] Failed to read avail ring element: {}",
-                        e
-                    );
+                    eprintln!("[VirtIO-Blk Error] Failed to read avail ring idx: {e}");
                     break;
                 }
             };
-
-            let bytes_transferred = self.handle_request(head_desc, q_size);
-            publish_used(&self.mem, &mut self.queue, head_desc, bytes_transferred);
-            self.used_idx = self.queue.used_idx;
-            self.queue.last_avail_idx = self.queue.last_avail_idx.wrapping_add(1);
+            if queue.last_avail_idx == avail_idx {
+                break;
+            }
+            let head = match self.mem.read_u16(
+                queue.avail_ring + 4 + 2 * (queue.last_avail_idx as u64 % queue.size as u64),
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("[VirtIO-Blk Error] Failed to read avail ring element: {e}");
+                    break;
+                }
+            };
+            let bytes = self.handle_request(index, head, &mut queue);
+            if self.transport.queue_epoch(index) != epoch {
+                break;
+            }
+            publish_used(&self.mem, &mut queue, head, bytes);
+            queue.last_avail_idx = queue.last_avail_idx.wrapping_add(1);
+            self.transport.diagnostics_mut().completions += 1;
+            self.transport.diagnostics_mut().bytes += bytes as u64;
             processed_any = true;
             let n = BLK_IOS.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 || n % 256 == 0 {
@@ -494,65 +453,78 @@ impl VirtioBlock {
                 {
                     let _ = writeln!(
                         f,
-                        "ios={} last_avail={} used_idx={} qsize={}",
-                        n, self.queue.last_avail_idx, self.used_idx, q_size
+                        "ios={n} q={index} last_avail={} used_idx={} qsize={}",
+                        queue.last_avail_idx, queue.used_idx, queue.size
                     );
                 }
             }
         }
-
+        *self.transport.queue_mut(index).unwrap() = queue;
         if processed_any {
-            self.interrupt_status |= 1;
-            // Always raise: vtblk_ident() busy-polls GET_ID but later bios
-            // wait on the IRQ. Skipping for NO_INTERRUPT wedged attach.
-            unsafe {
-                crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
-            }
-            crate::vcpu::kick_vcpu();
+            // vtblk_ident() busy-polls GET_ID, but later firmware waits on the IRQ.
+            // Skipping the line when NO_INTERRUPT is set wedged attach.
+            self.signal_irq();
         }
     }
 
-    fn handle_request(&mut self, head_desc: u16, q_size: u32) -> u32 {
-        let _ = q_size;
-        let descriptors = match self.queue.descriptors(
-            &self.mem,
-            head_desc,
-            self.driver_features & VIRTIO_RING_F_INDIRECT_DESC != 0,
-            MAX_CHAIN_BYTES,
-        ) {
-            Ok(d) => d
-                .into_iter()
-                .map(|d| (d.addr, d.len, d.flags))
-                .collect::<Vec<_>>(),
+    fn process_one(&mut self) -> bool {
+        if !self.transport.operational() {
+            return false;
+        }
+        let count = self.queue_count as usize;
+        for step in 0..count {
+            let index = (self.next_queue + step) % count;
+            let pending = self
+                .transport
+                .queue(index)
+                .and_then(|q| q.pending_count(&self.mem).ok())
+                .unwrap_or(0);
+            if pending == 0 {
+                continue;
+            }
+            let before = self.transport.queue(index).unwrap().last_avail_idx;
+            self.process_queue(index);
+            let after = self.transport.queue(index).unwrap().last_avail_idx;
+            if before != after {
+                self.next_queue = (index + 1) % count;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn handle_request(&mut self, _index: usize, head_desc: u16, queue: &mut VirtQueue) -> u32 {
+        let indirect = self.transport.negotiated(VIRTIO_RING_F_INDIRECT_DESC);
+        let descriptors = match queue.descriptors(&self.mem, head_desc, indirect, MAX_CHAIN_BYTES) {
+            Ok(d) => d,
             Err(_) => {
-                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                self.transport.set_needs_reset();
                 return 0;
             }
         };
         if descriptors.len() < 2 {
-            self.status |= VIRTIO_STATUS_NEEDS_RESET;
+            self.transport.set_needs_reset();
             return 0;
         }
-
-        let (hdr_addr, hdr_len, hdr_flags) = descriptors[0];
-        let (status_addr, status_len, status_flags) = descriptors[descriptors.len() - 1];
-        if status_len < 1 || status_flags & VRING_DESC_F_WRITE == 0 {
-            self.status |= VIRTIO_STATUS_NEEDS_RESET;
+        let hdr = descriptors[0];
+        let status_desc = descriptors[descriptors.len() - 1];
+        if status_desc.len < 1 || status_desc.flags & VRING_DESC_F_WRITE == 0 {
+            self.transport.set_needs_reset();
             return 0;
         }
-        let reject = || {
-            let _ = self.mem.write(status_addr, &[VIRTIO_BLK_S_IOERR]);
+        let reject = |mem: &GuestMemory| {
+            let _ = mem.write(status_desc.addr, &[VIRTIO_BLK_S_IOERR]);
             1
         };
-        if hdr_len < 16 || hdr_flags & VRING_DESC_F_WRITE != 0 {
-            return reject();
+        if hdr.len < 16 || hdr.flags & VRING_DESC_F_WRITE != 0 {
+            return reject(&self.mem);
         }
-        let req_type = self.mem.read_u32(hdr_addr).unwrap_or(u32::MAX);
-        let sector = self.mem.read_u64(hdr_addr + 8).unwrap_or(u64::MAX);
+        let req_type = self.mem.read_u32(hdr.addr).unwrap_or(u32::MAX);
+        let sector = self.mem.read_u64(hdr.addr + 8).unwrap_or(u64::MAX);
         let data = &descriptors[1..descriptors.len() - 1];
-        let total_len: usize = data.iter().map(|d| d.1 as usize).sum();
-        if data.iter().any(|d| d.1 > 1024 * 1024) {
-            return reject();
+        let total_len: usize = data.iter().map(|d| d.len as usize).sum();
+        if data.iter().any(|d| d.len > 1024 * 1024) {
+            return reject(&self.mem);
         }
         if matches!(
             req_type,
@@ -561,39 +533,35 @@ impl VirtioBlock {
             let writable = req_type != VIRTIO_BLK_T_OUT;
             if data
                 .iter()
-                .any(|d| (d.2 & VRING_DESC_F_WRITE != 0) != writable)
+                .any(|d| (d.flags & VRING_DESC_F_WRITE != 0) != writable)
             {
-                return reject();
+                return reject(&self.mem);
             }
         }
         let offset = sector.checked_mul(512);
-        if matches!(req_type, VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT) {
-            if total_len % 512 != 0
+        if matches!(req_type, VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT)
+            && (total_len % 512 != 0
                 || offset.is_none_or(|o| {
                     check_disk_range(self.capacity_sectors * 512, o, total_len).is_err()
-                })
-            {
-                return reject();
-            }
+                }))
+        {
+            return reject(&self.mem);
         }
-
         let mut total_bytes = 0u32;
         let mut status = VIRTIO_BLK_S_OK;
-
         match req_type {
             VIRTIO_BLK_T_IN => {
                 if let Some(ref mut backend) = self.backend {
                     let mut file_offset = offset.unwrap();
-                    for i in 1..descriptors.len() - 1 {
-                        let (buf_addr, buf_len, _) = descriptors[i];
-                        let mut temp_buf = vec![0u8; buf_len as usize];
+                    for desc in data {
+                        let mut temp_buf = vec![0u8; desc.len as usize];
                         if backend.read_exact_at(file_offset, &mut temp_buf).is_ok() {
-                            if self.mem.write(buf_addr, &temp_buf).is_err() {
+                            if self.mem.write(desc.addr, &temp_buf).is_err() {
                                 status = VIRTIO_BLK_S_IOERR;
                                 break;
                             }
-                            total_bytes += buf_len;
-                            file_offset += buf_len as u64;
+                            total_bytes += desc.len;
+                            file_offset += desc.len as u64;
                         } else {
                             status = VIRTIO_BLK_S_IOERR;
                             break;
@@ -606,12 +574,11 @@ impl VirtioBlock {
             VIRTIO_BLK_T_OUT => {
                 if let Some(ref mut backend) = self.backend {
                     let mut file_offset = offset.unwrap();
-                    for i in 1..descriptors.len() - 1 {
-                        let (buf_addr, buf_len, _) = descriptors[i];
-                        let mut temp_buf = vec![0u8; buf_len as usize];
-                        if self.mem.read(buf_addr, &mut temp_buf).is_ok() {
+                    for desc in data {
+                        let mut temp_buf = vec![0u8; desc.len as usize];
+                        if self.mem.read(desc.addr, &mut temp_buf).is_ok() {
                             if backend.write_all_at(file_offset, &temp_buf).is_ok() {
-                                file_offset += buf_len as u64;
+                                file_offset += desc.len as u64;
                             } else {
                                 status = VIRTIO_BLK_S_IOERR;
                                 break;
@@ -637,189 +604,243 @@ impl VirtioBlock {
                 let s_bytes = self.serial_id.as_bytes();
                 let copy_len = s_bytes.len().min(20);
                 id_bytes[..copy_len].copy_from_slice(&s_bytes[..copy_len]);
-                for i in 1..descriptors.len() - 1 {
-                    let (buf_addr, buf_len, _) = descriptors[i];
-                    let copy_len = (buf_len as usize).min(id_bytes.len());
-                    let _ = self.mem.write(buf_addr, &id_bytes[..copy_len]);
-                    total_bytes += copy_len as u32;
+                for desc in data {
+                    let n = (desc.len as usize).min(id_bytes.len());
+                    let _ = self.mem.write(desc.addr, &id_bytes[..n]);
+                    total_bytes += n as u32;
                 }
             }
-            _ => {
-                status = VIRTIO_BLK_S_UNSUPP;
+            _ => status = VIRTIO_BLK_S_UNSUPP,
+        }
+        let _ = self.mem.write(status_desc.addr, &[status]);
+        total_bytes + 1
+    }
+
+    fn config_byte(&self, index: usize) -> u8 {
+        let mut cfg = [0u8; 64];
+        cfg[0..8].copy_from_slice(&self.capacity_sectors.to_le_bytes());
+        cfg[8..12].copy_from_slice(&(1024u32 * 1024).to_le_bytes());
+        cfg[12..16].copy_from_slice(&VTBLK_SEG_MAX.to_le_bytes());
+        cfg[20..24].copy_from_slice(&512u32.to_le_bytes());
+        cfg[VTBLK_NUM_QUEUES_OFFSET..VTBLK_NUM_QUEUES_OFFSET + 2]
+            .copy_from_slice(&(self.queue_count as u16).to_le_bytes());
+        cfg.get(index).copied().unwrap_or(0)
+    }
+}
+
+impl VirtioBlock {
+    pub fn new(
+        backend: Option<Box<dyn BlockBackend>>,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+    ) -> Self {
+        Self::with_queues(backend, irq_num, serial_id, mem, 1)
+    }
+
+    pub fn with_queues(
+        backend: Option<Box<dyn BlockBackend>>,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+        queue_count: u32,
+    ) -> Self {
+        let queue_count = queue_count.clamp(1, 16);
+        let read_only = backend.as_ref().is_some_and(|b| b.is_read_only());
+        let capacity_sectors = backend.as_ref().map(|b| b.size_bytes() / 512).unwrap_or(0);
+        let mut offered = VIRTIO_BLK_F_SIZE_MAX
+            | VIRTIO_BLK_F_SEG_MAX
+            | VIRTIO_BLK_F_BLK_SIZE
+            | VIRTIO_BLK_F_FLUSH
+            | VIRTIO_RING_F_INDIRECT_DESC
+            | VIRTIO_F_VERSION_1;
+        if read_only {
+            offered |= VIRTIO_BLK_F_RO;
+        }
+        if queue_count > 1 {
+            offered |= VIRTIO_BLK_F_MQ;
+        }
+        let sizes = vec![VTBLK_QUEUE_SIZE; queue_count as usize];
+        let inner = Arc::new(Mutex::new(BlockInner {
+            backend,
+            capacity_sectors,
+            transport: MmioTransport::new(VIRTIO_DEV_BLOCK, offered, &sizes, irq_num),
+            serial_id: serial_id.to_string(),
+            mem,
+            read_only,
+            queue_count,
+            next_queue: 0,
+            work_pending: false,
+        }));
+        let wake = Arc::new(Condvar::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let mut workers = Vec::new();
+        if queue_count > 1 {
+            let pool = (queue_count as usize).clamp(1, 2);
+            for n in 0..pool {
+                let shared = Arc::clone(&inner);
+                let wake = Arc::clone(&wake);
+                let running = Arc::clone(&running);
+                workers.push(
+                    thread::Builder::new()
+                        .name(format!("vmm-blk-{n}"))
+                        .spawn(move || {
+                            while running.load(Ordering::Relaxed) {
+                                let mut guard = shared.lock().unwrap();
+                                while running.load(Ordering::Relaxed) && !guard.work_pending {
+                                    guard = wake.wait(guard).unwrap();
+                                }
+                                if !running.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                if !guard.process_one() {
+                                    guard.work_pending = false;
+                                }
+                            }
+                        })
+                        .expect("blk worker"),
+                );
             }
         }
+        Self {
+            inner,
+            wake,
+            running,
+            workers,
+        }
+    }
 
-        // Write status byte to status descriptor
-        let _ = self.mem.write(status_addr, &[status]);
+    pub fn from_raw(
+        path: &str,
+        read_only: bool,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+    ) -> Result<Self, String> {
+        Self::from_raw_queues(path, read_only, irq_num, serial_id, mem, 1)
+    }
 
-        total_bytes + 1 // status byte is device-written too
+    pub fn from_raw_queues(
+        path: &str,
+        read_only: bool,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+        queues: u32,
+    ) -> Result<Self, String> {
+        let backend = RawFileBackend::open(path, read_only)?;
+        let size_mb = backend.size_bytes() as f64 / (1024.0 * 1024.0);
+        println!(
+            "[VirtIO-Blk] Opened disk '{}' ({}) : {:.2} MB ({} sectors, {} queues)",
+            path,
+            if backend.is_read_only() {
+                "read-only"
+            } else {
+                "read-write"
+            },
+            size_mb,
+            backend.size_bytes() / 512,
+            queues.max(1)
+        );
+        Ok(Self::with_queues(
+            Some(Box::new(backend)),
+            irq_num,
+            serial_id,
+            mem,
+            queues,
+        ))
+    }
+
+    pub fn from_cow(
+        base_path: &str,
+        overlay_path: &str,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+    ) -> Result<Self, String> {
+        Self::from_cow_queues(base_path, overlay_path, irq_num, serial_id, mem, 1)
+    }
+
+    pub fn from_cow_queues(
+        base_path: &str,
+        overlay_path: &str,
+        irq_num: u32,
+        serial_id: &str,
+        mem: Arc<GuestMemory>,
+        queues: u32,
+    ) -> Result<Self, String> {
+        let backend = CowBackend::open(base_path, overlay_path)?;
+        Ok(Self::with_queues(
+            Some(Box::new(backend)),
+            irq_num,
+            serial_id,
+            mem,
+            queues,
+        ))
+    }
+
+    fn stop_workers(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.wake.notify_all();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for VirtioBlock {
+    fn drop(&mut self) {
+        self.stop_workers();
     }
 }
 
 impl MmioDevice for VirtioBlock {
     fn shutdown(&mut self) -> Result<(), String> {
-        if let Some(backend) = &mut self.backend {
+        self.stop_workers();
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(backend) = &mut inner.backend {
             backend.flush().map_err(|e| e.to_string())?;
         }
+        eprintln!("[VirtIO-Blk] {}", inner.transport.diagnostics_line());
         Ok(())
     }
+
     fn read(&mut self, offset: u64, size: usize) -> u64 {
-        match offset {
-            VIRTIO_MMIO_MAGIC_VALUE => VIRTIO_MMIO_MAGIC as u64,
-            VIRTIO_MMIO_VERSION => VIRTIO_MMIO_VERSION_2 as u64,
-            VIRTIO_MMIO_DEVICE_ID => VIRTIO_DEV_BLOCK as u64,
-            VIRTIO_MMIO_VENDOR_ID => VIRTIO_MMIO_VENDOR as u64,
-            VIRTIO_MMIO_DEVICE_FEATURES => {
-                let mut features = VIRTIO_BLK_F_SIZE_MAX
-                    | VIRTIO_BLK_F_SEG_MAX
-                    | VIRTIO_BLK_F_BLK_SIZE
-                    | VIRTIO_BLK_F_FLUSH
-                    | VIRTIO_RING_F_INDIRECT_DESC
-                    | VIRTIO_F_VERSION_1;
-                if let Some(ref b) = self.backend {
-                    if b.is_read_only() {
-                        features |= VIRTIO_BLK_F_RO;
-                    }
-                }
-                if self.device_features_sel == 0 {
-                    features & 0xffff_ffff
-                } else if self.device_features_sel == 1 {
-                    (features >> 32) & 0xffff_ffff
-                } else {
-                    0
-                }
+        let inner = self.inner.lock().unwrap();
+        if offset >= VIRTIO_MMIO_CONFIG {
+            let start = (offset - VIRTIO_MMIO_CONFIG) as usize;
+            let mut val = 0u64;
+            for i in 0..size {
+                val |= (inner.config_byte(start + i) as u64) << (i * 8);
             }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => {
-                if self.queue_sel == 0 {
-                    self.queue.max_size as u64
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY => {
-                if self.queue_sel == 0 && self.queue.ready {
-                    1
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status as u64,
-            VIRTIO_MMIO_STATUS => self.status as u64,
-            off if off >= VIRTIO_MMIO_CONFIG => {
-                let config_offset = (off - VIRTIO_MMIO_CONFIG) as usize;
-                let mut cfg = [0u8; 32];
-                cfg[0..8].copy_from_slice(&self.capacity_sectors.to_le_bytes());
-                cfg[8..12].copy_from_slice(&(1024u32 * 1024).to_le_bytes());
-                cfg[12..16].copy_from_slice(&VTBLK_SEG_MAX.to_le_bytes());
-                cfg[20..24].copy_from_slice(&512u32.to_le_bytes());
-                if config_offset + size <= cfg.len() {
-                    let mut val = 0u64;
-                    for (i, &b) in cfg[config_offset..config_offset + size].iter().enumerate() {
-                        val |= (b as u64) << (i * 8);
-                    }
-                    val
-                } else {
-                    0
-                }
-            }
-            _ => 0,
+            return val;
         }
+        inner.transport.read(offset)
     }
 
     fn write(&mut self, offset: u64, data: u64, _size: usize) {
-        match offset {
-            VIRTIO_MMIO_DEVICE_FEATURES_SEL => {
-                self.device_features_sel = data as u32;
-            }
-            VIRTIO_MMIO_DRIVER_FEATURES_SEL => {
-                self.driver_features_sel = data as u32;
-            }
-            VIRTIO_MMIO_DRIVER_FEATURES => {
-                if self.driver_features_sel == 0 {
-                    self.driver_features =
-                        (self.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
-                } else if self.driver_features_sel == 1 {
-                    self.driver_features =
-                        (self.driver_features & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
+        let mut inner = self.inner.lock().unwrap();
+        let effect = inner.transport.write(offset, data);
+        let irq = inner.transport.irq();
+        let multi = inner.queue_count > 1;
+        match effect {
+            WriteEffect::Notify { queue }
+                if (queue as usize) < inner.queue_count as usize
+                    && (queue == 0 || inner.transport.negotiated(VIRTIO_BLK_F_MQ)) =>
+            {
+                if multi {
+                    inner.work_pending = true;
+                    self.wake.notify_one();
+                } else {
+                    inner.process_queue(queue as usize);
                 }
             }
-            VIRTIO_MMIO_QUEUE_SEL => {
-                self.queue_sel = data as u32;
-            }
-            VIRTIO_MMIO_QUEUE_NUM => {
-                if self.queue_sel == 0 {
-                    self.queue.size = (data as u32).min(self.queue.max_size);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY => {
-                if self.queue_sel == 0 {
-                    self.queue.ready = (data & 1) == 1;
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.desc_table =
-                        (self.queue.desc_table & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.desc_table =
-                        (self.queue.desc_table & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DRIVER_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.avail_ring =
-                        (self.queue.avail_ring & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DRIVER_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.avail_ring =
-                        (self.queue.avail_ring & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DEVICE_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.used_ring =
-                        (self.queue.used_ring & !0xffff_ffff) | (data & 0xffff_ffff);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DEVICE_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.used_ring =
-                        (self.queue.used_ring & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                if data == 0 {
-                    self.process_queue();
-                }
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                self.interrupt_status &= !(data as u32);
-                if self.interrupt_status == 0 {
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-                    }
-                }
-            }
-            VIRTIO_MMIO_STATUS => {
-                self.status = data as u32;
-                if data == 0 {
-                    self.queue = VirtQueue {
-                        max_size: VTBLK_QUEUE_SIZE,
-                        size: VTBLK_QUEUE_SIZE,
-                        ..Default::default()
-                    };
-                    self.used_idx = 0;
-                    self.interrupt_status = 0;
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
-                    }
-                }
-            }
+            WriteEffect::Reset => unsafe {
+                crate::hypervisor::hv_gic_set_spi(irq, false);
+            },
+            WriteEffect::InterruptAck { line_low: true } => unsafe {
+                crate::hypervisor::hv_gic_set_spi(irq, false);
+            },
             _ => {}
         }
     }
@@ -910,18 +931,24 @@ mod tests {
         assert_eq!(std::fs::read(exported).unwrap(), data);
     }
 
+    fn arm_queue(inner: &mut BlockInner) {
+        let q = inner.transport.queue_mut(0).unwrap();
+        q.ready = true;
+        q.desc_table = 0x1000;
+        q.avail_ring = 0x1800;
+        q.used_ring = 0x1900;
+    }
+
     #[test]
     fn huge_sector_and_wrong_descriptor_direction_are_rejected_before_io() {
         let dir = TestDir::new();
         let path = dir.file("disk", &[0x11; 1024]);
         let mem = Arc::new(GuestMemory::new_test(0, 0x10000));
-        let mut disk = VirtioBlock::from_raw(name(&path), false, 34, "test", mem.clone()).unwrap();
-        disk.queue.ready = true;
-        disk.queue.desc_table = 0x1000;
-        disk.queue.avail_ring = 0x1800;
-        disk.queue.used_ring = 0x1900;
+        let disk = VirtioBlock::from_raw(name(&path), false, 34, "test", mem.clone()).unwrap();
+        let mut inner = disk.inner.lock().unwrap();
+        arm_queue(&mut inner);
         for (idx, addr, len, flags, next) in [
-            (0, 0x2000, 16, 1, 1),
+            (0u64, 0x2000u64, 16u32, 1u16, 1u16),
             (1, 0x3000, 512, 1, 2),
             (2, 0x4000, 1, 2, 0),
         ] {
@@ -934,17 +961,219 @@ mod tests {
         mem.write_u32(0x2000, VIRTIO_BLK_T_OUT).unwrap();
         mem.write_u64(0x2008, 1u64 << 55).unwrap();
         mem.write(0x3000, &[0x99; 512]).unwrap();
-        assert_eq!(disk.handle_request(0, 128), 1);
+        let mut queue = *inner.transport.queue(0).unwrap();
+        assert_eq!(inner.handle_request(0, 0, &mut queue), 1);
         assert_eq!(mem.read_u16(0x4000).unwrap(), VIRTIO_BLK_S_IOERR as u16);
         assert_eq!(std::fs::read(&path).unwrap(), [0x11; 1024]);
         mem.write_u64(0x2008, 0).unwrap();
         mem.write_u16(0x101c, VRING_DESC_F_NEXT | VRING_DESC_F_WRITE)
             .unwrap();
-        assert_eq!(disk.handle_request(0, 128), 1);
+        assert_eq!(inner.handle_request(0, 0, &mut queue), 1);
         assert_eq!(std::fs::read(&path).unwrap(), [0x11; 1024]);
         mem.write_u16(0x101c, VRING_DESC_F_NEXT).unwrap();
-        assert_eq!(disk.handle_request(0, 128), 1);
+        assert_eq!(inner.handle_request(0, 0, &mut queue), 1);
         assert_eq!(mem.read_u16(0x4000).unwrap(), VIRTIO_BLK_S_OK as u16);
-        assert_eq!(std::fs::read(path).unwrap()[0], 0x99);
+        assert_eq!(std::fs::read(&path).unwrap()[0], 0x99);
+    }
+
+    fn negotiate(disk: &mut VirtioBlock, indirect: bool) {
+        disk.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0, 4);
+        let low = if indirect {
+            VIRTIO_RING_F_INDIRECT_DESC
+        } else {
+            0
+        };
+        disk.write(VIRTIO_MMIO_DRIVER_FEATURES, low, 4);
+        disk.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1, 4);
+        disk.write(VIRTIO_MMIO_DRIVER_FEATURES, 1, 4);
+        let status = VIRTIO_STATUS_ACKNOWLEDGE
+            | VIRTIO_STATUS_DRIVER
+            | VIRTIO_STATUS_FEATURES_OK
+            | VIRTIO_STATUS_DRIVER_OK;
+        disk.write(VIRTIO_MMIO_STATUS, status as u64, 4);
+    }
+
+    #[test]
+    fn indirect_read_write_flush_malformed_and_reset() {
+        let dir = TestDir::new();
+        let path = dir.file("disk", &[0x11; 1024]);
+        let mem = Arc::new(GuestMemory::new_test(0, 0x10000));
+        let mut disk =
+            VirtioBlock::from_raw(name(&path), false, 34, "serial-1", mem.clone()).unwrap();
+        negotiate(&mut disk, true);
+        assert!(
+            disk.inner
+                .lock()
+                .unwrap()
+                .transport
+                .negotiated(VIRTIO_RING_F_INDIRECT_DESC)
+        );
+        {
+            let inner = disk.inner.lock().unwrap();
+            assert_eq!(inner.config_byte(VTBLK_NUM_QUEUES_OFFSET), 1);
+            assert_eq!(inner.config_byte(0), 2); // 1024/512 = 2 sectors
+        }
+        disk.write(VIRTIO_MMIO_QUEUE_SEL, 0, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_NUM, 3, 4);
+        assert_eq!(disk.read(VIRTIO_MMIO_QUEUE_NUM, 4), 0);
+        disk.write(VIRTIO_MMIO_QUEUE_NUM, 8, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_DESC_LOW, 0x1000, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_DRIVER_LOW, 0x1800, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_DEVICE_LOW, 0x1900, 4);
+        // desc 0: header, direct. desc 1: indirect table of data + status.
+        mem.write_u64(0x1000, 0x2000).unwrap();
+        mem.write_u32(0x1008, 16).unwrap();
+        mem.write_u16(0x100c, VRING_DESC_F_NEXT).unwrap();
+        mem.write_u16(0x100e, 1).unwrap();
+        mem.write_u64(0x1010, 0x3000).unwrap();
+        mem.write_u32(0x1018, 32).unwrap();
+        mem.write_u16(0x101c, VRING_DESC_F_INDIRECT).unwrap();
+        mem.write_u64(0x3000, 0x4000).unwrap();
+        mem.write_u32(0x3008, 512).unwrap();
+        mem.write_u16(0x300c, VRING_DESC_F_NEXT).unwrap();
+        mem.write_u16(0x300e, 1).unwrap();
+        mem.write_u64(0x3010, 0x5000).unwrap();
+        mem.write_u32(0x3018, 1).unwrap();
+        mem.write_u16(0x301c, VRING_DESC_F_WRITE).unwrap();
+        mem.write_u32(0x2000, VIRTIO_BLK_T_OUT).unwrap();
+        mem.write_u64(0x2008, 0).unwrap();
+        mem.write(0x4000, &[0x5a; 512]).unwrap();
+        mem.write_u16(0x1802, 1).unwrap();
+        mem.write_u16(0x1804, 0).unwrap();
+        disk.write(VIRTIO_MMIO_QUEUE_READY, 1, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_NOTIFY, 0, 4);
+        assert_eq!(std::fs::read(&path).unwrap()[..512], [0x5a; 512]);
+        assert_eq!(mem.read_u16(0x5000).unwrap(), VIRTIO_BLK_S_OK as u16);
+
+        // Read the sector back through a direct chain on a fresh avail slot.
+        mem.write_u64(0x1020, 0x2100).unwrap();
+        mem.write_u32(0x1028, 16).unwrap();
+        mem.write_u16(0x102c, VRING_DESC_F_NEXT).unwrap();
+        mem.write_u16(0x102e, 3).unwrap();
+        mem.write_u64(0x1030, 0x6000).unwrap();
+        mem.write_u32(0x1038, 512).unwrap();
+        mem.write_u16(0x103c, VRING_DESC_F_WRITE | VRING_DESC_F_NEXT)
+            .unwrap();
+        mem.write_u16(0x103e, 4).unwrap();
+        mem.write_u64(0x1040, 0x5100).unwrap();
+        mem.write_u32(0x1048, 1).unwrap();
+        mem.write_u16(0x104c, VRING_DESC_F_WRITE).unwrap();
+        mem.write_u32(0x2100, VIRTIO_BLK_T_IN).unwrap();
+        mem.write_u64(0x2108, 0).unwrap();
+        mem.write_u16(0x1802, 2).unwrap();
+        mem.write_u16(0x1806, 2).unwrap();
+        disk.write(VIRTIO_MMIO_QUEUE_NOTIFY, 0, 4);
+        assert_eq!(
+            mem.read(0x6000, &mut [0; 1])
+                .ok()
+                .map(|_| mem.read_u32(0x6000).unwrap()),
+            Some(0x5a5a5a5a)
+        );
+
+        // Flush.
+        mem.write_u64(0x1050, 0x2200).unwrap();
+        mem.write_u32(0x1058, 16).unwrap();
+        mem.write_u16(0x105c, VRING_DESC_F_NEXT).unwrap();
+        mem.write_u16(0x105e, 6).unwrap();
+        mem.write_u64(0x1060, 0x5200).unwrap();
+        mem.write_u32(0x1068, 1).unwrap();
+        mem.write_u16(0x106c, VRING_DESC_F_WRITE).unwrap();
+        mem.write_u32(0x2200, VIRTIO_BLK_T_FLUSH).unwrap();
+        mem.write_u16(0x1802, 3).unwrap();
+        mem.write_u16(0x1808, 5).unwrap();
+        disk.write(VIRTIO_MMIO_QUEUE_NOTIFY, 0, 4);
+        assert_eq!(mem.read_u16(0x5200).unwrap(), VIRTIO_BLK_S_OK as u16);
+
+        // Malformed indirect table must not be followed.
+        let before = std::fs::read(&path).unwrap();
+        mem.write_u64(0x1070, 0x2300).unwrap();
+        mem.write_u32(0x1078, 16).unwrap();
+        mem.write_u16(0x107c, VRING_DESC_F_INDIRECT | VRING_DESC_F_NEXT)
+            .unwrap();
+        mem.write_u16(0x1802, 4).unwrap();
+        mem.write_u16(0x180a, 7).unwrap();
+        disk.write(VIRTIO_MMIO_QUEUE_NOTIFY, 0, 4);
+        assert_ne!(
+            disk.read(VIRTIO_MMIO_STATUS, 4) & VIRTIO_STATUS_NEEDS_RESET as u64,
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        disk.write(VIRTIO_MMIO_STATUS, 0, 4);
+        let inner = disk.inner.lock().unwrap();
+        assert_eq!(inner.transport.status(), 0);
+        assert!(!inner.transport.queue(0).unwrap().ready);
+        assert_eq!(inner.transport.queue(0).unwrap().desc_table, 0);
+        assert_eq!(inner.transport.driver_features(), 0);
+    }
+
+    #[test]
+    fn multiqueue_config_and_second_queue_complete_on_that_queue() {
+        let dir = TestDir::new();
+        let path = dir.file("disk", &[0; 1024]);
+        let mem = Arc::new(GuestMemory::new_test(0, 0x20000));
+        let mut disk =
+            VirtioBlock::from_raw_queues(name(&path), false, 34, "mq", mem.clone(), 2).unwrap();
+        assert_eq!(
+            disk.read(VIRTIO_MMIO_DEVICE_FEATURES, 4) & VIRTIO_BLK_F_MQ,
+            VIRTIO_BLK_F_MQ
+        );
+        assert_eq!(
+            disk.read(VIRTIO_MMIO_CONFIG + VTBLK_NUM_QUEUES_OFFSET as u64, 2),
+            2
+        );
+        disk.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0, 4);
+        disk.write(VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_BLK_F_MQ, 4);
+        disk.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1, 4);
+        disk.write(VIRTIO_MMIO_DRIVER_FEATURES, 1, 4);
+        disk.write(
+            VIRTIO_MMIO_STATUS,
+            (VIRTIO_STATUS_ACKNOWLEDGE
+                | VIRTIO_STATUS_DRIVER
+                | VIRTIO_STATUS_FEATURES_OK
+                | VIRTIO_STATUS_DRIVER_OK) as u64,
+            4,
+        );
+        disk.write(VIRTIO_MMIO_QUEUE_SEL, 1, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_NUM, 8, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_DESC_LOW, 0x8000, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_DRIVER_LOW, 0x8800, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_DEVICE_LOW, 0x8900, 4);
+        disk.write(VIRTIO_MMIO_QUEUE_READY, 1, 4);
+        mem.write_u64(0x8000, 0x9000).unwrap();
+        mem.write_u32(0x8008, 16).unwrap();
+        mem.write_u16(0x800c, VRING_DESC_F_NEXT).unwrap();
+        mem.write_u16(0x800e, 1).unwrap();
+        mem.write_u64(0x8010, 0x9100).unwrap();
+        mem.write_u32(0x8018, 512).unwrap();
+        mem.write_u16(0x801c, VRING_DESC_F_NEXT).unwrap();
+        mem.write_u16(0x801e, 2).unwrap();
+        mem.write_u64(0x8020, 0x9300).unwrap();
+        mem.write_u32(0x8028, 1).unwrap();
+        mem.write_u16(0x802c, VRING_DESC_F_WRITE).unwrap();
+        mem.write_u32(0x9000, VIRTIO_BLK_T_OUT).unwrap();
+        mem.write(0x9100, &[0x77; 512]).unwrap();
+        mem.write_u16(0x8802, 1).unwrap();
+        mem.write_u16(0x8804, 0).unwrap();
+        disk.write(VIRTIO_MMIO_QUEUE_NOTIFY, 1, 4);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read(&path).unwrap()[..512] != [0x77; 512] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queue 1 request was not completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(mem.read_u16(0x8902).unwrap(), 1);
+        assert_eq!(
+            disk.inner
+                .lock()
+                .unwrap()
+                .transport
+                .queue(0)
+                .unwrap()
+                .used_idx,
+            0
+        );
     }
 }

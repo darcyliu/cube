@@ -13,6 +13,10 @@ impl TestDir {
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }
+    pub fn root(&self) -> &Path {
+        &self.0
+    }
+
     pub fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }

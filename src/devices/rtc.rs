@@ -3,28 +3,28 @@
 //! Conforms to ARM DDI 0224B (ARM PrimeCell Real Time Clock PL031 Technical Reference Manual).
 //! Provides the guest OS with the host's real UTC time via UNIX epoch seconds.
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::devices::MmioDevice;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // PL031 Register Offsets
-const RTC_DR: u64 = 0x000;   // Data Register (RO, seconds counter)
-const RTC_MR: u64 = 0x004;   // Match Register (RW, alarm match value)
-const RTC_LR: u64 = 0x008;   // Load Register (RW, counter load/offset)
-const RTC_CR: u64 = 0x00C;   // Control Register (RW, bit 0 = enable)
+const RTC_DR: u64 = 0x000; // Data Register (RO, seconds counter)
+const RTC_MR: u64 = 0x004; // Match Register (RW, alarm match value)
+const RTC_LR: u64 = 0x008; // Load Register (RW, counter load/offset)
+const RTC_CR: u64 = 0x00C; // Control Register (RW, bit 0 = enable)
 const RTC_IMSC: u64 = 0x010; // Interrupt Mask Set and Clear (RW)
-const RTC_RIS: u64 = 0x014;  // Raw Interrupt Status (RO)
-const RTC_MIS: u64 = 0x018;  // Masked Interrupt Status (RO)
-const RTC_ICR: u64 = 0x01C;  // Interrupt Clear Register (WO)
+const RTC_RIS: u64 = 0x014; // Raw Interrupt Status (RO)
+const RTC_MIS: u64 = 0x018; // Masked Interrupt Status (RO)
+const RTC_ICR: u64 = 0x01C; // Interrupt Clear Register (WO)
 
 // ARM PrimeCell Identification Registers
 const RTC_PERIPH_ID0: u64 = 0xFE0; // 0x31
 const RTC_PERIPH_ID1: u64 = 0xFE4; // 0x10 (Part 0x031)
 const RTC_PERIPH_ID2: u64 = 0xFE8; // 0x04 (Designer: ARM, Revision 0)
 const RTC_PERIPH_ID3: u64 = 0xFEC; // 0x00
-const RTC_PCELL_ID0: u64 = 0xFF0;  // 0x0D
-const RTC_PCELL_ID1: u64 = 0xFF4;  // 0xF0
-const RTC_PCELL_ID2: u64 = 0xFF8;  // 0x05
-const RTC_PCELL_ID3: u64 = 0xFFC;  // 0xB1
+const RTC_PCELL_ID0: u64 = 0xFF0; // 0x0D
+const RTC_PCELL_ID1: u64 = 0xFF4; // 0xF0
+const RTC_PCELL_ID2: u64 = 0xFF8; // 0x05
+const RTC_PCELL_ID3: u64 = 0xFFC; // 0xB1
 
 pub struct Pl031Rtc {
     /// Offset in seconds added to host UNIX timestamp
@@ -69,11 +69,27 @@ impl MmioDevice for Pl031Rtc {
             RTC_DR => self.current_counter() as u64,
             RTC_MR => self.match_value as u64,
             RTC_LR => self.current_counter() as u64,
-            RTC_CR => if self.enabled { 1 } else { 0 },
+            RTC_CR => {
+                if self.enabled {
+                    1
+                } else {
+                    0
+                }
+            }
             RTC_IMSC => self.imsc as u64,
-            RTC_RIS => if self.is_raw_irq { 1 } else { 0 },
+            RTC_RIS => {
+                if self.is_raw_irq {
+                    1
+                } else {
+                    0
+                }
+            }
             RTC_MIS => {
-                let mis = if self.is_raw_irq && (self.imsc & 1) != 0 { 1 } else { 0 };
+                let mis = if self.is_raw_irq && (self.imsc & 1) != 0 {
+                    1
+                } else {
+                    0
+                };
                 mis as u64
             }
             // PrimeCell identification

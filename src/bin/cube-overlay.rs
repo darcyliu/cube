@@ -1,8 +1,8 @@
 //! Offline inspection and export of VMMCOW01 disk overlays.
+use cube::cow::{CLUSTER_SIZE, CowImage};
 use std::env;
 use std::path::Path;
 use std::process;
-use cube::cow::{CowImage, CLUSTER_SIZE};
 
 fn run(args: &[String]) -> Result<(), String> {
     if args.len() < 4 || !matches!(args[1].as_str(), "inspect" | "export") {

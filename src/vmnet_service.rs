@@ -18,12 +18,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::vmnet_proto::{
-    decode_client_hello, server_hello_for_raw, ClientHello, ClientIngress, ClientRecord, HelloResult,
-    OutQueue, Registry, CLIENT_HELLO_LEN, STATUS_OK,
+    CLIENT_HELLO_LEN, ClientHello, ClientIngress, ClientRecord, HelloResult, OutQueue, Registry,
+    STATUS_OK, decode_client_hello, server_hello_for_raw,
 };
 use crate::vmnet_sys::{IoOutcome, VmnetPort};
 
 const SUN_PATH_LIMIT: usize = 104;
+// Keep this below the 64-frame per-client queue.  A vmnet receive callback can
+// represent a much larger burst, so draining to Idle before writing client
+// sockets needlessly turns a writable client into a "slow" one.
+const VMNET_DRAIN_BATCH: usize = 32;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -38,10 +42,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let user = invoking_user()?;
     let custom_socket = parsed.socket.is_some();
-    let path = parsed
-        .socket
-        .clone()
-        .unwrap_or_else(|| user.home.join("Library/Application Support/cube/vmnet.sock"));
+    let path = parsed.socket.clone().unwrap_or_else(|| {
+        user.home
+            .join("Library/Application Support/cube/vmnet.sock")
+    });
     check_sun_path(&path)?;
 
     let mut port = match &parsed.net {
@@ -91,9 +95,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         } else {
             eprintln!("[vmnet] using Apple default NAT for {nat_cidr}; skipping PF NAT");
         }
-        Some(
-            network_scope(&nat_cidr).unwrap_or(crate::vmnet_proto::DhcpDnsScope::SharedBridge),
-        )
+        Some(network_scope(&nat_cidr).unwrap_or(crate::vmnet_proto::DhcpDnsScope::SharedBridge))
     };
     let resolvers = if dns_scope.is_some() {
         load_resolvers()
@@ -132,7 +134,9 @@ use cube::runtime_paths::lookup_user;
 enum ServiceNet {
     Shared,
     /// `None` selects the default-route interface when the service starts.
-    Bridged { iface: Option<String> },
+    Bridged {
+        iface: Option<String>,
+    },
 }
 
 struct RequestedSubnet {
@@ -204,7 +208,11 @@ fn parse_service_args(args: &[String]) -> Result<ServiceArgs, String> {
     if subnet.is_some() && matches!(net, ServiceNet::Bridged { .. }) {
         return Err("--subnet applies to NAT mode; omit it with --bridge".into());
     }
-    Ok(ServiceArgs { socket, net, subnet })
+    Ok(ServiceArgs {
+        socket,
+        net,
+        subnet,
+    })
 }
 
 fn parse_subnet(text: &str) -> Result<RequestedSubnet, String> {
@@ -218,7 +226,9 @@ fn parse_subnet(text: &str) -> Result<RequestedSubnet, String> {
         .parse()
         .map_err(|_| format!("--subnet {text} is not an IPv4 CIDR"))?;
     if !(8..=30).contains(&prefix) {
-        return Err(format!("--subnet {text} must use a prefix from /8 through /30"));
+        return Err(format!(
+            "--subnet {text} must use a prefix from /8 through /30"
+        ));
     }
     let mask_bits = u32::MAX << (32 - prefix);
     let addr_bits = u32::from(addr);
@@ -299,7 +309,6 @@ fn invoking_user() -> Result<Invoker, String> {
     Ok(Invoker { uid, gid, home })
 }
 
-
 fn check_sun_path(path: &Path) -> Result<(), String> {
     let len = path.as_os_str().len();
     if len >= SUN_PATH_LIMIT {
@@ -357,8 +366,8 @@ fn parent_allows_bind(path: &Path, uid: u32) -> Result<(), String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let meta = fs::symlink_metadata(parent)
-        .map_err(|err| format!("lstat {}: {err}", parent.display()))?;
+    let meta =
+        fs::symlink_metadata(parent).map_err(|err| format!("lstat {}: {err}", parent.display()))?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(format!(
             "socket directory {} is not a real directory",
@@ -395,16 +404,10 @@ fn probe_socket(path: &Path) -> Result<Probe, String> {
         Ok(meta) => meta,
     };
     if meta.file_type().is_symlink() {
-        return Err(format!(
-            "refusing to unlink symlink {}",
-            path.display()
-        ));
+        return Err(format!("refusing to unlink symlink {}", path.display()));
     }
     if !meta.file_type().is_socket() {
-        return Err(format!(
-            "{} exists and is not a socket",
-            path.display()
-        ));
+        return Err(format!("{} exists and is not a socket", path.display()));
     }
     match UnixStream::connect(path) {
         Ok(_stream) => Ok(Probe::AlreadyListening),
@@ -478,8 +481,8 @@ fn configure_listener(
             io::Error::last_os_error()
         ));
     }
-    let meta = fs::symlink_metadata(path)
-        .map_err(|err| format!("lstat {}: {err}", path.display()))?;
+    let meta =
+        fs::symlink_metadata(path).map_err(|err| format!("lstat {}: {err}", path.display()))?;
     if meta.file_type().is_symlink() {
         return Err(format!(
             "{} is a symlink; refusing to listen",
@@ -573,10 +576,7 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), String> {
             || libc::setuid(uid) != 0
     };
     if rc {
-        return Err(format!(
-            "setuid({uid}): {}",
-            io::Error::last_os_error()
-        ));
+        return Err(format!("setuid({uid}): {}", io::Error::last_os_error()));
     }
     eprintln!("[vmnet] dropped privileges to uid {uid}");
     Ok(())
@@ -671,7 +671,9 @@ fn log_shared_interface(gateway: Option<Ipv4Addr>) {
     };
     let output = command_output(Command::new("ifconfig").arg("-a"), Duration::from_secs(3));
     let text = match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
         Ok(output) => {
             eprintln!(
                 "[vmnet] ifconfig -a failed: {}",
@@ -717,9 +719,14 @@ fn interface_with_inet(text: &str, gateway: Ipv4Addr) -> Option<String> {
 }
 
 fn log_bridge100_range() {
-    let output = command_output(Command::new("ifconfig").arg("bridge100"), Duration::from_secs(3));
+    let output = command_output(
+        Command::new("ifconfig").arg("bridge100"),
+        Duration::from_secs(3),
+    );
     let text = match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
         Ok(output) => {
             eprintln!(
                 "[vmnet] ifconfig bridge100 failed: {}",
@@ -772,7 +779,10 @@ fn enable_forwarding() -> Result<(), String> {
     require_network_setup_success("enable IPv4 forwarding", output)
 }
 
-fn require_network_setup_success(operation: &str, output: std::process::Output) -> Result<(), String> {
+fn require_network_setup_success(
+    operation: &str,
+    output: std::process::Output,
+) -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
@@ -861,6 +871,10 @@ struct SavedCounters {
     frame_oversize: u64,
     tx_spoof: u64,
     drop_slow_client: u64,
+    socket_write_calls: u64,
+    socket_write_bytes: u64,
+    socket_would_block: u64,
+    max_outq: usize,
 }
 
 struct ServiceSwitch {
@@ -893,6 +907,10 @@ impl ServiceSwitch {
                 frame_oversize: 0,
                 tx_spoof: 0,
                 drop_slow_client: 0,
+                socket_write_calls: 0,
+                socket_write_bytes: 0,
+                socket_would_block: 0,
+                max_outq: 0,
             },
         }
     }
@@ -910,6 +928,11 @@ impl ServiceSwitch {
         self.saved.frame_oversize += client.ingress.frame_oversize();
         self.saved.tx_spoof += client.ingress.tx_spoof;
         self.saved.drop_slow_client += client.out.drop_slow_client;
+        let (calls, bytes, blocked, max_queued) = client.out.write_stats();
+        self.saved.socket_write_calls += calls;
+        self.saved.socket_write_bytes += bytes;
+        self.saved.socket_would_block += blocked;
+        self.saved.max_outq = self.saved.max_outq.max(max_queued);
     }
 
     fn enqueue_rx(&mut self, frame: &[u8]) {
@@ -978,16 +1001,41 @@ impl ServiceSwitch {
         (close, writes)
     }
 
-    fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    fn snapshot(
+        &self,
+    ) -> (
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        usize,
+    ) {
         let mut runt = self.saved.frame_runt;
         let mut oversize = self.saved.frame_oversize;
         let mut spoof = self.saved.tx_spoof;
         let mut slow = self.saved.drop_slow_client;
+        let mut write_calls = self.saved.socket_write_calls;
+        let mut write_bytes = self.saved.socket_write_bytes;
+        let mut blocked = self.saved.socket_would_block;
+        let mut max_outq = self.saved.max_outq;
         for client in &self.clients {
             runt += client.ingress.frame_runt();
             oversize += client.ingress.frame_oversize();
             spoof += client.ingress.tx_spoof;
             slow += client.out.drop_slow_client;
+            let (calls, bytes, would_block, max_queued) = client.out.write_stats();
+            write_calls += calls;
+            write_bytes += bytes;
+            blocked += would_block;
+            max_outq = max_outq.max(max_queued);
         }
         (
             self.rx_frames,
@@ -999,6 +1047,10 @@ impl ServiceSwitch {
             self.rx_reflect,
             spoof,
             slow,
+            write_calls,
+            write_bytes,
+            blocked,
+            max_outq,
         )
     }
 }
@@ -1121,6 +1173,13 @@ fn adopt(table: &mut Table, mut stream: UnixStream) {
     match finish_hello(&mut stream, peer, &mut table.reg) {
         Admit::Closed => {}
         Admit::Attached(hello) => {
+            let buffers = match crate::vmnet_proto::tune_socket_buffers(fd) {
+                Ok(buffers) => buffers,
+                Err(err) => {
+                    eprintln!("[vmnet] socket buffer tuning failed: {err}");
+                    (0, 0)
+                }
+            };
             if stream.set_nonblocking(true).is_err() {
                 table.reg.release(&hello.mac);
                 return;
@@ -1129,9 +1188,11 @@ fn adopt(table: &mut Table, mut stream: UnixStream) {
             table.sw.attach(hello.mac, max_frame);
             table.lives.push(LiveIo { stream, uid: peer });
             eprintln!(
-                "[vmnet] attach mac={} uid={peer} clients={}",
+                "[vmnet] attach mac={} uid={peer} clients={} sndbuf={} rcvbuf={}",
                 format_mac(hello.mac),
-                table.reg.len()
+                table.reg.len(),
+                buffers.0,
+                buffers.1,
             );
         }
     }
@@ -1195,16 +1256,17 @@ fn drain_pipe(fd: i32) {
     }
 }
 
-fn drain_vmnet(
+/// Drain at most one batch from vmnet. Returns `true` once vmnet reports Idle.
+fn drain_vmnet_batch(
     port: &mut VmnetPort,
     buf: &mut [u8],
     sw: &mut ServiceSwitch,
     resolvers: &[Ipv4Addr],
     dns_scope: Option<crate::vmnet_proto::DhcpDnsScope>,
-) -> Result<(), String> {
-    loop {
+) -> Result<bool, String> {
+    for _ in 0..VMNET_DRAIN_BATCH {
         match port.read(buf) {
-            IoOutcome::Idle => return Ok(()),
+            IoOutcome::Idle => return Ok(true),
             IoOutcome::Packet(len) => {
                 let frame = &mut buf[..len];
                 if let Some(scope) = dns_scope {
@@ -1215,6 +1277,35 @@ fn drain_vmnet(
             IoOutcome::Oversize => sw.rx_oversize += 1,
             IoOutcome::Counted => {}
             IoOutcome::Fatal(message) => return Err(message),
+        }
+    }
+    Ok(false)
+}
+
+fn drain_vmnet(
+    port: &mut VmnetPort,
+    buf: &mut [u8],
+    table: &mut Table,
+    dead: &mut Vec<usize>,
+    resolvers: &[Ipv4Addr],
+    dns_scope: Option<crate::vmnet_proto::DhcpDnsScope>,
+) -> Result<bool, String> {
+    loop {
+        // First finish anything left by an earlier EAGAIN.  Do not consume
+        // more vmnet packets while a live client's bounded queue is full.
+        flush_outputs(table, dead);
+        if outputs_pending(table, dead) {
+            return Ok(false);
+        }
+        let idle = drain_vmnet_batch(port, buf, &mut table.sw, resolvers, dns_scope)?;
+        // A single vmnet notification may cover more than CLIENT_OUTQ frames.
+        // Give every writable client a chance to consume each bounded batch.
+        flush_outputs(table, dead);
+        if idle {
+            return Ok(true);
+        }
+        if outputs_pending(table, dead) {
+            return Ok(false);
         }
     }
 }
@@ -1232,13 +1323,21 @@ fn serve(
     let mut vmnet_buf = vec![0u8; port.read_budget];
     let mut last_log = Instant::now();
     let mut read_buf = [0u8; 16384];
+    // True when a bounded drain stopped before vmnet reported Idle.  The
+    // event-pipe byte has already been consumed, so remember to resume after
+    // POLLOUT even if vmnet does not deliver another edge notification.
+    let mut vmnet_pending = false;
 
     loop {
         if STOP.load(Ordering::Relaxed) {
             eprintln!("[vmnet] stopping");
             return Ok(());
         }
-        let timeout_ms = if event.is_some() { 100 } else { 0 };
+        let timeout_ms = if event.is_some() && !(vmnet_pending && !outputs_pending(&table, &[])) {
+            100
+        } else {
+            0
+        };
         let hits = poll_once(&listener, event.as_ref(), &table, timeout_ms)?;
         if hits.accept {
             loop {
@@ -1288,9 +1387,16 @@ fn serve(
             if let Some(pipe) = event.as_ref() {
                 drain_pipe(pipe.read);
             }
-            drain_vmnet(port, &mut vmnet_buf, &mut table.sw, resolvers, dns_scope)?;
-        } else if event.is_none() {
-            drain_vmnet(port, &mut vmnet_buf, &mut table.sw, resolvers, dns_scope)?;
+        }
+        if hits.vmnet || event.is_none() || vmnet_pending {
+            vmnet_pending = !drain_vmnet(
+                port,
+                &mut vmnet_buf,
+                &mut table,
+                &mut dead,
+                resolvers,
+                dns_scope,
+            )?;
         }
 
         for frame in vmnet_writes {
@@ -1399,13 +1505,14 @@ fn poll_once(
 fn flush_outputs(table: &mut Table, dead: &mut Vec<usize>) {
     let Table { sw, lives, .. } = table;
     for idx in 0..lives.len() {
-        let pending = sw.clients[idx].out.queued() > 0 || !sw.clients[idx].out.outbound().is_empty();
+        let pending =
+            sw.clients[idx].out.queued() > 0 || !sw.clients[idx].out.outbound().is_empty();
         if !pending {
             continue;
         }
         let ok = sw.clients[idx]
             .out
-            .flush_outbound(&mut |buf| lives[idx].stream.write(buf))
+            .flush_outbound_vectored(&mut |bufs| lives[idx].stream.write_vectored(bufs))
             .is_ok();
         if !ok {
             dead.push(idx);
@@ -1413,8 +1520,28 @@ fn flush_outputs(table: &mut Table, dead: &mut Vec<usize>) {
     }
 }
 
+fn outputs_pending(table: &Table, dead: &[usize]) -> bool {
+    table.sw.clients.iter().enumerate().any(|(idx, client)| {
+        !dead.contains(&idx) && (client.out.queued() > 0 || !client.out.outbound().is_empty())
+    })
+}
+
 fn log_counters(table: &Table, vmnet_err: u64) {
-    let (rx, tx, rx_over, runt, over, unclaimed, reflect, spoof, slow) = table.sw.snapshot();
+    let (
+        rx,
+        tx,
+        rx_over,
+        runt,
+        over,
+        unclaimed,
+        reflect,
+        spoof,
+        slow,
+        socket_write_calls,
+        socket_write_bytes,
+        socket_would_block,
+        max_outq,
+    ) = table.sw.snapshot();
     if rx == 0
         && tx == 0
         && rx_over == 0
@@ -1429,7 +1556,7 @@ fn log_counters(table: &Table, vmnet_err: u64) {
         return;
     }
     eprintln!(
-        "[vmnet] rx_frames={rx} tx_frames={tx} rx_oversize={rx_over} frame_runt={runt} frame_oversize={over} rx_unclaimed={unclaimed} rx_reflect={reflect} tx_spoof={spoof} drop_slow_client={slow} vmnet_err={vmnet_err} clients={}",
+        "[vmnet] rx_frames={rx} tx_frames={tx} rx_oversize={rx_over} frame_runt={runt} frame_oversize={over} rx_unclaimed={unclaimed} rx_reflect={reflect} tx_spoof={spoof} drop_slow_client={slow} vmnet_err={vmnet_err} socket_write_calls={socket_write_calls} socket_write_bytes={socket_write_bytes} socket_would_block={socket_would_block} max_outq={max_outq} clients={}",
         table.lives.len()
     );
 }
@@ -1505,7 +1632,12 @@ mod tests {
 
     #[test]
     fn bridge_flag_selects_lan_mode() {
-        let args = |parts: &[&str]| parts.iter().map(|part| part.to_string()).collect::<Vec<_>>();
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        };
         let shared = parse_service_args(&args(&["vmm", "--vmnet-service"])).unwrap();
         assert!(matches!(shared.net, ServiceNet::Shared));
         assert!(shared.socket.is_none());
@@ -1525,7 +1657,9 @@ mod tests {
         assert!(matches!(en.net, ServiceNet::Bridged { iface: Some(ref name) } if name == "en0"));
         assert_eq!(en.socket.unwrap(), PathBuf::from("/tmp/vmm.sock"));
 
-        assert!(parse_service_args(&args(&["vmm", "--vmnet-service", "--bridge", "--bridge"])).is_err());
+        assert!(
+            parse_service_args(&args(&["vmm", "--vmnet-service", "--bridge", "--bridge"])).is_err()
+        );
         assert!(parse_service_args(&args(&["vmm", "--vmnet-service", "--nat"])).is_err());
     }
 
@@ -1548,7 +1682,12 @@ mod tests {
         assert!(parse_subnet("192.168.18.0/31").is_err());
         assert!(parse_subnet("192.168.18.0").is_err());
 
-        let args = |parts: &[&str]| parts.iter().map(|part| part.to_string()).collect::<Vec<_>>();
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        };
         let parsed = parse_service_args(&args(&[
             "vmm",
             "--vmnet-service",
@@ -1557,14 +1696,16 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(parsed.subnet.unwrap().cidr, "192.168.18.0/24");
-        assert!(parse_service_args(&args(&[
-            "vmm",
-            "--vmnet-service",
-            "--bridge",
-            "--subnet",
-            "192.168.18.0/24",
-        ]))
-        .is_err());
+        assert!(
+            parse_service_args(&args(&[
+                "vmm",
+                "--vmnet-service",
+                "--bridge",
+                "--subnet",
+                "192.168.18.0/24",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1756,5 +1897,16 @@ bridge100: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu
         assert_eq!(records.len(), 64);
         assert!(matches!(records[0], ClientRecord::Forward(_)));
         assert!(sw.clients[1].out.outbound().is_empty());
+    }
+
+    #[test]
+    fn pending_live_output_pauses_vmnet_drain() {
+        let mut table = Table::new(501);
+        table.sw.attach(mac(1), 2048);
+        assert!(!outputs_pending(&table, &[]));
+
+        table.sw.enqueue_rx(&frame(mac(1), mac(9)));
+        assert!(outputs_pending(&table, &[]));
+        assert!(!outputs_pending(&table, &[0]));
     }
 }

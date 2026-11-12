@@ -4,9 +4,9 @@
 //! types; `--net vmnet` stays the in-process backend.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, ErrorKind, IoSlice, Read};
 use std::net::Ipv4Addr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 pub const MAGIC: &[u8; 8] = b"VMMNET\x01\x00";
@@ -19,6 +19,8 @@ pub const MIN_NEGOTIATED_FRAME: u32 = 1514;
 pub const MAX_DISCARD_FRAME: u32 = 65536;
 pub const MAX_CLIENTS: usize = 16;
 pub const CLIENT_OUTQ: usize = 64;
+pub const SOCKET_BUFFER_BYTES: i32 = 1024 * 1024;
+pub const OUTBOUND_IOV_MAX: usize = 32;
 pub const CLIENT_HELLO_LEN: usize = 24;
 pub const SERVER_HELLO_LEN: usize = 20;
 
@@ -244,12 +246,7 @@ pub fn read_exact_deadline(
             return Err(err);
         }
         match stream.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "handshake closed",
-                ))
-            }
+            Ok(0) => return Err(io::Error::new(ErrorKind::UnexpectedEof, "handshake closed")),
             Ok(n) => filled += n,
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
@@ -438,6 +435,10 @@ pub struct OutQueue {
     outq: VecDeque<Vec<u8>>,
     outbound: Vec<u8>,
     pub drop_slow_client: u64,
+    write_calls: u64,
+    write_bytes: u64,
+    would_block: u64,
+    max_queued: usize,
 }
 
 impl OutQueue {
@@ -446,6 +447,10 @@ impl OutQueue {
             outq: VecDeque::new(),
             outbound: Vec::new(),
             drop_slow_client: 0,
+            write_calls: 0,
+            write_bytes: 0,
+            would_block: 0,
+            max_queued: 0,
         }
     }
 
@@ -457,6 +462,15 @@ impl OutQueue {
         &self.outbound
     }
 
+    pub fn write_stats(&self) -> (u64, u64, u64, usize) {
+        (
+            self.write_calls,
+            self.write_bytes,
+            self.would_block,
+            self.max_queued,
+        )
+    }
+
     /// `false` when this frame was dropped before any of its bytes were queued.
     pub fn enqueue_frame(&mut self, frame: &[u8]) -> bool {
         if self.outq.len() >= CLIENT_OUTQ {
@@ -464,9 +478,81 @@ impl OutQueue {
             return false;
         }
         self.outq.push_back(encode_record(frame));
+        self.max_queued = self.max_queued.max(self.outq.len());
         true
     }
 
+    /// Flush several complete length-prefixed records with one vectored write.
+    /// A partial write is retained exactly, including one partially written
+    /// record, so the peer's stream parser never observes a torn record gap.
+    pub fn flush_outbound_vectored(
+        &mut self,
+        write: &mut dyn FnMut(&[IoSlice<'_>]) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        loop {
+            if self.outbound.is_empty() && self.outq.is_empty() {
+                return Ok(());
+            }
+            self.write_calls += 1;
+            let (offered, result) = {
+                let mut slices: [IoSlice<'_>; OUTBOUND_IOV_MAX] =
+                    std::array::from_fn(|_| IoSlice::new(&[]));
+                let mut count = 0;
+                if !self.outbound.is_empty() {
+                    slices[count] = IoSlice::new(&self.outbound);
+                    count += 1;
+                }
+                for record in self.outq.iter().take(OUTBOUND_IOV_MAX - count) {
+                    slices[count] = IoSlice::new(record);
+                    count += 1;
+                }
+                let offered = slices[..count]
+                    .iter()
+                    .map(|slice| slice.len())
+                    .sum::<usize>();
+                (offered, write(&slices[..count]))
+            };
+            let written = match result {
+                Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "peer closed")),
+                Ok(n) if n > offered => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "write reported more bytes than the buffers",
+                    ));
+                }
+                Ok(n) => n,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    self.would_block += 1;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+            self.write_bytes += written as u64;
+            self.consume_written(written);
+        }
+    }
+
+    fn consume_written(&mut self, mut written: usize) {
+        if !self.outbound.is_empty() {
+            let consumed = written.min(self.outbound.len());
+            self.outbound.drain(..consumed);
+            written -= consumed;
+        }
+        while written != 0 {
+            let Some(record) = self.outq.pop_front() else {
+                break;
+            };
+            if written >= record.len() {
+                written -= record.len();
+            } else {
+                self.outbound.extend_from_slice(&record[written..]);
+                written = 0;
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn flush_outbound(
         &mut self,
         write: &mut dyn FnMut(&[u8]) -> io::Result<usize>,
@@ -505,6 +591,47 @@ impl Default for OutQueue {
     }
 }
 
+pub fn tune_socket_buffers(fd: RawFd) -> io::Result<(i32, i32)> {
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        let requested = SOCKET_BUFFER_BYTES as libc::c_int;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                &requested as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of_val(&requested) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok((
+        socket_buffer(fd, libc::SO_SNDBUF)?,
+        socket_buffer(fd, libc::SO_RCVBUF)?,
+    ))
+}
+
+fn socket_buffer(fd: RawFd, option: libc::c_int) -> io::Result<i32> {
+    let mut value = 0 as libc::c_int;
+    let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            &mut value as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Ok(value)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DhcpDnsScope {
     /// In-process `--net vmnet` and bridge: only `192.168.x.1`.
@@ -520,9 +647,7 @@ impl DhcpDnsScope {
         let gateway = ip.len() == 4 && ip[0] == 192 && ip[1] == 168 && ip[3] == 1;
         match self {
             DhcpDnsScope::GatewayOnly => gateway,
-            DhcpDnsScope::SharedBridge => {
-                gateway || (ip[0] == 192 && ip[1] == 168 && ip[2] == 18)
-            }
+            DhcpDnsScope::SharedBridge => gateway || (ip[0] == 192 && ip[1] == 168 && ip[2] == 18),
             DhcpDnsScope::Network { network, prefix } => {
                 if ip.len() != 4 || prefix == 0 || prefix > 32 {
                     return false;
@@ -657,7 +782,10 @@ pub fn select_dns_resolvers(text: &str) -> Vec<Ipv4Addr> {
             if !key.starts_with("nameserver") {
                 continue;
             }
-            let Some(addr) = value.split_whitespace().next().and_then(|tok| tok.parse().ok())
+            let Some(addr) = value
+                .split_whitespace()
+                .next()
+                .and_then(|tok| tok.parse().ok())
             else {
                 continue;
             };
@@ -1007,10 +1135,7 @@ mod tests {
             STATUS_BAD_MAX_FRAME
         );
         assert_eq!(reg.admit(1, &hello(mac(1), 0, 1514)).status, STATUS_OK);
-        assert_eq!(
-            reg.admit(1, &hello(mac(2), 0, 2048)).max_frame,
-            2048
-        );
+        assert_eq!(reg.admit(1, &hello(mac(2), 0, 2048)).max_frame, 2048);
         assert_eq!(reg.len(), 2);
     }
 
@@ -1301,10 +1426,7 @@ resolver #2
   domain : corp.example
   nameserver[0] : 1.2.3.4
 ";
-        assert_eq!(
-            select_dns_resolvers(text),
-            vec![Ipv4Addr::new(9, 9, 9, 9)]
-        );
+        assert_eq!(select_dns_resolvers(text), vec![Ipv4Addr::new(9, 9, 9, 9)]);
     }
 
     #[test]
@@ -1315,10 +1437,7 @@ DNS configuration
 resolver #1
   nameserver[0] : 10.1.2.3
 ";
-        assert_eq!(
-            select_dns_resolvers(text),
-            vec![Ipv4Addr::new(10, 1, 2, 3)]
-        );
+        assert_eq!(select_dns_resolvers(text), vec![Ipv4Addr::new(10, 1, 2, 3)]);
     }
 
     #[test]
@@ -1379,5 +1498,69 @@ resolver #1
                 other => panic!("record {i} was {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn vectored_outq_preserves_records_across_partial_write() {
+        let mut queue = OutQueue::new();
+        let frames = [1u8, 2, 3].map(|tag| {
+            let mut frame = frame_from(mac(0x56));
+            frame[1] = tag;
+            frame
+        });
+        let frame_count = frames.len();
+        for frame in &frames {
+            assert!(queue.enqueue_frame(frame));
+        }
+
+        queue
+            .flush_outbound_vectored(&mut |_| Err(io::Error::new(ErrorKind::WouldBlock, "full")))
+            .unwrap();
+        assert_eq!(queue.queued(), frame_count);
+        assert!(queue.outbound().is_empty());
+
+        let mut written = Vec::new();
+        queue
+            .flush_outbound_vectored(&mut |slices| {
+                let limit = if written.is_empty() { 7 } else { usize::MAX };
+                let mut count = 0;
+                for slice in slices {
+                    let take = slice.len().min(limit.saturating_sub(count));
+                    written.extend_from_slice(&slice[..take]);
+                    count += take;
+                    if count == limit {
+                        break;
+                    }
+                }
+                Ok(count)
+            })
+            .unwrap();
+
+        assert_eq!(queue.queued(), 0);
+        assert!(queue.outbound().is_empty());
+        let mut ingress = ClientIngress::new(mac(0x56), MAX_FRAME as usize);
+        let records = ingress.push(&written);
+        assert_eq!(records.len(), frame_count);
+        for (record, expected) in records.into_iter().zip(frames) {
+            assert_eq!(record, ClientRecord::Forward(expected));
+        }
+        let (calls, bytes, blocked, max_queued) = queue.write_stats();
+        assert_eq!(calls, 3);
+        assert_eq!(bytes as usize, written.len());
+        assert_eq!(blocked, 1);
+        assert_eq!(max_queued, frame_count);
+    }
+
+    #[test]
+    fn socket_buffers_accept_throughput_tuning() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let before_send = socket_buffer(stream.as_raw_fd(), libc::SO_SNDBUF).unwrap();
+        let before_receive = socket_buffer(stream.as_raw_fd(), libc::SO_RCVBUF).unwrap();
+        let (send, receive) = tune_socket_buffers(stream.as_raw_fd()).unwrap();
+        assert!(send >= before_send, "send buffer {send} < {before_send}");
+        assert!(
+            receive >= before_receive,
+            "receive buffer {receive} < {before_receive}"
+        );
     }
 }

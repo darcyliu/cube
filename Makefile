@@ -1,4 +1,4 @@
-.PHONY: all build sign sign-networking run freebsd freebsd-zfs freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify alpine debian debian-cloud app cube run-cube debug-app sign-cube-networking debug-run-cube install install-cli dmg
+.PHONY: all build sign sign-networking run freebsd freebsd-gpu-balloon freebsd-zfs freebsd-zfs-uefi fetch-freebsd fetch-uefi release clean clean-vm install-iso install-seed verify verify-vsock-virtiofs alpine debian debian-cloud app cube run-cube debug-app sign-cube-networking debug-run-cube install install-cli dmg
 
 all: build sign
 
@@ -172,9 +172,24 @@ fetch-freebsd:
 
 CPUS ?= 2
 NET  ?= vmnet-proxy
+RAM_MB ?= 1024
+BALLOON_MB ?= 256
+GPU_DISPLAY ?= 1280x720
 
 freebsd: all fetch-freebsd
 	$(CUBE_BIN) --freebsd boot/freebsd/kernel --net $(NET)
+
+# FreeBSD VirtIO GPU + balloon verification run. Override settings as needed:
+#   make freebsd-gpu-balloon NET=none BALLOON_MB=128 GPU_DISPLAY=1920x1080
+BALLOON_CONTROL ?= /tmp/cube-balloon.sock
+freebsd-gpu-balloon: all fetch-freebsd fetch-image
+	@echo "[Cube] Using the interactive serial console. Press Ctrl-] to stop."
+	@echo "[Cube] At the FreeBSD shell, run: kldload virtio_balloon"
+	@echo "[Cube] Runtime balloon control: $(BALLOON_CONTROL)"
+	$(CUBE_BIN) --freebsd boot/freebsd/kernel --disk mini-memstick.img --net $(NET) --cpus $(CPUS) \
+		--ram $(RAM_MB) --mem-prealloc --gpu virtio \
+		--display $(GPU_DISPLAY) --balloon-target $(BALLOON_MB) \
+		--balloon-control "$(BALLOON_CONTROL)"
 
 fetch-image:
 	@if [ ! -f mini-memstick.img ]; then \
@@ -221,6 +236,20 @@ debian: all
 
 debian-cloud: all
 	./scripts/debian-cloud.sh
+
+# End-to-end Linux checks with networking disabled. Run `make debian-cloud`
+# once to prepare the default disk/kernel/initrd, then stop that VM with Ctrl-].
+VIRTIO_TEST ?= both
+DEBIAN_TEST_DISK ?= debian-cloud.img
+DEBIAN_TEST_KERNEL ?= boot/debian/cloud-vmlinuz
+DEBIAN_TEST_INITRD ?= boot/debian/cloud-initrd.img
+DEBIAN_TEST_SEED ?=
+
+verify-vsock-virtiofs: all
+	python3 scripts/cube/check_vsock_virtiofs.py $(CUBE_BIN) \
+		--disk "$(DEBIAN_TEST_DISK)" --kernel "$(DEBIAN_TEST_KERNEL)" \
+		--initrd "$(DEBIAN_TEST_INITRD)" --only "$(VIRTIO_TEST)" \
+		$(if $(DEBIAN_TEST_SEED),--seed "$(DEBIAN_TEST_SEED)",)
 
 release:
 	DIST=1 $(MAKE) build sign

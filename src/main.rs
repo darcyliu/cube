@@ -11,13 +11,13 @@ mod preload;
 mod runtime_status;
 mod shared_fs;
 mod terminal;
-mod vmnet_proto;
-mod vmnet_service;
-mod vmnet_sys;
 #[cfg(test)]
 mod test_support;
 mod vcpu;
 mod vm;
+mod vmnet_proto;
+mod vmnet_service;
+mod vmnet_sys;
 
 use std::env;
 use std::fs;
@@ -121,6 +121,16 @@ fn main() {
         }
         return;
     }
+    if args
+        .get(1)
+        .is_some_and(|s| s == "--internal-virtiofs-worker")
+    {
+        if let Err(e) = shared_fs::fuse_worker(&args) {
+            eprintln!("[virtiofs helper] {e}");
+            process::exit(1);
+        }
+        return;
+    }
     if args.get(1).is_some_and(|s| s == "--vmnet-service") {
         if let Err(e) = vmnet_service::run(&args) {
             eprintln!("[vmnet] {e}");
@@ -184,6 +194,13 @@ fn run_cli(args: Vec<String>) {
     let mut display_requested = false;
     let mut no_reboot = false;
     let mut mem_prealloc = false;
+    let mut blk_queues: u32 = 1;
+    let mut net_queue_pairs: u32 = 1;
+    let mut balloon_mb: u32 = 0;
+    let mut balloon_control: Option<PathBuf> = None;
+    let mut vsock_cfg = devices::virtio::vsock::VsockConfig::default();
+    let mut gpu_mode = devices::virtio::gpu::GpuMode::Simple;
+    let mut share_transport = shared_fs::ShareTransport::P9;
 
     let mut i = 1;
     while i < args.len() {
@@ -208,6 +225,17 @@ fn run_cli(args: Vec<String>) {
                 }
                 shares.push(share);
                 i += 2;
+            }
+            "--share-transport" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("--share-transport requires 9p or virtiofs");
+                    process::exit(1);
+                };
+                share_transport = shared_fs::ShareTransport::parse(raw).unwrap_or_else(|e| {
+                    eprintln!("\x1b[1;31m[Cube Error] {e}\x1b[0m");
+                    process::exit(1);
+                });
             }
             "--efi-vars" => {
                 i += 1;
@@ -396,6 +424,84 @@ fn run_cli(args: Vec<String>) {
                     process::exit(1);
                 }
             }
+            "--blk-queues" => {
+                i += 1;
+                blk_queues = parse_queue_count(&args, i, "--blk-queues");
+            }
+            "--net-queue-pairs" => {
+                i += 1;
+                net_queue_pairs = parse_queue_count(&args, i, "--net-queue-pairs");
+            }
+            "--balloon-target" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("--balloon-target requires a size in MiB");
+                    process::exit(1);
+                };
+                balloon_mb = raw.parse::<u32>().unwrap_or_else(|_| {
+                    eprintln!("--balloon-target requires a size in MiB, got '{raw}'");
+                    process::exit(1);
+                });
+            }
+            "--balloon-control" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("--balloon-control requires a Unix socket path");
+                    process::exit(1);
+                };
+                balloon_control = Some(PathBuf::from(raw));
+            }
+            "--vsock-cid" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("--vsock-cid requires a CID of 3 or higher");
+                    process::exit(1);
+                };
+                let cid = raw.parse::<u64>().unwrap_or_else(|_| {
+                    eprintln!("--vsock-cid requires a CID of 3 or higher, got '{raw}'");
+                    process::exit(1);
+                });
+                if !devices::virtio::vsock::valid_guest_cid(cid) {
+                    eprintln!(
+                        "--vsock-cid {cid} is invalid or reserved; use 3 through {}",
+                        u32::MAX - 1
+                    );
+                    process::exit(1);
+                }
+                vsock_cfg.cid = Some(cid);
+            }
+            "--vsock-listen" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("--vsock-listen requires a unix socket path");
+                    process::exit(1);
+                };
+                vsock_cfg.listen = Some(PathBuf::from(raw));
+            }
+            "--vsock-map" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("--vsock-map requires PORT=PATH");
+                    process::exit(1);
+                };
+                let map = parse_vsock_map(raw);
+                if vsock_cfg.maps.iter().any(|(port, _)| *port == map.0) {
+                    eprintln!("--vsock-map port {} is duplicated", map.0);
+                    process::exit(1);
+                }
+                vsock_cfg.maps.push(map);
+            }
+            "--gpu" => {
+                i += 1;
+                let Some(raw) = args.get(i) else {
+                    eprintln!("--gpu requires simple, virtio, or none");
+                    process::exit(1);
+                };
+                gpu_mode = devices::virtio::gpu::GpuMode::parse(raw).unwrap_or_else(|e| {
+                    eprintln!("\x1b[1;31m[Cube Error] {e}\x1b[0m");
+                    process::exit(1);
+                });
+            }
             "--vmnet-socket" => {
                 if i + 1 < args.len() {
                     i += 1;
@@ -486,14 +592,13 @@ fn run_cli(args: Vec<String>) {
                     "  --share-rw TAG PATH      Export a host directory read-write (repeatable)"
                 );
                 println!(
+                    "      --share-transport 9p|virtiofs  Share protocol (default 9p). virtiofs is read-only and uses a 35-byte tag"
+                );
+                println!(
                     "  -f, --freebsd [PATH]     Boot FreeBSD kernel ELF (defaults to boot/freebsd/kernel)"
                 );
-                println!(
-                    "  -l, --linux <PATH>       Boot Linux ARM64 kernel Image/vmlinuz"
-                );
-                println!(
-                    "      --initrd <PATH>      Load initrd/initramfs for Linux boot"
-                );
+                println!("  -l, --linux <PATH>       Boot Linux ARM64 kernel Image/vmlinuz");
+                println!("      --initrd <PATH>      Load initrd/initramfs for Linux boot");
                 println!(
                     "      --uefi [PATH]        Boot EDK2/UEFI firmware (defaults to firmware/QEMU_EFI.fd); loader.efi handles ZFS"
                 );
@@ -533,23 +638,41 @@ fn run_cli(args: Vec<String>) {
                 println!(
                     "  -m, --ram <MB>           Guest physical RAM in MB (default: 1024 for OS)"
                 );
-                println!(
-                    "  -n, --net <MODE>         Network mode: none (default, offline),"
-                );
+                println!("  -n, --net <MODE>         Network mode: none (default, offline),");
                 println!(
                     "                           vmnet-proxy (unprivileged client of --vmnet-service),"
                 );
-                println!(
-                    "                           vmnet (in-process NAT, root),"
-                );
-                println!(
-                    "                           bridge[:iface], tap:<dev>, mock"
-                );
+                println!("                           vmnet (in-process NAT, root),");
+                println!("                           bridge[:iface], tap:<dev>, mock");
                 println!(
                     "      --vmnet-socket <PATH> Unix socket for --net vmnet-proxy (default: ~/Library/Application Support/cube/vmnet.sock)"
                 );
                 println!(
                     "      --mac <MAC>          Network MAC address (default: 52:54:00:12:34:56)"
+                );
+                println!(
+                    "      --blk-queues <N>     VirtIO block request queues (default 1, capped by vCPU count, max 16)"
+                );
+                println!(
+                    "      --net-queue-pairs <N> VirtIO net RX/TX pairs (default 1; above 1 offers MQ)"
+                );
+                println!(
+                    "      --balloon-target <MiB> Inflate the virtio-balloon toward this many MiB (default off)"
+                );
+                println!(
+                    "      --balloon-control <PATH> Runtime balloon target/status Unix socket (JSON lines)"
+                );
+                println!(
+                    "      --vsock-cid <CID>     virtio-vsock guest CID (3 or higher; allocated if omitted)"
+                );
+                println!(
+                    "      --vsock-listen <PATH> Unix control socket; line command: connect <guest_port>"
+                );
+                println!(
+                    "      --vsock-map PORT=PATH Connect that guest port to a host Unix socket (repeatable)"
+                );
+                println!(
+                    "      --gpu simple|virtio|none  Display device (default simple). virtio adds a 2D virtio-gpu and keeps simple-framebuffer when --vnc or --gui is set"
                 );
                 println!(
                     "      --vnc [ADDR]          Enable simple-framebuffer + VNC + USB HID (default 127.0.0.1:5900)"
@@ -599,6 +722,23 @@ fn run_cli(args: Vec<String>) {
         }
     }
 
+    if matches!(share_transport, shared_fs::ShareTransport::VirtioFs) {
+        for share in &shares {
+            if share.tag.len() > 35 {
+                eprintln!(
+                    "[Cube Error] virtiofs tag '{}' is longer than 35 bytes",
+                    share.tag
+                );
+                process::exit(1);
+            }
+            if !share.read_only {
+                eprintln!(
+                    "[Cube Error] virtiofs is read-only; use --share, or --share-transport 9p for --share-rw"
+                );
+                process::exit(1);
+            }
+        }
+    }
     if !shares.is_empty() && !is_freebsd && !is_uefi && kernel_path.is_none() {
         eprintln!("shared folders require an OS kernel or UEFI boot");
         process::exit(1);
@@ -606,6 +746,11 @@ fn run_cli(args: Vec<String>) {
 
     if native_gui && vnc_bind.is_some() {
         eprintln!("[Cube Error] --gui native and --vnc cannot be combined");
+        process::exit(1);
+    }
+    if matches!(gpu_mode, devices::virtio::gpu::GpuMode::None) && (native_gui || vnc_bind.is_some())
+    {
+        eprintln!("[Cube Error] --gpu none cannot be combined with --vnc or --gui");
         process::exit(1);
     }
     if native_gui && !is_freebsd && !is_uefi && !is_linux {
@@ -616,8 +761,14 @@ fn run_cli(args: Vec<String>) {
         eprintln!("[Cube Error] --retina requires --gui native");
         process::exit(1);
     }
-    if display_requested && vnc_bind.is_none() && !native_gui {
-        eprintln!("\x1b[1;31m[Cube Error] --display requires --vnc or --gui native\x1b[0m");
+    if display_requested
+        && vnc_bind.is_none()
+        && !native_gui
+        && !matches!(gpu_mode, devices::virtio::gpu::GpuMode::Virtio)
+    {
+        eprintln!(
+            "\x1b[1;31m[Cube Error] --display requires --vnc, --gui native, or --gpu virtio\x1b[0m"
+        );
         process::exit(1);
     }
     if retina {
@@ -752,6 +903,13 @@ fn run_cli(args: Vec<String>) {
                 &shares,
                 vmnet_socket.as_deref(),
                 mem_prealloc,
+                blk_queues,
+                net_queue_pairs,
+                balloon_mb,
+                balloon_control.as_deref(),
+                &vsock_cfg,
+                gpu_mode,
+                share_transport,
             ),
             no_reboot,
         );
@@ -820,6 +978,13 @@ fn run_cli(args: Vec<String>) {
                     &shares,
                     vmnet_socket.as_deref(),
                     mem_prealloc,
+                    blk_queues,
+                    net_queue_pairs,
+                    balloon_mb,
+                    balloon_control.as_deref(),
+                    &vsock_cfg,
+                    gpu_mode,
+                    share_transport,
                 ),
                 no_reboot,
             );
@@ -874,6 +1039,13 @@ fn run_cli(args: Vec<String>) {
                     &shares,
                     vmnet_socket.as_deref(),
                     mem_prealloc,
+                    blk_queues,
+                    net_queue_pairs,
+                    balloon_mb,
+                    balloon_control.as_deref(),
+                    &vsock_cfg,
+                    gpu_mode,
+                    share_transport,
                 ),
                 no_reboot,
             );
@@ -901,6 +1073,36 @@ fn run_cli(args: Vec<String>) {
         DEFAULT_BAREMETAL_RAM_SIZE,
         cpu_model,
     );
+}
+
+fn parse_vsock_map(raw: &str) -> (u32, PathBuf) {
+    let Some((port_raw, path)) = raw.split_once('=') else {
+        eprintln!("--vsock-map requires PORT=PATH, got '{raw}'");
+        process::exit(1);
+    };
+    let port = port_raw.parse::<u32>().unwrap_or_else(|_| {
+        eprintln!("--vsock-map port must be 1..=4294967295, got '{port_raw}'");
+        process::exit(1);
+    });
+    if port == 0 || path.is_empty() {
+        eprintln!("--vsock-map requires a non-zero port and a unix socket path, got '{raw}'");
+        process::exit(1);
+    }
+    (port, PathBuf::from(path))
+}
+
+fn parse_queue_count(args: &[String], index: usize, flag: &str) -> u32 {
+    let Some(raw) = args.get(index) else {
+        eprintln!("{flag} requires a queue count from 1 to 16");
+        process::exit(1);
+    };
+    match raw.parse::<u32>() {
+        Ok(n) if (1..=16).contains(&n) => n,
+        _ => {
+            eprintln!("{flag} requires a queue count from 1 to 16, got '{raw}'");
+            process::exit(1);
+        }
+    }
 }
 
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -992,16 +1194,34 @@ fn boot_os_kernel(
     shares: &[shared_fs::ShareConfig],
     vmnet_socket: Option<&Path>,
     mem_prealloc: bool,
+    blk_queues: u32,
+    net_queue_pairs: u32,
+    balloon_mb: u32,
+    balloon_control: Option<&Path>,
+    vsock: &devices::virtio::vsock::VsockConfig,
+    gpu: devices::virtio::gpu::GpuMode,
+    share_transport: shared_fs::ShareTransport,
 ) -> Result<bool, String> {
-    let layout = devices::layout::dynamic_devices(disk_configs.len(), shares.len())?;
+    let balloon_pages = balloon_mb.saturating_mul(256).min((ram_size / 4096) as u32);
+    let balloon_enabled = balloon_pages > 0 || balloon_control.is_some();
+    let plan = devices::layout::plan_devices(devices::layout::DeviceRequest {
+        extra_disks: disk_configs.len().saturating_sub(1),
+        shares: shares.len(),
+        balloon: balloon_enabled,
+        vsock: vsock.enabled(),
+        gpu: matches!(gpu, devices::virtio::gpu::GpuMode::Virtio),
+    })?;
+    let layout: Vec<(u64, u32)> = plan.devices.iter().map(|d| (d.base, d.irq)).collect();
     let share_backends = shares
         .iter()
-        .map(shared_fs::Backend::start)
+        .map(|share| match share_transport {
+            shared_fs::ShareTransport::P9 => shared_fs::Backend::start(share),
+            shared_fs::ShareTransport::VirtioFs => shared_fs::Backend::start_virtiofs(share),
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let effective_net = net_mode.unwrap_or("none");
     if ssh_port.is_some()
-        && (matches!(effective_net, "none" | "mock")
-            || effective_net.starts_with("tap:"))
+        && (matches!(effective_net, "none" | "mock") || effective_net.starts_with("tap:"))
     {
         return Err("--ssh-port requires a DHCP-capable vmnet/bridge NIC; use --forward for an explicit destination".into());
     }
@@ -1029,7 +1249,11 @@ fn boot_os_kernel(
         "[Cube] Allocating {}MB RAM at GPA 0x{:08x}{}...",
         ram_size / (1024 * 1024),
         DEFAULT_RAM_BASE,
-        if mem_prealloc { " (pre-allocated)" } else { " (demand-paged)" }
+        if mem_prealloc {
+            " (pre-allocated)"
+        } else {
+            " (demand-paged)"
+        }
     );
     println!("[Cube] Configuring {} virtual CPUs (SMP)...", cpus);
     println!("[Cube] Bootargs: \"{}\"", bootargs);
@@ -1102,15 +1326,29 @@ fn boot_os_kernel(
     // Attach shared folders using the same layout tuples as the FDT.
     for (idx, (share, backend)) in shares.iter().zip(share_backends).enumerate() {
         let (base, irq) = layout[disk_configs.len().saturating_sub(1) + idx];
-        let dev = devices::virtio::p9::VirtioP9::new(&share.tag, irq, vm.memory(), backend)?;
-        vm.mmio_mut().register(base, 0x200, Box::new(dev));
+        let protocol = match share_transport {
+            shared_fs::ShareTransport::P9 => "9P",
+            shared_fs::ShareTransport::VirtioFs => "virtiofs",
+        };
+        match share_transport {
+            shared_fs::ShareTransport::P9 => {
+                let dev =
+                    devices::virtio::p9::VirtioP9::new(&share.tag, irq, vm.memory(), backend)?;
+                vm.mmio_mut().register(base, 0x200, Box::new(dev));
+            }
+            shared_fs::ShareTransport::VirtioFs => {
+                let dev =
+                    devices::virtio::fs::VirtioFs::open(&share.tag, irq, vm.memory(), backend)?;
+                vm.mmio_mut().register(base, 0x200, Box::new(dev));
+            }
+        }
         virtio_devices.push(fdt::VirtioMmioDevice {
             base,
             size: 0x200,
             irq,
         });
         println!(
-            "[Cube] 9P share '{}' {} ({}) at {base:#x}, IRQ {irq}",
+            "[Cube] {protocol} share '{}' {} ({}) at {base:#x}, IRQ {irq}",
             share.tag,
             share.path.display(),
             if share.read_only { "ro" } else { "rw" }
@@ -1124,11 +1362,26 @@ fn boot_os_kernel(
             (layout[idx - 1].0, layout[idx - 1].1)
         };
         let serial_id = format!("vmm-disk-{}", idx);
+        let queues = blk_queues.min(cpus as u32).clamp(1, 16);
         let blk_res = if disk.cow {
             let overlay_path = format!("{}.cow", disk.path);
-            VirtioBlock::from_cow(&disk.path, &overlay_path, irq, &serial_id, vm.memory())
+            VirtioBlock::from_cow_queues(
+                &disk.path,
+                &overlay_path,
+                irq,
+                &serial_id,
+                vm.memory(),
+                queues,
+            )
         } else {
-            VirtioBlock::from_raw(&disk.path, disk.read_only, irq, &serial_id, vm.memory())
+            VirtioBlock::from_raw_queues(
+                &disk.path,
+                disk.read_only,
+                irq,
+                &serial_id,
+                vm.memory(),
+                queues,
+            )
         };
 
         match blk_res {
@@ -1158,12 +1411,14 @@ fn boot_os_kernel(
     // Attach VirtIO-MMIO Network Device
     let mut runtime_address = Arc::new(Mutex::new(None));
     if effective_net != "none" {
-        let virtio_net = VirtioNet::new(
+        let pairs = net_queue_pairs.min(cpus as u32).clamp(1, 16);
+        let virtio_net = VirtioNet::with_queue_pairs(
             mac_addr,
             VIRTIO_NET_IRQ,
             vm.memory(),
             effective_net,
             vmnet_socket,
+            pairs,
         )?;
         runtime_address = virtio_net.guest_address();
         if let Some(port) = ssh_port {
@@ -1274,6 +1529,100 @@ fn boot_os_kernel(
         None
     };
 
+    let mut _balloon_controller = None;
+    if balloon_enabled {
+        let Some((base, irq)) = plan.one(devices::layout::DeviceRole::Balloon) else {
+            return Err("virtio-balloon was requested without a layout slot".into());
+        };
+        let protected: Vec<(u64, u64)> = fb_cfg
+            .map(|fb| vec![(fb.gpa, fb.reg_size)])
+            .unwrap_or_default();
+        let balloon = Arc::new(Mutex::new(devices::virtio::balloon::VirtioBalloon::new(
+            irq,
+            vm.memory(),
+            &protected,
+            balloon_pages,
+        )));
+        let mmio_balloon: Arc<Mutex<dyn devices::MmioDevice>> = balloon.clone();
+        vm.mmio_mut().register_shared(base, 0x200, mmio_balloon);
+        if let Some(path) = balloon_control {
+            _balloon_controller = Some(devices::virtio::balloon::BalloonController::start(
+                path.to_path_buf(),
+                balloon,
+            )?);
+            println!("[Cube] Balloon control socket: {}", path.display());
+        }
+        virtio_devices.push(fdt::VirtioMmioDevice {
+            base,
+            size: 0x200,
+            irq,
+        });
+        println!(
+            "[Cube] Registered virtio-balloon at GPA {base:#x} (IRQ {irq}), target {balloon_pages} pages"
+        );
+    }
+
+    let _vsock_lease = if vsock.enabled() {
+        let Some((base, irq)) = plan.one(devices::layout::DeviceRole::Vsock) else {
+            return Err("virtio-vsock was requested without a layout slot".into());
+        };
+        let dir = cube::runtime_paths::vsock_dir()?;
+        let lease = match vsock.cid {
+            Some(cid) => devices::virtio::vsock::CidLease::acquire(&dir, cid)?,
+            None => devices::virtio::vsock::CidLease::allocate(&dir)?,
+        };
+        let dev = devices::virtio::vsock::VirtioVsock::open(
+            irq,
+            vm.memory(),
+            lease.cid(),
+            vsock.maps.clone(),
+            vsock.listen.clone(),
+        )?;
+        vm.mmio_mut().register(base, 0x200, Box::new(dev));
+        virtio_devices.push(fdt::VirtioMmioDevice {
+            base,
+            size: 0x200,
+            irq,
+        });
+        println!(
+            "[Cube] Registered virtio-vsock CID {} at GPA {base:#x} (IRQ {irq})",
+            lease.cid()
+        );
+        Some(lease)
+    } else {
+        None
+    };
+
+    let gpu_frames = if matches!(gpu, devices::virtio::gpu::GpuMode::Virtio) {
+        let Some((base, irq)) = plan.one(devices::layout::DeviceRole::Gpu) else {
+            return Err("virtio-gpu was requested without a layout slot".into());
+        };
+        let publisher = Arc::new(devices::display::FramePublisher::new(
+            display_size.0,
+            display_size.1,
+        ));
+        let dev = devices::virtio::gpu::VirtioGpu::new(
+            irq,
+            vm.memory(),
+            display_size.0,
+            display_size.1,
+            publisher.clone(),
+        );
+        vm.mmio_mut().register(base, 0x200, Box::new(dev));
+        virtio_devices.push(fdt::VirtioMmioDevice {
+            base,
+            size: 0x200,
+            irq,
+        });
+        println!(
+            "[Cube] Registered virtio-gpu 2D {}x{} at GPA {base:#x} (IRQ {irq})",
+            display_size.0, display_size.1
+        );
+        Some(publisher)
+    } else {
+        None
+    };
+
     let (vnc_keyboard, vnc_tablet, vnc_usb) = if graphics_enabled {
         let fb = fb_cfg.expect("framebuffer configured when graphics is enabled");
         let xhci = Arc::new(Mutex::new(XhciController::new(
@@ -1360,7 +1709,10 @@ fn boot_os_kernel(
         let data = match fs::read(path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("\x1b[1;31m[Cube Error] Failed to read initrd file '{}': {}\x1b[0m", path, e);
+                eprintln!(
+                    "\x1b[1;31m[Cube Error] Failed to read initrd file '{}': {}\x1b[0m",
+                    path, e
+                );
                 process::exit(1);
             }
         };
@@ -1375,7 +1727,10 @@ fn boot_os_kernel(
             process::exit(1);
         }
         if let Err(e) = vm.memory().write(initrd_start, &data) {
-            eprintln!("\x1b[1;31m[Cube Error] Failed to write initrd to RAM: {}\x1b[0m", e);
+            eprintln!(
+                "\x1b[1;31m[Cube Error] Failed to write initrd to RAM: {}\x1b[0m",
+                e
+            );
             process::exit(1);
         }
         println!(
@@ -1408,7 +1763,10 @@ fn boot_os_kernel(
     ) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("\x1b[1;31m[Cube Error] Failed to generate DTB: {}\x1b[0m", e);
+            eprintln!(
+                "\x1b[1;31m[Cube Error] Failed to generate DTB: {}\x1b[0m",
+                e
+            );
             process::exit(1);
         }
     };
@@ -1431,6 +1789,7 @@ fn boot_os_kernel(
             vnc_keyboard.clone(),
             vnc_tablet.clone(),
             vnc_usb.clone(),
+            gpu_frames.clone(),
         ) {
             Ok(server) => {
                 vnc_server = Some(server);
@@ -1446,6 +1805,7 @@ fn boot_os_kernel(
             vm.memory(),
             fb_cfg.expect("native GUI framebuffer"),
             vnc_usb.as_ref().expect("native GUI USB HID").clone(),
+            gpu_frames.clone(),
         ))
     } else {
         None
@@ -1481,12 +1841,18 @@ fn boot_os_kernel(
             let fw_dir = std::path::Path::new(kernel_path).parent();
             let cand_next_to_fw = fw_dir.map(|p| p.join("QEMU_VARS.fd"));
             let cand_rel = std::path::PathBuf::from("firmware/QEMU_VARS.fd");
-            let cand_home = std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".local/share/cube/firmware/QEMU_VARS.fd"));
-            let cand_app = std::path::PathBuf::from("/Applications/Cube.app/Contents/Resources/firmware/QEMU_VARS.fd");
+            let cand_home = std::env::var_os("HOME").map(|h| {
+                std::path::PathBuf::from(h).join(".local/share/cube/firmware/QEMU_VARS.fd")
+            });
+            let cand_app = std::path::PathBuf::from(
+                "/Applications/Cube.app/Contents/Resources/firmware/QEMU_VARS.fd",
+            );
 
             let mut vars_data = None;
-            for cand in [cand_next_to_fw, Some(cand_rel), cand_home, Some(cand_app)].into_iter().flatten() {
+            for cand in [cand_next_to_fw, Some(cand_rel), cand_home, Some(cand_app)]
+                .into_iter()
+                .flatten()
+            {
                 if cand.is_file() {
                     if let Ok(v) = std::fs::read(&cand) {
                         vars_data = Some(v);
@@ -1495,9 +1861,7 @@ fn boot_os_kernel(
                 }
             }
 
-            let vars = vars_data.unwrap_or_else(|| {
-                vec![0xffu8; 64 * 1024 * 1024]
-            });
+            let vars = vars_data.unwrap_or_else(|| vec![0xffu8; 64 * 1024 * 1024]);
             let vars_len = vars.len() as u64;
             let default_store = disk_configs
                 .first()
@@ -1859,7 +2223,10 @@ fn boot_flat_binary(name: &str, payload_data: &[u8], ram_size: usize, cpu_model:
     );
 
     if let Err(e) = vm.memory().write(DEFAULT_RAM_BASE, payload_data) {
-        eprintln!("\x1b[1;31m[Cube Error] Failed to load payload: {}\x1b[0m", e);
+        eprintln!(
+            "\x1b[1;31m[Cube Error] Failed to load payload: {}\x1b[0m",
+            e
+        );
         process::exit(1);
     }
     println!(

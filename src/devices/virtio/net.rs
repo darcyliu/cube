@@ -16,13 +16,70 @@ use super::*;
 use crate::devices::MmioDevice;
 use crate::memory::GuestMemory;
 
-// VirtIO Network Features
-const VIRTIO_NET_F_MAC_BIT: u64 = 1 << 5;
-const VIRTIO_NET_F_STATUS_BIT: u64 = 1 << 16;
-const VIRTIO_F_VERSION_1_BIT: u64 = 1 << 32;
+const NET_OFFERED: u64 =
+    VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_RING_F_INDIRECT_DESC | VIRTIO_F_VERSION_1;
+const NET_QUEUE_MAX: u32 = 1024;
+const NET_CTRL_QUEUE_MAX: u32 = 64;
+const NET_FRAME_BYTES: usize = 65536;
+const PROXY_RX_BUFFER_BYTES: usize = 64 * 1024;
+const PROXY_RX_DELIVERY_BATCH: usize = 16;
+const NET_MAX_PAIRS: u32 = 16;
+const VIRTIO_NET_F_CTRL_VQ: u64 = 1 << 17;
+const VIRTIO_NET_F_MQ: u64 = 1 << 22;
+const VIRTIO_NET_CTRL_MQ: u8 = 4;
+const VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET: u8 = 0;
+const VIRTIO_NET_OK: u8 = 0;
+const VIRTIO_NET_ERR: u8 = 1;
 
-// VirtIO Network Status
-const VIRTIO_NET_S_LINK_UP_VAL: u16 = 1;
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Stable RX steering. Uses the five-tuple when the frame parses as IPv4 or
+/// IPv6 TCP/UDP, and the Ethernet header otherwise.
+fn flow_hash(frame: &[u8]) -> u32 {
+    if frame.len() < 14 {
+        return fnv1a(frame);
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype == 0x0800 {
+        let ihl = usize::from(frame[14] & 0x0f) * 4;
+        if frame[14] >> 4 == 4 && ihl >= 20 && frame.len() >= 14 + ihl {
+            let proto = frame[23];
+            let mut hash = fnv1a(&frame[26..30]);
+            hash ^= fnv1a(&frame[30..34]);
+            hash ^= fnv1a(&[proto]);
+            if (proto == 6 || proto == 17) && frame.len() >= 14 + ihl + 4 {
+                hash ^= fnv1a(&frame[14 + ihl..14 + ihl + 4]);
+            }
+            return hash;
+        }
+    }
+    if ethertype == 0x86dd && frame.len() >= 54 && frame[14] >> 4 == 6 {
+        let proto = frame[20];
+        let mut hash = fnv1a(&frame[22..38]);
+        hash ^= fnv1a(&frame[38..54]);
+        hash ^= fnv1a(&[proto]);
+        if (proto == 6 || proto == 17) && frame.len() >= 58 {
+            hash ^= fnv1a(&frame[54..58]);
+        }
+        return hash;
+    }
+    fnv1a(&frame[..14])
+}
+
+fn flow_pair(frame: &[u8], pairs: u32) -> usize {
+    if pairs <= 1 {
+        0
+    } else {
+        (flow_hash(frame) as usize) % pairs as usize
+    }
+}
 
 struct NetDebugStats {
     tx_pkts: AtomicU64,
@@ -37,6 +94,12 @@ struct NetDebugStats {
     tx_notify: AtomicU64,
     vmnet_err: AtomicU64,
     sock_drop: AtomicU64,
+    proxy_rx_reads: AtomicU64,
+    proxy_rx_bytes: AtomicU64,
+    proxy_rx_records: AtomicU64,
+    proxy_rx_max_records: AtomicU64,
+    proxy_rx_would_block: AtomicU64,
+    proxy_rx_pending_max: AtomicU64,
 }
 
 static NET_STATS: NetDebugStats = NetDebugStats {
@@ -52,6 +115,12 @@ static NET_STATS: NetDebugStats = NetDebugStats {
     tx_notify: AtomicU64::new(0),
     vmnet_err: AtomicU64::new(0),
     sock_drop: AtomicU64::new(0),
+    proxy_rx_reads: AtomicU64::new(0),
+    proxy_rx_bytes: AtomicU64::new(0),
+    proxy_rx_records: AtomicU64::new(0),
+    proxy_rx_max_records: AtomicU64::new(0),
+    proxy_rx_would_block: AtomicU64::new(0),
+    proxy_rx_pending_max: AtomicU64::new(0),
 };
 
 fn net_log(msg: &str) {
@@ -65,25 +134,31 @@ fn net_log(msg: &str) {
     }
 }
 
+fn queue_of(inner: &VirtioNetInner, index: usize) -> VirtQueue {
+    inner.transport.queue(index).copied().unwrap_or_default()
+}
+
 fn write_net_stats(inner: &VirtioNetInner) {
+    let rx = queue_of(inner, 0);
+    let tx = queue_of(inner, 1);
     let rx_avail = inner
         .mem
-        .read_u16(inner.rx_queue.avail_ring.saturating_add(2))
+        .read_u16(rx.avail_ring.saturating_add(2))
         .unwrap_or(0);
     let rx_used = inner
         .mem
-        .read_u16(inner.rx_queue.used_ring.saturating_add(2))
+        .read_u16(rx.used_ring.saturating_add(2))
         .unwrap_or(0);
     let tx_avail = inner
         .mem
-        .read_u16(inner.tx_queue.avail_ring.saturating_add(2))
+        .read_u16(tx.avail_ring.saturating_add(2))
         .unwrap_or(0);
     let tx_used = inner
         .mem
-        .read_u16(inner.tx_queue.used_ring.saturating_add(2))
+        .read_u16(tx.used_ring.saturating_add(2))
         .unwrap_or(0);
     net_log(&format!(
-        "tx_pkts={} tx_bytes={} rx_pkts={} rx_bytes={} rx_drop={} rx_nomem={} irq_raise={} irq_ack={} irq_defer={} tx_notify={} vmnet_err={} sock_drop={} backlog={} irq_asserted={} isr={:#x} pending_ack={} rx_last={} rx_avail={} rx_used={} tx_last={} tx_avail={} tx_used={} rx_ready={} tx_ready={}",
+        "tx_pkts={} tx_bytes={} rx_pkts={} rx_bytes={} rx_drop={} rx_nomem={} irq_raise={} irq_ack={} irq_defer={} tx_notify={} vmnet_err={} sock_drop={} proxy_rx_reads={} proxy_rx_bytes={} proxy_rx_records={} proxy_rx_max_records={} proxy_rx_would_block={} proxy_rx_pending_max={} backlog={} irq_asserted={} isr={:#x} pending_ack={} rx_last={} rx_avail={} rx_used={} tx_last={} tx_avail={} tx_used={} rx_ready={} tx_ready={}",
         NET_STATS.tx_pkts.load(Ordering::Relaxed),
         NET_STATS.tx_bytes.load(Ordering::Relaxed),
         NET_STATS.rx_pkts.load(Ordering::Relaxed),
@@ -96,18 +171,24 @@ fn write_net_stats(inner: &VirtioNetInner) {
         NET_STATS.tx_notify.load(Ordering::Relaxed),
         NET_STATS.vmnet_err.load(Ordering::Relaxed),
         NET_STATS.sock_drop.load(Ordering::Relaxed),
-        inner.rx_backlog.len(),
+        NET_STATS.proxy_rx_reads.load(Ordering::Relaxed),
+        NET_STATS.proxy_rx_bytes.load(Ordering::Relaxed),
+        NET_STATS.proxy_rx_records.load(Ordering::Relaxed),
+        NET_STATS.proxy_rx_max_records.load(Ordering::Relaxed),
+        NET_STATS.proxy_rx_would_block.load(Ordering::Relaxed),
+        NET_STATS.proxy_rx_pending_max.load(Ordering::Relaxed),
+        inner.backlog_len(),
         inner.irq_asserted,
-        inner.interrupt_status,
+        inner.transport.interrupt_status(),
         inner.irq_pending_after_ack,
-        inner.rx_queue.last_avail_idx,
+        rx.last_avail_idx,
         rx_avail,
         rx_used,
-        inner.tx_queue.last_avail_idx,
+        tx.last_avail_idx,
         tx_avail,
         tx_used,
-        inner.rx_queue.ready,
-        inner.tx_queue.ready,
+        rx.ready,
+        tx.ready,
     ));
 }
 
@@ -563,6 +644,14 @@ impl SocketBackend {
             return Err(proxy_status(reply.status, mac));
         }
         set_nosigpipe(stream.as_raw_fd())?;
+        match crate::vmnet_proto::tune_socket_buffers(stream.as_raw_fd()) {
+            Ok((send, receive)) => crate::host_log!(
+                "[VirtIO-Net] vmnet-proxy socket buffers: send={send} receive={receive}"
+            ),
+            Err(err) => {
+                crate::host_log!("[VirtIO-Net] vmnet-proxy socket buffer tuning failed: {err}")
+            }
+        }
         stream
             .set_nonblocking(true)
             .map_err(|err| format!("Cannot start vmnet: {err}"))?;
@@ -649,7 +738,9 @@ fn proxy_status(status: u32, mac: [u8; 6]) -> String {
         crate::vmnet_proto::STATUS_TOO_MANY_CLIENTS => {
             "Cannot start vmnet: vmnet service rejected the handshake (status 6).".into()
         }
-        other => format!("Cannot start vmnet: vmnet service rejected the handshake (status {other})."),
+        other => {
+            format!("Cannot start vmnet: vmnet service rejected the handshake (status {other}).")
+        }
     }
 }
 
@@ -669,25 +760,49 @@ fn socket_rx_loop(
     discovered: crate::forward::GuestAddress,
 ) {
     let mut downlink = crate::vmnet_proto::Downlink::new(max_frame);
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; PROXY_RX_BUFFER_BYTES];
     let mut last_stats = Instant::now();
     let mut logged_disconnect = false;
+    let mut pending_frames: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut stop_after_pending = false;
     let fd = stream.as_raw_fd();
     let _ = File::create("/tmp/vmm-net.log");
     net_log("[net] vmnet-proxy rx thread started");
     while running.load(Ordering::Relaxed) {
-        let backlog_full = {
+        let (backlog_full, delivered) = {
             let mut inner = inner.lock().unwrap();
-            if !inner.rx_backlog.is_empty() {
+            if inner.backlog_len() != 0 {
                 inner.drain_rx_backlog();
             }
+            let mut delivered = 0;
+            while delivered < PROXY_RX_DELIVERY_BATCH {
+                let Some(packet) = pending_frames.front() else {
+                    break;
+                };
+                if !inner.receive_packet_after_backlog(packet) {
+                    break;
+                }
+                pending_frames.pop_front();
+                delivered += 1;
+            }
             inner.flush_deferred_interrupt();
-            inner.rx_backlog.len() >= 64
+            (inner.rx_saturated(), delivered)
         };
         if last_stats.elapsed() >= Duration::from_secs(1) {
             last_stats = Instant::now();
             let inner = inner.lock().unwrap();
             write_net_stats(&inner);
+        }
+        if !pending_frames.is_empty() {
+            if delivered == 0 {
+                thread::sleep(Duration::from_millis(1));
+            } else {
+                thread::yield_now();
+            }
+            continue;
+        }
+        if stop_after_pending {
+            break;
         }
         if backlog_full {
             thread::sleep(Duration::from_millis(1));
@@ -716,8 +831,19 @@ fn socket_rx_loop(
                 break;
             }
             Ok(n) => {
-                let mut stop = false;
-                for record in downlink.push(&buf[..n]) {
+                NET_STATS.proxy_rx_reads.fetch_add(1, Ordering::Relaxed);
+                NET_STATS
+                    .proxy_rx_bytes
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                let records = downlink.push(&buf[..n]);
+                let record_count = records.len() as u64;
+                NET_STATS
+                    .proxy_rx_records
+                    .fetch_add(record_count, Ordering::Relaxed);
+                NET_STATS
+                    .proxy_rx_max_records
+                    .fetch_max(record_count, Ordering::Relaxed);
+                for record in records {
                     match record {
                         crate::vmnet_proto::ClientRecord::Forward(frame) => {
                             if let Some(ip) = dhcp_guest_address(&frame, mac) {
@@ -729,26 +855,31 @@ fn socket_rx_loop(
                                     );
                                 }
                             }
-                            let mut inner = inner.lock().unwrap();
-                            inner.receive_packet(&frame);
-                            inner.flush_deferred_interrupt();
+                            pending_frames.push_back(frame);
                         }
                         crate::vmnet_proto::ClientRecord::Discard => {}
                         crate::vmnet_proto::ClientRecord::Close
                         | crate::vmnet_proto::ClientRecord::Spoof => {
                             log_proxy_disconnect(&mut logged_disconnect);
-                            stop = true;
+                            stop_after_pending = true;
                             break;
                         }
                     }
                 }
-                if stop {
-                    break;
-                }
+                NET_STATS
+                    .proxy_rx_pending_max
+                    .fetch_max(pending_frames.len() as u64, Ordering::Relaxed);
             }
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::Interrupted => {}
+                    || err.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    NET_STATS
+                        .proxy_rx_would_block
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
             Err(_) => {
                 log_proxy_disconnect(&mut logged_disconnect);
                 break;
@@ -810,18 +941,15 @@ impl NetBackend for UserMockBackend {
 
 pub struct VirtioNetInner {
     mac: [u8; 6],
-    status: u32,
-    device_features_sel: u32,
-    driver_features_sel: u32,
-    driver_features: u64,
-    rx_queue: VirtQueue,
-    tx_queue: VirtQueue,
-    queue_sel: u32,
-    interrupt_status: u32,
-    irq_num: u32,
+    transport: MmioTransport,
     mem: Arc<GuestMemory>,
     backend: Arc<Mutex<Box<dyn NetBackend>>>,
-    rx_backlog: VecDeque<Vec<u8>>,
+    rx_backlogs: Vec<VecDeque<Vec<u8>>>,
+    max_pairs: u32,
+    /// Pairs the guest has enabled. Pair 0 is the only active pair until
+    /// VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET succeeds.
+    active_pairs: u32,
+    rx_cursor: usize,
     /// GIC SPI line currently driven high.
     irq_asserted: bool,
     /// Used-buffer event arrived while the SPI was already high. Re-raise after ACK.
@@ -837,28 +965,32 @@ impl VirtioNetInner {
         mem: Arc<GuestMemory>,
         backend: Box<dyn NetBackend>,
     ) -> Self {
+        Self::with_pairs(mac, irq_num, mem, backend, 1)
+    }
+
+    pub fn with_pairs(
+        mac: [u8; 6],
+        irq_num: u32,
+        mem: Arc<GuestMemory>,
+        backend: Box<dyn NetBackend>,
+        pairs: u32,
+    ) -> Self {
+        let pairs = pairs.clamp(1, NET_MAX_PAIRS);
+        let mut offered = NET_OFFERED;
+        let mut sizes = vec![NET_QUEUE_MAX; pairs as usize * 2];
+        if pairs > 1 {
+            offered |= VIRTIO_NET_F_CTRL_VQ | VIRTIO_NET_F_MQ;
+            sizes.push(NET_CTRL_QUEUE_MAX);
+        }
         Self {
             mac,
-            status: 0,
-            device_features_sel: 0,
-            driver_features_sel: 0,
-            driver_features: 0,
-            rx_queue: VirtQueue {
-                max_size: 1024,
-                size: 1024,
-                ..Default::default()
-            },
-            tx_queue: VirtQueue {
-                max_size: 1024,
-                size: 1024,
-                ..Default::default()
-            },
-            queue_sel: 0,
-            interrupt_status: 0,
-            irq_num,
+            transport: MmioTransport::new(VIRTIO_DEV_NET, offered, &sizes, irq_num),
             mem,
             backend: Arc::new(Mutex::new(backend)),
-            rx_backlog: VecDeque::new(),
+            rx_backlogs: (0..pairs).map(|_| VecDeque::new()).collect(),
+            max_pairs: pairs,
+            active_pairs: 1,
+            rx_cursor: 0,
             irq_asserted: false,
             irq_pending_after_ack: false,
             last_ack: std::time::Instant::now()
@@ -867,27 +999,68 @@ impl VirtioNetInner {
         }
     }
 
-    fn reset(&mut self) {
-        self.status = 0;
-        self.device_features_sel = 0;
-        self.driver_features_sel = 0;
-        self.driver_features = 0;
-        self.queue_sel = 0;
-        for queue in [&mut self.rx_queue, &mut self.tx_queue] {
-            *queue = VirtQueue {
-                max_size: 1024,
-                size: 1024,
-                ..Default::default()
-            };
+    fn config_byte(&self, index: usize) -> u8 {
+        match index {
+            0..=5 => self.mac[index],
+            6 => VIRTIO_NET_S_LINK_UP as u8,
+            8 if self.max_pairs > 1 => self.max_pairs as u8,
+            9 if self.max_pairs > 1 => (self.max_pairs >> 8) as u8,
+            _ => 0,
         }
-        self.rx_backlog.clear();
-        self.interrupt_status = 0;
+    }
+
+    fn ctrl_index(&self) -> Option<u32> {
+        (self.max_pairs > 1).then_some(self.max_pairs * 2)
+    }
+
+    fn pair_active(&self, queue: u32) -> bool {
+        queue < self.max_pairs * 2 && queue / 2 < self.active_pairs
+    }
+
+    fn backlog_len(&self) -> usize {
+        self.rx_backlogs.iter().map(VecDeque::len).sum()
+    }
+
+    fn rx_saturated(&self) -> bool {
+        let active = self.active_pairs as usize;
+        active > 0 && self.rx_backlogs.iter().take(active).all(|q| q.len() >= 64)
+    }
+
+    fn clear_runtime(&mut self) {
+        for queue in &mut self.rx_backlogs {
+            queue.clear();
+        }
+        self.active_pairs = 1;
+        self.rx_cursor = 0;
         self.irq_asserted = false;
         self.irq_pending_after_ack = false;
     }
 
+    fn reset(&mut self) {
+        let _ = self.transport.write(VIRTIO_MMIO_STATUS, 0);
+        self.clear_runtime();
+    }
+
+    fn note_completion(&mut self, bytes: u64) {
+        let diag = self.transport.diagnostics_mut();
+        diag.completions = diag.completions.saturating_add(1);
+        diag.bytes = diag.bytes.saturating_add(bytes);
+    }
+
+    fn push_backlog(&mut self, pair: usize, packet: &[u8]) -> bool {
+        let Some(queue) = self.rx_backlogs.get_mut(pair) else {
+            return false;
+        };
+        if queue.len() < 64 {
+            queue.push_back(packet.to_vec());
+            true
+        } else {
+            false
+        }
+    }
+
     fn notify_used(&mut self, avail_ring: u64) {
-        self.interrupt_status |= 1;
+        self.transport.set_interrupt_bit(1);
         std::sync::atomic::fence(Ordering::SeqCst);
         // QEMU virtio_split_should_notify: do not interrupt while the driver
         // has VRING_AVAIL_F_NO_INTERRUPT set (it will poll used.idx).
@@ -903,7 +1076,8 @@ impl VirtioNetInner {
     }
 
     fn irq_needs_raise(&self) -> bool {
-        !self.irq_asserted && ((self.interrupt_status & 1) != 0 || self.irq_pending_after_ack)
+        !self.irq_asserted
+            && ((self.transport.interrupt_status() & 1) != 0 || self.irq_pending_after_ack)
     }
 
     fn raise_irq(&mut self) {
@@ -912,10 +1086,10 @@ impl VirtioNetInner {
         }
         self.irq_asserted = true;
         self.irq_pending_after_ack = false;
-        self.interrupt_status |= 1;
+        self.transport.set_interrupt_bit(1);
         NET_STATS.irq_raise.fetch_add(1, Ordering::Relaxed);
         unsafe {
-            crate::hypervisor::hv_gic_set_spi(self.irq_num, true);
+            crate::hypervisor::hv_gic_set_spi(self.transport.irq(), true);
         }
         crate::vcpu::kick_vcpu();
     }
@@ -929,19 +1103,19 @@ impl VirtioNetInner {
 
     fn handle_interrupt_ack(&mut self, data: u32) {
         NET_STATS.irq_ack.fetch_add(1, Ordering::Relaxed);
-        self.interrupt_status &= !data;
+        // One clear. A deferred used-buffer event puts the bit back so the
+        // guest observes it, and the RX worker re-raises the line later.
+        let _ = self.transport.write(VIRTIO_MMIO_INTERRUPT_ACK, data as u64);
         self.last_ack = std::time::Instant::now();
         if self.irq_asserted {
             self.irq_asserted = false;
             unsafe {
-                crate::hypervisor::hv_gic_set_spi(self.irq_num, false);
+                crate::hypervisor::hv_gic_set_spi(self.transport.irq(), false);
             }
         }
         if self.irq_pending_after_ack {
-            self.interrupt_status |= 1;
+            self.transport.set_interrupt_bit(1);
         }
-        // QEMU virtio_mmio ACK only clears ISR then update_irq. Re-raise
-        // from the RX worker if used buffers were added during the ISR.
     }
 
     /// Raise a deferred used-buffer IRQ once the ACK holdoff has expired.
@@ -949,55 +1123,68 @@ impl VirtioNetInner {
         self.try_assert_irq();
     }
 
+    fn rx_ready(&self, queue_index: usize) -> bool {
+        self.transport.operational()
+            && self.pair_active(queue_index as u32)
+            && self
+                .transport
+                .queue(queue_index)
+                .is_some_and(|q| q.ready && q.avail_ring != 0 && q.desc_table != 0 && q.size != 0)
+    }
+
     /// Receives an Ethernet frame from the network backend and delivers it into the guest RX queue.
     pub fn receive_packet(&mut self, packet: &[u8]) {
         self.drain_rx_backlog();
-
-        if !self.rx_queue.ready || self.rx_queue.avail_ring == 0 || self.rx_queue.desc_table == 0 {
-            if self.rx_backlog.len() < 64 {
-                self.rx_backlog.push_back(packet.to_vec());
-            } else {
-                NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
-            }
-            return;
-        }
-
-        if !self.rx_backlog.is_empty() || !self.deliver_to_rx_queue(packet) {
-            // Buffer in backlog if queue was full or prior backlog exists (preserve in-order delivery)
-            if self.rx_backlog.len() < 64 {
-                self.rx_backlog.push_back(packet.to_vec());
-            } else {
-                NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
-            }
+        if !self.receive_packet_after_backlog(packet) {
+            NET_STATS.rx_drop.fetch_add(1, Ordering::Relaxed);
+            let drops = &mut self.transport.diagnostics_mut().drops;
+            *drops = drops.saturating_add(1);
         }
     }
 
-    fn deliver_to_rx_queue(&mut self, packet: &[u8]) -> bool {
-        let q_size = self.rx_queue.size;
-        if q_size == 0 {
+    fn receive_packet_after_backlog(&mut self, packet: &[u8]) -> bool {
+        let pair = flow_pair(packet, self.active_pairs);
+        if !self.rx_ready(pair * 2) {
+            return self.push_backlog(pair, packet);
+        }
+        if !self.rx_backlogs[pair].is_empty() || !self.deliver_to_rx_queue(pair * 2, packet) {
+            return self.push_backlog(pair, packet);
+        }
+        true
+    }
+
+    fn deliver_to_rx_queue(&mut self, queue_index: usize, packet: &[u8]) -> bool {
+        if !self.rx_ready(queue_index) {
             return false;
         }
-
-        match self.rx_queue.pending_count(&self.mem) {
+        let Some(mut queue) = self.transport.queue(queue_index).copied() else {
+            return false;
+        };
+        if !queue.ready || queue.avail_ring == 0 || queue.desc_table == 0 || queue.size == 0 {
+            return false;
+        }
+        match queue.pending_count(&self.mem) {
             Ok(0) => {
                 NET_STATS.rx_nomem.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             Ok(_) => {}
             Err(_) => {
-                self.status |= VIRTIO_STATUS_NEEDS_RESET;
-                self.rx_queue.ready = false;
+                self.transport.set_needs_reset();
                 return false;
             }
         }
-        let ring_elem_offset = self.rx_queue.avail_ring
-            + 4
-            + 2 * (self.rx_queue.last_avail_idx as u64 % q_size as u64);
-        let head_desc = self.mem.read_u16(ring_elem_offset).unwrap();
-        let buffers = match self
-            .rx_queue
-            .descriptors(&self.mem, head_desc, false, 65536)
-        {
+        let ring_elem_offset =
+            queue.avail_ring + 4 + 2 * (queue.last_avail_idx as u64 % queue.size as u64);
+        let head_desc = match self.mem.read_u16(ring_elem_offset) {
+            Ok(head) => head,
+            Err(_) => {
+                self.transport.set_needs_reset();
+                return false;
+            }
+        };
+        let indirect = self.transport.negotiated(VIRTIO_RING_F_INDIRECT_DESC);
+        let buffers = match queue.descriptors(&self.mem, head_desc, indirect, NET_FRAME_BYTES) {
             Ok(d)
                 if d.iter().all(|d| d.flags & VRING_DESC_F_WRITE != 0)
                     && d.iter().map(|d| d.len as usize).sum::<usize>()
@@ -1006,139 +1193,274 @@ impl VirtioNetInner {
                 d
             }
             _ => {
-                self.status |= VIRTIO_STATUS_NEEDS_RESET;
-                self.rx_queue.ready = false;
+                self.transport.set_needs_reset();
                 return false;
             }
         };
 
-        // Construct VirtIO Modern Net Header (12 bytes, all zeros for standard packet)
         let hdr = [0u8; VIRTIO_NET_HDR_SIZE];
-        let mut total_written = 0usize;
-        let total_packet_bytes = hdr.len() + packet.len();
-
-        let mut data_to_write = Vec::with_capacity(total_packet_bytes);
+        let mut data_to_write = Vec::with_capacity(hdr.len() + packet.len());
         data_to_write.extend_from_slice(&hdr);
         data_to_write.extend_from_slice(packet);
 
         let mut src_offset = 0;
-        for desc in buffers {
-            let (buf_addr, buf_len) = (desc.addr, desc.len);
+        let mut total_written = 0usize;
+        for desc in &buffers {
             if src_offset >= data_to_write.len() {
                 break;
             }
-            let to_write = (buf_len as usize).min(data_to_write.len() - src_offset);
+            let to_write = (desc.len as usize).min(data_to_write.len() - src_offset);
             if self
                 .mem
-                .write(buf_addr, &data_to_write[src_offset..src_offset + to_write])
+                .write(desc.addr, &data_to_write[src_offset..src_offset + to_write])
                 .is_err()
             {
-                self.status |= VIRTIO_STATUS_NEEDS_RESET;
+                self.transport.set_needs_reset();
                 return false;
             }
             src_offset += to_write;
             total_written += to_write;
         }
 
-        publish_used(
-            &self.mem,
-            &mut self.rx_queue,
-            head_desc,
-            total_written as u32,
-        );
-        self.rx_queue.last_avail_idx = self.rx_queue.last_avail_idx.wrapping_add(1);
-
+        publish_used(&self.mem, &mut queue, head_desc, total_written as u32);
+        queue.last_avail_idx = queue.last_avail_idx.wrapping_add(1);
+        if let Some(slot) = self.transport.queue_mut(queue_index) {
+            *slot = queue;
+        }
         NET_STATS.rx_pkts.fetch_add(1, Ordering::Relaxed);
         NET_STATS
             .rx_bytes
             .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        self.notify_used(self.rx_queue.avail_ring);
+        self.note_completion(packet.len() as u64);
+        let avail = queue.avail_ring;
+        self.notify_used(avail);
         true
     }
 
     fn drain_rx_backlog(&mut self) {
-        if !self.rx_queue.ready || self.rx_queue.avail_ring == 0 || self.rx_queue.desc_table == 0 {
+        let active = self.active_pairs as usize;
+        if active == 0 {
             return;
         }
-        while let Some(pkt) = self.rx_backlog.pop_front() {
-            if !self.deliver_to_rx_queue(&pkt) {
-                self.rx_backlog.push_front(pkt);
+        loop {
+            let mut progress = false;
+            for step in 0..active {
+                let pair = (self.rx_cursor + step) % active;
+                if self.rx_backlogs[pair].is_empty() || !self.rx_ready(pair * 2) {
+                    continue;
+                }
+                let packet = self.rx_backlogs[pair].pop_front().unwrap();
+                if self.deliver_to_rx_queue(pair * 2, &packet) {
+                    progress = true;
+                } else {
+                    self.rx_backlogs[pair].push_front(packet);
+                }
+            }
+            self.rx_cursor = (self.rx_cursor + 1) % active;
+            if !progress {
                 break;
             }
         }
     }
 
-    fn process_tx(&mut self) -> Vec<Vec<u8>> {
-        let mut to_send = Vec::new();
-        if !self.tx_queue.ready || self.tx_queue.avail_ring == 0 || self.tx_queue.desc_table == 0 {
-            return to_send;
+    fn on_queue_notify(&mut self, queue: u32) -> Option<Vec<Vec<u8>>> {
+        if self.ctrl_index() == Some(queue) {
+            self.process_ctrl();
+            return None;
         }
-
-        let q_size = self.tx_queue.size;
-        if q_size == 0 {
-            return to_send;
+        if !self.pair_active(queue) {
+            return None;
         }
+        if queue % 2 == 0 {
+            self.drain_rx_backlog();
+            self.flush_deferred_interrupt();
+            None
+        } else {
+            NET_STATS.tx_notify.fetch_add(1, Ordering::Relaxed);
+            Some(self.process_tx(queue as usize))
+        }
+    }
 
-        let count = match self.tx_queue.pending_count(&self.mem) {
+    fn process_ctrl(&mut self) {
+        let Some(index) = self.ctrl_index() else {
+            return;
+        };
+        if !self.transport.operational() || !self.transport.negotiated(VIRTIO_NET_F_CTRL_VQ) {
+            return;
+        }
+        let Some(mut queue) = self.transport.queue(index as usize).copied() else {
+            return;
+        };
+        if !queue.ready || queue.avail_ring == 0 || queue.desc_table == 0 || queue.size == 0 {
+            return;
+        }
+        let count = match queue.pending_count(&self.mem) {
             Ok(n) => n,
             Err(_) => {
-                self.status |= VIRTIO_STATUS_NEEDS_RESET;
-                return to_send;
+                self.transport.set_needs_reset();
+                return;
             }
         };
-        let mut curr_idx = self.tx_queue.last_avail_idx;
+        let indirect = self.transport.negotiated(VIRTIO_RING_F_INDIRECT_DESC);
+        let mut curr_idx = queue.last_avail_idx;
         let mut processed_any = false;
-
         for _ in 0..count {
-            let ring_elem_offset =
-                self.tx_queue.avail_ring + 4 + 2 * (curr_idx as u64 % q_size as u64);
-            let head_desc = match self.mem.read_u16(ring_elem_offset) {
-                Ok(h) => h,
-                Err(_) => break,
-            };
-
-            let descriptors = match self
-                .tx_queue
-                .descriptors(&self.mem, head_desc, false, 65536)
-            {
-                Ok(d) if d.iter().all(|d| d.flags & VRING_DESC_F_WRITE == 0) => d,
-                _ => {
-                    self.status |= VIRTIO_STATUS_NEEDS_RESET;
+            let ring_elem_offset = queue.avail_ring + 4 + 2 * (curr_idx as u64 % queue.size as u64);
+            let head = match self.mem.read_u16(ring_elem_offset) {
+                Ok(head) => head,
+                Err(_) => {
+                    self.transport.set_needs_reset();
                     break;
                 }
             };
+            let descriptors = match queue.descriptors(&self.mem, head, indirect, 256) {
+                Ok(d)
+                    if d.len() >= 2
+                        && d.last()
+                            .is_some_and(|d| d.flags & VRING_DESC_F_WRITE != 0 && d.len >= 1) =>
+                {
+                    d
+                }
+                _ => {
+                    self.transport.set_needs_reset();
+                    break;
+                }
+            };
+            let status_at = descriptors.len() - 1;
+            if descriptors[..status_at]
+                .iter()
+                .any(|d| d.flags & VRING_DESC_F_WRITE != 0)
+            {
+                self.transport.set_needs_reset();
+                break;
+            }
+            let mut data = Vec::new();
+            let mut read_ok = true;
+            for desc in &descriptors[..status_at] {
+                let start = data.len();
+                data.resize(start + desc.len as usize, 0);
+                if self.mem.read(desc.addr, &mut data[start..]).is_err() {
+                    self.transport.set_needs_reset();
+                    read_ok = false;
+                    break;
+                }
+            }
+            if !read_ok {
+                break;
+            }
+            let status = self.ctrl_command(&data);
+            if self
+                .mem
+                .write(descriptors[status_at].addr, &[status])
+                .is_err()
+            {
+                self.transport.set_needs_reset();
+                break;
+            }
+            publish_used(&self.mem, &mut queue, head, 1);
+            curr_idx = curr_idx.wrapping_add(1);
+            processed_any = true;
+        }
+        queue.last_avail_idx = curr_idx;
+        let avail = queue.avail_ring;
+        if let Some(slot) = self.transport.queue_mut(index as usize) {
+            *slot = queue;
+        }
+        if processed_any {
+            self.notify_used(avail);
+        }
+    }
+
+    fn ctrl_command(&mut self, data: &[u8]) -> u8 {
+        if data.first() == Some(&VIRTIO_NET_CTRL_MQ)
+            && data.get(1) == Some(&VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET)
+        {
+            if !self.transport.negotiated(VIRTIO_NET_F_MQ) || data.len() < 4 {
+                return VIRTIO_NET_ERR;
+            }
+            let pairs = u16::from_le_bytes([data[2], data[3]]) as u32;
+            if pairs == 0 || pairs > self.max_pairs {
+                return VIRTIO_NET_ERR;
+            }
+            self.active_pairs = pairs;
+            return VIRTIO_NET_OK;
+        }
+        VIRTIO_NET_ERR
+    }
+
+    fn process_tx(&mut self, queue_index: usize) -> Vec<Vec<u8>> {
+        let mut to_send = Vec::new();
+        if !self.transport.operational() || !self.pair_active(queue_index as u32) {
+            return to_send;
+        }
+        let Some(mut queue) = self.transport.queue(queue_index).copied() else {
+            return to_send;
+        };
+        if !queue.ready || queue.avail_ring == 0 || queue.desc_table == 0 || queue.size == 0 {
+            return to_send;
+        }
+        let count = match queue.pending_count(&self.mem) {
+            Ok(n) => n,
+            Err(_) => {
+                self.transport.set_needs_reset();
+                return to_send;
+            }
+        };
+        let indirect = self.transport.negotiated(VIRTIO_RING_F_INDIRECT_DESC);
+        let mut curr_idx = queue.last_avail_idx;
+        let mut processed_any = false;
+        for _ in 0..count {
+            let ring_elem_offset = queue.avail_ring + 4 + 2 * (curr_idx as u64 % queue.size as u64);
+            let head_desc = match self.mem.read_u16(ring_elem_offset) {
+                Ok(head) => head,
+                Err(_) => {
+                    self.transport.set_needs_reset();
+                    break;
+                }
+            };
+            let descriptors =
+                match queue.descriptors(&self.mem, head_desc, indirect, NET_FRAME_BYTES) {
+                    Ok(d) if d.iter().all(|d| d.flags & VRING_DESC_F_WRITE == 0) => d,
+                    _ => {
+                        self.transport.set_needs_reset();
+                        break;
+                    }
+                };
             let mut full_data = vec![0; descriptors.iter().map(|d| d.len as usize).sum()];
             let mut offset = 0;
-            for d in descriptors {
+            let mut read_ok = true;
+            for d in &descriptors {
                 let end = offset + d.len as usize;
                 if self.mem.read(d.addr, &mut full_data[offset..end]).is_err() {
-                    self.status |= VIRTIO_STATUS_NEEDS_RESET;
-                    return to_send;
+                    self.transport.set_needs_reset();
+                    read_ok = false;
+                    break;
                 }
                 offset = end;
             }
-
-            // Strip 12-byte VirtIO Net header and transmit payload after dropping
-            // the device lock, so RX/ACK MMIO is not blocked on vmnet_write.
+            if !read_ok {
+                break;
+            }
             if full_data.len() > VIRTIO_NET_HDR_SIZE {
                 let payload = &full_data[VIRTIO_NET_HDR_SIZE..];
                 NET_STATS.tx_pkts.fetch_add(1, Ordering::Relaxed);
                 NET_STATS
                     .tx_bytes
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                self.note_completion(payload.len() as u64);
                 to_send.push(payload.to_vec());
             }
-
-            publish_used(&self.mem, &mut self.tx_queue, head_desc, 0);
-
+            publish_used(&self.mem, &mut queue, head_desc, 0);
             curr_idx = curr_idx.wrapping_add(1);
             processed_any = true;
         }
-
-        self.tx_queue.last_avail_idx = curr_idx;
-
+        queue.last_avail_idx = curr_idx;
+        let avail = queue.avail_ring;
+        if let Some(slot) = self.transport.queue_mut(queue_index) {
+            *slot = queue;
+        }
         if processed_any {
-            self.notify_used(self.tx_queue.avail_ring);
+            self.notify_used(avail);
         }
         to_send
     }
@@ -1229,6 +1551,17 @@ impl VirtioNet {
         backend_choice: &str,
         vmnet_socket: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::with_queue_pairs(mac, irq_num, mem, backend_choice, vmnet_socket, 1)
+    }
+
+    pub fn with_queue_pairs(
+        mac: [u8; 6],
+        irq_num: u32,
+        mem: Arc<GuestMemory>,
+        backend_choice: &str,
+        vmnet_socket: Option<&Path>,
+        queue_pairs: u32,
+    ) -> Result<Self, String> {
         let (backend, vmnet_iface, socket_rx) = match backend_choice {
             s if s == "bridge"
                 || s.starts_with("bridge:")
@@ -1250,7 +1583,11 @@ impl VirtioNet {
                 match VmnetBackend::new_bridged(&host_if) {
                     Ok(b) => {
                         let iface = b.interface;
-                        (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)), None)
+                        (
+                            Box::new(b) as Box<dyn NetBackend>,
+                            Some(SendPtr(iface)),
+                            None,
+                        )
                     }
                     Err(e) => return Err(bridge_start_failure(&host_if, &e)),
                 }
@@ -1268,10 +1605,7 @@ impl VirtioNet {
                 };
                 match SocketBackend::connect(&path, mac) {
                     Ok((backend, rx, max_frame)) => {
-                        println!(
-                            "[VirtIO-Net] vmnet-proxy connected to {}",
-                            path.display()
-                        );
+                        println!("[VirtIO-Net] vmnet-proxy connected to {}", path.display());
                         (
                             Box::new(backend) as Box<dyn NetBackend>,
                             None,
@@ -1284,7 +1618,11 @@ impl VirtioNet {
             "vmnet" => match VmnetBackend::new() {
                 Ok(b) => {
                     let iface = b.interface;
-                    (Box::new(b) as Box<dyn NetBackend>, Some(SendPtr(iface)), None)
+                    (
+                        Box::new(b) as Box<dyn NetBackend>,
+                        Some(SendPtr(iface)),
+                        None,
+                    )
                 }
                 Err(e) => {
                     return Err(format!(
@@ -1318,7 +1656,13 @@ impl VirtioNet {
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], irq_num
         );
 
-        let inner = Arc::new(Mutex::new(VirtioNetInner::new(mac, irq_num, mem, backend)));
+        let inner = Arc::new(Mutex::new(VirtioNetInner::with_pairs(
+            mac,
+            irq_num,
+            mem,
+            backend,
+            queue_pairs,
+        )));
         let running = Arc::new(AtomicBool::new(true));
         let guest_address = Arc::new(Mutex::new(None));
         let mut worker = None;
@@ -1341,7 +1685,7 @@ impl VirtioNet {
                         // we wait for the next packet, and TCP stalls at 0 Bps.
                         let defer_read = {
                             let mut inner = inner_clone.lock().unwrap();
-                            if !inner.rx_backlog.is_empty() {
+                            if inner.backlog_len() != 0 {
                                 inner.drain_rx_backlog();
                             }
                             inner.flush_deferred_interrupt();
@@ -1474,38 +1818,341 @@ fn dhcp_guest_address(packet: &[u8], mac: [u8; 6]) -> Option<std::net::Ipv4Addr>
 mod backend_tests {
     use super::*;
 
+    fn accept_features(inner: &mut VirtioNetInner, low: u64) {
+        inner.transport.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+        inner.transport.write(VIRTIO_MMIO_DRIVER_FEATURES, low);
+        inner.transport.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        inner.transport.write(VIRTIO_MMIO_DRIVER_FEATURES, 1);
+        let base =
+            (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK) as u64;
+        assert_eq!(
+            inner.transport.write(VIRTIO_MMIO_STATUS, base),
+            WriteEffect::None
+        );
+        assert_ne!(inner.transport.status() & VIRTIO_STATUS_FEATURES_OK, 0);
+        inner
+            .transport
+            .write(VIRTIO_MMIO_STATUS, base | VIRTIO_STATUS_DRIVER_OK as u64);
+        assert!(inner.transport.operational());
+    }
+
+    fn program_queue(inner: &mut VirtioNetInner, index: u32, desc: u64, avail: u64, used: u64) {
+        inner.transport.write(VIRTIO_MMIO_QUEUE_SEL, index as u64);
+        inner.transport.write(VIRTIO_MMIO_QUEUE_NUM, 8);
+        assert_eq!(inner.transport.read(VIRTIO_MMIO_QUEUE_NUM), 8);
+        inner.transport.write(VIRTIO_MMIO_QUEUE_DESC_LOW, desc);
+        inner
+            .transport
+            .write(VIRTIO_MMIO_QUEUE_DESC_HIGH, desc >> 32);
+        inner.transport.write(VIRTIO_MMIO_QUEUE_DRIVER_LOW, avail);
+        inner
+            .transport
+            .write(VIRTIO_MMIO_QUEUE_DRIVER_HIGH, avail >> 32);
+        inner.transport.write(VIRTIO_MMIO_QUEUE_DEVICE_LOW, used);
+        inner
+            .transport
+            .write(VIRTIO_MMIO_QUEUE_DEVICE_HIGH, used >> 32);
+        assert_eq!(
+            inner.transport.write(VIRTIO_MMIO_QUEUE_READY, 1),
+            WriteEffect::QueueReady { queue: index }
+        );
+    }
+
+    fn write_desc(mem: &GuestMemory, at: u64, addr: u64, len: u32, flags: u16, next: u16) {
+        mem.write(at, &addr.to_le_bytes()).unwrap();
+        mem.write(at + 8, &len.to_le_bytes()).unwrap();
+        mem.write_u16(at + 12, flags).unwrap();
+        mem.write_u16(at + 14, next).unwrap();
+    }
+
+    fn arm_avail(mem: &GuestMemory, avail: u64) {
+        mem.write_u16(avail, VRING_AVAIL_F_NO_INTERRUPT).unwrap();
+        mem.write_u16(avail + 2, 1).unwrap();
+        mem.write_u16(avail + 4, 0).unwrap();
+    }
+
     #[test]
     fn reset_discards_firmware_queues_before_os_reinitializes_them() {
         let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
         let mut inner = VirtioNetInner::new([0; 6], 35, memory, Box::new(UserMockBackend::new()));
-        inner.status = VIRTIO_STATUS_DRIVER_OK;
-        inner.driver_features = VIRTIO_F_VERSION_1_BIT;
-        inner.rx_queue.ready = true;
-        inner.rx_queue.last_avail_idx = 4;
-        inner.rx_queue.used_idx = 4;
-        inner.tx_queue.ready = true;
-        inner.tx_queue.last_avail_idx = 2;
-        inner.tx_queue.used_idx = 2;
-        inner.interrupt_status = 1;
+        accept_features(
+            &mut inner,
+            VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_RING_F_INDIRECT_DESC,
+        );
+        for (index, last) in [(0u32, 4u16), (1, 2u16)] {
+            let queue = inner.transport.queue_mut(index as usize).unwrap();
+            queue.ready = true;
+            queue.last_avail_idx = last;
+            queue.used_idx = last;
+            queue.desc_table = 0x1000;
+            queue.avail_ring = 0x2000;
+            queue.used_ring = 0x3000;
+        }
+        inner.transport.set_interrupt_bit(1);
         inner.irq_asserted = true;
         inner.irq_pending_after_ack = true;
-        inner.rx_backlog.push_back(vec![1]);
+        inner.rx_backlogs[0].push_back(vec![1]);
 
         inner.reset();
 
-        assert_eq!(inner.status, 0);
-        assert_eq!(inner.driver_features, 0);
-        for queue in [inner.rx_queue, inner.tx_queue] {
+        assert_eq!(inner.transport.status(), 0);
+        assert_eq!(inner.transport.driver_features(), 0);
+        for index in [0, 1] {
+            let queue = inner.transport.queue(index).unwrap();
             assert!(!queue.ready);
             assert_eq!(queue.last_avail_idx, 0);
             assert_eq!(queue.used_idx, 0);
             assert_eq!(queue.avail_ring, 0);
             assert_eq!(queue.used_ring, 0);
+            assert_eq!(queue.desc_table, 0);
         }
-        assert_eq!(inner.interrupt_status, 0);
+        assert_eq!(inner.transport.interrupt_status(), 0);
         assert!(!inner.irq_asserted);
         assert!(!inner.irq_pending_after_ack);
-        assert!(inner.rx_backlog.is_empty());
+        assert!(inner.rx_backlogs.iter().all(|queue| queue.is_empty()));
+        assert_eq!(inner.active_pairs, 1);
+    }
+
+    #[test]
+    fn proxy_can_defer_when_the_device_backlog_is_full() {
+        let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let mut inner = VirtioNetInner::new([0; 6], 35, memory, Box::new(UserMockBackend::new()));
+        for _ in 0..64 {
+            assert!(inner.push_backlog(0, &[0; 14]));
+        }
+        let drops = inner.transport.diagnostics().drops;
+        assert!(!inner.receive_packet_after_backlog(&[0; 14]));
+        assert_eq!(inner.transport.diagnostics().drops, drops);
+
+        inner.receive_packet(&[0; 14]);
+        assert_eq!(inner.transport.diagnostics().drops, drops + 1);
+    }
+
+    #[test]
+    fn offers_indirect_and_rejects_illegal_queue_size() {
+        let memory = Arc::new(GuestMemory::new_test(0, 0x4000));
+        let mut dev = VirtioNet::new([0x52, 0x54, 0, 0, 0, 1], 35, memory, "mock", None).unwrap();
+        dev.write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0, 4);
+        assert_eq!(
+            dev.read(VIRTIO_MMIO_DEVICE_FEATURES, 4),
+            VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_RING_F_INDIRECT_DESC
+        );
+        dev.write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1, 4);
+        assert_eq!(dev.read(VIRTIO_MMIO_DEVICE_FEATURES, 4), 1);
+        dev.write(VIRTIO_MMIO_QUEUE_SEL, 0, 4);
+        assert_eq!(dev.read(VIRTIO_MMIO_QUEUE_NUM_MAX, 4), NET_QUEUE_MAX as u64);
+        dev.write(VIRTIO_MMIO_QUEUE_NUM, 3, 4);
+        assert_eq!(dev.read(VIRTIO_MMIO_QUEUE_NUM, 4), 0);
+        dev.write(VIRTIO_MMIO_QUEUE_NUM, 8, 4);
+        assert_eq!(dev.read(VIRTIO_MMIO_QUEUE_NUM, 4), 8);
+        dev.write(VIRTIO_MMIO_QUEUE_SEL, 2, 4);
+        assert_eq!(dev.read(VIRTIO_MMIO_QUEUE_NUM_MAX, 4), 0);
+        assert_eq!(dev.read(0x108, 2), 0);
+    }
+
+    #[test]
+    fn indirect_rx_and_tx_split_segments() {
+        let memory = Arc::new(GuestMemory::new_test(0, 0x8000));
+        let mut inner =
+            VirtioNetInner::new([0; 6], 35, memory.clone(), Box::new(UserMockBackend::new()));
+        accept_features(
+            &mut inner,
+            VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_RING_F_INDIRECT_DESC,
+        );
+        write_desc(
+            &memory,
+            0x2000,
+            0x3000,
+            12,
+            VRING_DESC_F_WRITE | VRING_DESC_F_NEXT,
+            1,
+        );
+        write_desc(&memory, 0x2010, 0x3100, 60, VRING_DESC_F_WRITE, 0);
+        write_desc(&memory, 0x1000, 0x2000, 32, VRING_DESC_F_INDIRECT, 0);
+        arm_avail(&memory, 0x1800);
+        program_queue(&mut inner, 0, 0x1000, 0x1800, 0x1900);
+        memory.write(0x3000, &[0xA5; 12]).unwrap();
+        memory.write(0x3100, &[0xA5; 8]).unwrap();
+        inner.receive_packet(&[9, 8, 7, 6]);
+        let mut hdr = [0u8; 12];
+        let mut payload = [0u8; 4];
+        memory.read(0x3000, &mut hdr).unwrap();
+        memory.read(0x3100, &mut payload).unwrap();
+        assert_eq!(hdr, [0; 12]);
+        assert_eq!(payload, [9, 8, 7, 6]);
+        assert_eq!(memory.read_u16(0x1902).unwrap(), 1);
+        assert_eq!(inner.transport.queue(0).unwrap().used_idx, 1);
+
+        memory.write(0x3200, &[0; 12]).unwrap();
+        memory.write(0x3300, &[1, 2, 3, 4]).unwrap();
+        write_desc(&memory, 0x2200, 0x3200, 12, VRING_DESC_F_NEXT, 1);
+        write_desc(&memory, 0x2210, 0x3300, 4, 0, 0);
+        write_desc(&memory, 0x1100, 0x2200, 32, VRING_DESC_F_INDIRECT, 0);
+        arm_avail(&memory, 0x1A00);
+        program_queue(&mut inner, 1, 0x1100, 0x1A00, 0x1B00);
+        assert_eq!(inner.process_tx(1), vec![vec![1, 2, 3, 4]]);
+        assert_eq!(inner.transport.queue(1).unwrap().used_idx, 1);
+        assert_eq!(inner.transport.status() & VIRTIO_STATUS_NEEDS_RESET, 0);
+    }
+
+    #[test]
+    fn unnegotiated_indirect_sets_needs_reset_without_writing_buffers() {
+        let memory = Arc::new(GuestMemory::new_test(0, 0x8000));
+        let mut inner =
+            VirtioNetInner::new([0; 6], 35, memory.clone(), Box::new(UserMockBackend::new()));
+        accept_features(&mut inner, VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
+        assert!(!inner.transport.negotiated(VIRTIO_RING_F_INDIRECT_DESC));
+        write_desc(
+            &memory,
+            0x2000,
+            0x3000,
+            12,
+            VRING_DESC_F_WRITE | VRING_DESC_F_NEXT,
+            1,
+        );
+        write_desc(&memory, 0x2010, 0x3100, 60, VRING_DESC_F_WRITE, 0);
+        write_desc(&memory, 0x1000, 0x2000, 32, VRING_DESC_F_INDIRECT, 0);
+        arm_avail(&memory, 0x1800);
+        program_queue(&mut inner, 0, 0x1000, 0x1800, 0x1900);
+        memory.write(0x3000, &[0xA5; 12]).unwrap();
+        memory.write(0x3100, &[0xA5; 8]).unwrap();
+        memory.write(0x1900, &[0x5A; 16]).unwrap();
+        inner.receive_packet(&[9, 8, 7, 6]);
+        let mut hdr = [0u8; 12];
+        let mut payload = [0u8; 8];
+        let mut used = [0u8; 16];
+        memory.read(0x3000, &mut hdr).unwrap();
+        memory.read(0x3100, &mut payload).unwrap();
+        memory.read(0x1900, &mut used).unwrap();
+        assert_eq!(hdr, [0xA5; 12]);
+        assert_eq!(payload, [0xA5; 8]);
+        assert_eq!(used, [0x5A; 16]);
+        assert_ne!(inner.transport.status() & VIRTIO_STATUS_NEEDS_RESET, 0);
+        assert_eq!(inner.transport.queue(0).unwrap().used_idx, 0);
+    }
+
+    fn udp_frame(dst_port: u16) -> Vec<u8> {
+        let mut frame = vec![0u8; 42];
+        frame[12] = 0x08;
+        frame[14] = 0x45;
+        frame[23] = 17;
+        frame[34] = 0;
+        frame[35] = 1;
+        frame[36] = (dst_port >> 8) as u8;
+        frame[37] = dst_port as u8;
+        frame[41] = dst_port as u8;
+        frame
+    }
+
+    #[test]
+    fn multiqueue_stays_on_pair_zero_until_vq_pairs_set() {
+        let memory = Arc::new(GuestMemory::new_test(0, 0x8000));
+        let mut inner = VirtioNetInner::with_pairs(
+            [0; 6],
+            35,
+            memory.clone(),
+            Box::new(UserMockBackend::new()),
+            2,
+        );
+        inner.transport.write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0);
+        let offered = inner.transport.read(VIRTIO_MMIO_DEVICE_FEATURES);
+        assert_eq!(offered & VIRTIO_NET_F_MQ, VIRTIO_NET_F_MQ);
+        assert_eq!(offered & VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_CTRL_VQ);
+        assert_eq!(inner.config_byte(8), 2);
+        assert_eq!(inner.config_byte(9), 0);
+        accept_features(
+            &mut inner,
+            VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_NET_F_CTRL_VQ | VIRTIO_NET_F_MQ,
+        );
+        write_desc(&memory, 0x1000, 0x3000, 128, VRING_DESC_F_WRITE, 0);
+        write_desc(&memory, 0x1010, 0x3080, 128, VRING_DESC_F_WRITE, 0);
+        write_desc(&memory, 0x1200, 0x3400, 128, VRING_DESC_F_WRITE, 0);
+        write_desc(&memory, 0x1210, 0x3480, 128, VRING_DESC_F_WRITE, 0);
+        memory
+            .write_u16(0x1800, VRING_AVAIL_F_NO_INTERRUPT)
+            .unwrap();
+        memory.write_u16(0x1802, 2).unwrap();
+        memory.write_u16(0x1804, 0).unwrap();
+        memory.write_u16(0x1806, 1).unwrap();
+        memory
+            .write_u16(0x1C00, VRING_AVAIL_F_NO_INTERRUPT)
+            .unwrap();
+        memory.write_u16(0x1C02, 2).unwrap();
+        memory.write_u16(0x1C04, 0).unwrap();
+        memory.write_u16(0x1C06, 1).unwrap();
+        program_queue(&mut inner, 0, 0x1000, 0x1800, 0x1900);
+        program_queue(&mut inner, 2, 0x1200, 0x1C00, 0x1D00);
+        assert!(inner.on_queue_notify(2).is_none());
+        assert_eq!(inner.transport.queue(2).unwrap().used_idx, 0);
+
+        let mut pair0 = None;
+        let mut pair1 = None;
+        for port in 1..300u16 {
+            let frame = udp_frame(port);
+            match flow_pair(&frame, 2) {
+                0 if pair0.is_none() => pair0 = Some(frame),
+                1 if pair1.is_none() => pair1 = Some(frame),
+                _ => {}
+            }
+        }
+        let pair0 = pair0.unwrap();
+        let pair1 = pair1.unwrap();
+        assert_eq!(flow_pair(&pair0, 2), 0);
+        assert_eq!(flow_hash(&pair0), flow_hash(&pair0));
+        inner.receive_packet(&pair1);
+        assert_eq!(inner.transport.queue(0).unwrap().used_idx, 1);
+        assert_eq!(inner.transport.queue(2).unwrap().used_idx, 0);
+        let mut got = [0u8; 1];
+        memory
+            .read(0x3000 + VIRTIO_NET_HDR_SIZE as u64 + 41, &mut got)
+            .unwrap();
+        assert_eq!(got[0], pair1[41]);
+
+        write_desc(&memory, 0x4000, 0x5000, 2, VRING_DESC_F_NEXT, 1);
+        write_desc(&memory, 0x4010, 0x5010, 2, VRING_DESC_F_NEXT, 2);
+        write_desc(&memory, 0x4020, 0x5020, 1, VRING_DESC_F_WRITE, 0);
+        write_desc(&memory, 0x4030, 0x6000, 16, VRING_DESC_F_INDIRECT, 0);
+        memory.write(0x6000, &[0xA5; 16]).unwrap();
+        memory
+            .write_u16(0x4800, VRING_AVAIL_F_NO_INTERRUPT)
+            .unwrap();
+        program_queue(&mut inner, 4, 0x4000, 0x4800, 0x4900);
+        for (nth, pairs, expect) in [
+            (1u16, 0u16, VIRTIO_NET_ERR),
+            (2, 3, VIRTIO_NET_ERR),
+            (3, 2, VIRTIO_NET_OK),
+        ] {
+            memory
+                .write(
+                    0x5000,
+                    &[VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET],
+                )
+                .unwrap();
+            memory.write(0x5010, &pairs.to_le_bytes()).unwrap();
+            memory.write(0x5020, &[0xFF]).unwrap();
+            memory.write_u16(0x4802, nth).unwrap();
+            memory.write_u16(0x4804 + 2 * (nth as u64 - 1), 0).unwrap();
+            inner.on_queue_notify(4);
+            let mut status = [0u8; 1];
+            memory.read(0x5020, &mut status).unwrap();
+            assert_eq!(status[0], expect, "pairs {pairs}");
+        }
+        assert_eq!(inner.active_pairs, 2);
+        inner.receive_packet(&pair0);
+        inner.receive_packet(&pair1);
+        assert_eq!(inner.transport.queue(0).unwrap().used_idx, 2);
+        assert_eq!(inner.transport.queue(2).unwrap().used_idx, 1);
+
+        memory.write_u16(0x4802, 4).unwrap();
+        memory.write_u16(0x4804 + 6, 3).unwrap();
+        inner.on_queue_notify(4);
+        assert_ne!(inner.transport.status() & VIRTIO_STATUS_NEEDS_RESET, 0);
+        let mut canary = [0u8; 16];
+        memory.read(0x6000, &mut canary).unwrap();
+        assert_eq!(canary, [0xA5; 16]);
+        inner.reset();
+        assert_eq!(inner.active_pairs, 1);
+        assert!(inner.rx_backlogs.iter().all(|queue| queue.is_empty()));
     }
 
     #[test]
@@ -1576,9 +2223,7 @@ mod backend_tests {
         packet[42..45].copy_from_slice(&[2, 1, 6]);
         packet[58..62].copy_from_slice(&[192, 168, 18, 20]);
         packet[70..76].copy_from_slice(&mac);
-        packet[278..292].copy_from_slice(&[
-            99, 130, 83, 99, 6, 4, 192, 168, 18, 1, 53, 1, 5, 255,
-        ]);
+        packet[278..292].copy_from_slice(&[99, 130, 83, 99, 6, 4, 192, 168, 18, 1, 53, 1, 5, 255]);
         patch_dhcp_response(&mut packet);
         assert_eq!(
             dhcp_guest_address(&packet, mac),
@@ -1618,196 +2263,64 @@ impl MmioDevice for VirtioNet {
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| "Network worker panicked")?;
         }
+        if let Ok(inner) = self.inner.lock() {
+            eprintln!("[VirtIO-Net] {}", inner.transport.diagnostics_line());
+        }
         Ok(())
     }
-    fn read(&mut self, offset: u64, _size: usize) -> u64 {
+    fn read(&mut self, offset: u64, size: usize) -> u64 {
         let inner = self.inner.lock().unwrap();
-        match offset {
-            VIRTIO_MMIO_MAGIC_VALUE => VIRTIO_MMIO_MAGIC as u64,
-            VIRTIO_MMIO_VERSION => VIRTIO_MMIO_VERSION_2 as u64,
-            VIRTIO_MMIO_DEVICE_ID => VIRTIO_DEV_NET as u64,
-            VIRTIO_MMIO_VENDOR_ID => VIRTIO_MMIO_VENDOR as u64,
-            VIRTIO_MMIO_DEVICE_FEATURES => {
-                if inner.device_features_sel == 0 {
-                    (VIRTIO_NET_F_MAC_BIT | VIRTIO_NET_F_STATUS_BIT) as u64
-                } else if inner.device_features_sel == 1 {
-                    (VIRTIO_F_VERSION_1_BIT >> 32) as u64
-                } else {
-                    0
-                }
+        if offset >= VIRTIO_MMIO_CONFIG {
+            let start = (offset - VIRTIO_MMIO_CONFIG) as usize;
+            let mut value = 0u64;
+            for byte in 0..size.min(8) {
+                value |= u64::from(inner.config_byte(start + byte)) << (byte * 8);
             }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => {
-                if inner.queue_sel < 2 {
-                    1024
-                } else {
-                    0
-                }
-            }
-            VIRTIO_MMIO_QUEUE_READY => {
-                let q = if inner.queue_sel == 0 {
-                    &inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &inner.tx_queue
-                } else {
-                    return 0;
-                };
-                if q.ready { 1 } else { 0 }
-            }
-            VIRTIO_MMIO_INTERRUPT_STATUS => inner.interrupt_status as u64,
-            VIRTIO_MMIO_STATUS => inner.status as u64,
-
-            // Config space: MAC address (0..6) + Link Status (6..8)
-            0x100..=0x105 => {
-                let idx = (offset - 0x100) as usize;
-                inner.mac[idx] as u64
-            }
-            0x106 => (VIRTIO_NET_S_LINK_UP_VAL & 0xff) as u64,
-            0x107 => ((VIRTIO_NET_S_LINK_UP_VAL >> 8) & 0xff) as u64,
-
-            _ => 0,
+            return value;
         }
+        inner.transport.read(offset)
     }
 
     fn write(&mut self, offset: u64, data: u64, _size: usize) {
         let mut inner = self.inner.lock().unwrap();
+        if offset == VIRTIO_MMIO_INTERRUPT_ACK {
+            inner.handle_interrupt_ack(data as u32);
+            return;
+        }
+        if offset >= VIRTIO_MMIO_CONFIG {
+            return;
+        }
+        let effect = inner.transport.write(offset, data);
+        if offset == VIRTIO_MMIO_STATUS && inner.transport.status() & VIRTIO_STATUS_FAILED != 0 {
+            eprintln!("[VirtIO-Net] Guest marked device as FAILED");
+        }
         let mut tx_packets: Option<Vec<Vec<u8>>> = None;
-        match offset {
-            VIRTIO_MMIO_DEVICE_FEATURES_SEL => {
-                inner.device_features_sel = data as u32;
+        let mut reset_irq = None;
+        match effect {
+            WriteEffect::Notify { queue } => {
+                tx_packets = inner.on_queue_notify(queue);
             }
-            VIRTIO_MMIO_DRIVER_FEATURES_SEL => {
-                inner.driver_features_sel = data as u32;
+            WriteEffect::QueueReady { queue } if queue % 2 == 0 => {
+                inner.drain_rx_backlog();
             }
-            VIRTIO_MMIO_DRIVER_FEATURES => {
-                if inner.driver_features_sel == 0 {
-                    inner.driver_features =
-                        (inner.driver_features & !0xffff_ffff) | (data & 0xffff_ffff);
-                } else if inner.driver_features_sel == 1 {
-                    inner.driver_features =
-                        (inner.driver_features & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-                }
+            WriteEffect::DriverOk => {
+                inner.drain_rx_backlog();
             }
-            VIRTIO_MMIO_QUEUE_SEL => {
-                inner.queue_sel = data as u32;
-            }
-            VIRTIO_MMIO_QUEUE_NUM => {
-                let q = if inner.queue_sel == 0 {
-                    &mut inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &mut inner.tx_queue
-                } else {
-                    return;
-                };
-                q.size = data as u32;
-            }
-            VIRTIO_MMIO_QUEUE_READY => {
-                let ready = data != 0;
-                let q = if inner.queue_sel == 0 {
-                    &mut inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &mut inner.tx_queue
-                } else {
-                    return;
-                };
-                q.ready = ready;
-                if inner.queue_sel == 0 && ready {
-                    inner.drain_rx_backlog();
-                }
-            }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                let q_idx = data as u32;
-                if q_idx == 0 {
-                    // Guest added RX buffers
-                    inner.drain_rx_backlog();
-                    inner.flush_deferred_interrupt();
-                } else if q_idx == 1 {
-                    // Guest queued packets to transmit
-                    NET_STATS.tx_notify.fetch_add(1, Ordering::Relaxed);
-                    tx_packets = Some(inner.process_tx());
-                }
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                inner.handle_interrupt_ack(data as u32);
-            }
-            VIRTIO_MMIO_STATUS => {
-                inner.status = data as u32;
-                if data == 0 {
-                    // UEFI may have used this NIC before handing it to the OS.
-                    // FreeBSD starts fresh rings at index zero after reset.
-                    inner.reset();
-                    *self.guest_address.lock().unwrap() = None;
-                    unsafe {
-                        crate::hypervisor::hv_gic_set_spi(inner.irq_num, false);
-                    }
-                } else if (inner.status & VIRTIO_STATUS_FAILED) != 0 {
-                    eprintln!("[VirtIO-Net] Guest marked device as FAILED");
-                }
-            }
-            VIRTIO_MMIO_QUEUE_DESC_LOW => {
-                let q = if inner.queue_sel == 0 {
-                    &mut inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &mut inner.tx_queue
-                } else {
-                    return;
-                };
-                q.desc_table = (q.desc_table & !0xffff_ffff) | (data & 0xffff_ffff);
-            }
-            VIRTIO_MMIO_QUEUE_DESC_HIGH => {
-                let q = if inner.queue_sel == 0 {
-                    &mut inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &mut inner.tx_queue
-                } else {
-                    return;
-                };
-                q.desc_table = (q.desc_table & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-            }
-            VIRTIO_MMIO_QUEUE_DRIVER_LOW => {
-                let q = if inner.queue_sel == 0 {
-                    &mut inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &mut inner.tx_queue
-                } else {
-                    return;
-                };
-                q.avail_ring = (q.avail_ring & !0xffff_ffff) | (data & 0xffff_ffff);
-            }
-            VIRTIO_MMIO_QUEUE_DRIVER_HIGH => {
-                let q = if inner.queue_sel == 0 {
-                    &mut inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &mut inner.tx_queue
-                } else {
-                    return;
-                };
-                q.avail_ring = (q.avail_ring & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
-            }
-            VIRTIO_MMIO_QUEUE_DEVICE_LOW => {
-                let q = if inner.queue_sel == 0 {
-                    &mut inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &mut inner.tx_queue
-                } else {
-                    return;
-                };
-                q.used_ring = (q.used_ring & !0xffff_ffff) | (data & 0xffff_ffff);
-            }
-            VIRTIO_MMIO_QUEUE_DEVICE_HIGH => {
-                let q = if inner.queue_sel == 0 {
-                    &mut inner.rx_queue
-                } else if inner.queue_sel == 1 {
-                    &mut inner.tx_queue
-                } else {
-                    return;
-                };
-                q.used_ring = (q.used_ring & 0xffff_ffff) | ((data & 0xffff_ffff) << 32);
+            WriteEffect::Reset => {
+                let irq = inner.transport.irq();
+                inner.clear_runtime();
+                reset_irq = Some(irq);
             }
             _ => {}
         }
-
         let backend = tx_packets.as_ref().map(|_| Arc::clone(&inner.backend));
         drop(inner);
+        if let Some(irq) = reset_irq {
+            *self.guest_address.lock().unwrap() = None;
+            unsafe {
+                crate::hypervisor::hv_gic_set_spi(irq, false);
+            }
+        }
         if let (Some(pkts), Some(backend)) = (tx_packets, backend) {
             let mut b = backend.lock().unwrap();
             for p in pkts {

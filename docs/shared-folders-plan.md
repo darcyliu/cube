@@ -2,10 +2,11 @@
 
 Date: 2026-09-25. Original design proposal.
 
-Implementation update: an initial FreeBSD 14.4 shared-folder implementation now
-exists. See [the runbook](shared-folders.md) for delivered behavior, verification
-and limitations. The analysis and milestones below record the original plan;
-not every hardening or performance milestone is complete.
+Implementation update: the FreeBSD 14.4 VirtIO-9P implementation and a separate
+read-only Linux virtio-fs implementation now exist. See
+[the runbook](shared-folders.md) for delivered behavior, verification and
+limitations. The analysis and milestones below record the original plan; not
+every hardening or performance milestone is complete.
 
 ## Recommendation and scope
 
@@ -26,7 +27,7 @@ that have been unlinked and changes in process privileges [2].
 | --- | --- | --- |
 | Hypervisor | `src/vm.rs`, `src/hypervisor/mod.rs` use Hypervisor.framework and explicit guest RAM mappings | Folder sharing needs a device and host filesystem service; it does not follow from mapping RAM. |
 | Device bus | `src/devices/mod.rs`: `MmioDevice`, per-device mutexes, registration and shutdown | A new device fits the existing dispatch path. Blocking filesystem work must leave the vCPU/MMIO handler promptly. |
-| VirtIO | `src/devices/virtio/mod.rs`: modern registers, split queues, bounded descriptor parsing, indirect descriptors, used-ring publication | Reuse queue validation; there is no general transport object that already implements every device's register state machine. |
+| VirtIO | `src/devices/virtio/transport.rs` provides the reusable modern-MMIO state machine; `src/devices/virtio/mod.rs` provides bounded split/indirect descriptor parsing and used-ring publication | New devices share feature negotiation, queue configuration, reset, interrupt, and descriptor-validation behavior. |
 | Storage | `src/devices/virtio/block.rs`: raw/COW sector backends | A directory cannot be passed to `--disk`; filesystem sharing requires file operations and metadata, not sectors. |
 | Discovery | `src/main.rs` builds a list consumed by `src/fdt.rs::generate_dtb` | Add one device and mount tag per share through the same device list for direct and UEFI boots. |
 | Async lifecycle | `src/devices/virtio/net.rs` has a worker and shutdown/join hooks; `src/main.rs` stops vCPUs before device shutdown | Reuse lifecycle patterns, with explicit protection against completions after queue reset. |
@@ -35,26 +36,19 @@ that have been unlinked and changes in process privileges [2].
 
 ### Prerequisite: device address and interrupt allocation
 
-Additional disks are assigned starting at `0x0a000800`, IRQ 39
-(`src/main.rs`, disk registration loop). Graphics registers keyboard and tablet
-devices at `0x0a000800`/IRQ 39 and `0x0a000a00`/IRQ 40. A fourth disk uses IRQ 41,
-also assigned to xHCI. The bus registers entries without overlap validation and
-dispatches the first matching address.
-
-These are static allocation conflicts visible in the source, not failures
-reproduced in a guest during this review. Before adding shares, introduce a
-single validated platform device layout. Reserve fixed platform ranges, allocate
-dynamic disks and shares from a separate bounded region, and validate MMIO
-overlaps and IRQ uniqueness before creating devices. Generate both bus
-registrations and FDT entries from that layout. Keep existing boot-device
-locations where possible; regression-test firmware boot with multiple disks.
+The original layout placed additional disks at addresses also used by graphics
+input and xHCI. That prerequisite is complete: `src/devices/layout.rs` now
+allocates optional disks, shares, balloon, vsock, and GPU devices from a bounded
+dynamic region while preserving the first boot disk. It validates address/IRQ
+uniqueness, and the same plan feeds MMIO registration and FDT generation. The
+MMIO bus also rejects overlapping registrations.
 
 ## Protocol choice and compatibility evidence
 
 | Approach | Assessment |
 | --- | --- |
 | VirtIO-9P | Recommended. Fits the present transport and works without a NIC. FreeBSD 14.4 added p9fs [1]; its driver uses `VIRTIO_DRIVER_MODULE`, which registers both MMIO and PCI [3,4]. |
-| Virtio-fs | Reassess for a later Linux/performance milestone. It uses a filesystem protocol based on FUSE [6]; this repository has no corresponding device/backend. A usable macOS backend and the exact FreeBSD guest release would need independent validation. |
+| Virtio-fs | Implemented as a read-only, non-DAX Linux transport using device ID 26, hiprio/request queues, a dedicated FUSE codec, and the same confined helper model. Debian 13 passed mount/read/coherence/write-rejection and sustained-read tests. The tested FreeBSD 15/16 media lack functional guest drivers, so FreeBSD remains on 9P. |
 | NFS/SMB | Candidate fallback if the guest compatibility spike fails. Requires a host server, export/identity configuration, and network reachability. Evaluate as a separate integration; do not add an NFS server implementation to this VMM. |
 | SSHFS | Possible separate workflow with a guest package and SSH service. Adds deployment and authentication requirements. |
 | Shared disk image | Unsuitable for a live host directory. Existing image locks and COW behavior serve a different storage model. |
@@ -65,13 +59,14 @@ including `Tcreate`. Supporting only a Linux-oriented list of `.L` operations
 could leave FreeBSD writes broken. The source supports the choice of transport;
 it is not proof that the release media boots and mounts successfully here.
 
-## Proposed interface
+## Delivered interface
 
-New flags, **not currently implemented**:
+9P remains the default; virtio-fs is selected explicitly and is read-only:
 
 ```sh
 cube <existing boot options> --share work ~/Dev/project
 cube <existing boot options> --share-rw work ~/Dev/project
+cube <existing boot options> --share work ~/Dev/project --share-transport virtiofs
 ```
 
 Each option takes two arguments (tag and path), is repeatable, and avoids

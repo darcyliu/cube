@@ -8,76 +8,75 @@ use std::thread::{self, JoinHandle};
 
 const FEATURES: u64 = VIRTIO_F_VERSION_1 | VIRTIO_RING_F_INDIRECT_DESC | 1;
 const QUEUE_SIZE: u32 = 128;
+
 struct State {
-    status: u32,
-    feature_sel: u32,
-    driver_sel: u32,
-    features: u64,
-    queue_sel: u32,
-    queue: VirtQueue,
-    interrupt: u32,
+    transport: MmioTransport,
     epoch: u64,
     notified: bool,
     stopped: bool,
     backend_failed: bool,
-    irq: u32,
 }
+
 impl State {
     fn new(irq: u32) -> Self {
         Self {
-            status: 0,
-            feature_sel: 0,
-            driver_sel: 0,
-            features: 0,
-            queue_sel: 0,
-            queue: VirtQueue {
-                max_size: QUEUE_SIZE,
-                ..Default::default()
-            },
-            interrupt: 0,
+            transport: MmioTransport::with_policy(
+                VIRTIO_DEV_9P,
+                FEATURES,
+                &[QUEUE_SIZE],
+                irq,
+                true,
+            ),
             epoch: 0,
             notified: false,
             stopped: false,
             backend_failed: false,
-            irq,
         }
     }
+
     fn signal(&self) {
+        let pending = self.transport.interrupt_status() != 0;
         #[cfg(not(test))]
         unsafe {
-            crate::hypervisor::hv_gic_set_spi(self.irq, self.interrupt != 0);
+            crate::hypervisor::hv_gic_set_spi(self.transport.irq(), pending);
         }
-        if self.interrupt != 0 {
+        if pending {
             crate::vcpu::kick_vcpu();
         }
     }
+
     fn fail(&mut self, error: &str) {
         eprintln!("[VirtIO-9P] {error}");
-        self.status |= VIRTIO_STATUS_NEEDS_RESET;
-        self.interrupt |= 2;
+        self.transport.set_needs_reset();
+        self.transport.set_interrupt_bit(2);
         self.signal();
     }
 }
+
 pub struct VirtioP9 {
     shared: Arc<(Mutex<State>, Condvar)>,
-    child: Arc<Mutex<std::process::Child>>,
+    child: Arc<Mutex<Option<std::process::Child>>>,
     worker: Option<JoinHandle<()>>,
     config: Vec<u8>,
 }
+
 struct Request {
     head: u16,
     epoch: u64,
     bytes: Vec<u8>,
     output: Vec<Descriptor>,
 }
+
 fn take_request(state: &mut State, mem: &GuestMemory) -> Result<Option<Request>, String> {
-    if state.status & (VIRTIO_STATUS_DRIVER_OK | VIRTIO_STATUS_NEEDS_RESET | VIRTIO_STATUS_FAILED)
-        != VIRTIO_STATUS_DRIVER_OK
-        || !state.queue.ready
-    {
+    if !state.transport.operational() {
         return Ok(None);
     }
-    let q = &mut state.queue;
+    let Some(mut q) = state.transport.queue(0).copied() else {
+        return Ok(None);
+    };
+    if !q.ready {
+        return Ok(None);
+    }
     if q.pending_count(mem)? == 0 {
         return Ok(None);
     }
@@ -85,7 +84,7 @@ fn take_request(state: &mut State, mem: &GuestMemory) -> Result<Option<Request>,
     let descs = q.descriptors(
         mem,
         head,
-        state.features & VIRTIO_RING_F_INDIRECT_DESC != 0,
+        state.transport.negotiated(VIRTIO_RING_F_INDIRECT_DESC),
         2 * MAX_MESSAGE,
     )?;
     let mut bytes = Vec::new();
@@ -117,20 +116,31 @@ fn take_request(state: &mut State, mem: &GuestMemory) -> Result<Option<Request>,
         return Err("response buffer too small for request before filesystem I/O".into());
     }
     q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
+    let epoch = state.epoch;
+    if let Some(slot) = state.transport.queue_mut(0) {
+        *slot = q;
+    }
     Ok(Some(Request {
         head,
-        epoch: state.epoch,
+        epoch,
         bytes,
         output,
     }))
 }
+
 fn complete(
     state: &mut State,
     mem: &GuestMemory,
     request: Request,
     mut reply: Vec<u8>,
 ) -> Result<(), String> {
-    if request.epoch != state.epoch || !state.queue.ready {
+    if request.epoch != state.epoch {
+        return Ok(());
+    }
+    let Some(mut queue) = state.transport.queue(0).copied() else {
+        return Ok(());
+    };
+    if !queue.ready {
         return Ok(());
     }
     let capacity: usize = request.output.iter().map(|d| d.len as usize).sum();
@@ -158,13 +168,18 @@ fn complete(
             break;
         }
     }
-    publish_used(mem, &mut state.queue, request.head, reply.len() as u32);
-    if avail_wants_interrupt(mem, state.queue.avail_ring) {
-        state.interrupt |= 1;
+    publish_used(mem, &mut queue, request.head, reply.len() as u32);
+    let avail = queue.avail_ring;
+    if let Some(slot) = state.transport.queue_mut(0) {
+        *slot = queue;
+    }
+    if avail_wants_interrupt(mem, avail) {
+        state.transport.set_interrupt_bit(1);
         state.signal();
     }
     Ok(())
 }
+
 impl VirtioP9 {
     pub fn new(
         tag: &str,
@@ -241,6 +256,7 @@ impl VirtioP9 {
             config,
         })
     }
+
     fn stop(&mut self) -> Result<(), String> {
         {
             let mut s = self.shared.0.lock().unwrap();
@@ -250,7 +266,9 @@ impl VirtioP9 {
         // Kill unresponsive filesystem helper before joining the transport thread.
         // Accepted writes are not transactional; the guest must sync/unmount first.
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
+            if let Some(child) = child.as_mut() {
+                let _ = child.kill();
+            }
         }
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| "9P worker panicked")?;
@@ -258,15 +276,18 @@ impl VirtioP9 {
         Ok(())
     }
 }
+
 impl Drop for VirtioP9 {
     fn drop(&mut self) {
         let _ = self.stop();
     }
 }
+
 impl MmioDevice for VirtioP9 {
     fn shutdown(&mut self) -> Result<(), String> {
         self.stop()
     }
+
     fn read(&mut self, offset: u64, size: usize) -> u64 {
         if offset >= VIRTIO_MMIO_CONFIG {
             let start = (offset - VIRTIO_MMIO_CONFIG) as usize;
@@ -279,112 +300,49 @@ impl MmioDevice for VirtioP9 {
             }
             return u64::from_le_bytes(raw);
         }
-        let s = self.shared.0.lock().unwrap();
-        match offset {
-            VIRTIO_MMIO_MAGIC_VALUE => VIRTIO_MMIO_MAGIC as u64,
-            VIRTIO_MMIO_VERSION => 2,
-            VIRTIO_MMIO_DEVICE_ID => 9,
-            VIRTIO_MMIO_VENDOR_ID => VIRTIO_MMIO_VENDOR as u64,
-            VIRTIO_MMIO_DEVICE_FEATURES if s.feature_sel < 2 => {
-                (FEATURES >> (s.feature_sel * 32)) & 0xffffffff
-            }
-            VIRTIO_MMIO_QUEUE_NUM_MAX if s.queue_sel == 0 => QUEUE_SIZE as u64,
-            VIRTIO_MMIO_QUEUE_READY if s.queue_sel == 0 => s.queue.ready as u64,
-            VIRTIO_MMIO_INTERRUPT_STATUS => s.interrupt as u64,
-            VIRTIO_MMIO_STATUS => s.status as u64,
-            _ => 0,
-        }
+        self.shared.0.lock().unwrap().transport.read(offset)
     }
+
     fn write(&mut self, offset: u64, data: u64, size: usize) {
-        if size != 4 {
+        if size != 4 || offset >= VIRTIO_MMIO_CONFIG {
             return;
         }
-        let value = data as u32;
         let mut s = self.shared.0.lock().unwrap();
-        match offset {
-            VIRTIO_MMIO_DEVICE_FEATURES_SEL => s.feature_sel = value,
-            VIRTIO_MMIO_DRIVER_FEATURES_SEL => s.driver_sel = value,
-            VIRTIO_MMIO_DRIVER_FEATURES
-                if s.driver_sel < 2
-                    && s.status & (VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) == 0 =>
-            {
-                let shift = s.driver_sel * 32;
-                s.features = (s.features & !(0xffffffff << shift)) | ((value as u64) << shift);
-            }
-            VIRTIO_MMIO_QUEUE_SEL => s.queue_sel = value,
-            VIRTIO_MMIO_QUEUE_NOTIFY if value == 0 => {
+        if offset == VIRTIO_MMIO_INTERRUPT_ACK {
+            let _ = s.transport.write(offset, data);
+            s.signal();
+            return;
+        }
+        let effect = s.transport.write(offset, data);
+        match effect {
+            WriteEffect::Notify { queue: 0 } => {
                 s.notified = true;
                 self.shared.1.notify_one();
             }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                s.interrupt &= !value;
+            WriteEffect::Reset => {
+                s.epoch = s.epoch.wrapping_add(1);
+                s.notified = true;
                 s.signal();
+                self.shared.1.notify_one();
             }
-            VIRTIO_MMIO_STATUS => {
-                if value == 0 {
-                    let epoch = s.epoch.wrapping_add(1);
-                    let irq = s.irq;
-                    let backend_failed = s.backend_failed;
-                    *s = State::new(irq);
-                    s.backend_failed = backend_failed;
-                    s.epoch = epoch;
-                    s.notified = true;
+            WriteEffect::QueueReset { .. } => {
+                s.epoch = s.epoch.wrapping_add(1);
+                s.notified = true;
+                self.shared.1.notify_one();
+            }
+            WriteEffect::DriverOk => {
+                if s.backend_failed {
+                    s.fail("filesystem helper unavailable; restart the VM");
+                }
+            }
+            WriteEffect::NegotiationFailed => {
+                if s.transport.status() & VIRTIO_STATUS_NEEDS_RESET != 0 {
+                    eprintln!("[VirtIO-9P] DRIVER_OK with invalid features");
+                    s.transport.set_interrupt_bit(2);
                     s.signal();
-                    self.shared.1.notify_one();
-                } else {
-                    s.status = value;
-                    if s.backend_failed && value & VIRTIO_STATUS_DRIVER_OK != 0 {
-                        s.fail("filesystem helper unavailable; restart the VM");
-                    }
-                    if s.status & VIRTIO_STATUS_FEATURES_OK != 0
-                        && (s.features & !FEATURES != 0 || s.features & VIRTIO_F_VERSION_1 == 0)
-                    {
-                        s.status &= !VIRTIO_STATUS_FEATURES_OK;
-                    }
-                    // FreeBSD 14.4 virtio_p9fs omits virtio_finalize_features().
-                    // Accept its DRIVER_OK transition only with a valid modern
-                    // feature set; clients that set FEATURES_OK still use the
-                    // normal feature acceptance check above.
-                    if s.status & VIRTIO_STATUS_DRIVER_OK != 0
-                        && (s.features & !FEATURES != 0 || s.features & VIRTIO_F_VERSION_1 == 0)
-                    {
-                        s.fail("DRIVER_OK with invalid features");
-                    }
                 }
             }
-            VIRTIO_MMIO_QUEUE_READY if s.queue_sel == 0 => {
-                if value == 0 {
-                    s.epoch = s.epoch.wrapping_add(1);
-                    s.queue.last_avail_idx = 0;
-                    s.queue.used_idx = 0;
-                    s.notified = true;
-                    self.shared.1.notify_one();
-                }
-                s.queue.ready = value == 1;
-            }
-            _ if s.queue_sel == 0 && !s.queue.ready => {
-                let q = &mut s.queue;
-                let address = match offset {
-                    VIRTIO_MMIO_QUEUE_NUM => {
-                        q.size = value;
-                        return;
-                    }
-                    VIRTIO_MMIO_QUEUE_DESC_LOW | VIRTIO_MMIO_QUEUE_DESC_HIGH => &mut q.desc_table,
-                    VIRTIO_MMIO_QUEUE_DRIVER_LOW | VIRTIO_MMIO_QUEUE_DRIVER_HIGH => {
-                        &mut q.avail_ring
-                    }
-                    VIRTIO_MMIO_QUEUE_DEVICE_LOW | VIRTIO_MMIO_QUEUE_DEVICE_HIGH => {
-                        &mut q.used_ring
-                    }
-                    _ => return,
-                };
-                if offset & 4 == 0 {
-                    *address = (*address & !0xffffffff) | value as u64;
-                } else {
-                    *address = (*address & 0xffffffff) | ((value as u64) << 32);
-                }
-            }
-            _ => (),
+            _ => {}
         }
     }
 }
@@ -392,19 +350,24 @@ impl MmioDevice for VirtioP9 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn setup() -> (State, GuestMemory) {
         let mut s = State::new(48);
-        s.status = VIRTIO_STATUS_DRIVER_OK;
-        s.features = VIRTIO_F_VERSION_1;
-        s.queue = VirtQueue {
-            max_size: 128,
-            size: 8,
-            ready: true,
-            desc_table: 0x100,
-            avail_ring: 0x200,
-            used_ring: 0x300,
-            ..Default::default()
-        };
+        s.transport.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        s.transport.write(VIRTIO_MMIO_DRIVER_FEATURES, 1);
+        s.transport.write(
+            VIRTIO_MMIO_STATUS,
+            (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK) as u64,
+        );
+        assert!(s.transport.operational());
+        {
+            let q = s.transport.queue_mut(0).unwrap();
+            q.size = 8;
+            q.ready = true;
+            q.desc_table = 0x100;
+            q.avail_ring = 0x200;
+            q.used_ring = 0x300;
+        }
         let mem = GuestMemory::new_test(0, 0x8000);
         mem.write_u64(0x100, 0x1000).unwrap();
         mem.write_u32(0x108, 7).unwrap();
@@ -419,6 +382,7 @@ mod tests {
         mem.write_u16(0x200, VRING_AVAIL_F_NO_INTERRUPT).unwrap();
         (s, mem)
     }
+
     #[test]
     fn scatter_response_and_reset_discard() {
         let (mut s, mem) = setup();
@@ -426,13 +390,14 @@ mod tests {
         s.epoch += 1;
         complete(&mut s, &mem, request, vec![1; 11]).unwrap();
         assert_eq!(mem.read_u16(0x302).unwrap(), 0);
-        s.queue.last_avail_idx = 0;
+        s.transport.queue_mut(0).unwrap().last_avail_idx = 0;
         let request = take_request(&mut s, &mem).unwrap().unwrap();
         complete(&mut s, &mem, request, vec![3; 11]).unwrap();
         assert_eq!(mem.read_u16(0x302).unwrap(), 1);
         assert_eq!(mem.read_u32(0x308).unwrap(), 11);
         assert_eq!(mem.read_u16(0x2000).unwrap(), 0x0303);
     }
+
     #[test]
     fn bad_direction_and_short_create_reply_rejected_before_io() {
         let (mut s, mem) = setup();
@@ -442,6 +407,37 @@ mod tests {
         mem.write_u32(0x118, 11).unwrap();
         mem.write(0x1004, &[114]).unwrap();
         assert!(take_request(&mut s, &mem).is_err());
-        assert_eq!(s.queue.last_avail_idx, 0);
+        assert_eq!(s.transport.queue(0).unwrap().last_avail_idx, 0);
+    }
+
+    #[test]
+    fn freebsd_driver_ok_without_features_ok_accepts_only_a_valid_set() {
+        let mut ok = State::new(48);
+        ok.transport.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        ok.transport.write(VIRTIO_MMIO_DRIVER_FEATURES, 1);
+        assert_eq!(
+            ok.transport.write(
+                VIRTIO_MMIO_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK) as u64,
+            ),
+            WriteEffect::DriverOk
+        );
+        assert_eq!(ok.transport.status() & VIRTIO_STATUS_FEATURES_OK, 0);
+        assert!(ok.transport.operational());
+
+        let mut bad = State::new(48);
+        bad.transport.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+        bad.transport.write(VIRTIO_MMIO_DRIVER_FEATURES, 1 << 3);
+        bad.transport.write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        bad.transport.write(VIRTIO_MMIO_DRIVER_FEATURES, 1);
+        assert_eq!(
+            bad.transport.write(
+                VIRTIO_MMIO_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK) as u64,
+            ),
+            WriteEffect::NegotiationFailed
+        );
+        assert_ne!(bad.transport.status() & VIRTIO_STATUS_NEEDS_RESET, 0);
+        assert!(!bad.transport.operational());
     }
 }

@@ -1,8 +1,9 @@
-# Shared host folders (FreeBSD 14.4)
+# Shared host folders (FreeBSD 9P and Linux virtio-fs)
 
 The VMM exposes host directories through VirtIO-9P over modern MMIO. FreeBSD
 14.4's `virtio_p9fs` module mounts them without a network interface or guest
 agent. Each export has its own device, mount tag and filesystem helper process.
+Linux guests may instead select the read-only, non-DAX virtio-fs transport.
 
 ## Launch and mount
 
@@ -30,6 +31,38 @@ For a read-only export, adding `-o ro` to the guest mount is useful but not
 required for protection: the host server rejects mutations independently.
 Unmount with `umount /mnt/host` before stopping the VM. An export is attached
 at boot; hot plugging and automatic guest mounting are not implemented.
+
+## Linux virtio-fs transport
+
+Select virtio-fs for all exports in a direct Cube launch with
+`--share-transport virtiofs`. This transport is deliberately read-only; use
+`--share`, not `--share-rw`. Its mount tag is limited to 35 bytes.
+
+```sh
+./target/debug/cube \
+  --linux boot/debian/cloud-vmlinuz \
+  --initrd boot/debian/cloud-initrd.img \
+  --bootargs "console=ttyAMA0 earlycon root=/dev/vda1 rw" \
+  --disk debian-cloud.img --net none \
+  --share source /path/to/export \
+  --share-transport virtiofs
+```
+
+Inside Linux:
+
+```sh
+mkdir -p /mnt/source
+mount -t virtiofs -o ro source /mnt/source
+```
+
+Cube provides the hiprio and request queues and forwards FUSE requests to a
+confined helper. It does not advertise DAX, so Linux may log
+`virtio_fs_setup_dax: No cache capability`; that message is expected. The live
+test confirmed mounting, reads, symlink metadata, host-update coherence,
+read-only enforcement, and a four-worker 60-second `fio` read. Stock FreeBSD
+15/16 media used here do not provide functional virtio-fs guest drivers, so 9P
+remains the supported FreeBSD transport. `cubectl` share configuration currently
+uses the default 9P transport; select virtio-fs with a direct Cube invocation.
 
 Use the same export flags with `--uefi`. Direct kernel boot does not read
 `loader.conf`; loading the module from the running installed guest works.
@@ -108,8 +141,9 @@ same directory; these are not exclusive disk-image claims.
 
 ## Compatibility and device layout
 
-The tested guest is stock FreeBSD 14.4 ARM64. FreeBSD 13 needs an external guest
-module and has not been validated; Linux compatibility is also unverified.
+The tested 9P guest is stock FreeBSD 14.4 ARM64. FreeBSD 13 needs an external
+guest module and has not been validated. The tested virtio-fs guest is Debian
+13 ARM64; it uses the separate FUSE backend described above.
 The server supports 9P2000.L and FreeBSD's legacy Tcreate and open-flag usage.
 It does not negotiate 9P2000 or 9P2000.u.
 
@@ -143,6 +177,15 @@ runs too. The check is included in `verify.py --suite offline` and `full`.
 Rust tests cover malformed protocol requests, path traversal, symlink opens,
 identity checks on replaced files, read-only enforcement, descriptor direction,
 short reply buffers and discarding completions after reset.
+
+The offline Debian check covers the separate virtio-fs path:
+
+```sh
+make verify-vsock-virtiofs VIRTIO_TEST=virtiofs
+```
+
+For the retained 512 MiB sustained-read workload and its confirmed result, see
+the [VirtIO live-verification runbook](virtio-live-verification.md#3-virtio-fs-sustained-read-test).
 
 The initial real-guest checks used direct kernel boot from the 14.4 ISO.
 Installed UEFI/ZFS shared-folder mounts, privileged networking plus sharing,

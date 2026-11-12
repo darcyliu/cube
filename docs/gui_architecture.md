@@ -91,14 +91,15 @@ chosen {
 
 ---
 
-### Option B: `VirtIO-GPU` 2D MMIO Device (Recommended Phase 3)
+### Option B: `VirtIO-GPU` 2D MMIO Device (implemented, optional)
 
 VirtIO-GPU provides standard virtualized 2D display hardware under the VirtIO MMIO v2 specification.
 
 #### 1. Hardware Definition
-* **Base Address**: `0x0a000400`
+* **Base Address**: allocated by the validated device-layout planner (currently
+  in the dynamic `0x0a020000` region after disks and shares)
 * **MMIO Size**: `0x200`
-* **GIC IRQ**: `37` (SPI 5)
+* **GIC IRQ**: allocated from the corresponding dynamic IRQ range
 * **Device ID**: `16` (`VIRTIO_ID_GPU`)
 * **Virtqueues**:
   * Queue 0: `controlq` (Processes 2D graphics requests)
@@ -248,10 +249,14 @@ as the owner of the application event loop.
 2. [x] Add the AppKit/Metal window and a `--gui native` option using simple-framebuffer.
 3. [ ] Verify interactive XFCE input, lifecycle, and performance against the VNC baseline.
 
-### Separate future track: VirtIO-GPU 2D
-Implement the virtio-gpu control/cursor queues only when a guest capability or
-measured display limitation justifies a new virtual display device. It is not
-a prerequisite for the native window.
+### Implemented optional track: VirtIO-GPU 2D
+`--gpu virtio` registers the control/cursor queues and publishes flushed scanout
+damage through the same display-source abstraction consumed by VNC and the
+native window. `--gpu simple` remains the compatibility default, and
+virtio-gpu is still not a prerequisite for the native window. FreeBSD `vtgpu`
+attachment and EDK2 `VirtioGpuDxe` GOP output have both passed live tests. The
+implementation is deliberately 2D; VirGL, Venus, multi-head, and runtime mode
+changes remain outside this track.
 
 
 ## FreeBSD input reality check (2026-09-20)

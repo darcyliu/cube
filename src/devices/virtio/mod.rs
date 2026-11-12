@@ -2,12 +2,19 @@
 
 #![allow(dead_code)]
 
+pub mod balloon;
 pub mod block;
 pub mod console;
+pub mod fs;
+pub mod gpu;
 pub mod input;
 pub mod net;
 pub mod p9;
 pub mod rng;
+pub mod transport;
+pub mod vsock;
+
+pub use transport::{MmioTransport, WriteEffect};
 
 pub use console::VirtioConsole;
 pub use input::VirtioInput;
@@ -35,6 +42,11 @@ pub const VIRTIO_MMIO_QUEUE_DRIVER_LOW: u64 = 0x090;
 pub const VIRTIO_MMIO_QUEUE_DRIVER_HIGH: u64 = 0x094;
 pub const VIRTIO_MMIO_QUEUE_DEVICE_LOW: u64 = 0x0a0;
 pub const VIRTIO_MMIO_QUEUE_DEVICE_HIGH: u64 = 0x0a4;
+pub const VIRTIO_MMIO_SHM_SEL: u64 = 0x0ac;
+pub const VIRTIO_MMIO_SHM_LEN_LOW: u64 = 0x0b0;
+pub const VIRTIO_MMIO_SHM_LEN_HIGH: u64 = 0x0b4;
+pub const VIRTIO_MMIO_SHM_BASE_LOW: u64 = 0x0b8;
+pub const VIRTIO_MMIO_SHM_BASE_HIGH: u64 = 0x0bc;
 pub const VIRTIO_MMIO_CONFIG: u64 = 0x100;
 
 // Magic and Version constants
@@ -47,7 +59,12 @@ pub const VIRTIO_DEV_NET: u32 = 1;
 pub const VIRTIO_DEV_BLOCK: u32 = 2;
 pub const VIRTIO_DEV_CONSOLE: u32 = 3;
 pub const VIRTIO_DEV_RNG: u32 = 4;
+pub const VIRTIO_DEV_BALLOON: u32 = 5;
+pub const VIRTIO_DEV_9P: u32 = 9;
+pub const VIRTIO_DEV_GPU: u32 = 16;
 pub const VIRTIO_DEV_INPUT: u32 = 18;
+pub const VIRTIO_DEV_VSOCK: u32 = 19;
+pub const VIRTIO_DEV_FS: u32 = 26;
 
 // VirtIO Device Status Bits
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;
@@ -170,13 +187,21 @@ impl VirtQueue {
         let mut result = Vec::new();
         let mut total = 0usize;
         let mut in_indirect = false;
+        let mut seen_write = false;
+        let chain_limit = self.size as usize;
         loop {
-            if idx >= count || seen[idx as usize] {
+            if result.len() >= chain_limit {
+                return Err("descriptor chain exceeds queue size".into());
+            }
+            if idx >= count || seen.get(idx as usize).copied().unwrap_or(true) {
                 return Err("Invalid/cyclic descriptor chain".into());
             }
             seen[idx as usize] = true;
+            let entry = table
+                .checked_add(idx as u64 * 16)
+                .ok_or("descriptor address overflow")?;
             let mut raw = [0u8; 16];
-            mem.read(table + idx as u64 * 16, &mut raw)?;
+            mem.read(entry, &mut raw)?;
             let addr = u64::from_le_bytes(raw[..8].try_into().unwrap());
             let len = u32::from_le_bytes(raw[8..12].try_into().unwrap());
             let flags = u16::from_le_bytes(raw[12..14].try_into().unwrap());
@@ -185,35 +210,77 @@ impl VirtQueue {
                 return Err("Unknown descriptor flags".into());
             }
             if flags & VRING_DESC_F_INDIRECT != 0 {
+                let entries = len / 16;
+                let remaining = chain_limit.saturating_sub(result.len());
                 if !indirect
                     || in_indirect
-                    || !result.is_empty()
                     || flags & VRING_DESC_F_NEXT != 0
                     || len == 0
                     || len % 16 != 0
-                    || len / 16 > self.max_size
+                    || entries > self.max_size
+                    || entries as usize > remaining
                     || addr % 16 != 0
+                    || addr.checked_add(len as u64).is_none()
                 {
                     return Err("Invalid indirect descriptor table".into());
                 }
                 mem.checked_offset(addr, len as usize)?;
                 table = addr;
-                count = len / 16;
+                count = entries;
                 seen = vec![false; count as usize];
                 idx = 0;
                 in_indirect = true;
                 continue;
             }
+            let write = flags & VRING_DESC_F_WRITE != 0;
+            if !write && seen_write {
+                return Err("invalid descriptor direction".into());
+            }
+            seen_write |= write;
             total = total
                 .checked_add(len as usize)
                 .filter(|&n| n <= max_bytes)
                 .ok_or("Descriptor chain exceeds transfer limit")?;
-            mem.checked_offset(addr, len as usize)?;
+            if len > 0 {
+                mem.checked_offset(addr, len as usize)?;
+            }
             result.push(Descriptor { addr, len, flags });
             if flags & VRING_DESC_F_NEXT == 0 {
                 return Ok(result);
             }
             idx = next as u32;
+        }
+    }
+}
+
+/// LibFuzzer-style entry. Any byte string is a queue plus a descriptor image.
+/// The parser must not panic and must not return a buffer it did not bounds-check.
+#[cfg(test)]
+pub fn fuzz_descriptor_parser(data: &[u8]) {
+    if data.len() < 4 {
+        return;
+    }
+    let mem = crate::memory::GuestMemory::new_test(0, 0x1_0000);
+    let image = data.len().min(0x1000);
+    let _ = mem.write(0x1000, &data[..image]);
+    let size = 1u32 << (data[0] % 4);
+    let q = VirtQueue {
+        max_size: 8,
+        size,
+        ready: true,
+        desc_table: 0x1000,
+        avail_ring: 0x3000,
+        used_ring: 0x3800,
+        ..VirtQueue::default()
+    };
+    let head = u16::from_le_bytes([data[1], data.get(2).copied().unwrap_or(0)]) % size as u16;
+    let indirect = data.get(3).copied().unwrap_or(0) & 1 == 1;
+    if let Ok(chain) = q.descriptors(&mem, head, indirect, 4096) {
+        for desc in chain {
+            if desc.len > 0 {
+                assert!(mem.checked_offset(desc.addr, desc.len as usize).is_ok());
+            }
+            assert_eq!(desc.flags & !7, 0);
         }
     }
 }
@@ -274,5 +341,89 @@ mod tests {
         mem.write_u32(0x1008, 16).unwrap();
         mem.write_u16(0x100c, VRING_DESC_F_INDIRECT).unwrap();
         assert!(q.descriptors(&mem, 0, true, 64).is_err());
+    }
+
+    fn write_desc(mem: &GuestMemory, at: u64, addr: u64, len: u32, flags: u16, next: u16) {
+        mem.write_u64(at, addr).unwrap();
+        mem.write_u32(at + 8, len).unwrap();
+        mem.write_u16(at + 12, flags).unwrap();
+        mem.write_u16(at + 14, next).unwrap();
+    }
+
+    #[test]
+    fn accepts_final_indirect_table_after_direct_descriptors() {
+        let (q, mem) = queue();
+        write_desc(&mem, 0x100, 0x1800, 4, VRING_DESC_F_NEXT, 1);
+        write_desc(&mem, 0x110, 0x1000, 32, VRING_DESC_F_INDIRECT, 0);
+        write_desc(&mem, 0x1000, 0x2000, 8, VRING_DESC_F_NEXT, 1);
+        write_desc(&mem, 0x1010, 0x2100, 8, VRING_DESC_F_WRITE, 0);
+        let chain = q.descriptors(&mem, 0, true, 64).unwrap();
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0].addr, 0x1800);
+        assert_eq!(chain[1].addr, 0x2000);
+        assert_eq!(chain[2].flags & VRING_DESC_F_WRITE, VRING_DESC_F_WRITE);
+        write_desc(
+            &mem,
+            0x110,
+            0x1000,
+            32,
+            VRING_DESC_F_INDIRECT | VRING_DESC_F_NEXT,
+            2,
+        );
+        assert!(q.descriptors(&mem, 0, true, 64).is_err());
+    }
+
+    #[test]
+    fn rejects_direction_cycles_overflow_and_long_chains() {
+        let (q, mem) = queue();
+        write_desc(
+            &mem,
+            0x100,
+            0x1800,
+            4,
+            VRING_DESC_F_WRITE | VRING_DESC_F_NEXT,
+            1,
+        );
+        write_desc(&mem, 0x110, 0x2000, 4, VRING_DESC_F_NEXT, 0);
+        assert!(
+            q.descriptors(&mem, 0, false, 64)
+                .unwrap_err()
+                .contains("direction")
+        );
+        write_desc(&mem, 0x110, 0x2000, 4, 0, 0);
+        write_desc(&mem, 0x100, u64::MAX - 8, 32, 0, 0);
+        assert!(q.descriptors(&mem, 0, false, 64).is_err());
+        write_desc(&mem, 0x100, 0x1800, u32::MAX, 0, 0);
+        assert!(q.descriptors(&mem, 0, false, usize::MAX).is_err());
+        let (mut small, mem) = queue();
+        small.size = 2;
+        write_desc(&mem, 0x100, 0x1800, 1, VRING_DESC_F_NEXT, 1);
+        write_desc(&mem, 0x110, 0x1900, 1, VRING_DESC_F_NEXT, 2);
+        write_desc(&mem, 0x120, 0x1a00, 1, 0, 0);
+        assert!(
+            small
+                .descriptors(&mem, 0, false, 64)
+                .unwrap_err()
+                .contains("queue size")
+        );
+        for _ in 0..64 {
+            fuzz_descriptor_parser(&[0xff, 0xfe, 3, 1, 0, 16, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0]);
+        }
+    }
+
+    #[test]
+    fn descriptor_parser_fuzz_target_accepts_hostile_inputs() {
+        let mut state = 0x1234_5678u32;
+        for _ in 0..200 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let mut bytes = vec![0u8; 64];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = state.rotate_left(i as u32) as u8;
+            }
+            bytes[0] = (state % 4) as u8;
+            fuzz_descriptor_parser(&bytes);
+            fuzz_descriptor_parser(&[]);
+            fuzz_descriptor_parser(&[0, 1, 2]);
+        }
     }
 }

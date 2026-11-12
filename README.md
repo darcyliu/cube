@@ -12,7 +12,20 @@ It supports booting both custom baremetal ARM64 payloads at EL1 and full operati
 - **Memory Management**: Allocates 16KB-page-aligned host RAM and maps it into Guest Physical Address (GPA) space (`hv_vm_map`).
 - **EL1 Execution**: Launches vCPUs running at Exception Level 1 (Supervisor Mode, `CPSR=0x3c5`) with flat physical addressing.
 - **In-Kernel ARM GICv3**: Hardware-accelerated interrupt routing using macOS 15's native `hv_gic_create()` (GICD at `0x08000000`, GICR at `0x080a0000`).
-- **VirtIO-MMIO Block Device**: Modern VirtIO v2 MMIO block device (`virtio-blk`) supporting sector read/write, disk flushing, split virtqueues, and GIC SPI interrupt signaling (`0x0a000000`, IRQ 34).
+- **Shared VirtIO-MMIO Transport**: Modern feature negotiation, reset/config
+  interrupts, bounded split-ring parsing, negotiated indirect descriptors, and
+  validated dynamic MMIO/IRQ layout shared by the device implementations.
+- **VirtIO Block and Network Multi-Queue**: Configurable block request queues
+  and network RX/TX queue pairs, with indirect descriptors and queue-control
+  handling. The first block device remains at `0x0a000000`, IRQ 34.
+- **VirtIO RNG, Balloon, and Vsock**: Host CSPRNG entropy; reclaimable balloon
+  inflation/deflation with runtime target control; and credit-controlled stream
+  vsock with explicit host Unix-socket endpoints.
+- **VirtIO GPU 2D**: Optional guest-backed resources, scanout, flush, and cursor
+  queues consumed by VNC or the native window; verified with FreeBSD `vtgpu`
+  and EDK2 `VirtioGpuDxe`.
+- **Shared Folders**: Writable/read-only VirtIO-9P for FreeBSD and a read-only,
+  non-DAX virtio-fs/FUSE transport for Linux, both using confined helpers.
 - **Interactive PL011 UART Console**: Hardware-accelerated Stage-2 Data Abort handling (`EC 0x24` with `ESR_EL2` syndrome decoding) routed to a bidirectional ARM PL011 UART console (`0x09000000`, IRQ 33) with terminal raw mode and `Ctrl-]` escape.
 - **Device Tree (FDT) Synthesis**: Generates an ARM virt Device Tree blob describing memory, vCPU topology, PSCI, GICv3, timers, PL011 console, and VirtIO MMIO.
 - **ELF64 Kernel Loader**: Parses and loads uncompressed AArch64 kernel ELFs (e.g. FreeBSD `kernel`) at 2MiB physical alignment.
@@ -38,7 +51,7 @@ It supports booting both custom baremetal ARM64 payloads at EL1 and full operati
 │   ┌───────────────────────────┐         ┌───────────────────────────┐  │
 │   │   vCPU Thread             │  MMIO   │ MmioBus                   │  │
 │   │   (hv_vcpu_run)           ├────────►│ 0x09000000: PL011 UART    │  │
-│   │   - Stage 2 Data Aborts   │         │ 0x0a000000: VirtIO Block  │  │
+│   │   - Stage 2 Data Aborts   │         │ Fixed + dynamic VirtIO    │  │
 │   │   - Debug Regs (OSLAR)    │         └───────┬───────────┬───────┘  │
 │   │   - PSCI HVC calls        │                 │           │          │
 │   └─────────────┬─────────────┘                 ▼           ▼          │
@@ -113,7 +126,100 @@ fetch --no-verify-peer -o - https://www.freebsd.org | head -n 15
 
 For complete architectural details, troubleshooting steps, and NAT forwarding explanations, see [docs/networking.md](docs/networking.md).
 
-### 4. Boot Linux (Alpine / Debian)
+### 4. Verify VirtIO GPU and Balloon with FreeBSD
+
+```bash
+# Uses the fetched FreeBSD kernel and mini-memstick image, a 1280x720 VirtIO
+# GPU, 1 GiB of preallocated RAM, and a 256 MiB balloon target.
+make freebsd-gpu-balloon NET=none
+```
+
+The target keeps the host serial console interactive; no VNC viewer is needed.
+Inside FreeBSD, confirm that the GPU attached and that the balloon reached its
+requested size:
+
+```sh
+kldload virtio_balloon       # required once with the 14.4 GENERIC kernel
+dmesg | grep -Ei 'virtio.*gpu|vtgpu|virtio.*balloon|vtballoon'
+devinfo -rv | grep -A8 -B2 -Ei 'vtgpu|vtballoon'
+sysctl dev.vtballoon.0.desired dev.vtballoon.0.current
+```
+
+The default 256 MiB target is 65,536 VirtIO 4 KiB pages, so both balloon
+sysctls should converge to `65536`. From another host terminal, inspect or
+change the target while the same VM remains running:
+
+```sh
+python3 scripts/balloonctl.py status
+python3 scripts/balloonctl.py set 0 --wait
+python3 scripts/balloonctl.py set 256 --wait
+python3 scripts/balloonctl.py set 512 --wait
+```
+
+Cube moves between targets in 64 MiB steps and waits for the guest's `actual`
+value at each step. `driver_ok` must be true and `converged` must become true;
+if not, load `virtio_balloon` inside FreeBSD first. The launch target and socket
+path accept Make overrides:
+
+```bash
+make freebsd-gpu-balloon NET=none RAM_MB=2048 BALLOON_MB=512 \
+  BALLOON_CONTROL=/tmp/my-balloon.sock GPU_DISPLAY=1920x1080
+```
+
+See the [FreeBSD runbook](docs/freebsd_runbook.md#virtio-gpu-and-balloon-verification)
+for visual checks, kernel-driver troubleshooting, and host-memory measurements.
+
+### Test VirtIO-vsock and VirtIO-fs
+
+Prepare the Debian cloud guest once with `make debian-cloud`, then stop it with
+`Ctrl-]` after it reaches the root shell. Run the offline end-to-end verifier:
+
+```bash
+make verify-vsock-virtiofs
+```
+
+The verifier boots an APFS clone of `debian-cloud.img` with no NIC. It checks a
+guest-to-host vsock echo and a read-only virtio-fs mount, file reads, symlink
+metadata, write rejection, and visibility of a host-side file update. Run only
+one part with `VIRTIO_TEST=vsock` or `VIRTIO_TEST=virtiofs`. Custom assets can be
+supplied through `DEBIAN_TEST_DISK`, `DEBIAN_TEST_KERNEL`, and
+`DEBIAN_TEST_INITRD`.
+
+For direct vsock launches, `--vsock-cid CID` selects or reserves the guest CID,
+`--vsock-listen PATH` exposes the host control socket used to initiate a stream
+with `connect GUEST_PORT`, and repeatable `--vsock-map GUEST_PORT=PATH` entries
+allow guest-initiated streams only to explicitly mapped host Unix sockets.
+Cube implements stream sockets, credit flow control, half-close, reset, and
+bounded buffering; datagram and seqpacket sockets are not advertised.
+
+To include both data-path checks in `scripts/verify.py --suite offline|full`,
+pass the prepared guest as `--virtio-test-disk`, `--virtio-test-kernel`, and
+`--virtio-test-initrd` (plus `--virtio-test-seed` when needed). FreeBSD 15/16
+continues to cover the supported VirtIO-9P shared-folder path; it has no guest
+drivers for functional virtio-vsock or virtio-fs testing.
+
+For repeatable live `fio`, `iperf3`, balloon-pressure, extended-vsock, and UEFI
+`VirtioGpuDxe` checks, follow the
+[VirtIO live verification runbook](docs/virtio-live-verification.md).
+
+### VirtIO queue controls
+
+Block and network devices support indirect descriptors and configurable
+multi-queue operation. Queue counts are capped at 16 and by the vCPU count:
+
+```sh
+target/debug/cube <boot options> \
+  --cpus 4 --blk-queues 4 --net-queue-pairs 4
+```
+
+Linux live tests confirmed four block queues under CRC32C-verifying `fio` and
+four network RX/TX pairs under sustained `iperf3`. The common descriptor parser
+accepts negotiated direct chains ending in an indirect table and rejects nested,
+cyclic, unnegotiated, and out-of-range forms. See the
+[capability audit](docs/virtio-feature-plan.md#current-support) for the complete
+support matrix and the live-verification runbook for reproducible commands.
+
+### 5. Boot Linux (Alpine / Debian)
 The VMM natively supports direct Linux ARM64 kernel booting (`--linux`, `--initrd`, `--bootargs`):
 ```bash
 # Alpine live environment (static IPv4 + DNS; internet works out of the box):

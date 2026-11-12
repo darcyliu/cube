@@ -52,9 +52,11 @@ pub fn load_elf64(
     if e_phnum == 0 || e_phentsize < 56 {
         return Err("Invalid program header table in ELF".into());
     }
-    let table_len = e_phnum.checked_mul(e_phentsize)
+    let table_len = e_phnum
+        .checked_mul(e_phentsize)
         .ok_or("Program header table size overflow")?;
-    let table_end = e_phoff.checked_add(table_len)
+    let table_end = e_phoff
+        .checked_add(table_len)
         .filter(|&end| end <= elf_data.len())
         .ok_or("Program header table out of bounds")?;
 
@@ -78,39 +80,58 @@ pub fn load_elf64(
         if file_size > mem_size {
             return Err("ELF segment file size exceeds memory size".into());
         }
-        let end = vaddr.checked_add(mem_size).ok_or("ELF segment address overflow")?;
-        let file_end = offset.checked_add(file_size)
+        let end = vaddr
+            .checked_add(mem_size)
+            .ok_or("ELF segment address overflow")?;
+        let file_end = offset
+            .checked_add(file_size)
             .filter(|&end| end <= elf_data.len() as u64)
             .ok_or("ELF segment file range out of bounds")?;
-        let mem_size = usize::try_from(mem_size)
-            .map_err(|_| "ELF segment exceeds host address space")?;
+        let mem_size =
+            usize::try_from(mem_size).map_err(|_| "ELF segment exceeds host address space")?;
         if mem_size != 0 {
             segments.push(Segment {
-                vaddr, end, bytes: offset as usize..file_end as usize, mem_size, target: 0,
+                vaddr,
+                end,
+                bytes: offset as usize..file_end as usize,
+                mem_size,
+                target: 0,
             });
         }
     }
-    let min_vaddr = segments.iter().map(|s| s.vaddr).min()
+    let min_vaddr = segments
+        .iter()
+        .map(|s| s.vaddr)
+        .min()
         .ok_or("No nonempty PT_LOAD segments found in ELF")?;
     let max_vaddr = segments.iter().map(|s| s.end).max().unwrap();
-    if !segments.iter().any(|s| s.vaddr <= e_entry && e_entry < s.end) {
+    if !segments
+        .iter()
+        .any(|s| s.vaddr <= e_entry && e_entry < s.end)
+    {
         return Err("ELF entry point is outside loaded segments".into());
     }
-    let phys_entry = phys_load_base.checked_add(e_entry - min_vaddr)
+    let phys_entry = phys_load_base
+        .checked_add(e_entry - min_vaddr)
         .ok_or("ELF physical entry point overflow")?;
 
     // Validate every destination before modifying guest RAM or allocating BSS.
     for segment in &mut segments {
-        segment.target = phys_load_base.checked_add(segment.vaddr - min_vaddr)
+        segment.target = phys_load_base
+            .checked_add(segment.vaddr - min_vaddr)
             .ok_or("ELF physical segment address overflow")?;
-        segment.target.checked_add(segment.mem_size as u64)
+        segment
+            .target
+            .checked_add(segment.mem_size as u64)
             .ok_or("ELF physical segment end overflow")?;
         guest_mem.checked_offset(segment.target, segment.mem_size)?;
     }
 
     println!(
         "[ELF] Kernel virtual memory range: 0x{:016x}..0x{:016x} (size: {:.2} MB)",
-        min_vaddr, max_vaddr, (max_vaddr - min_vaddr) as f64 / (1024.0 * 1024.0)
+        min_vaddr,
+        max_vaddr,
+        (max_vaddr - min_vaddr) as f64 / (1024.0 * 1024.0)
     );
     let zeroes = [0u8; 64 * 1024];
     for segment in segments {
@@ -124,7 +145,10 @@ pub fn load_elf64(
         }
         println!(
             "  -> PT_LOAD: vaddr 0x{:016x} -> GPA 0x{:08x} (filesz: 0x{:x}, memsz: 0x{:x})",
-            segment.vaddr, segment.target, bytes.len(), segment.mem_size
+            segment.vaddr,
+            segment.target,
+            bytes.len(),
+            segment.mem_size
         );
     }
     println!(
@@ -183,18 +207,21 @@ mod tests {
         let mem = GuestMemory::new_test(0x4000, 0x24000);
         for (field, value) in [
             (32, u64::MAX - 8), // program header table overflow
-            (32, 100), // truncated program header table
-            (72, u64::MAX), // file range overflow
+            (32, 100),          // truncated program header table
+            (72, u64::MAX),     // file range overflow
             (80, u64::MAX - 1), // virtual address overflow
-            (96, 0x30000), // file size larger than memory size
-            (104, 1u64 << 50), // BSS too large for guest RAM
-            (24, 0xfff), // entry below the first segment
-            (24, 0x21001), // entry at the exclusive segment end
+            (96, 0x30000),      // file size larger than memory size
+            (104, 1u64 << 50),  // BSS too large for guest RAM
+            (24, 0xfff),        // entry below the first segment
+            (24, 0x21001),      // entry at the exclusive segment end
         ] {
             let mut data = image();
             set(&mut data, field, value);
             mem.write_u16(0x4000, 0xcccc).unwrap();
-            assert!(load_elf64(&data, &mem, 0x4000).is_err(), "field {field}: {value:#x}");
+            assert!(
+                load_elf64(&data, &mem, 0x4000).is_err(),
+                "field {field}: {value:#x}"
+            );
             assert_eq!(mem.read_u16(0x4000).unwrap(), 0xcccc);
         }
         assert!(load_elf64(&image(), &mem, u64::MAX).is_err());

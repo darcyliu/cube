@@ -6,10 +6,16 @@ use std::time::{Duration, Instant};
 
 use crate::util::{canonical_path_buf, find_cube_binary, require, resolve_path};
 
-pub fn find_default_firmware(user_fw: Option<&PathBuf>, cube_binary: Option<&Path>) -> Result<PathBuf, String> {
+pub fn find_default_firmware(
+    user_fw: Option<&PathBuf>,
+    cube_binary: Option<&Path>,
+) -> Result<PathBuf, String> {
     if let Some(fw) = user_fw {
         let resolved = resolve_path(&fw.to_string_lossy(), Path::new("."))?;
-        require(resolved.is_file(), format!("firmware file not found: {:?}", resolved))?;
+        require(
+            resolved.is_file(),
+            format!("firmware file not found: {:?}", resolved),
+        )?;
         return canonical_path_buf(&resolved);
     }
 
@@ -65,7 +71,9 @@ pub fn auto_detect_iso() -> Option<PathBuf> {
     None
 }
 
-pub fn resolve_ssh_public_key(specified: Option<&str>) -> (Option<String>, Option<String>, Option<PathBuf>) {
+pub fn resolve_ssh_public_key(
+    specified: Option<&str>,
+) -> (Option<String>, Option<String>, Option<PathBuf>) {
     if let Some(s) = specified {
         let trimmed = s.trim();
         let path = Path::new(trimmed);
@@ -78,10 +86,18 @@ pub fn resolve_ssh_public_key(specified: Option<&str>) -> (Option<String>, Optio
                 } else {
                     None
                 };
-                return (Some(key_str), Some(format!("{} (user specified)", path.display())), priv_key);
+                return (
+                    Some(key_str),
+                    Some(format!("{} (user specified)", path.display())),
+                    priv_key,
+                );
             }
         }
-        return (Some(trimmed.to_string()), Some("inline SSH public key".into()), None);
+        return (
+            Some(trimmed.to_string()),
+            Some("inline SSH public key".into()),
+            None,
+        );
     }
 
     // Check user preference from settings.json if configured
@@ -94,8 +110,16 @@ pub fn resolve_ssh_public_key(specified: Option<&str>) -> (Option<String>, Optio
                     let key_str = content.trim().to_string();
                     if !key_str.is_empty() {
                         let priv_candidate = resolved.with_extension("");
-                        let priv_key = if priv_candidate.is_file() { Some(priv_candidate) } else { None };
-                        return (Some(key_str), Some(format!("{} (configured in preferences)", custom_path)), priv_key);
+                        let priv_key = if priv_candidate.is_file() {
+                            Some(priv_candidate)
+                        } else {
+                            None
+                        };
+                        return (
+                            Some(key_str),
+                            Some(format!("{} (configured in preferences)", custom_path)),
+                            priv_key,
+                        );
                     }
                 }
             }
@@ -111,8 +135,16 @@ pub fn resolve_ssh_public_key(specified: Option<&str>) -> (Option<String>, Optio
                     let key_str = content.trim().to_string();
                     if !key_str.is_empty() {
                         let priv_path = home_path.join(".ssh").join(key_type);
-                        let priv_key = if priv_path.is_file() { Some(priv_path) } else { None };
-                        return (Some(key_str), Some(format!("~/.ssh/{}.pub (auto-detected)", key_type)), priv_key);
+                        let priv_key = if priv_path.is_file() {
+                            Some(priv_path)
+                        } else {
+                            None
+                        };
+                        return (
+                            Some(key_str),
+                            Some(format!("~/.ssh/{}.pub (auto-detected)", key_type)),
+                            priv_key,
+                        );
                     }
                 }
             }
@@ -135,19 +167,28 @@ pub fn build_cidata_seed(
     if cidata_dir.exists() {
         let _ = fs::remove_dir_all(&cidata_dir);
     }
-    fs::create_dir_all(&cidata_dir).map_err(|e| format!("cannot create cidata directory: {}", e))?;
+    fs::create_dir_all(&cidata_dir)
+        .map_err(|e| format!("cannot create cidata directory: {}", e))?;
 
-    let meta_data = format!("instance-id: {}-01\nlocal-hostname: {}\n", hostname, hostname);
-    fs::write(cidata_dir.join("meta-data"), meta_data).map_err(|e| format!("cannot write meta-data: {}", e))?;
+    let meta_data = format!(
+        "instance-id: {}-01\nlocal-hostname: {}\n",
+        hostname, hostname
+    );
+    fs::write(cidata_dir.join("meta-data"), meta_data)
+        .map_err(|e| format!("cannot write meta-data: {}", e))?;
 
     let mut user_data = format!(
         "#cloud-config\nhostname: {}\npassword: {}\nchpasswd: {{ expire: False }}\nssh_pwauth: True\n",
         hostname, password
     );
     if let Some(pub_key) = ssh_pub_key {
-        user_data.push_str(&format!("ssh_authorized_keys:\n  - \"{}\"\n", pub_key.trim()));
+        user_data.push_str(&format!(
+            "ssh_authorized_keys:\n  - \"{}\"\n",
+            pub_key.trim()
+        ));
     }
-    fs::write(cidata_dir.join("user-data"), user_data).map_err(|e| format!("cannot write user-data: {}", e))?;
+    fs::write(cidata_dir.join("user-data"), user_data)
+        .map_err(|e| format!("cannot write user-data: {}", e))?;
 
     let mut script = String::new();
     if filesystem == "zfs" {
@@ -236,7 +277,10 @@ LOADER\n",
         .map_err(|e| format!("failed to execute hdiutil: {}", e))?;
     require(
         status.status.success(),
-        format!("hdiutil makehybrid failed: {}", String::from_utf8_lossy(&status.stderr)),
+        format!(
+            "hdiutil makehybrid failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        ),
     )?;
     Ok(())
 }
@@ -279,8 +323,10 @@ pub fn send_uart_command(uart_path: &Path, text: &str) -> Result<(), String> {
     }
     let mut payload = text.to_string();
     payload.push('\n');
-    fs::write(&next_path, payload).map_err(|e| format!("cannot write UART mailbox {:?}: {}", next_path, e))?;
-    fs::rename(&next_path, uart_path).map_err(|e| format!("cannot publish UART command {:?}: {}", uart_path, e))?;
+    fs::write(&next_path, payload)
+        .map_err(|e| format!("cannot write UART mailbox {:?}: {}", next_path, e))?;
+    fs::rename(&next_path, uart_path)
+        .map_err(|e| format!("cannot publish UART command {:?}: {}", uart_path, e))?;
     Ok(())
 }
 
@@ -334,14 +380,24 @@ pub fn run_unattended_install(
 
     let disk_size_bytes = fs::metadata(target_disk).map(|m| m.len()).unwrap_or(0);
     let disk_size_desc = if disk_size_bytes > 0 {
-        format!("{:.1} GiB", disk_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        format!(
+            "{:.1} GiB",
+            disk_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        )
     } else {
         "target disk".into()
     };
 
-    println!("==> Starting automated unattended installation for '{}'...", vm_name);
+    println!(
+        "==> Starting automated unattended installation for '{}'...",
+        vm_name
+    );
     println!("    Installer ISO: {}", iso_path.display());
-    println!("    Target Disk:   {} ({})", target_disk.display(), disk_size_desc);
+    println!(
+        "    Target Disk:   {} ({})",
+        target_disk.display(),
+        disk_size_desc
+    );
     println!("    Filesystem:    {}", filesystem);
     println!("    Root Password: {}", password);
     if let Some(desc) = ssh_key_desc {
@@ -352,7 +408,15 @@ pub fn run_unattended_install(
     std::io::stdout().flush().ok();
 
     let seed_iso = staging_dir.join("seed.iso");
-    build_cidata_seed(&staging_dir, &seed_iso, hostname, password, ssh_pub_key, filesystem, base_dist)?;
+    build_cidata_seed(
+        &staging_dir,
+        &seed_iso,
+        hostname,
+        password,
+        ssh_pub_key,
+        filesystem,
+        base_dist,
+    )?;
 
     let extracted_kernel = extract_kernel_from_iso(iso_path, &staging_dir)?;
     println!("done.");
@@ -376,12 +440,15 @@ pub fn run_unattended_install(
     cmd.arg("--serial-log").arg(&console_log);
     cmd.env("VMM_UART_IN", &uart_path);
     let stderr_log = staging_dir.join("stderr.log");
-    let stderr_file = fs::File::create(&stderr_log).map_err(|e| format!("cannot create stderr log: {}", e))?;
+    let stderr_file =
+        fs::File::create(&stderr_log).map_err(|e| format!("cannot create stderr log: {}", e))?;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::from(stderr_file));
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to launch installer VM: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to launch installer VM: {}", e))?;
 
     struct ChildGuard<'a>(&'a mut std::process::Child, bool);
     impl<'a> Drop for ChildGuard<'a> {
@@ -404,7 +471,8 @@ pub fn run_unattended_install(
     while Instant::now() < install_deadline {
         match guard.0.try_wait() {
             Ok(Some(status)) => {
-                if status.success() && fs::read_to_string(&console_log)
+                if status.success()
+                    && fs::read_to_string(&console_log)
                         .map(|s| installation_complete(&s))
                         .unwrap_or(false)
                 {
@@ -423,7 +491,10 @@ pub fn run_unattended_install(
                     }
                     let _ = fs::write(&failed_log, combined);
                     let msg = if !err_tail.trim().is_empty() {
-                        format!("VM error output:\n{}\nLast console output:\n{}", err_tail, tail)
+                        format!(
+                            "VM error output:\n{}\nLast console output:\n{}",
+                            err_tail, tail
+                        )
                     } else {
                         format!("Last console output:\n{}", tail)
                     };
@@ -449,7 +520,9 @@ pub fn run_unattended_install(
             } else if !sent_install_cmd {
                 if is_shell_ready(&content) {
                     std::thread::sleep(Duration::from_millis(1000));
-                    println!("  [3/4] Running bsdinstall (partitioning disk, installing base & kernel packages)...");
+                    println!(
+                        "  [3/4] Running bsdinstall (partitioning disk, installing base & kernel packages)..."
+                    );
                     let install_script = "mdmfs -s 64M md1 /tmp && mdmfs -s 64M md2 /var && (mount -t cd9660 /dev/iso9660/CIDATA /media 2>/dev/null || mount -t cd9660 /dev/vtbd1 /media 2>/dev/null) && bsdinstall script /media/installerconfig && echo VMM_INSTALL_COMPLETE && poweroff";
                     send_uart_command(&uart_path, install_script)?;
                     sent_install_cmd = true;
@@ -479,7 +552,10 @@ pub fn run_unattended_install(
         guard.1 = false;
         let failed_log = dest_dir.join("install-failed.log");
         let _ = fs::copy(&console_log, &failed_log);
-        return Err(format!("timeout during unattended installation (log: {})", failed_log.display()));
+        return Err(format!(
+            "timeout during unattended installation (log: {})",
+            failed_log.display()
+        ));
     }
 
     let kernel_dest = dest_dir.join("kernel");
@@ -493,7 +569,8 @@ pub fn run_unattended_install(
 }
 
 pub fn installation_complete(log: &str) -> bool {
-    log.lines().any(|line| line.trim() == "VMM_INSTALL_COMPLETE")
+    log.lines()
+        .any(|line| line.trim() == "VMM_INSTALL_COMPLETE")
 }
 
 #[cfg(test)]
@@ -503,7 +580,9 @@ mod tests {
 
     #[test]
     fn completion_requires_standalone_marker() {
-        assert!(!installation_complete("# bsdinstall script /media/installerconfig && echo VMM_INSTALL_COMPLETE && poweroff\ninstallation failed"));
+        assert!(!installation_complete(
+            "# bsdinstall script /media/installerconfig && echo VMM_INSTALL_COMPLETE && poweroff\ninstallation failed"
+        ));
         assert!(installation_complete("done\r\nVMM_INSTALL_COMPLETE\r\n"));
     }
 
@@ -545,7 +624,13 @@ mod tests {
 
         let direct = firmware_near_binary(&bin).expect("bundle firmware via real binary");
         assert_eq!(direct, fw.canonicalize().unwrap());
-        assert!(!link.parent().unwrap().join("Resources/firmware/QEMU_EFI.fd").is_file());
+        assert!(
+            !link
+                .parent()
+                .unwrap()
+                .join("Resources/firmware/QEMU_EFI.fd")
+                .is_file()
+        );
     }
 
     #[test]

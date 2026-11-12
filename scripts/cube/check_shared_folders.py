@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot a disposable FreeBSD 14.4 ISO and verify host directory sharing without a NIC."""
+"""Boot a disposable FreeBSD ISO and verify host directory sharing without a NIC."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -7,11 +7,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import argparse
 import os
+import re
 import tempfile
 import time
 
 from support.process import VM
 from support.guest import publish
+
+
+ROOT_PROMPT = re.compile(r"(?:^|\n)root@:[^\r\n]*# ")
 
 
 def prepare_export(directory):
@@ -70,10 +74,23 @@ def main():
         encoded = "".join("\\%03o" % ord(c) for c in marker + "\n")
         send(f"({cmd}) && printf '{encoded}'")
         vm.wait_for(marker, timeout=40)
+    def wait_for_shell_prompt(offset):
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            if ROOT_PROMPT.search(vm.text()[offset:]):
+                return
+            if vm.proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        raise AssertionError(f"Timed out waiting for FreeBSD root prompt:\n{vm.text()[-4000:]}")
     try:
         vm.wait_for("RETURN for /bin/sh", timeout=90)
+        offset = len(vm.text())
         send("")
-        vm.wait_for("root@:/ #", timeout=30)
+        # FreeBSD 14 prints `root@:/ #`, while 16-CURRENT prints `root@:~ #`.
+        # Wait until resizewin has finished its terminal query before injecting
+        # commands, otherwise it can consume the first bytes as a cursor reply.
+        wait_for_shell_prompt(offset)
         check("mount -t tmpfs tmpfs /tmp; mkdir -p /tmp/ro /tmp/rw; kldload virtio_p9fs; "
               "mount -t p9fs readonly /tmp/ro && mount -t p9fs work /tmp/rw", "SHARES_MOUNTED")
         check("test \"$(cat /tmp/ro/host.txt)\" = host-original && ls /tmp/ro", "SHARE_READ_OK")
@@ -100,9 +117,9 @@ def main():
         check("umount /tmp/rw", "SHARE_BEFORE_REBOOT")
         send("reboot")
         vm.wait_for("RETURN for /bin/sh", timeout=90, count=2)
-        prompts = vm.text().count("root@:/ #")
+        offset = len(vm.text())
         send("")
-        vm.wait_for("root@:/ #", timeout=30, count=prompts + 1)
+        wait_for_shell_prompt(offset)
         check("mount -t tmpfs tmpfs /tmp; mkdir -p /tmp/rw; kldload virtio_p9fs; "
               "mount -t p9fs work /tmp/rw && test $(wc -l < /tmp/rw/hard) -eq 2", "SHARE_REBOOT_OK")
         vm.finish(stop=True)

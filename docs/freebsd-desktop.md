@@ -368,20 +368,25 @@ Record the script's `PASS` lines and retain `desktop-results`, `desktop-vmm.log`
 roadmap criteria.
 Stop the guest with `shutdown -p now`; Ctrl-] remains available as a host stop.
 
-## Virtio-gpu decision
+## Virtio-gpu status
 
 FreeBSD 14.4 contains `virtio_gpu`, introduced in FreeBSD 14.0, and ARM64
 GENERIC includes it through `std.virt`. The driver creates a 2D `vt(4)`
 framebuffer; it does not provide a DRM/VirGL accelerated desktop. The
-ArmVirtQemu EDK2 build includes `VirtioGpuDxe`, so a future VMM device can also
-provide GOP output before the kernel starts.
+ArmVirtQemu EDK2 includes `VirtioGpuDxe`, so the implemented Cube device also
+provides GOP output before the kernel starts.
 
-The decision for this milestone is **defer**. Implementing the control queue,
-guest-backed 2D resources, scanout and cursor queue is feasible, but it adds no
-known compatibility requirement for the SCFB desktop and no 3D acceleration.
-Keep simple-framebuffer as the supported path, collect the measurements above,
-and reconsider virtio-gpu if changed-row scanning or fixed boot-time geometry
-becomes the limiting behavior.
+Cube now implements the 2D control and cursor queues, guest-backed resources,
+scanout, transfer, and flush commands behind `--gpu virtio`. FreeBSD attached
+`vtgpu0`, and a UEFI FreeBSD installer was visible over VNC after
+`VirtioGpuDxe` published and flushed its scanout. This confirms firmware and
+kernel-console compatibility; it does not add DRM/VirGL acceleration.
+
+The established SCFB desktop regression remains the default broad X11/input
+test because it has the longer performance and lifecycle history. Use the
+[VirtIO live-verification runbook](virtio-live-verification.md#8-uefi-virtiogpudxe-ab-test)
+for the firmware A/B test and the [FreeBSD runbook](freebsd_runbook.md#virtio-gpu-and-balloon-verification)
+for direct-kernel `vtgpu` checks.
 
 Sources: [FreeBSD virtio_gpu(4) in 14.4](https://cgit.freebsd.org/src/tree/share/man/man4/virtio_gpu.4?h=releng/14.4),
 [FreeBSD ARM64 std.virt in 14.4](https://cgit.freebsd.org/src/tree/sys/arm64/conf/std.virt?h=releng/14.4),

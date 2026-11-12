@@ -1,7 +1,7 @@
+use cube::cow::{CLUSTER_SIZE, MAGIC, TABLE_START};
 use std::fs;
 use std::process::{self, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
-use cube::cow::{CLUSTER_SIZE, MAGIC, TABLE_START};
 
 #[test]
 fn inspect_and_export_commands_use_read_only_sources() {
@@ -9,7 +9,8 @@ fn inspect_and_export_commands_use_read_only_sources() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!("cube-overlay-cli-{}-{stamp}", process::id()));
+    let directory =
+        std::env::temp_dir().join(format!("cube-overlay-cli-{}-{stamp}", process::id()));
     fs::create_dir(&directory).unwrap();
     let base = directory.join("base.img");
     let overlay = directory.join("base.img.cow");
@@ -52,9 +53,11 @@ fn inspect_and_export_commands_use_read_only_sources() {
     assert!(exported.status.success());
     let result = fs::read(&output).unwrap();
     assert_eq!(result.len(), (CLUSTER_SIZE + 5) as usize);
-    assert!(result[..CLUSTER_SIZE as usize]
-        .iter()
-        .all(|&byte| byte == 7));
+    assert!(
+        result[..CLUSTER_SIZE as usize]
+            .iter()
+            .all(|&byte| byte == 7)
+    );
     assert_eq!(&result[CLUSTER_SIZE as usize..], &[2u8; 5]);
     assert_eq!(fs::read(&base).unwrap()[0], 1);
     assert_eq!(fs::read(&overlay).unwrap(), bytes);

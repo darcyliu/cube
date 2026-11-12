@@ -16,7 +16,7 @@ use crate::devices::usb::xhci::XhciController;
 use crate::devices::virtio::VirtioInput;
 use crate::memory::GuestMemory;
 
-use super::{FramebufferConfig, keysym};
+use super::{DamageRect, FramePublisher, FramebufferConfig, keysym};
 
 const RFB_VERSION: &[u8] = b"RFB 003.008\n";
 
@@ -156,6 +156,7 @@ pub fn spawn(
     keyboard: Option<Arc<Mutex<VirtioInput>>>,
     tablet: Option<Arc<Mutex<VirtioInput>>>,
     usb: Option<Arc<Mutex<XhciController>>>,
+    frames: Option<Arc<FramePublisher>>,
 ) -> Result<VncServer, String> {
     if !bind.ip().is_loopback() {
         return Err(
@@ -174,13 +175,16 @@ pub fn spawn(
     let keyboard_thr = keyboard.clone();
     let tablet_thr = tablet.clone();
     let usb_thr = usb.clone();
+    let frames_thr = frames.clone();
 
     let worker = thread::Builder::new()
         .name("vmm-vnc".into())
         .spawn(move || {
             crate::host_log!(
                 "[VNC] Listening on {bind} ({}x{}, stride {})",
-                fb.width, fb.height, fb.stride
+                fb.width,
+                fb.height,
+                fb.stride
             );
             let viewer = match bind.ip() {
                 std::net::IpAddr::V4(ip) => format!("{ip}::{}", bind.port()),
@@ -196,8 +200,11 @@ pub fn spawn(
                         let keyboard_c = keyboard_thr.clone();
                         let tablet_c = tablet_thr.clone();
                         let usb_c = usb_thr.clone();
+                        let frames_c = frames_thr.clone();
                         let stop_c = Arc::clone(&stop_thr);
-                        if let Err(e) = handle_client(stream, mem_c, fb, stop_c, keyboard_c, tablet_c, usb_c) {
+                        if let Err(e) = handle_client(
+                            stream, mem_c, fb, stop_c, keyboard_c, tablet_c, usb_c, frames_c,
+                        ) {
                             crate::host_log!("[VNC] Client session ended: {e}");
                         }
                     }
@@ -227,6 +234,7 @@ fn handle_client(
     keyboard: Option<Arc<Mutex<VirtioInput>>>,
     tablet: Option<Arc<Mutex<VirtioInput>>>,
     usb: Option<Arc<Mutex<XhciController>>>,
+    frames: Option<Arc<FramePublisher>>,
 ) -> Result<(), String> {
     stream.set_nonblocking(false).map_err(|e| e.to_string())?;
     let mut input = SessionInput {
@@ -394,40 +402,68 @@ fn handle_client(
                 read_exact_timeout(&mut stream, &mut rest, &stop)?;
                 metrics.requests += 1;
                 let read_started = Instant::now();
-                mem.read(fb.gpa, &mut fb_buf)
-                    .map_err(|e| format!("FB read: {e}"))?;
+                let published = load_frame(&mem, fb, frames.as_deref(), &mut fb_buf)?;
                 metrics.read_time += read_started.elapsed();
                 metrics.read_bytes += fb.pixel_bytes() as u64;
                 let requested = Rect::from_request(&rest, fb);
                 let compare = rest[0] != 0 && have_full_frame;
-                if compare {
-                    metrics.compared_bytes +=
-                        u64::from(requested.width) * u64::from(requested.height) * 4;
-                }
-                let diff_started = Instant::now();
-                let rect = if compare {
-                    changed_rect(requested, fb.stride as usize, &fb_buf, &previous)
-                } else {
-                    requested
-                };
-                metrics.diff_time += diff_started.elapsed();
                 let send_started = Instant::now();
-                metrics.sent_bytes +=
-                    send_raw_update(&mut stream, fb, &fb_buf, pixel_format, rect)? as u64;
+                if published && compare {
+                    let damage = frames
+                        .as_ref()
+                        .and_then(|frames| frames.take_damage())
+                        .unwrap_or_default();
+                    let diff_started = Instant::now();
+                    let rects: Vec<Rect> = damage
+                        .iter()
+                        .map(|piece| damage_in_request(*piece, requested, fb))
+                        .filter(|rect| rect.width != 0 && rect.height != 0)
+                        .collect();
+                    metrics.diff_time += diff_started.elapsed();
+                    if rects.is_empty() {
+                        metrics.sent_bytes += send_raw_update(
+                            &mut stream,
+                            fb,
+                            &fb_buf,
+                            pixel_format,
+                            Rect {
+                                width: 0,
+                                height: 0,
+                                ..requested
+                            },
+                        )? as u64;
+                    }
+                    for rect in rects {
+                        metrics.sent_bytes +=
+                            send_raw_update(&mut stream, fb, &fb_buf, pixel_format, rect)? as u64;
+                        metrics.sent_pixels += u64::from(rect.width) * u64::from(rect.height);
+                        remember_rect(&mut previous, &fb_buf, fb.stride as usize, rect);
+                    }
+                } else {
+                    if compare {
+                        metrics.compared_bytes +=
+                            u64::from(requested.width) * u64::from(requested.height) * 4;
+                    }
+                    let diff_started = Instant::now();
+                    let rect = if compare {
+                        changed_rect(requested, fb.stride as usize, &fb_buf, &previous)
+                    } else {
+                        requested
+                    };
+                    metrics.diff_time += diff_started.elapsed();
+                    metrics.sent_bytes +=
+                        send_raw_update(&mut stream, fb, &fb_buf, pixel_format, rect)? as u64;
+                    metrics.sent_pixels += u64::from(rect.width) * u64::from(rect.height);
+                    remember_rect(&mut previous, &fb_buf, fb.stride as usize, rect);
+                    if rect.x == 0
+                        && rect.y == 0
+                        && rect.width == fb.width as u16
+                        && rect.height == fb.height as u16
+                    {
+                        have_full_frame = true;
+                    }
+                }
                 metrics.send_time += send_started.elapsed();
-                metrics.sent_pixels += u64::from(rect.width) * u64::from(rect.height);
-                for y in rect.y..rect.y + rect.height {
-                    let start = y as usize * fb.stride as usize + rect.x as usize * 4;
-                    let end = start + rect.width as usize * 4;
-                    previous[start..end].copy_from_slice(&fb_buf[start..end]);
-                }
-                if rect.x == 0
-                    && rect.y == 0
-                    && rect.width == fb.width as u16
-                    && rect.height == fb.height as u16
-                {
-                    have_full_frame = true;
-                }
                 thread::sleep(Duration::from_millis(16));
             }
             4 => {
@@ -564,6 +600,60 @@ impl Rect {
             y,
             width,
             height,
+        }
+    }
+}
+
+fn load_frame(
+    mem: &GuestMemory,
+    fb: FramebufferConfig,
+    frames: Option<&FramePublisher>,
+    buf: &mut [u8],
+) -> Result<bool, String> {
+    if let Some(frames) = frames {
+        if frames.copy_published(buf) {
+            return Ok(true);
+        }
+    }
+    mem.read(fb.gpa, buf).map_err(|e| format!("FB read: {e}"))?;
+    Ok(false)
+}
+
+fn damage_in_request(damage: DamageRect, request: Rect, fb: FramebufferConfig) -> Rect {
+    let x0 = damage.x.max(u32::from(request.x)).min(fb.width);
+    let y0 = damage.y.max(u32::from(request.y)).min(fb.height);
+    let x1 = damage
+        .x
+        .saturating_add(damage.width)
+        .min(u32::from(request.x).saturating_add(u32::from(request.width)))
+        .min(fb.width);
+    let y1 = damage
+        .y
+        .saturating_add(damage.height)
+        .min(u32::from(request.y).saturating_add(u32::from(request.height)))
+        .min(fb.height);
+    if x1 <= x0 || y1 <= y0 {
+        return Rect {
+            x: x0 as u16,
+            y: y0 as u16,
+            width: 0,
+            height: 0,
+        };
+    }
+    Rect {
+        x: x0 as u16,
+        y: y0 as u16,
+        width: (x1 - x0) as u16,
+        height: (y1 - y0) as u16,
+    }
+}
+
+fn remember_rect(previous: &mut [u8], pixels: &[u8], stride: usize, rect: Rect) {
+    for y in rect.y..rect.y.saturating_add(rect.height) {
+        let start = y as usize * stride + rect.x as usize * 4;
+        let end = start + rect.width as usize * 4;
+        if end <= previous.len() && end <= pixels.len() {
+            previous[start..end].copy_from_slice(&pixels[start..end]);
         }
     }
 }
@@ -715,6 +805,50 @@ mod tests {
             }
         );
         assert_eq!(changed_rect(rect, 16, &pixels, &pixels).height, 0);
+        assert_eq!(
+            damage_in_request(
+                DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4
+                },
+                rect,
+                fb
+            ),
+            rect
+        );
+    }
+    #[test]
+    fn published_scanout_replaces_guest_framebuffer() {
+        let mem = Arc::new(GuestMemory::new_test(0x1000, 0x4000));
+        let fb = FramebufferConfig {
+            gpa: 0x1000,
+            width: 2,
+            height: 2,
+            stride: 8,
+            reg_size: 0x1000,
+        };
+        mem.write(fb.gpa, &[1u8; 16]).unwrap();
+        let frames = FramePublisher::new(2, 2);
+        let mut buf = [0u8; 16];
+        assert!(!load_frame(&mem, fb, Some(&frames), &mut buf).unwrap());
+        assert_eq!(buf, [1u8; 16]);
+        frames.blit(
+            DamageRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            &[2u8; 16],
+            8,
+        );
+        assert!(load_frame(&mem, fb, Some(&frames), &mut buf).unwrap());
+        assert_eq!(buf, [2u8; 16]);
+        frames.clear();
+        assert!(!load_frame(&mem, fb, Some(&frames), &mut buf).unwrap());
+        assert_eq!(buf, [1u8; 16]);
     }
     #[test]
     fn negotiated_pixel_formats_change_wire_bytes() {

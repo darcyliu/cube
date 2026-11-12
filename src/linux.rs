@@ -162,7 +162,8 @@ pub fn load_linux_image(
         println!("[Linux] Detected EFI zimg compressed kernel format (Alpine / EFI stub).");
         let start_offset = u32::from_le_bytes(kernel_data[0x08..0x0c].try_into().unwrap()) as usize;
         let payload_size = u32::from_le_bytes(kernel_data[0x0c..0x10].try_into().unwrap()) as usize;
-        let payload_end = start_offset.checked_add(payload_size)
+        let payload_end = start_offset
+            .checked_add(payload_size)
             .filter(|&end| end <= kernel_data.len())
             .ok_or("zimg payload offset/size exceeds file size")?;
         let compressed_payload = &kernel_data[start_offset..payload_end];
@@ -262,14 +263,22 @@ mod tests {
         for len in 8..16 {
             let mut data = vec![0; len];
             data[..8].copy_from_slice(&ZIMG_MAGIC);
-            assert!(load_linux_image(&data, &mem, 0).unwrap_err().contains("Truncated"));
+            assert!(
+                load_linux_image(&data, &mem, 0)
+                    .unwrap_err()
+                    .contains("Truncated")
+            );
         }
         for (offset, size) in [(16u32, 1u32), (u32::MAX, u32::MAX)] {
             let mut data = [0; 16];
             data[..8].copy_from_slice(&ZIMG_MAGIC);
             data[8..12].copy_from_slice(&offset.to_le_bytes());
             data[12..16].copy_from_slice(&size.to_le_bytes());
-            assert!(load_linux_image(&data, &mem, 0).unwrap_err().contains("payload"));
+            assert!(
+                load_linux_image(&data, &mem, 0)
+                    .unwrap_err()
+                    .contains("payload")
+            );
         }
     }
 

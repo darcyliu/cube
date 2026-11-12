@@ -96,6 +96,152 @@ pkg install -y curl
 curl -I https://www.freebsd.org
 ```
 
+### VirtIO GPU and Balloon Verification
+
+Cube includes a dedicated FreeBSD launch target for exercising both devices:
+
+```bash
+# NET=none avoids requiring a running vmnet proxy for this device test.
+make freebsd-gpu-balloon NET=none
+```
+
+The target rebuilds and signs Cube, fetches the FreeBSD 14.4 ARM64 kernel and
+mini-memstick image when needed, attaches the image as `vtbd0`, and launches it
+with these defaults:
+
+| Setting | Default |
+| --- | --- |
+| vCPUs | `CPUS=2` |
+| Guest RAM | `RAM_MB=1024` |
+| Balloon target | `BALLOON_MB=256` |
+| GPU scanout | `GPU_DISPLAY=1280x720` |
+
+The target does not start VNC. FreeBSD boots on Cube's interactive serial
+console, where `Ctrl-]` stops the VM. The VirtIO GPU is still present and can be
+verified through the kernel attachment messages and `devinfo`:
+
+```sh
+dmesg | grep -Ei 'virtio.*gpu|vtgpu|replacing driver'
+devinfo -rv | grep -A8 -B2 -Ei 'vtgpu|virtio.*gpu'
+
+# FreeBSD 14.4 GENERIC ships this driver as a module. Direct ELF boot bypasses
+# loader(8), so load it from the mounted mini-memstick before testing it.
+kldload virtio_balloon
+dmesg | grep -Ei 'virtio.*balloon|vtballoon'
+devinfo -rv | grep -A8 -B2 -Ei 'vtballoon|virtio.*balloon'
+```
+
+Typical device names are `vtgpu0` and `vtballoon0`, attached below a
+VirtIO-MMIO transport. A successful GPU probe should also produce a `VT:` line
+showing that the `virtio_gpu` console driver was installed. Exercise screen
+updates with:
+
+```sh
+clear
+yes "virtio-gpu test" | head -100
+vidcontrol -i mode
+```
+
+FreeBSD's base `virtio_gpu` driver provides a 2D `vt(4)` console; this check does
+not require `/dev/dri` or imply 3D acceleration. Because this target has no
+graphical frontend, it verifies discovery, feature negotiation, queues, and
+interrupt handling rather than visually inspecting the GPU scanout.
+
+The balloon driver exposes its requested and current sizes as 4 KiB VirtIO
+pages:
+
+```sh
+sysctl dev.vtballoon.0.desired dev.vtballoon.0.current
+```
+
+For the default 256 MiB target, both values should converge to `65536`:
+
+```text
+dev.vtballoon.0.desired: 65536
+dev.vtballoon.0.current: 65536
+```
+
+Watch convergence if it is not immediate:
+
+```sh
+while :; do
+    sysctl dev.vtballoon.0.desired dev.vtballoon.0.current
+    sleep 1
+done
+```
+
+The target uses `--mem-prealloc`, which makes host reclamation measurable. On
+macOS, watch Cube's resident memory after `current` reaches the target:
+
+```bash
+PID=$(pgrep -n cube)
+while true; do
+    ps -o pid,rss,vsz,command -p "$PID"
+    sleep 1
+done
+```
+
+For an A/B comparison, first use `BALLOON_MB=0`, then repeat with the default:
+
+```bash
+make freebsd-gpu-balloon NET=none BALLOON_MB=0
+make freebsd-gpu-balloon NET=none BALLOON_MB=256
+```
+
+The second run should settle at a substantially lower host footprint, although
+macOS accounting and other resident VM memory mean the difference need not be
+exactly 256 MiB.
+
+All settings can be overridden without editing the Makefile:
+
+```bash
+make freebsd-gpu-balloon \
+    NET=none \
+    RAM_MB=2048 \
+    BALLOON_MB=512 \
+    GPU_DISPLAY=1920x1080
+```
+
+If the GPU is absent, confirm the FreeBSD kernel includes its driver. If the
+balloon is absent, confirm its module exists and loaded successfully:
+
+```sh
+sysctl kern.conftxt | grep -E 'device[[:space:]]+virtio_gpu'
+ls -l /boot/kernel/virtio_balloon.ko
+kldstat -n virtio_balloon.ko
+```
+
+The 14.4-RELEASE GENERIC kernel has `virtio_gpu` built in, while its balloon
+driver is a module. Direct ELF boot bypasses `loader(8)`, and Cube's current
+FreeBSD module-preload path is not suitable for this test, so load the driver
+with `kldload virtio_balloon` after the UFS root is mounted. Before that command,
+the MMIO device is visible but no `vtballoon0` driver is attached.
+
+`make freebsd-gpu-balloon` now creates `/tmp/cube-balloon.sock` and passes it
+through `--balloon-control`, allowing the target to change without restarting
+the VM. Override it with `BALLOON_CONTROL=/path/to/socket`. Restarting with
+`BALLOON_MB=0` remains useful as an inflation A/B comparison, but it is not a
+deflation test.
+
+For the recorded 512 MiB cycle, launch with
+`make freebsd-gpu-balloon NET=none RAM_MB=2048 BALLOON_MB=512`. After loading
+`virtio_balloon` in the guest, run the complete cycle from a host terminal:
+
+```sh
+python3 scripts/balloonctl.py status
+python3 scripts/balloonctl.py set 256 --wait
+python3 scripts/balloonctl.py set 0 --wait
+python3 scripts/balloonctl.py set 512 --wait
+```
+
+Every completed step must report `"ok": true`, `"driver_ok": true`, and
+`"converged": true`. The requested, target, actual, and held page counts must
+all be equal. If `driver_ok` is false and `actual_pages` remains zero, run
+`kldload virtio_balloon` in FreeBSD before retrying. This exact cycle passed
+with page counts 131,072, 65,536, zero, and 131,072. The runtime protocol,
+safety ordering, returned-memory test, and full acceptance evidence are in
+[VirtIO live verification](virtio-live-verification.md#handling-same-vm-balloon-deflation).
+
 ---
 
 ## 5. One-Time Setup for Automated Multi-User & SSH

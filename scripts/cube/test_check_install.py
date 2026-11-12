@@ -15,10 +15,21 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_install import (ConsoleSession, Machine, desktop_packages, direct_command,
                            password_from_file, desktop_session, find_usb_tablet,
-                           line_present, main)
+                           detect_base_mode, line_present, main)
 
 
 class InstallGuards(unittest.TestCase):
+    def test_base_mode_detects_offline_pkgbase_repository(self):
+        with patch("check_install.subprocess.run",
+                   return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertEqual(detect_base_mode(Path("freebsd-16.iso")), "pkgbase")
+        self.assertIn("FreeBSD-base-offline.conf", run.call_args.args[0][-1])
+
+    def test_base_mode_falls_back_to_distribution_sets(self):
+        with patch("check_install.subprocess.run",
+                   return_value=subprocess.CompletedProcess([], 1)):
+            self.assertEqual(detect_base_mode(Path("freebsd-14.iso")), "distsets")
+
     def test_tablet_detection_uses_descriptors_not_database_names_or_addresses(self):
         listing = """ugen2.1: <XHCI root HUB Generic> at usbus2
 ugen2.8: <QEMU Tablet Adomax Technology Co., Ltd> at usbus2

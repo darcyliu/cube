@@ -45,6 +45,18 @@ def escaped(text):
     return "".join(f"\\{ord(c):03o}" for c in text)
 
 
+def detect_base_mode(iso):
+    """Select the distribution format carried by a FreeBSD disc1 image."""
+    offline_repo = "usr/freebsd-packages/repos/FreeBSD-base-offline.conf"
+    result = subprocess.run(
+        ["tar", "-tf", str(iso), offline_repo],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return "pkgbase" if result.returncode == 0 else "distsets"
+
+
 def find_usb_tablet(execute, listing, deadline):
     # usbconfig's summary uses a VID/PID database. Both emulated devices
     # share those IDs, so only their actual string descriptors distinguish them.
@@ -657,8 +669,9 @@ def main():
     parser.add_argument("--artifacts", type=Path, help="parent for a new private run directory")
     parser.add_argument("--run-name",
                         help="install into ARTIFACTS/NAME instead of a generated directory")
-    parser.add_argument("--base", choices=("distsets", "pkgbase"), default="distsets",
-                        help="pkgbase for FreeBSD 15.1+ disc1; distsets for 14.x")
+    parser.add_argument("--base", choices=("auto", "distsets", "pkgbase"), default="auto",
+                        help="base format (default: detect pkgbase on FreeBSD 15.1+, "
+                             "otherwise 14.x distsets)")
     parser.add_argument("--keep", action="store_true", help="also retain artifacts on success")
     parser.add_argument("--skip-verify", action="store_true",
                         help="install the guest and, for a desktop, its packages and "
@@ -715,6 +728,9 @@ def main():
         if not path.is_file():
             parser.error(f"{name} is not a file: {path}")
         setattr(args, name, path)
+    if args.base == "auto":
+        args.base = detect_base_mode(args.iso)
+        print(f"[install] Auto-detected FreeBSD base format: {args.base}", flush=True)
     if not 0 <= args.ssh_port <= 65535 or not 0 <= args.vnc_port <= 65535:
         parser.error("--ssh-port and --vnc-port must be 0..65535")
     if args.desktop and args.ssh_port != 0 and args.ssh_port == args.vnc_port:

@@ -93,12 +93,16 @@ mod tests {
         image.export(&output).unwrap();
         let exported = fs::read(&output).unwrap();
         assert_eq!(exported.len(), (2 * CLUSTER_SIZE + 13) as usize);
-        assert!(exported[..CLUSTER_SIZE as usize]
-            .iter()
-            .all(|&byte| byte == 7));
-        assert!(exported[CLUSTER_SIZE as usize..2 * CLUSTER_SIZE as usize]
-            .iter()
-            .all(|&byte| byte == 2));
+        assert!(
+            exported[..CLUSTER_SIZE as usize]
+                .iter()
+                .all(|&byte| byte == 7)
+        );
+        assert!(
+            exported[CLUSTER_SIZE as usize..2 * CLUSTER_SIZE as usize]
+                .iter()
+                .all(|&byte| byte == 2)
+        );
         assert_eq!(&exported[2 * CLUSTER_SIZE as usize..], &[9u8; 13]);
         assert_eq!(fs::read(&base).unwrap(), original_base);
         assert_eq!(fs::read(&overlay).unwrap(), original_overlay);
@@ -116,10 +120,12 @@ mod tests {
             .open(&overlay)
             .unwrap();
         writer.try_lock().unwrap();
-        assert!(CowImage::open(&base, &overlay)
-            .err()
-            .unwrap()
-            .contains("in use"));
+        assert!(
+            CowImage::open(&base, &overlay)
+                .err()
+                .unwrap()
+                .contains("in use")
+        );
         writer.unlock().unwrap();
         let writer = OpenOptions::new()
             .read(true)
@@ -127,10 +133,12 @@ mod tests {
             .open(&base)
             .unwrap();
         writer.try_lock().unwrap();
-        assert!(CowImage::open(&base, &overlay)
-            .err()
-            .unwrap()
-            .contains("in use"));
+        assert!(
+            CowImage::open(&base, &overlay)
+                .err()
+                .unwrap()
+                .contains("in use")
+        );
     }
 
     #[test]
