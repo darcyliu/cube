@@ -1,5 +1,9 @@
 # GUI Display & Input Architecture Guide
 
+For the current order of native-window, VNC, dynamic-resize, clipboard, and
+advanced-graphics work, see the
+[prioritized feature and product roadmap](next-features.md#p4-shared-display-core-and-native-window-polish).
+
 This document outlines the architectural designs, device specifications, host presentation backends, and implementation roadmap for adding Graphical User Interface (GUI) and interactive pointer/keyboard support to the macOS ARM64 `vmm`.
 
 ---
@@ -49,7 +53,7 @@ Running a graphical desktop (such as Debian GNOME/XFCE, Alpine desktop, or FreeB
 | **Complexity** | Minimal (~100 lines of code) | Moderate (~800 lines of code) |
 | **Guest Drivers** | Built-in (`simpledrm`, `simplefb`, `vt_simplefb`) | FreeBSD 14 base `virtio_gpu` 2D VT driver; Linux DRM driver |
 | **Memory Model** | Reserved GPA physical RAM block | Guest-allocated scatter-gather buffers |
-| **Resolution** | Fixed at boot (e.g. 1920x1080 or 1280x720) | Dynamic runtime resizing & multi-head |
+| **Resolution** | Fixed at boot (e.g. 1920x1080 or 1280x720) | Currently fixed at boot, one scanout; runtime resize and multi-head are future work |
 | **Hardware 3D** | No (CPU blit only) | Not provided by the FreeBSD base driver |
 | **Best For** | Fast bring-up, OS installers, bootloaders | Production desktop VMs, multi-resolution |
 
@@ -229,7 +233,12 @@ as the owner of the application event loop.
 
 ---
 
-## 5. Recommended Implementation Roadmap
+## 5. Implementation history and remaining verification
+
+Phases 1 and 2 below are implemented; their numbered steps preserve the original
+design outline, not an outstanding task list. Current framebuffer placement and
+size come from the validated layout and geometry, rather than the original
+fixed-address example below. See the prioritized roadmap for new work.
 
 ### Phase 1: SimpleFB + Embedded VNC Server
 1. **Memory Allocation**: Reserve 8MB RAM at `0x5000_0000` for 1920x1080 32bpp framebuffer.

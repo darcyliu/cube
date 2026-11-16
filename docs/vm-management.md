@@ -28,6 +28,7 @@ Place a file such as `vms/freebsd-zfs.json` in the repository:
     "forwards": ["127.0.0.1:8080=192.168.2.77:80"]
   },
   "vnc": {"bind": "127.0.0.1:5901", "display": "1280x720"},
+  "gpu": "virtio",
   "shutdown": {
     "host": "127.0.0.1", "port": 2222, "user": "root",
     "identity_file": "/path/to/guest-ssh-key"
@@ -43,6 +44,10 @@ an explicit path; otherwise the manager uses the instance's private
 `efi-vars.fd`. Paths in the JSON file are relative to that file. The manager
 assigns a stable locally administered MAC from the VM name unless `network.mac`
 is set. `network.mode` defaults to `none`; `vnc` and `shutdown` are optional.
+`gpu` accepts `virtio`, `simple`, or `none`. Configurations created by older
+versions that omit it retain the `simple` framebuffer default. Cube.app selects
+`virtio` for newly created VMs; this is a 2D VirtIO-GPU device and does not
+provide VirGL, Venus, or guest 3D acceleration.
 The SSH endpoint used for shutdown must be reachable from the host. The example
 uses `ssh_port` forwarding to a DHCP guest; use a static `network.forwards`
 rule and matching shutdown port for a static guest address.

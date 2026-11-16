@@ -209,6 +209,9 @@ pub struct StartArgs {
     #[arg(long, help = "Override display resolution (WIDTHxHEIGHT)")]
     pub display: Option<String>,
 
+    #[arg(long, value_parser = ["simple", "virtio", "none"], help = "Override guest graphics device")]
+    pub gpu: Option<String>,
+
     #[arg(long, help = "Override EFI vars store path")]
     pub efi_vars: Option<PathBuf>,
 
@@ -360,6 +363,10 @@ pub struct CreateArgs {
     /// Display resolution (e.g. 1280x800)
     #[arg(long)]
     pub display: Option<String>,
+
+    /// Guest graphics device
+    #[arg(long, value_parser = ["simple", "virtio", "none"], default_value = "simple")]
+    pub gpu: String,
 
     /// SSH private key path for graceful shutdown
     #[arg(long)]

@@ -14,6 +14,30 @@ use crate::util::{
     control_socket_path, ensure_control_root, query_socket, require, write_json_atomic,
 };
 
+fn manager_log(message: impl std::fmt::Display) {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = duration.as_secs() as libc::time_t;
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&seconds, &mut local);
+    }
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(
+        stdout,
+        "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}] {message}",
+        local.tm_year + 1900,
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec,
+        duration.subsec_millis()
+    );
+    let _ = stdout.flush();
+}
+
 pub fn live_status(state_dir: &Path) -> Option<serde_json::Value> {
     let sock = control_socket_path(state_dir);
     if !sock.exists() {
@@ -143,6 +167,12 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
     let spec_data = fs::read_to_string(&spec_path)
         .map_err(|e| format!("cannot read {:?}: {}", spec_path, e))?;
     let spec: LaunchSpec = serde_json::from_str(&spec_data).map_err(|e| e.to_string())?;
+    manager_log(format!(
+        "Manager daemon starting for VM '{}' (PID {}, instance {})",
+        spec.name,
+        std::process::id(),
+        spec.id
+    ));
 
     drop(crate::util::lock_resources(&spec.resources)?);
 
@@ -229,6 +259,11 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         })
     });
     let child_pid = child.id();
+    manager_log(format!(
+        "VMM started (PID {child_pid}, interactive={}, control={})",
+        spec.interactive,
+        control.display()
+    ));
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -256,9 +291,16 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
 
     let exit_code = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(1),
+            Ok(Some(status)) => {
+                let code = status.code().unwrap_or(1);
+                manager_log(format!("VMM exited with status {status} (code {code})"));
+                break code;
+            }
             Ok(None) => {}
-            Err(_) => break 1,
+            Err(error) => {
+                manager_log(format!("Could not query VMM process status: {error}"));
+                break 1;
+            }
         }
 
         match listener.accept() {
@@ -310,10 +352,24 @@ fn serve_inner(state_dir: &Path, start_lock: Option<fs::File>) -> Result<(), Str
         "exit_code": exit_code,
         "ended": ended
     });
-    let _ = write_json_atomic(&state_dir.join("last.json"), &last);
-    let _ = fs::remove_file(&control);
-    let _ = fs::remove_file(state_dir.join("instance.json"));
-    let _ = fs::remove_file(&runtime_path);
+    if let Err(error) = write_json_atomic(&state_dir.join("last.json"), &last) {
+        manager_log(format!("Could not write final lifecycle state: {error}"));
+    }
+    for (label, path) in [
+        ("control socket", control.clone()),
+        ("instance state", state_dir.join("instance.json")),
+        ("runtime status", runtime_path.clone()),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => manager_log(format!(
+                "Could not remove {label} {}: {error}",
+                path.display()
+            )),
+        }
+    }
+    manager_log("Manager cleanup complete");
 
     if spec.interactive && exit_code != 0 {
         return Err(format!("VM exited with code {exit_code}"));
@@ -331,12 +387,18 @@ fn handle_client_request(
 ) -> serde_json::Value {
     let req: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(e) => return serde_json::json!({"ok": false, "error": format!("invalid json: {}", e)}),
+        Err(e) => {
+            manager_log(format!("Rejected invalid control request: {e}"));
+            return serde_json::json!({"ok": false, "error": format!("invalid json: {}", e)});
+        }
     };
 
     let action = match req.get("action").and_then(|a| a.as_str()) {
         Some(a) => a,
-        None => return serde_json::json!({"ok": false, "error": "missing action"}),
+        None => {
+            manager_log("Rejected control request without an action");
+            return serde_json::json!({"ok": false, "error": "missing action"});
+        }
     };
 
     match action {
@@ -373,12 +435,14 @@ fn handle_client_request(
         }
         "stop" => {
             let timeout = req.get("timeout").and_then(|t| t.as_u64()).unwrap_or(10);
+            manager_log(format!("Forced stop requested (timeout {timeout}s)"));
             let signal = force_stop_child(
                 child,
                 spec.sudo,
                 spec.interactive,
                 Duration::from_secs(timeout),
             );
+            manager_log(format!("Forced stop completed using {signal}"));
             serde_json::json!({"ok": true, "result": "forced-stop", "signal": signal})
         }
         "shutdown" => {
@@ -387,16 +451,29 @@ fn handle_client_request(
                 .get("force_after")
                 .and_then(|f| f.as_bool())
                 .unwrap_or(false);
-            guest_shutdown(
+            manager_log(format!(
+                "Guest shutdown requested (timeout {timeout}s, force_after={force_after})"
+            ));
+            let response = guest_shutdown(
                 child,
                 spec,
                 state_dir,
                 Duration::from_secs(timeout),
                 force_after,
                 output_thread,
-            )
+            );
+            let result = response
+                .get("result")
+                .and_then(|value| value.as_str())
+                .or_else(|| response.get("error").and_then(|value| value.as_str()))
+                .unwrap_or("unknown result");
+            manager_log(format!("Guest shutdown completed: {result}"));
+            response
         }
-        other => serde_json::json!({"ok": false, "error": format!("unknown action: {}", other)}),
+        other => {
+            manager_log(format!("Rejected unknown control action '{other}'"));
+            serde_json::json!({"ok": false, "error": format!("unknown action: {}", other)})
+        }
     }
 }
 

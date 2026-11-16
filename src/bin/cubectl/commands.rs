@@ -475,6 +475,7 @@ pub fn do_create(args: CreateArgs, state_root: &Path) -> Result<(), String> {
         shares,
         network,
         vnc,
+        gpu: args.gpu,
         efi_vars: None,
         shutdown,
         no_reboot: false,

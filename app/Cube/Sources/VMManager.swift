@@ -44,6 +44,7 @@ struct CreateVMOptions {
     var shareTag: String?
     var shareReadOnly: Bool = false
     var memPrealloc: Bool = false
+    var gpuMode: String = "virtio"
 }
 
 class VMManager {
@@ -447,6 +448,7 @@ class VMManager {
         args.extend(["--cpus", String(options.cpus)])
         args.extend(["--ram", String(options.ramMB)])
         args.extend(["--disk", "rootfs.img:\(options.diskSizeGB)G"])
+        args.extend(["--gpu", options.gpuMode])
 
         args.extend(["--net", options.netMode])
 
@@ -836,6 +838,7 @@ struct DetailedVMConfig {
     var shares: [VMShareConfig] = []
     var noReboot: Bool = false
     var memPrealloc: Bool = false
+    var gpuMode: String = "simple"
 
     var diskPath: String? {
         return disks.first?.path
@@ -880,6 +883,7 @@ extension VMInfo {
             if let o = json["os"] as? String { cfg.os = o }
             if let c = json["cpus"] as? Int { cfg.cpus = c }
             if let r = json["ram_mb"] as? Int { cfg.ramMB = r }
+            if let gpu = json["gpu"] as? String { cfg.gpuMode = gpu }
             if let b = json["boot"] as? [String: Any] {
                 if let m = b["mode"] as? String { cfg.bootMode = m }
                 if let fw = b["firmware"] as? String { cfg.firmware = fw }
@@ -1092,6 +1096,7 @@ extension VMInfo {
         // 2. RAM & vCPUs
         parts.append(contentsOf: ["--ram", "\(cfg.ramMB)"])
         parts.append(contentsOf: ["--cpus", "\(cfg.cpus)"])
+        parts.append(contentsOf: ["--gpu", cfg.gpuMode])
 
         // 3. Disks
         for d in cfg.disks {

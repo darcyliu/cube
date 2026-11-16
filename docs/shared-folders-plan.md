@@ -75,7 +75,7 @@ invalid tags, missing directories, unsupported settings, and excess devices
 before boot. Define a conservative tag length that fits the device config
 window. Opening an export must succeed under its configured host identity.
 
-Proposed manager configuration:
+Delivered manager configuration (9P):
 
 ```json
 {
@@ -91,7 +91,7 @@ the manager's existing disk/forward conventions. Record effective paths, modes,
 and identities in launch/status output. Directories may intentionally be shared
 across VMs; do not apply the exclusive disk-image ownership rule to them.
 
-Expected FreeBSD usage, to verify during the spike:
+Verified FreeBSD 14.4 read-only mount workflow (see the runbook for coverage):
 
 ```sh
 kldload virtio_p9fs

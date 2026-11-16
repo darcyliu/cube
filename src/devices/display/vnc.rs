@@ -16,7 +16,9 @@ use crate::devices::usb::xhci::XhciController;
 use crate::devices::virtio::VirtioInput;
 use crate::memory::GuestMemory;
 
-use super::{DamageRect, FramePublisher, FramebufferConfig, keysym};
+#[cfg(test)]
+use super::DamageRect;
+use super::{FramePublisher, FramebufferConfig, keysym};
 
 const RFB_VERSION: &[u8] = b"RFB 003.008\n";
 
@@ -324,7 +326,7 @@ fn handle_client(
     init.push(8); // green-shift
     init.push(0); // blue-shift
     init.extend_from_slice(&[0, 0, 0]); // padding
-    let name = b"vmm simplefb";
+    let name = b"Cube VM";
     init.extend_from_slice(&(name.len() as u32).to_be_bytes());
     init.extend_from_slice(name);
     stream
@@ -408,38 +410,14 @@ fn handle_client(
                 let requested = Rect::from_request(&rest, fb);
                 let compare = rest[0] != 0 && have_full_frame;
                 let send_started = Instant::now();
-                if published && compare {
-                    let damage = frames
-                        .as_ref()
-                        .and_then(|frames| frames.take_damage())
-                        .unwrap_or_default();
-                    let diff_started = Instant::now();
-                    let rects: Vec<Rect> = damage
-                        .iter()
-                        .map(|piece| damage_in_request(*piece, requested, fb))
-                        .filter(|rect| rect.width != 0 && rect.height != 0)
-                        .collect();
-                    metrics.diff_time += diff_started.elapsed();
-                    if rects.is_empty() {
-                        metrics.sent_bytes += send_raw_update(
-                            &mut stream,
-                            fb,
-                            &fb_buf,
-                            pixel_format,
-                            Rect {
-                                width: 0,
-                                height: 0,
-                                ..requested
-                            },
-                        )? as u64;
-                    }
-                    for rect in rects {
-                        metrics.sent_bytes +=
-                            send_raw_update(&mut stream, fb, &fb_buf, pixel_format, rect)? as u64;
-                        metrics.sent_pixels += u64::from(rect.width) * u64::from(rect.height);
-                        remember_rect(&mut previous, &fb_buf, fb.stride as usize, rect);
-                    }
-                } else {
+                if published {
+                    // Flushes can repeat unchanged or overlapping regions. Consume
+                    // damage, but diff this snapshot against what this client saw.
+                    // One request must not fan out into many full-frame replies,
+                    // blocking this thread from reading keyboard/pointer events.
+                    let _ = frames.as_ref().and_then(|frames| frames.take_damage());
+                }
+                {
                     if compare {
                         metrics.compared_bytes +=
                             u64::from(requested.width) * u64::from(requested.height) * 4;
@@ -490,6 +468,7 @@ fn handle_client(
                 let buttons = rest[0];
                 let x = u16::from_be_bytes([rest[1], rest[2]]);
                 let y = u16::from_be_bytes([rest[3], rest[4]]);
+                crate::device_trace!("[VNC] PointerEvent x={x} y={y} buttons={buttons}");
                 input.pointer(x, y, buttons);
             }
             255 => {
@@ -619,6 +598,7 @@ fn load_frame(
     Ok(false)
 }
 
+#[cfg(test)]
 fn damage_in_request(damage: DamageRect, request: Rect, fb: FramebufferConfig) -> Rect {
     let x0 = damage.x.max(u32::from(request.x)).min(fb.width);
     let y0 = damage.y.max(u32::from(request.y)).min(fb.height);

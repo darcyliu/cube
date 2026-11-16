@@ -31,6 +31,8 @@ pub struct VmConfig {
     pub network: Option<NetworkConfig>,
     #[serde(default)]
     pub vnc: Option<VncConfig>,
+    #[serde(default = "default_gpu")]
+    pub gpu: String,
     #[serde(default)]
     pub efi_vars: Option<String>,
     #[serde(default)]
@@ -46,6 +48,9 @@ fn default_ram() -> u64 {
 }
 fn default_cpus() -> u32 {
     1
+}
+fn default_gpu() -> String {
+    "simple".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +536,17 @@ pub fn build_launch_spec(
             command.extend(["--display".into(), disp]);
         }
     }
+
+    let gpu = cli_overrides.gpu.as_deref().unwrap_or(&config.gpu);
+    require(
+        matches!(gpu, "simple" | "virtio" | "none"),
+        "gpu must be simple, virtio, or none",
+    )?;
+    require(
+        gpu != "none" || (!native_gui && vnc_bind.is_none()),
+        "gpu none cannot be combined with VNC or native display",
+    )?;
+    command.extend(["--gpu".into(), gpu.into()]);
 
     // 8. EFI vars & console log
     let efi = if let Some(ref e) = cli_overrides.efi_vars {

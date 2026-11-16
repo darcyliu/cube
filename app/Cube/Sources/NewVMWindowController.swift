@@ -52,6 +52,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
     private var desktopPopUp: NSPopUpButton!
     private var cpuPopUp: NSPopUpButton!
     private var ramPopUp: NSPopUpButton!
+    private var gpuPopUp: NSPopUpButton!
     private var memPreallocCheckbox: NSButton!
     private var diskField: NSTextField!
     private var passwordField: NSTextField!
@@ -142,6 +143,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         desktopPopUp.selectItem(at: 0)
         cpuPopUp.selectItem(at: 1) // 2 vCPUs
         ramPopUp.selectItem(at: 1) // 2048 MB
+        gpuPopUp.selectItem(at: 0) // VirtIO GPU 2D
         memPreallocCheckbox?.state = .off
         diskField.stringValue = "20"
         securePasswordField.stringValue = "root"
@@ -614,6 +616,16 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             label: "Memory (RAM):", control: ramRow, in: card, topAnchor: lastAnchor,
             height: 24, baselineView: ramPopUp
         )
+
+        // Guest graphics device
+        gpuPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        gpuPopUp.font = NSFont.systemFont(ofSize: 12)
+        gpuPopUp.addItems(withTitles: ["VirtIO GPU (2D)", "Simple Framebuffer"])
+        gpuPopUp.item(at: 0)?.representedObject = "virtio"
+        gpuPopUp.item(at: 1)?.representedObject = "simple"
+        gpuPopUp.selectItem(at: 0)
+        gpuPopUp.toolTip = "VirtIO GPU provides a guest-visible 2D graphics device. It does not provide 3D acceleration."
+        lastAnchor = addFormRow(label: "Graphics:", control: gpuPopUp, in: card, topAnchor: lastAnchor, height: 24)
 
         // Virtual Disk Size
         let diskRow = NSView()
@@ -1199,6 +1211,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         let cpus = [1, 2, 4, 8][cpuPopUp.indexOfSelectedItem]
         let rams = [1024, 2048, 4096, 8192, 16384][ramPopUp.indexOfSelectedItem]
         let diskGB = Int(diskField.stringValue) ?? 20
+        let gpuMode = (gpuPopUp.selectedItem?.representedObject as? String) ?? "virtio"
         let password = passwordField.stringValue.isEmpty ? "root" : passwordField.stringValue
         let desktopValue = desktopPopUp.selectedItem?.representedObject as? String
         let desktop = desktopValue?.isEmpty == false ? desktopValue : nil
@@ -1236,7 +1249,8 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
             sharePath: sharePath.isEmpty ? nil : sharePath,
             shareTag: shareTag.isEmpty ? nil : shareTag,
             shareReadOnly: shareReadOnly,
-            memPrealloc: (memPreallocCheckbox.state == .on)
+            memPrealloc: (memPreallocCheckbox.state == .on),
+            gpuMode: gpuMode
         )
 
         isBusy = true
@@ -1319,6 +1333,7 @@ class NewVMWindowController: NSWindowController, NSWindowDelegate {
         desktopPopUp.isEnabled = enabled && unattendedCheckbox.state == .on
         cpuPopUp.isEnabled = enabled
         ramPopUp.isEnabled = enabled
+        gpuPopUp.isEnabled = enabled
         memPreallocCheckbox?.isEnabled = enabled
         diskField.isEnabled = enabled
         securePasswordField.isEnabled = enabled

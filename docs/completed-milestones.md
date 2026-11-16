@@ -1,7 +1,11 @@
-# Follow-up roadmap
+# Completed milestones
+
+This file records completed follow-up milestones. For proposed work ordered by
+current priority, see the [prioritized feature and product roadmap](next-features.md).
 
 Recorded 2026-09-20 after the device/lifecycle hardening and unattended-console
-fixes in `06fb2b3`. Updated through 2026-09-23: item 1 is complete with regression coverage
+fixes in `06fb2b3`. Lifecycle results recorded through 2026-09-23; graphics status updated with
+the 2026-11-11 VirtIO verification. Item 1 is complete with regression coverage
 and user-confirmed guest SSH forwarding. Item 2 is complete with a user-confirmed
 full privileged install → boot → reboot regression run. Item 3 is complete for
 the offline UEFI/ZFS disk-boot path, including EFI persistence and cold start.
@@ -84,10 +88,9 @@ pass in debug and release; 13 runner tests pass, as do real offline UFS and ZFS
 lifecycle runs. The six firmware driver messages are identified in the runbook.
 Firmware TLS context initialization remains unresolved, outside local disk boot.
 
-See [ZFS implementation plan](zfs_implementation_plan.md),
-[ZFS boot notes](freebsd_zfs_boot.md), and [ZFS runbook](freebsd_zfs_runbook.md).
-Those documents now reflect the verified path and supersede the old direct
-MODINFO implementation plan.
+See [ZFS boot architecture and status](freebsd_zfs_boot.md) and the
+[ZFS runbook](freebsd_zfs_runbook.md). These supersede the old direct MODINFO
+implementation plan.
 
 ## 4. Graphical desktop support
 

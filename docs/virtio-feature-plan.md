@@ -22,13 +22,19 @@ the table below is the current support state.
 and TX queues. VirtIO net multiqueue means multiple RX/TX *pairs* selected via
 the control queue.
 
-## Recommended delivery order
+## Delivery record and remaining work
+
+The headings summarize delivered capability, not completion of every original
+acceptance criterion. Post-optimization forward TCP/UDP, the network soak and
+two-VM isolation retest, and mixed-device reset/shutdown stress remain open.
+Use the [live result checklist](virtio-live-verification.md#result-checklist)
+and [current priorities](next-features.md) for release qualification.
 
 Implement the work as independently mergeable vertical slices. Do not advertise
 a feature until its queue topology, config fields, reset path, and malformed
 guest-input tests are complete.
 
-### 0. Shared VirtIO transport foundation — completed
+### 0. Shared VirtIO transport foundation — implemented; fuzzing follow-up remains
 
 This is the prerequisite for every new device and for safe multiqueue work.
 
@@ -39,9 +45,10 @@ This is the prerequisite for every new device and for safe multiqueue work.
 2. Validate driver features against the offered mask when `FEATURES_OK` is set;
    refuse invalid negotiation instead of retaining arbitrary guest bits. Require
    `DRIVER_OK` before consuming queues.
-3. Make queue-size writes reject zero, non-powers-of-two, and values above the
-   advertised maximum rather than silently accepting or clamping inconsistent
-   values.
+3. Queue-size writes reject zero, non-powers-of-two, and values above the
+   advertised maximum. The delivered GPU-only EDK2 compatibility exception
+   retains the advertised queue maximum on a zero write; other devices retain
+   strict validation. See the live runbook for the firmware evidence.
 4. Complete split-ring indirect parsing, including a final indirect table after
    normal descriptors, while continuing to reject nesting, cycles, invalid
    direction, unnegotiated use, integer overflow, and chains over device limits.
@@ -51,7 +58,8 @@ This is the prerequisite for every new device and for safe multiqueue work.
    registration and FDT generation.
 6. Add table-driven transport tests for feature pages, every queue index,
    independent queue state, reset epochs, interrupt ACK, direct/indirect chains,
-   and hostile GPA/length values. Add a descriptor-parser fuzz target.
+   and hostile GPA/length values. These have regression coverage; a dedicated
+   descriptor-parser fuzz target remains outstanding.
 
 Acceptance gate: existing block, net, RNG, console, input, and 9P unit tests and
 guest boot regressions pass through the shared transport with no feature-mask or

@@ -19,6 +19,15 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
     private var refreshTimer: Timer?
     private var rawLogContent: String = ""
     private var lastFileModificationDate: Date?
+    private var lastFileSize: UInt64?
+
+    private struct ClearedLogPosition {
+        let byteOffset: UInt64
+        let fileNumber: UInt64?
+    }
+
+    /// View-only clear positions, kept separately for every VM and log type.
+    private var clearedLogPositions: [String: ClearedLogPosition] = [:]
 
     enum LogType: Int {
         case console = 0
@@ -150,6 +159,14 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
         clearBtn.font = NSFont.systemFont(ofSize: 11)
         headerView.addSubview(clearBtn)
 
+        let clearFileBtn = NSButton(title: "Clear Log File…", target: self, action: #selector(clearLogFileClicked))
+        clearFileBtn.translatesAutoresizingMaskIntoConstraints = false
+        clearFileBtn.bezelStyle = .rounded
+        clearFileBtn.controlSize = .small
+        clearFileBtn.font = NSFont.systemFont(ofSize: 11)
+        clearFileBtn.toolTip = "Permanently truncate the selected log file (VM must be stopped)"
+        headerView.addSubview(clearFileBtn)
+
         let copyBtn = NSButton(title: "Copy", target: self, action: #selector(copyClicked(_:)))
         copyBtn.translatesAutoresizingMaskIntoConstraints = false
         copyBtn.bezelStyle = .rounded
@@ -266,7 +283,11 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
             wrapLinesCheckbox.leadingAnchor.constraint(equalTo: autoScrollCheckbox.trailingAnchor, constant: 12),
             wrapLinesCheckbox.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
 
-            statusLabel.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -18),
+            clearFileBtn.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -18),
+            clearFileBtn.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            clearFileBtn.widthAnchor.constraint(equalToConstant: 104),
+
+            statusLabel.trailingAnchor.constraint(equalTo: clearFileBtn.leadingAnchor, constant: -8),
             statusLabel.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
             statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: wrapLinesCheckbox.trailingAnchor, constant: 10),
 
@@ -338,6 +359,8 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
 
     private func loadLogs(silent: Bool = false, resetPosition: Bool = false) {
         guard let path = currentLogPath else {
+            lastFileModificationDate = nil
+            lastFileSize = nil
             setDisplayedText("No Virtual Machine selected.")
             statusLabel.stringValue = ""
             return
@@ -345,6 +368,8 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
 
         let fileManager = FileManager.default
         if !fileManager.fileExists(atPath: path) {
+            lastFileModificationDate = nil
+            lastFileSize = nil
             rawLogContent = ""
             setDisplayedText("Log file does not exist yet:\n\(path)\n\nLogs will appear once '\(currentVMName ?? "")' starts.")
             statusLabel.stringValue = "Offline / Not started"
@@ -353,19 +378,41 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
 
         guard let attrs = try? fileManager.attributesOfItem(atPath: path),
               let modDate = attrs[.modificationDate] as? Date,
-              let fileSize = attrs[.size] as? UInt64 else {
+              let fileSizeNumber = attrs[.size] as? NSNumber else {
             return
         }
+        let fileSize = fileSizeNumber.uint64Value
+        let fileNumber = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value
 
-        if silent && lastFileModificationDate == modDate {
+        if silent && lastFileModificationDate == modDate && lastFileSize == fileSize {
             return
         }
         lastFileModificationDate = modDate
+        lastFileSize = fileSize
 
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let content = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) {
+        var visibleByteOffset: UInt64 = 0
+        if let clearedPosition = clearedLogPositions[path] {
+            let fileWasReplaced = clearedPosition.fileNumber != nil &&
+                fileNumber != nil &&
+                clearedPosition.fileNumber != fileNumber
+            let fileWasTruncated = fileSize < clearedPosition.byteOffset
+            if fileWasReplaced || fileWasTruncated {
+                clearedLogPositions.removeValue(forKey: path)
+            } else {
+                visibleByteOffset = clearedPosition.byteOffset
+            }
+        }
+
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
+            let safeOffset = min(visibleByteOffset, UInt64(data.count))
+            let visibleData = data.dropFirst(Int(safeOffset))
+            let content = String(decoding: visibleData, as: UTF8.self)
             rawLogContent = VMLogWindowController.cleanAnsiCodes(content)
-            applyFilterAndDisplay(resetPosition: resetPosition)
+            if rawLogContent.isEmpty && visibleByteOffset > 0 {
+                setDisplayedText("(View cleared. New output will append when the file updates)")
+            } else {
+                applyFilterAndDisplay(resetPosition: resetPosition)
+            }
             let kb = Double(fileSize) / 1024.0
             statusLabel.stringValue = String(format: "%.1f KB • %@", kb, modDate.formatted(date: .omitted, time: .standard))
         }
@@ -470,8 +517,78 @@ class VMLogWindowController: NSWindowController, NSWindowDelegate, NSSearchField
     }
 
     @objc private func clearViewClicked() {
+        guard let path = currentLogPath else { return }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let fileSizeNumber = attrs[.size] as? NSNumber else {
+            rawLogContent = ""
+            setDisplayedText("(Log file does not exist yet)")
+            return
+        }
+
+        let fileSize = fileSizeNumber.uint64Value
+        let fileNumber = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value
+        clearedLogPositions[path] = ClearedLogPosition(byteOffset: fileSize, fileNumber: fileNumber)
+        lastFileModificationDate = attrs[.modificationDate] as? Date
+        lastFileSize = fileSize
         rawLogContent = ""
         setDisplayedText("(View cleared. New output will append when file updates)")
+        statusLabel.stringValue = "View cleared • log file retained"
+    }
+
+    @objc private func clearLogFileClicked() {
+        guard let vmName = currentVMName, let path = currentLogPath else { return }
+
+        VMManager.shared.refreshVMs { [weak self] vms in
+            guard let self else { return }
+            guard self.currentVMName == vmName, self.currentLogPath == path else { return }
+            if vms.first(where: { $0.name == vmName })?.isRunning == true {
+                let alert = NSAlert()
+                alert.messageText = "Stop the VM First"
+                alert.informativeText = "The log file cannot be cleared while '\(vmName)' is running. Stop the VM, then try again."
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                return
+            }
+            self.confirmAndClearLogFile(path: path)
+        }
+    }
+
+    private func confirmAndClearLogFile(path: String) {
+        guard FileManager.default.fileExists(atPath: path) else {
+            let alert = NSAlert()
+            alert.messageText = "Log File Does Not Exist"
+            alert.informativeText = path
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Clear Log File?"
+        alert.informativeText = "This permanently removes all content from \(URL(fileURLWithPath: path).lastPathComponent). This cannot be undone."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Clear Log File")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+            try handle.truncate(atOffset: 0)
+            try handle.close()
+            clearedLogPositions.removeValue(forKey: path)
+            lastFileModificationDate = nil
+            lastFileSize = nil
+            rawLogContent = ""
+            loadLogs(resetPosition: true)
+            statusLabel.stringValue = "Log file cleared"
+        } catch {
+            let errorAlert = NSAlert(error: error)
+            errorAlert.messageText = "Could Not Clear Log File"
+            errorAlert.informativeText = error.localizedDescription
+            errorAlert.runModal()
+        }
     }
 
     @objc private func revealInFinderClicked() {

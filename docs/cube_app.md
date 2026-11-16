@@ -42,6 +42,37 @@ in an alert; **Open Service Log** provides the helper's diagnostics.
 The socket and log are under `~/Library/Application Support/cube/`.
 Stopping or restarting networking disconnects attached guests.
 
+## Known issues: updating Cube.app with running VMs
+
+Cube.app does not currently support a zero-downtime application update while
+managed VMs are running:
+
+- Quitting Cube.app does not stop managed VMs. Their manager and VMM processes
+  run independently and continue using the version of the executable with which
+  they were started.
+- A normal quit stops the network service owned by Cube.app. Running guests that
+  use `vmnet-proxy` remain powered on but lose network connectivity.
+- A running VMM does not reconnect to a restarted `vmnet-proxy` service. Starting
+  the updated app and its service therefore does not restore networking to those
+  guests; the VMs must be restarted.
+- The updated app does not adopt a network service launched by the previous app
+  process. Service ownership is intentionally limited to the process that
+  launched it.
+
+Until service handoff or VMM reconnection is implemented, update Cube.app as
+follows:
+
+1. Run `cubectl shutdown <name>` for every running VM. Prefer guest shutdown to
+   `cubectl stop`, which is a host-side forced stop.
+2. Run `cubectl list` and confirm that no VMs remain running.
+3. Quit Cube.app normally, replace or update the application, and launch the new
+   version.
+4. Confirm that the network service has started, then start the VMs again.
+
+An updater should offer **Shut Down VMs and Update** and **Update Later** when it
+detects running VMs. If a guest cannot shut down, the updater should cancel or
+defer the update rather than force-stop it without explicit confirmation.
+
 ## Installing a FreeBSD desktop
 
 The **New Virtual Machine** window includes a **Desktop** selector with server,

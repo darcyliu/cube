@@ -47,6 +47,7 @@ struct VMManagementTests {
         precondition(desktopCreateArgs[desktopCreateArgs.firstIndex(of: "--desktop-user")! + 1] == "cube")
         precondition(desktopCreateArgs[desktopCreateArgs.firstIndex(of: "--desktop-password")! + 1] == "desktop-secret")
         precondition(desktopCreateArgs[desktopCreateArgs.firstIndex(of: "--display")! + 1] == "1280x800")
+        precondition(desktopCreateArgs[desktopCreateArgs.firstIndex(of: "--gpu")! + 1] == "virtio")
 
         let vmDir = dir.appendingPathComponent("VM's files with spaces")
         try fm.createDirectory(at: vmDir, withIntermediateDirectories: true)
@@ -81,6 +82,7 @@ struct VMManagementTests {
         precondition(value("--disk") == vmDir.appendingPathComponent("disk with spaces.img").path)
         precondition(value("--bootargs") == bootargs)
         precondition(value("--module") == vmDir.appendingPathComponent("modules/zfs.ko").path)
+        precondition(value("--gpu") == "simple", "Existing configs must retain the simple framebuffer default")
         precondition(args.contains("--multiuser"), "Default FreeBSD boot must be multiuser")
         precondition(value("--vnc") == "127.0.0.1:5999")
         precondition(!fm.fileExists(atPath: marker.path), "Shell substitutions must remain literal")
@@ -100,6 +102,12 @@ struct VMManagementTests {
         precondition(vncArgs[vncArgs.firstIndex(of: "--vnc")! + 1] == "127.0.0.1:5999")
         precondition(vm.managedStartArguments(displayMode: .vnc) ==
                      ["start", "example", "--vnc", "127.0.0.1:5999", "--display", "1440x900"])
+
+        var gpuConfig = try JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as! [String: Any]
+        gpuConfig["gpu"] = "virtio"
+        try JSONSerialization.data(withJSONObject: gpuConfig).write(to: configURL)
+        let virtioArgs = try shellArguments(vm.generateCubeCommand())
+        precondition(virtioArgs[virtioArgs.firstIndex(of: "--gpu")! + 1] == "virtio")
 
         includeVNC = false
         try writeConfig()

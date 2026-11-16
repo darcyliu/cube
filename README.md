@@ -349,38 +349,54 @@ UI scaling separately for readable text.
 
 ## Project Structure
 
-See the [follow-up roadmap](docs/roadmap.md) for prioritized work and completion
-criteria covering networking, installation tests, UEFI/ZFS, graphics, VM
-management, and disk-overlay tools.
+See the [documentation index](docs/README.md) for guides, architecture, and
+verification. [Completed milestones](docs/completed-milestones.md) record delivered
+work; [next features](docs/next-features.md) defines future priorities.
 
-```
-vmm/
-├── Cargo.toml               # Rust package manifest
-├── build.rs                 # Links Hypervisor.framework & assembles guest payload
-├── entitlements.plist       # com.apple.security.hypervisor entitlement
-├── Makefile                 # Convenient build, sign, and run automation
+Selected source and documentation paths (generated builds and local guest images
+are omitted):
+
+```text
+cube/
+├── Cargo.toml                 # Rust package manifest
+├── build.rs                   # Framework linking and guest payload assembly
+├── Makefile                   # Build, sign, package, and run automation
+├── entitlements.plist         # Hypervisor entitlement
+├── entitlements.networking.plist # Networking entitlements
+├── app/Cube/                  # Native macOS management app and tests
 ├── docs/
-│   ├── networking.md        # VirtIO-Net architecture, troubleshooting & UX guide
-│   └── vmnet_protocol.md    # VMMNET wire protocol specification for third-party clients
-├── guest/
-│   └── payload.S            # Baremetal ARM64 assembly test program
+│   ├── README.md              # Documentation index
+│   ├── next-features.md       # Prioritized future work
+│   ├── completed-milestones.md # Delivery history
+│   ├── verification.md        # Verification suite guide
+│   └── virtio-live-verification.md # Live qualification evidence and gaps
+├── guest/payload.S            # Bare-metal ARM64 test program
+├── scripts/                   # Build, install, signing, and verification tools
+├── tests/                     # Rust integration tests
 └── src/
-    ├── main.rs              # CLI entry point, VM wiring, and run orchestration
-    ├── hypervisor/
-    │   └── mod.rs           # FFI bindings (VM, vCPU, GICv3), register definitions
-    ├── memory.rs            # GuestMemory (16KB page-aligned allocator and mapper)
-    ├── terminal.rs          # Raw terminal mode guard with Ctrl-] escape handler
-    ├── vcpu.rs              # vCPU abstraction, ESR_EL2 syndrome decoding & trap loop
-    ├── vm.rs                # High-level VM container with GICv3 initialization
-    ├── elf.rs               # ELF64 parser and segment loader
-    ├── fdt.rs               # Device Tree synthesizer (via dtc)
+    ├── main.rs                # VMM CLI, device wiring, and orchestration
+    ├── bin/
+    │   ├── cubectl/           # Named VM configuration and management
+    │   └── cube-overlay.rs    # Offline COW inspection and export
+    ├── hypervisor/            # Hypervisor.framework bindings
+    ├── memory.rs              # Guest RAM allocation and mapping
+    ├── vcpu.rs                # vCPU execution and trap handling
+    ├── vm.rs                  # VM lifecycle and GIC initialization
+    ├── elf.rs                 # ELF loading
+    ├── fdt.rs                 # Device-tree generation
+    ├── cow.rs                 # Copy-on-write disk backend
+    ├── native.rs              # Native display bridge
+    ├── native.m               # Cocoa/Metal presentation and input
+    ├── shared_fs/             # Shared-folder server and FUSE support
+    ├── vmnet_service.rs       # Shared host networking service
     └── devices/
-        ├── mod.rs           # MmioDevice trait and MmioBus dispatcher
-        ├── uart.rs          # ARM PL011-compatible virtual serial console
-        └── virtio/
-            ├── mod.rs       # Modern VirtIO MMIO v2 constants and ring structures
-            ├── block.rs     # VirtIO block device (virtio-blk) implementation
-            └── net.rs       # VirtIO network device (virtio-net) with macOS vmnet backend
+        ├── layout.rs          # Validated MMIO and interrupt allocation
+        ├── display/           # Shared frame state and VNC frontend
+        ├── usb/               # xHCI and HID input
+        ├── pflash.rs          # Persistent EFI variable flash
+        ├── uart.rs            # Serial console
+        └── virtio/            # Transport, block, net, GPU, input, console,
+                               # RNG, balloon, vsock, 9P, and virtio-fs
 ```
 
 ## License
